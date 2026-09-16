@@ -33,6 +33,10 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
+The agent editor uses progressive disclosure: identity fields stay visible for
+quick setup, while Skills, model, workspace, capabilities, tools, behavior,
+verification, autonomy, output, and limits are compact expandable sections.
+
 The **Skills** page manages reusable declarative knowledge. Create or edit a
 Skill with a stable lowercase ID, version, instructions, adaptable procedures,
 tags, and required/recommended capabilities. Assign it to an agent with a
