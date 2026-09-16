@@ -35,20 +35,20 @@ class InstanceLock:
                 fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             self.file.close()
-            raise RuntimeError("Ya hay un servidor usando este directorio de datos.") from exc
+            raise RuntimeError("Another server is already using this data directory.") from exc
 
     def close(self):
         self.file.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Agent Control Center · panel local para Ollama")
+    parser = argparse.ArgumentParser(description="Agent Control Center - local Ollama platform")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
-    parser.add_argument("--workers", type=int, default=2, help="Procesos de ejecución simultáneos (1–8)")
+    parser.add_argument("--workers", type=int, default=2, help="Concurrent worker processes (1-8)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.workers <= 8:
-        parser.error("Usa un puerto de 1 a 65535 y entre 1 y 8 workers.")
+        parser.error("Use a port from 1 to 65535 and between 1 and 8 workers.")
     data_dir = args.data_dir.resolve()
     lock = InstanceLock(data_dir)
     runtime = None
@@ -60,10 +60,10 @@ def main():
         server = ControlServer(("127.0.0.1", args.port), application)
         runtime.start()
         print(f"Agent Control Center: http://127.0.0.1:{args.port}", flush=True)
-        print(f"Datos: {data_dir} | Workers: {args.workers} | Ctrl+C para detener", flush=True)
+        print(f"Data: {data_dir} | Workers: {args.workers} | Ctrl+C to stop", flush=True)
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:
-        print("\nDeteniendo ejecuciones y cerrando el servidor...", flush=True)
+        print("\nStopping executions and shutting down the server...", flush=True)
     finally:
         if server:
             server.server_close()

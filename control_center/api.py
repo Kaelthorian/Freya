@@ -45,7 +45,7 @@ class Application:
     def _idle_required(self, agent_id):
         tasks = self.store.list_tasks(agent_id=agent_id, limit=10000)
         if any(task["status"] in LIVE for task in tasks):
-            raise ApiError(409, "Cancela o completa las tareas pendientes antes de editar o eliminar el agente.")
+            raise ApiError(409, "Cancel or complete pending tasks before editing or deleting the agent.")
 
     def _agent_event(self, agent, event_type):
         self.store.append_event(None, {"agent_id": agent["id"], "event_type": event_type,
@@ -82,7 +82,7 @@ class Application:
                 response = request_json("GET", endpoint + "/api/tags", timeout=4)
                 models = response.get("models", [])
                 if not isinstance(models, list):
-                    raise ValueError("Respuesta de modelos inválida.")
+                    raise ValueError("Invalid model response.")
                 return {"models": models, "error": None}
             except Exception as exc:
                 return {"models": [], "error": str(exc)}
@@ -106,21 +106,21 @@ class Application:
                                           limit=self._limit(query), **filters)
         if parts == ["metrics"]:
             return self.store.metrics(agent_id=query.get("agent_id") or None)
-        raise ApiError(404, "Ruta no encontrada.")
+        raise ApiError(404, "Route not found.")
 
     @staticmethod
     def _browse_workspaces(value: str) -> dict:
         if not isinstance(value, str) or len(value) > 2048 or "\x00" in value:
-            raise ValueError("La ruta de workspace no es válida.")
+            raise ValueError("The workspace path is invalid.")
         candidate = Path(value).expanduser() if value.strip() else Path.home()
         if value.strip() and not candidate.is_absolute():
-            raise ValueError("La ruta de workspace debe ser absoluta.")
+            raise ValueError("The workspace path must be absolute.")
         try:
             current = candidate.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
-            raise ValueError("La carpeta no existe o no es accesible.") from exc
+            raise ValueError("The folder does not exist or is inaccessible.") from exc
         if not current.is_dir():
-            raise ValueError("La ruta debe apuntar a una carpeta.")
+            raise ValueError("The path must point to a folder.")
         directories = []
         truncated = False
         try:
@@ -134,7 +134,7 @@ class Application:
                 except (OSError, PermissionError):
                     continue
         except (OSError, PermissionError) as exc:
-            raise ValueError("No se puede leer la carpeta seleccionada.") from exc
+            raise ValueError("The selected folder cannot be read.") from exc
         parent = None if current.parent == current else str(current.parent)
         return {"path": str(current), "parent": parent, "writable": os.access(current, os.W_OK),
                 "directories": directories, "truncated": truncated}
@@ -143,7 +143,7 @@ class Application:
     def _limit(query):
         limit = int(query.get("limit", 200))
         if limit < 1 or limit > 10000:
-            raise ValueError("limit debe estar entre 1 y 10000.")
+            raise ValueError("limit must be between 1 and 10000.")
         return limit
 
     def _mutate(self, method, path, body):
@@ -173,7 +173,7 @@ class Application:
                 action = parts[2]
                 if action == "duplicate":
                     data = {k: agent[k] for k in ("name", "description", "role", "enabled", "config", "tools")}
-                    data["name"] = data["name"][:92] + " (copia)"
+                    data["name"] = data["name"][:92] + " (copy)"
                     new = self.store.create_agent(normalize_agent(data))
                     self._agent_event(new, "agent.created")
                     return 201, new
@@ -186,24 +186,24 @@ class Application:
                     if (set(body) - {"prompt", "workspace_path"} or "prompt" not in body
                             or not isinstance(body["prompt"], str) or not body["prompt"].strip()
                             or len(body["prompt"]) > 32000):
-                        raise ValueError("Envía un prompt no vacío de hasta 32000 caracteres.")
+                        raise ValueError("Enter a non-empty prompt of up to 32,000 characters.")
                     workspace_path = (normalize_workspace_path(body["workspace_path"])
                                       if "workspace_path" in body else None)
                     if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:
-                        raise ApiError(409, "Activa y reanuda el agente antes de asignar una tarea.")
+                        raise ApiError(409, "Enable and resume the agent before assigning a task.")
                     return 201, self.runtime.submit(agent_id, body["prompt"].strip(), workspace_path)
         if method == "POST" and len(parts) == 3 and parts[0] == "tasks":
             task = self.store.get_task(parts[1])
             if parts[2] == "cancel":
                 if task["status"] not in LIVE:
-                    raise ApiError(409, "La tarea ya terminó.")
+                    raise ApiError(409, "The task has already finished.")
                 self.runtime.cancel(task["id"])
                 return 200, self.store.get_task(task["id"])
             if parts[2] == "retry":
                 if task["status"] in LIVE:
-                    raise ApiError(409, "La tarea sigue activa.")
+                    raise ApiError(409, "The task is still active.")
                 agent = self.store.get_agent(task["agent_id"])
                 if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:
-                    raise ApiError(409, "Activa y reanuda el agente antes de reintentar.")
+                    raise ApiError(409, "Enable and resume the agent before retrying.")
                 return 201, self.runtime.submit(agent["id"], task["prompt"], task["workspace"])
-        raise ApiError(404, "Ruta o método no disponible.")
+        raise ApiError(404, "Route or method not available.")

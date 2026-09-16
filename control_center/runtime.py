@@ -133,7 +133,7 @@ class Runtime:
             task = self.store.create_task(agent_id, prompt, str(workspace))
             self.pending.append(task["id"])
             self.store.append_event(task["id"], {"event_type": "task.queued", "level": "info", "status": "Queued",
-                                                   "reason": "Esperar un trabajador y un workspace disponibles; cada agente ejecuta una tarea a la vez."})
+                                                   "reason": "Waiting for an available worker and workspace; each agent runs one task at a time."})
             self._refresh_agent(agent_id)
             self.wake.set()
             return task
@@ -146,7 +146,7 @@ class Runtime:
                 if worker["agent_id"] == agent_id:
                     worker["pause"].set()
                     self.store.append_event(task_id, {"event_type": "task.pause_requested", "level": "info",
-                                                      "reason": "Pausa solicitada: la llamada en curso termina antes de pausar; el tiempo límite sigue avanzando."})
+                                                      "reason": "Pause requested: the current call must finish before pausing, and the time limit continues to run."})
             self._refresh_agent(agent_id)
             return self.store.get_agent(agent_id)
 
@@ -278,7 +278,7 @@ class Runtime:
                 worker["job"] = _WindowsJob(process.pid)
             go_event.set()
             self.store.append_event(task["id"], {"event_type": "task.started", "level": "info", "status": "Running",
-                                                  "reason": "Proceso local iniciado con presupuesto de tiempo y herramientas del agente."})
+                                                  "reason": "Local process started with the agent time budget and tools."})
             self._refresh_agent(task["agent_id"])
         except Exception as exc:
             self._finish(task["id"], {"status": "Failed", "error": "Worker initialization failed: " + str(exc)})
@@ -328,7 +328,7 @@ class Runtime:
                                 status = "Paused" if kind == "paused" else "Running"
                                 self.store.update_task(task_id, status=status)
                                 self.store.append_event(task_id, {"event_type": "task." + kind, "level": "info", "status": status,
-                                                                  "reason": "Pausa cooperativa entre llamadas." if kind == "paused" else "Ejecución reanudada."})
+                                                                  "reason": "Paused between calls." if kind == "paused" else "Run resumed."})
                     except queue.Empty:
                         pass
                     if task_id in self.active and not worker["process"].is_alive():

@@ -64,24 +64,24 @@ class Handler(BaseHTTPRequestHandler):
         hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         host = self.headers.get("Host", "").lower()
         if host not in hosts:
-            raise ApiError(403, "Host local no permitido.")
+            raise ApiError(403, "Local host not allowed.")
         origin = self.headers.get("Origin")
         if origin and origin.lower() != "http://" + host:
-            raise ApiError(403, "Origen no permitido.")
+            raise ApiError(403, "Origin not allowed.")
         if self.headers.get("Sec-Fetch-Site") == "cross-site":
-            raise ApiError(403, "Solicitud entre sitios bloqueada.")
+            raise ApiError(403, "Cross-site request blocked.")
         if self.headers.get("Transfer-Encoding"):
-            raise ApiError(400, "Transfer-Encoding no admitido.")
+            raise ApiError(400, "Transfer-Encoding is not supported.")
 
     def _body(self):
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
-            raise ApiError(415, "Usa Content-Type: application/json.")
+            raise ApiError(415, "Use Content-Type: application/json.")
         size = int(self.headers.get("Content-Length", "0"))
         if size < 0 or size > MAX_BODY:
-            raise ApiError(413, "Solicitud demasiado grande.")
+            raise ApiError(413, "Request is too large.")
         value = json.loads(self.rfile.read(size) or b"{}")
         if not isinstance(value, dict):
-            raise ValueError("El cuerpo debe ser un objeto JSON.")
+            raise ValueError("The body must be a JSON object.")
         return value
 
     def _handle(self):
@@ -105,13 +105,13 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as exc:
             self._json(exc.status, {"error": str(exc)})
         except KeyError:
-            self._json(404, {"error": "Agente o tarea no encontrado."})
+            self._json(404, {"error": "Agent or task not found."})
         except (ValueError, TypeError) as exc:
             self._json(400, {"error": str(exc)})
         except (ConnectionError, TimeoutError):
             pass
         except Exception:
-            self._json(500, {"error": "Error interno del servidor. Revisa el estado e intenta de nuevo."})
+            self._json(500, {"error": "Internal server error. Check the server status and try again."})
 
     do_GET = _handle
     do_POST = _handle
@@ -122,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
         relative = "index.html" if path == "/" else path.lstrip("/")
         target = (FRONTEND / relative).resolve()
         if FRONTEND not in target.parents or target.suffix not in {".html", ".css", ".js", ".svg", ".ico"} or not target.is_file():
-            raise ApiError(404, "Archivo no encontrado.")
+            raise ApiError(404, "File not found.")
         content = target.read_bytes()
         mime = {".js": "text/javascript", ".css": "text/css", ".html": "text/html"}.get(target.suffix)
         mime = mime or mimetypes.guess_type(str(target))[0] or "application/octet-stream"
@@ -137,14 +137,14 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         task_id = parts[2] if len(parts) == 4 else None
         if path != "/api/events" and (len(parts) != 4 or parts[1] != "tasks"):
-            raise ApiError(404, "Stream no encontrado.")
+            raise ApiError(404, "Stream not found.")
         if task_id:
             store.get_task(task_id)
         after = int(self.headers.get("Last-Event-ID") or query.get("after", "0"))
         if after < 0:
-            raise ValueError("Cursor inválido.")
+            raise ValueError("Invalid cursor.")
         if not self.server.sse_slots.acquire(blocking=False):
-            raise ApiError(503, "Demasiadas conexiones de eventos.")
+            raise ApiError(503, "Too many event connections.")
         try:
             self.send_response(200)
             self._headers("text/event-stream; charset=utf-8")
@@ -171,4 +171,3 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             self.server.sse_slots.release()
-

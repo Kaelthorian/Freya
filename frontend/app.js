@@ -17,7 +17,7 @@ function updateChrome() {
   document.querySelectorAll('[data-nav]').forEach(link => { const active = link.dataset.nav === current.page; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
   document.querySelector('#agent-count').textContent = number(state.agents.length);
   const m = state.metrics || {}, good = state.health?.status === 'ok';
-  document.querySelector('#system-overview').innerHTML = `<span class="header-system-status"><span class="dot ${good ? 'success' : 'error'}"></span>${good ? 'Sistema operativo' : 'API sin conexión'}</span><span class="header-divider"></span><span>${icon('agents')}<strong>${number(m.active_agents)}</strong> activos</span><span>${icon('activity')}<strong>${number(m.running_tasks)}</strong> ejecutando</span>`;
+  document.querySelector('#system-overview').innerHTML = `<span class="header-system-status"><span class="dot ${good ? 'success' : 'error'}"></span>${good ? 'System online' : 'API offline'}</span><span class="header-divider"></span><span>${icon('agents')}<strong>${number(m.active_agents)}</strong> active</span><span>${icon('activity')}<strong>${number(m.running_tasks)}</strong> running</span>`;
 }
 
 function preserveUI() {
@@ -44,13 +44,13 @@ async function render(navigation = false) {
     else if (current.page === 'logs') html = await logs();
     else if (current.page === 'metrics') html = metricsView(state.metrics);
     else if (current.page === 'settings') html = settings();
-    else html = empty('search', 'Esta vista no existe', 'Vuelve al dashboard para continuar.', '<a class="button primary" href="#/dashboard">Abrir dashboard</a>');
+    else html = empty('search', 'This page does not exist', 'Return to the dashboard to continue.', '<a class="button primary" href="#/dashboard">Open dashboard</a>');
     if (sequence !== renderSequence) return;
     main.innerHTML = html;
     if (navigation) window.scrollTo({ top: 0, behavior: 'instant' }); else restoreUI(saved);
   } catch (error) {
     if (sequence !== renderSequence) return;
-    main.innerHTML = `<section class="panel error-page">${empty('alert', 'No se pudo cargar esta vista', error.message, button('Reintentar', 'refresh', 'refresh', '', 'primary'))}</section>`;
+    main.innerHTML = `<section class="panel error-page">${empty('alert', 'Could not load this page', error.message, button('Retry', 'refresh', 'refresh', '', 'primary'))}</section>`;
   }
 }
 
@@ -63,7 +63,7 @@ async function refresh(navigation = false) {
     await render(navigation);
   } catch (error) {
     state.health = null; updateChrome();
-    if (!currentKey) main.innerHTML = `<section class="panel error-page">${empty('alert', 'No se pudo conectar con el servidor', error.message, button('Reintentar', 'refresh', 'refresh', '', 'primary'))}</section>`;
+    if (!currentKey) main.innerHTML = `<section class="panel error-page">${empty('alert', 'Could not connect to the server', error.message, button('Retry', 'refresh', 'refresh', '', 'primary'))}</section>`;
   } finally { refreshing = false; if (refreshAgain) { refreshAgain = false; queueRefresh(); } }
 }
 
@@ -88,14 +88,14 @@ document.addEventListener('click', async event => {
     if (action === 'chart') { state.chart = value; return render(); }
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
-    if (action === 'delete-agent') return confirmAction({ title: 'Eliminar agente', description: 'El agente se eliminará del workspace. No se puede eliminar mientras tiene tareas activas.', label: 'Eliminar agente', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agente eliminado.'); } });
-    if (action === 'cancel-task') return confirmAction({ title: 'Cancelar esta ejecución', description: 'Se solicitará la cancelación al runtime y quedará registrada en el historial. Una acción en curso puede terminar antes de que se aplique.', label: 'Cancelar ejecución', danger: true, action: async () => { await api(`/tasks/${id}/cancel`, 'POST', {}); toast('Cancelación solicitada.'); } });
-    if (action === 'restart-agent') return confirmAction({ title: 'Reiniciar agente', description: 'El runtime cancelará la ejecución activa y dejará al agente disponible para recibir nuevas tareas.', label: 'Reiniciar agente', action: async () => { await api(`/agents/${id}/restart`, 'POST', {}); toast('Reinicio solicitado.'); } });
+    if (action === 'delete-agent') return confirmAction({ title: 'Delete agent', description: 'This agent will be removed from the workspace. Agents with active tasks cannot be deleted.', label: 'Delete agent', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agent deleted.'); } });
+    if (action === 'cancel-task') return confirmAction({ title: 'Cancel this run', description: 'The runtime will be asked to cancel this run, and the request will be recorded in its history. An action already in progress may finish before cancellation takes effect.', label: 'Cancel run', danger: true, action: async () => { await api(`/tasks/${id}/cancel`, 'POST', {}); toast('Cancellation requested.'); } });
+    if (action === 'restart-agent') return confirmAction({ title: 'Restart agent', description: 'The runtime will cancel the active run and make the agent available for new tasks.', label: 'Restart agent', action: async () => { await api(`/agents/${id}/restart`, 'POST', {}); toast('Restart requested.'); } });
     target.disabled = true;
-    if (action === 'toggle-agent') { await api(`/agents/${id}`, 'PATCH', { enabled: target.dataset.enabled === 'true' }); toast(target.dataset.enabled === 'true' ? 'Agente activado.' : 'Agente desactivado.'); }
-    else if (action === 'duplicate-agent') { const agent = await api(`/agents/${id}/duplicate`, 'POST', {}); location.hash = `#/agents/${agent.id}`; toast('Agente duplicado.'); }
-    else if (action === 'pause-agent' || action === 'resume-agent') { await api(`/agents/${id}/${action === 'pause-agent' ? 'pause' : 'resume'}`, 'POST', {}); toast(action === 'pause-agent' ? 'Pausa solicitada. Se aplica entre acciones.' : 'Agente reanudado.'); }
-    else if (action === 'retry-task') { const task = await api(`/tasks/${id}/retry`, 'POST', {}); location.hash = `#/tasks/${task.id}`; toast('Nueva ejecución creada.'); }
+    if (action === 'toggle-agent') { await api(`/agents/${id}`, 'PATCH', { enabled: target.dataset.enabled === 'true' }); toast(target.dataset.enabled === 'true' ? 'Agent enabled.' : 'Agent disabled.'); }
+    else if (action === 'duplicate-agent') { const agent = await api(`/agents/${id}/duplicate`, 'POST', {}); location.hash = `#/agents/${agent.id}`; toast('Agent duplicated.'); }
+    else if (action === 'pause-agent' || action === 'resume-agent') { await api(`/agents/${id}/${action === 'pause-agent' ? 'pause' : 'resume'}`, 'POST', {}); toast(action === 'pause-agent' ? 'Pause requested. It takes effect between actions.' : 'Agent resumed.'); }
+    else if (action === 'retry-task') { const task = await api(`/tasks/${id}/retry`, 'POST', {}); location.hash = `#/tasks/${task.id}`; toast('New run created.'); }
     await refresh();
   } catch (error) { toast(error.message, true); }
   finally { target.disabled = false; }
@@ -113,7 +113,7 @@ function connectEvents() {
   const source = new EventSource('/api/events');
   const setConnection = connected => {
     state.connected = connected;
-    document.querySelector('#connection-label').textContent = connected ? 'Conectado en tiempo real' : 'Reconectando · sondeo activo';
+    document.querySelector('#connection-label').textContent = connected ? 'Connected in real time' : 'Reconnecting · polling active';
     document.querySelector('#connection-dot').className = `dot ${connected ? 'success' : 'waiting'}`;
   };
   source.addEventListener('open', () => setConnection(true));

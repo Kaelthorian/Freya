@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="es">
+<html lang="en">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,18 +9,18 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <a class="skip-link" href="#main-content">Ir al contenido</a>
-    <aside class="sidebar" aria-label="Navegación principal">
-      <a class="brand" href="#/dashboard" aria-label="Agent Control Center inicio"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m7 24 9-16 9 16M11 18h10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span>agent<span class="brand-weight">control</span><small>CONTROL CENTER</small></span></a>
-      <div class="workspace-label"><span class="workspace-icon">L</span><span>Local workspace<small>Entorno de desarrollo</small></span><span class="local-dot"></span></div>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#/dashboard" aria-label="Agent Control Center home"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m7 24 9-16 9 16M11 18h10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span>agent<span class="brand-weight">control</span><small>CONTROL CENTER</small></span></a>
+      <div class="workspace-label"><span class="workspace-icon">L</span><span>Local workspace<small>Development environment</small></span><span class="local-dot"></span></div>
       <div class="nav-label">WORKSPACE</div>
       <nav id="navigation"></nav>
-      <div class="sidebar-footer"><div class="connection"><span id="connection-dot" class="dot waiting"></span><span id="connection-label">Conectando…</span><span class="mono">SSE</span></div><div class="version">Agent Control Center <span>v1.0</span></div></div>
+      <div class="sidebar-footer"><div class="connection"><span id="connection-dot" class="dot waiting"></span><span id="connection-label">Connecting…</span><span class="mono">SSE</span></div><div class="version">Agent Control Center <span>v1.0</span></div></div>
     </aside>
     <div class="app-shell">
-      <header class="topbar"><div class="breadcrumbs"><span class="breadcrumb-icon" id="breadcrumb-icon"></span><span>Workspace</span><span class="crumb-sep">/</span><strong id="breadcrumb">Dashboard</strong></div><div class="system-overview" id="system-overview"><span class="status-pill"><span class="dot waiting"></span>Conectando al sistema</span></div></header>
-      <main id="main-content" tabindex="-1"><div class="initial-loading"><span class="spinner"></span>Cargando tu workspace…</div></main>
-      <footer class="page-footer"><span><span class="dot"></span> Datos persistidos localmente · SQLite</span><span>Tu infraestructura. Tus agentes.</span></footer>
+      <header class="topbar"><div class="breadcrumbs"><span class="breadcrumb-icon" id="breadcrumb-icon"></span><span>Workspace</span><span class="crumb-sep">/</span><strong id="breadcrumb">Dashboard</strong></div><div class="system-overview" id="system-overview"><span class="status-pill"><span class="dot waiting"></span>Connecting to the system</span></div></header>
+      <main id="main-content" tabindex="-1"><div class="initial-loading"><span class="spinner"></span>Loading your workspace…</div></main>
+      <footer class="page-footer"><span><span class="dot"></span> Data stored locally · SQLite</span><span>Your infrastructure. Your agents.</span></footer>
     </div>
     <dialog id="app-dialog" aria-labelledby="dialog-title"></dialog>
     <dialog id="workspace-dialog" class="workspace-dialog" aria-labelledby="workspace-dialog-title"></dialog>

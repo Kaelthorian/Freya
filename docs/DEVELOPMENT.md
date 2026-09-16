@@ -26,8 +26,8 @@ SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
 `-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. These
 generated paths are ignored by Git.
 
-In agent settings, **Seleccionar carpeta** chooses that agent's default folder.
-The **Asignar una tarea** form also has its own folder selector. It starts with
+In agent settings, **Choose folder** chooses that agent's default folder.
+The **Assign a task** form also has its own folder selector. It starts with
 the agent default, can override it for one execution, and uses a fresh generated
 workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
