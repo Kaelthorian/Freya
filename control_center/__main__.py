@@ -11,6 +11,7 @@ from .api import Application
 from .http import ControlServer
 from .runtime import Runtime
 from .storage import Store
+from .orchestrator import Orchestrator
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -56,7 +57,8 @@ def main():
     try:
         store = Store(data_dir / "control_center.sqlite3")
         runtime = Runtime(store, data_dir, ROOT, max_workers=args.workers)
-        application = Application(store, runtime, data_dir)
+        orchestrator = Orchestrator(store, runtime)
+        application = Application(store, runtime, data_dir, orchestrator)
         server = ControlServer(("127.0.0.1", args.port), application)
         runtime.start()
         print(f"Agent Control Center: http://127.0.0.1:{args.port}", flush=True)

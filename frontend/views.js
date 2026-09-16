@@ -6,6 +6,13 @@ const agentOptions = selected => `<option value="">All agents</option>${state.ag
 const tabs = (items, selected, action) => `<div class="tabs" role="tablist">${items.map(([value, label]) => `<button role="tab" aria-selected="${selected === value}" class="tab ${selected === value ? 'active' : ''}" data-action="${action}" data-value="${value}">${label}</button>`).join('')}</div>`;
 const chartTabs = () => tabs([['tasks', 'Tasks'], ['tokens', 'Tokens'], ['errors', 'Errors'], ['duration_seconds', 'Duration']], state.chart, 'chart');
 
+export function freya() {
+  const runs = state.orchestrations || [];
+  return `${heading('Freya', 'Tell Freya what you need and it will coordinate the available agents.', '', 'ORCHESTRATOR')}
+    <section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want..."></textarea><button class="button primary" type="submit">Ask Freya</button></form></section>
+    <section class="panel"><h2>Recent orchestrations</h2>${runs.length ? runs.map(r => `<article class="timeline-item"><strong>${esc(r.status)}</strong><span>${esc(r.prompt)}</span><small>${esc(r.response || r.error || 'Freya is working...')}</small></article>`).join('') : '<p class="muted">No orchestration runs yet.</p>'}</section>`;
+}
+
 export function dashboard() {
   const m = state.metrics || {}, h = state.health || {}, system = h.system || {};
   return `${heading('Operations dashboard', 'A clear view of your agents, runs, and resources.', button('Assign task', 'assign', 'play', '', 'secondary') + button('Create agent', 'create-agent', 'plus', '', 'primary'), 'OVERVIEW')}

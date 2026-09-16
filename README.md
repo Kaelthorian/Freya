@@ -1,4 +1,14 @@
-# Agent Control Center
+# Freya
+
+Freya is a local Ollama multi-agent control center. The Freya orchestrator receives user requests, selects existing enabled agents, delegates through the protected runtime, and returns an integrated response. Agents have explicit identity, instructions, capabilities, workspace and limits.
+
+Run from the repository root:
+
+```powershell
+python -m control_center --port 8765
+```
+
+Open `http://127.0.0.1:8765`. The **Freya** page is the primary flow; **Agents**, **Tasks**, **Logs**, **Metrics**, and **Settings** remain available.
 
 Plataforma web local para crear agentes de programación con Ollama, asignarles
 tareas y observar sus herramientas, logs y métricas en tiempo real. Usa Python

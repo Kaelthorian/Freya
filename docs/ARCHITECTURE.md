@@ -1,5 +1,7 @@
 # Architecture
 
+Freya includes a first-class orchestration layer. User prompts enter `control_center/orchestrator.py`, which persists a run, selects enabled existing agents, delegates bounded tasks through `Runtime`, and integrates persisted results. Workers remain the only components allowed to invoke tools; each receives a generic policy plus its identity, instructions, skills, workspace, and limits. Orchestration runs, delegations, and events are stored durably, and SQLite migrations preserve existing data.
+
 ## Boundaries
 
 The browser, API, runtime, worker and database are separate responsibilities.

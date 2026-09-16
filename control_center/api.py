@@ -20,9 +20,10 @@ class ApiError(Exception):
 
 
 class Application:
-    def __init__(self, store, runtime, data_dir: Path):
+    def __init__(self, store, runtime, data_dir: Path, orchestrator=None):
         self.store = store
         self.runtime = runtime
+        self.orchestrator = orchestrator
         self.data_dir = data_dir.resolve()
         self.lock = threading.RLock()
         self._psutil = None
@@ -75,6 +76,8 @@ class Application:
             return self._browse_workspaces(query.get("path") or str(self.data_dir.parent))
         if parts == ["tools"]:
             return TOOL_CATALOG
+        if parts == ["skills"]:
+            return self.store.list_skills()
         if parts == ["models"]:
             from .transport import request_json
             endpoint = validate_endpoint(query.get("endpoint", DEFAULT_CONFIG["endpoint"]))
@@ -106,6 +109,12 @@ class Application:
                                           limit=self._limit(query), **filters)
         if parts == ["metrics"]:
             return self.store.metrics(agent_id=query.get("agent_id") or None)
+        if parts == ["orchestrations"]:
+            return self.store.list_orchestrations(self._limit(query))
+        if len(parts) == 2 and parts[0] == "orchestrations":
+            return self.store.get_orchestration(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "events":
+            return self.store.get_orchestration(parts[1])["events"]
         raise ApiError(404, "Route not found.")
 
     @staticmethod
@@ -152,6 +161,11 @@ class Application:
             agent = self.store.create_agent(normalize_agent(body))
             self._agent_event(agent, "agent.created")
             return 201, agent
+        if method == "POST" and parts == ["orchestrations"]:
+            if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
+            prompt = body.get("prompt") if isinstance(body, dict) else None
+            if not isinstance(prompt, str) or not prompt.strip(): raise ValueError("Enter a non-empty prompt.")
+            return 201, self.orchestrator.submit(prompt.strip())
         if len(parts) >= 2 and parts[0] == "agents":
             agent_id = parts[1]
             agent = self.store.get_agent(agent_id)

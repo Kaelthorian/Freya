@@ -11,6 +11,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           loopback server entry point and instance lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
+│   ├── orchestrator.py       Freya planning, delegation and result integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
 │   ├── transport.py          non-redirecting local Ollama HTTP client

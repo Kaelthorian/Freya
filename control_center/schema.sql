@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS agents (
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'Idle',
     created_at TEXT NOT NULL,
@@ -35,6 +36,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace TEXT NOT NULL,
     config_json TEXT NOT NULL,
     tools_json TEXT NOT NULL,
+    agent_role TEXT NOT NULL DEFAULT '',
+    agent_description TEXT NOT NULL DEFAULT '',
+    agent_instructions TEXT NOT NULL DEFAULT '',
+    skills_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS task_executions (
@@ -92,3 +97,50 @@ CREATE INDEX IF NOT EXISTS idx_executions_status ON task_executions(status);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON log_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_agent_id ON log_events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_filters ON log_events(level, tool, timestamp);
+
+CREATE TABLE IF NOT EXISTS skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
+    required_tools_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS agent_skills (
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    PRIMARY KEY (agent_id, skill_id)
+);
+CREATE TABLE IF NOT EXISTS orchestration_runs (
+    id TEXT PRIMARY KEY,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Queued',
+    response TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orchestration_delegations (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    task_id TEXT REFERENCES tasks(id),
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Queued',
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS orchestration_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    timestamp TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT,
+    agent_id TEXT,
+    task_id TEXT,
+    message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_orch_events ON orchestration_events(orchestration_id,id);

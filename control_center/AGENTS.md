@@ -4,6 +4,10 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
+`orchestrator.py` is the Freya-only coordination boundary. It may select and
+delegate to existing agents through `Runtime`, but workers cannot create agents
+or bypass tool policy.
+
 ## Boundaries
 
 - Keep HTTP parsing/same-origin checks in `http.py` and business validation in

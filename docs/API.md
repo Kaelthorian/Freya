@@ -4,6 +4,13 @@ All routes are same-origin under `/api` and return JSON errors as
 `{"error":"message"}`. Mutations accept `application/json`. SSE is
 `text/event-stream`.
 
+## Freya orchestration
+
+`POST /api/orchestrations` with `{ "prompt": "..." }` queues a bounded run.
+`GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
+the run, delegations, and events needed to reconstruct it. Existing agent and
+task routes remain compatible.
+
 ## Agents and catalogue
 
 | Method | Route | Purpose |

@@ -1,11 +1,11 @@
 import { state, api, esc, number, route, toast } from './core.js';
 import { icon } from './icons.js';
 import { empty, button } from './components.js';
-import { dashboard, agents, agentDetail, tasks, taskDetail, logs, metricsView, settings } from './views.js';
+import { freya, dashboard, agents, agentDetail, tasks, taskDetail, logs, metricsView, settings } from './views.js';
 import { agentDialog, assignDialog, confirmAction, setDialogRefresh } from './dialogs.js';
 
 const main = document.querySelector('#main-content');
-const pages = [['dashboard', 'Dashboard'], ['agents', 'Agents'], ['tasks', 'Tasks'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
+const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['tasks', 'Tasks'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
 document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 3 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 5 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
 
@@ -38,7 +38,8 @@ async function render(navigation = false) {
   updateChrome();
   try {
     let html;
-    if (current.page === 'dashboard') html = dashboard();
+    if (current.page === 'freya') html = freya();
+    else if (current.page === 'dashboard') html = dashboard();
     else if (current.page === 'agents') html = current.id ? await agentDetail(current.id) : agents();
     else if (current.page === 'tasks') html = current.id ? await taskDetail(current.id) : await tasks();
     else if (current.page === 'logs') html = await logs();
@@ -58,8 +59,8 @@ async function refresh(navigation = false) {
   if (refreshing) { refreshAgain = true; return; }
   refreshing = true;
   try {
-    const [health, agents, tasks, metrics] = await Promise.all([api('/health'), api('/agents'), api('/tasks'), api('/metrics')]);
-    Object.assign(state, { health, agents, tasks, metrics });
+    const [health, agents, tasks, metrics, orchestrations] = await Promise.all([api('/health'), api('/agents'), api('/tasks'), api('/metrics'), api('/orchestrations')]);
+    Object.assign(state, { health, agents, tasks, metrics, orchestrations });
     await render(navigation);
   } catch (error) {
     state.health = null; updateChrome();
@@ -108,6 +109,7 @@ document.addEventListener('change', event => {
   render();
 });
 document.addEventListener('submit', event => { if (event.target.id === 'log-filters') event.preventDefault(); });
+document.addEventListener('submit', async event => { if (event.target.id === 'freya-form') { event.preventDefault(); const prompt=event.target.prompt.value.trim(); if (!prompt) return; try { await api('/orchestrations','POST',{prompt}); toast('Freya started the orchestration.'); await refresh(); } catch (error) { toast(error.message,true); } } });
 
 function connectEvents() {
   const source = new EventSource('/api/events');

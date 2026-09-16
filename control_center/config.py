@@ -102,17 +102,17 @@ def normalize_workspace_path(value: str, *, allow_empty: bool = True) -> str:
 def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Configuration must be a JSON object.")
-    allowed = {"name", "description", "role", "enabled", "config", "tools"}
+    allowed = {"name", "description", "role", "instructions", "enabled", "config", "tools", "skills"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError("Unknown fields: " + ", ".join(sorted(unknown)))
     baseline = existing or {}
     result = {key: copy.deepcopy(baseline.get(key, default)) for key, default in (
-        ("name", ""), ("description", ""), ("role", "Developer"),
+        ("name", ""), ("description", ""), ("role", ""), ("instructions", ""),
         ("enabled", True), ("tools", DEFAULT_TOOLS),
     )}
     result.update({key: value for key, value in data.items() if key != "config"})
-    for name, maximum, required in (("name", 100, True), ("description", 2000, False), ("role", 100, False)):
+    for name, maximum, required in (("name", 100, True), ("description", 2000, False), ("role", 100, False), ("instructions", 16000, False)):
         result[name] = _text(result[name], name, maximum, required)
     if not isinstance(result["enabled"], bool):
         raise ValueError("enabled must be a boolean.")
@@ -159,6 +159,10 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(selected, list) or any(not isinstance(x, str) or x not in available for x in selected):
         raise ValueError("tools may only contain names of available tools.")
     result["tools"] = list(dict.fromkeys(selected))
+    skills = result.get("skills", [])
+    if not isinstance(skills, list) or any(not isinstance(x, (str, dict)) for x in skills):
+        raise ValueError("skills must be a list of skill IDs or objects.")
+    result["skills"] = skills
     if config["permissions"] == "read_only" and set(selected) & {"write_file", "edit_file", "run_command"}:
         raise ValueError("The read_only permission does not allow writes or execution.")
     if config["permissions"] != "execute" and "run_command" in selected:

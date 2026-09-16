@@ -54,6 +54,15 @@ class Store:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
+            # In-place migrations keep existing local databases usable.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(agents)")}
+            if "instructions" not in columns:
+                connection.execute("ALTER TABLE agents ADD COLUMN instructions TEXT NOT NULL DEFAULT ''")
+            task_columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+            for name, definition in (("agent_role", "TEXT NOT NULL DEFAULT ''"), ("agent_description", "TEXT NOT NULL DEFAULT ''"),
+                                     ("agent_instructions", "TEXT NOT NULL DEFAULT ''"), ("skills_json", "TEXT NOT NULL DEFAULT '[]'")):
+                if name not in task_columns:
+                    connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
             connection.executemany(
                 "INSERT INTO tools(name, description, available, dangerous) VALUES(?,?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET description=excluded.description, "
@@ -92,6 +101,11 @@ class Store:
         agent["tools"] = [item[0] for item in connection.execute(
             "SELECT tool_name FROM agent_tools WHERE agent_id=? ORDER BY tool_name", (agent_id,),
         )]
+        agent["skills"] = [dict(item) for item in connection.execute(
+            "SELECT s.id,s.name,s.description,s.instructions,s.required_tools_json FROM skills s JOIN agent_skills a ON a.skill_id=s.id WHERE a.agent_id=? ORDER BY s.name", (agent_id,)
+        )]
+        for skill in agent["skills"]:
+            skill["required_tools"] = _load(skill.pop("required_tools_json")) or []
         totals = connection.execute(
             "SELECT COUNT(*) AS task_count, SUM(e.status='Success') AS successes, "
             "SUM(e.status IN ('Success','Failed','Cancelled')) AS finished, "
@@ -117,9 +131,9 @@ class Store:
         agent_id, now = str(uuid4()), utcnow()
         with self._connection(write=True) as connection:
             connection.execute(
-                "INSERT INTO agents(id,name,description,role,enabled,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (agent_id, clean["name"], clean.get("description", ""), clean.get("role", ""),
+                "INSERT INTO agents(id,name,description,role,instructions,enabled,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (agent_id, clean["name"], clean.get("description", ""), clean.get("role", ""), clean.get("instructions", ""),
                  int(clean.get("enabled", True)), "Idle" if clean.get("enabled", True) else "Offline", now, now),
             )
             self._save_config(connection, agent_id, clean)
@@ -134,6 +148,10 @@ class Store:
         connection.execute("DELETE FROM agent_tools WHERE agent_id=?", (agent_id,))
         connection.executemany("INSERT INTO agent_tools(agent_id,tool_name) VALUES(?,?)",
                                [(agent_id, name) for name in dict.fromkeys(data.get("tools", []))])
+        connection.execute("DELETE FROM agent_skills WHERE agent_id=?", (agent_id,))
+        for skill in data.get("skills", []):
+            sid = skill.get("id") if isinstance(skill, dict) else skill
+            if sid: connection.execute("INSERT OR IGNORE INTO agent_skills(agent_id,skill_id) VALUES(?,?)", (agent_id, sid))
 
     def update_agent(self, agent_id: str, data: dict) -> dict:
         clean = sanitize(data)
@@ -146,8 +164,8 @@ class Store:
             elif status == "Offline":
                 status = "Idle"
             connection.execute(
-                "UPDATE agents SET name=?,description=?,role=?,enabled=?,status=?,updated_at=? WHERE id=?",
-                (clean["name"], clean.get("description", ""), clean.get("role", ""),
+                "UPDATE agents SET name=?,description=?,role=?,instructions=?,enabled=?,status=?,updated_at=? WHERE id=?",
+                (clean["name"], clean.get("description", ""), clean.get("role", ""), clean.get("instructions", ""),
                  int(enabled), status, utcnow(), agent_id),
             )
             self._save_config(connection, agent_id, clean)
@@ -191,9 +209,9 @@ class Store:
         with self._connection(write=True) as connection:
             agent = self._agent(connection, agent_id)
             connection.execute(
-                "INSERT INTO tasks(id,agent_id,agent_name,prompt,workspace,config_json,tools_json,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)", (task_id, agent_id, agent["name"], sanitize(prompt),
-                sanitize(workspace), _dump(agent["config"]), _dump(agent["tools"]), now),
+                "INSERT INTO tasks(id,agent_id,agent_name,prompt,workspace,config_json,tools_json,agent_role,agent_description,agent_instructions,skills_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (task_id, agent_id, agent["name"], sanitize(prompt),
+                sanitize(workspace), _dump(agent["config"]), _dump(agent["tools"]), agent.get("role", ""), agent.get("description", ""), agent.get("instructions", ""), _dump(agent.get("skills", [])), now),
             )
             connection.execute("INSERT INTO task_executions(id,task_id) VALUES(?,?)", (execution_id, task_id))
             connection.execute("INSERT INTO metrics(task_id) VALUES(?)", (task_id,))
@@ -212,6 +230,55 @@ class Store:
         query += " ORDER BY t.created_at DESC,t.id DESC LIMIT ?"
         with self._connection() as connection:
             return [self._task(row) for row in connection.execute(query, [*params, max(1, min(int(limit), 10000))])]
+
+    def create_orchestration(self, prompt: str, config: dict | None = None) -> dict:
+        oid, now = str(uuid4()), utcnow()
+        with self._connection(write=True) as c:
+            c.execute("INSERT INTO orchestration_runs(id,prompt,config_json,created_at,updated_at) VALUES(?,?,?,?,?)", (oid, sanitize(prompt), _dump(config or {}), now, now))
+        return self.get_orchestration(oid)
+
+    def get_orchestration(self, oid: str) -> dict:
+        with self._connection() as c:
+            row = c.execute("SELECT * FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if row is None: raise KeyError(oid)
+            result = dict(row); result["config"] = _load(result.pop("config_json")) or {}
+            result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
+            for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
+            result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
+            return result
+
+    def list_orchestrations(self, limit=100):
+        with self._connection() as c:
+            bounded = max(1, min(int(limit), 1000))
+            ids = [r[0] for r in c.execute("SELECT id FROM orchestration_runs ORDER BY created_at DESC LIMIT ?", (bounded,))]
+        return [self.get_orchestration(i) for i in ids]
+
+    def list_skills(self):
+        with self._connection() as c:
+            rows=c.execute("SELECT id,name,description,instructions,required_tools_json,enabled FROM skills ORDER BY name").fetchall()
+            return [{**dict(r), "required_tools": _load(r["required_tools_json"]) or []} for r in rows]
+
+    def update_orchestration(self, oid, **fields):
+        allowed={"status","response","error"}; unknown=set(fields)-allowed
+        if unknown: raise ValueError("Unknown orchestration fields: " + ", ".join(sorted(unknown)))
+        with self._connection(write=True) as c:
+            values={**fields,"updated_at":utcnow()}; c.execute("UPDATE orchestration_runs SET "+",".join(k+"=?" for k in values)+" WHERE id=?", [*values.values(),oid])
+        return self.get_orchestration(oid)
+
+    def add_orchestration_event(self, oid, event):
+        with self._connection(write=True) as c:
+            c.execute("INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)", (oid,utcnow(),event.get("event_type","update"),event.get("status"),event.get("agent_id"),event.get("task_id"),event.get("message",event.get("reason","")),_dump(event)))
+
+    def add_delegation(self, oid, agent_id, objective, task_id=None):
+        did=str(uuid4()); now=utcnow()
+        with self._connection(write=True) as c:
+            c.execute("INSERT INTO orchestration_delegations(id,orchestration_id,agent_id,task_id,objective,created_at) VALUES(?,?,?,?,?,?)",(did,oid,agent_id,task_id,sanitize(objective),now))
+        return did
+
+    def update_delegation(self, did, **fields):
+        allowed={"task_id","status","result_json","finished_at"}; fields={k:v for k,v in fields.items() if k in allowed}
+        with self._connection(write=True) as c:
+            c.execute("UPDATE orchestration_delegations SET "+",".join(k+"=?" for k in fields)+" WHERE id=?", [*fields.values(),did])
 
     def get_task(self, task_id: str) -> dict:
         with self._connection() as connection:
