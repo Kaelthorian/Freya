@@ -1,0 +1,4 @@
+Crea un archivo .py con el titulo "Resultado de Prueba"
+
+Cuando ejecute el archivo tiene que pasar lo siguiente:
+1- Decir "Hola Mundo"

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Model outputs and disposable per-run benchmark workspaces.
+/workspace/*
+!/workspace/.gitkeep
+/results/*
+!/results/.gitkeep
+
+# Local control-center database, logs, lock and isolated task workspaces.
+/data/
+/test-artifacts/
