@@ -55,10 +55,11 @@ task routes remain compatible.
 | GET | `/api/agents/{id}/skills` | resolved Skill compatibility summaries |
 
 Create/patch fields are `name`, `description`, `role`, `enabled`, `tools`, `skills`,
-`capability_policy` and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
+and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
-optional `secret_env` name. Agent `workspace_path` is either empty for a
+optional `secret_env` name. The `capability_policy` belongs inside `config`
+and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
 The structured blocks are validated against their supported modes and limits;
 `autonomy` never overrides capability policy.

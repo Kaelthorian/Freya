@@ -72,6 +72,21 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("hidden", json.dumps(detail))
         self.assertEqual(self.request("GET", "/api/agents")[1], [])
 
+    def test_agent_creation_accepts_editor_capability_policy_inside_config(self):
+        status, agent = self.request("POST", "/api/agents", {
+            "name": "Policy editor",
+            "config": {
+                "capability_policy": {
+                    "capabilities": {
+                        "filesystem": {"read": {"mode": "allow"}}
+                    }
+                }
+            },
+        })
+        self.assertEqual(status, 201, agent)
+        self.assertEqual(agent["config"]["capability_policy"]["capabilities"]["filesystem"]["read"]["mode"], "allow")
+        self.assertEqual(agent["capability_policy"]["capabilities"]["filesystem"]["read"]["mode"], "allow")
+
     def test_origin_host_and_body_guards(self):
         for headers in ({"Origin": "https://evil.example"}, {"Host": "evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
             self.assertEqual(self.request("POST", "/api/agents", {"name": "bad"}, headers)[0], 403)
