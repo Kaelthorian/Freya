@@ -1,32 +1,45 @@
-# Freya
+# Freya Agent Control Center
 
-Freya is a local Ollama multi-agent control center. The Freya orchestrator receives user requests, selects existing enabled agents, delegates through the protected runtime, and returns an integrated response. Agents have explicit identity, instructions, capabilities, workspace and limits.
+Freya is a local Ollama agent platform with a loopback web UI, bounded worker
+runtime, SQLite history and workspace-scoped tools. The runtime flow is:
 
-Run from the repository root:
-
-```powershell
-python -m control_center --port 8765
+```text
+frontend → API → scheduler → worker → Ollama → Capability Resolver → Policy Engine → tools
 ```
 
-Open `http://127.0.0.1:8765`. The **Freya** page is the primary flow; **Agents**, **Tasks**, **Logs**, **Metrics**, and **Settings** remain available.
+Agents combine structured Identity, Behavior, Autonomy, Verification, Output,
+Skills, model settings and a Capability Policy. Skills are reusable knowledge:
+
+```text
+Skill ≠ Tool
+Skill ≠ Capability
+Skill ≠ Permission
+```
+
+A Skill can provide instructions, adaptable procedures and required or
+recommended capability diagnostics. It never grants access or executes code;
+the Capability Policy remains authoritative. Tasks snapshot the effective Skill
+definitions and versions so later edits do not change historical runs.
 
 Plataforma web local para crear agentes de programación con Ollama, asignarles
 tareas y observar sus herramientas, logs y métricas en tiempo real. Usa Python
 3.10+, SQLite y JavaScript sin proceso de build. No crea datos de demostración
 ni descarga modelos automáticamente.
 
-## Iniciar
-
-Desde la raíz del repositorio, en PowerShell:
+Run from the repository root in PowerShell:
 
 ```powershell
 ollama list
-python -m control_center --port 8765
+python -m control_center --port 8765 --workers 2 --data-dir .\data
+python -m unittest discover -s tests -v
+python -m compileall -q control_center
 ```
 
-Abre `http://127.0.0.1:8765`. Los datos locales se guardan en
-`data/control_center.sqlite3`. El servidor escucha solo en loopback y está
-diseñado para un único usuario local.
+Open `http://127.0.0.1:8765`. Ollama must be running locally with an installed
+model for live execution. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md),
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/API.md](docs/API.md) and
+[docs/REPOSITORY_MAP.md](docs/REPOSITORY_MAP.md) for operations, routes and
+change locations.
 
 Cada agente puede tener una carpeta predeterminada y el formulario de cada tarea
 permite elegir otra carpeta para esa ejecución. Si queda vacía, la tarea obtiene
@@ -43,7 +56,9 @@ python -m control_center --port 8765 --workers 2 --data-dir .\data
 
 ## Funciones
 
-- CRUD y duplicación de agentes con workspace, modelo, tools y límites propios.
+- CRUD y duplicación de agentes con workspace, modelo, Skills y límites propios.
+- CRUD de Skills con IDs estables, versión, instrucciones y procedures adaptables.
+- Diagnósticos de compatibilidad entre Skills y Capability Policy.
 - Procesos independientes con cola, cancelación y pausa cooperativa.
 - Actualizaciones SSE, timeline, logs, métricas e historial persistente.
 - Límites de pasos, tiempo, tokens y llamadas al modelo o a tools.

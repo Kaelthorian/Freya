@@ -102,13 +102,24 @@ CREATE TABLE IF NOT EXISTS skills (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    version INTEGER NOT NULL DEFAULT 1,
     instructions TEXT NOT NULL DEFAULT '',
+    procedures_json TEXT NOT NULL DEFAULT '[]',
+    recommended_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'user',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     required_tools_json TEXT NOT NULL DEFAULT '[]',
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id TEXT NOT NULL REFERENCES agents(id),
     skill_id TEXT NOT NULL REFERENCES skills(id),
+    priority INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_id, skill_id)
 );
 CREATE TABLE IF NOT EXISTS orchestration_runs (

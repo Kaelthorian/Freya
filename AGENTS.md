@@ -10,6 +10,13 @@ Ollama and allowlisted tools → selected agent workspace.
   use an existing absolute folder or a generated per-task folder.
 - Keep tool dispatch allowlisted. Never add `shell=True` or a free-form shell
   tool. `run_command` accepts argv arrays and a small command set.
+- Resolve every tool request to a concrete capability and pass it through the
+  single fail-closed policy engine before invoking the underlying tool.
+- Keep identity, behavior, autonomy, verification, and output as structured
+  agent configuration. Autonomy records preferences only and never grants a
+  capability.
+- Keep reusable Skills declarative. `skills.py` validates and resolves them;
+  required/recommended capabilities are diagnostics and never grants.
 - Keep Ollama inference loopback-only and preserve token and timing metrics.
 - Keep the web server loopback-only and the worker/database ownership boundary.
 - Preserve serialization per agent and per selected workspace.

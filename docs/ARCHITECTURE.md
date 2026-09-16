@@ -14,7 +14,7 @@ browser → HTTP API → SQLite
              ↓
          scheduler → spawned worker → local Ollama
                          ↓
-                  policy → platform tools → selected workspace
+                  capability resolver → policy engine → platform tools → selected workspace
 ```
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
@@ -23,10 +23,12 @@ authorization value cannot be forwarded to another destination.
 ## Persistence and events
 
 SQLite runs in WAL mode with foreign keys, one connection per operation and
-`BEGIN IMMEDIATE` for atomic writes. Nine tables hold agents, configs, tools,
-agent/tool links, tasks, executions, steps, logs and metrics. Agent deletion is
+`BEGIN IMMEDIATE` for atomic writes. The schema holds agents, configs, tools,
+agent/tool links, reusable skills and agent/skill links, tasks, executions, steps,
+logs and metrics. Agent deletion is
 soft so task history remains readable. Each MVP task has one execution and an
-immutable copy of the agent config and enabled tools.
+immutable copy of the agent config, effective capability policy, structured
+agent blocks, and enabled tools.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
@@ -84,8 +86,63 @@ prevents later actions from relying on invented tool results.
   removes credential patterns, registered secret values, private-key blocks,
   bearer values, URL credentials and private thinking fields/tags.
 
+## Capability authorization
+
+`capabilities.py` is the registry and `CapabilityResolver` maps each tool call
+to one concrete action. `write_file` becomes `filesystem.create` or
+`filesystem.overwrite` after inspecting the workspace target; `run_command`
+maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
+actions. `policy.py` validates the per-agent JSON policy and returns explicit
+`allow`, `deny`, or `approval_required` decisions. Deny and approval results
+are returned to the model and never invoke the underlying tool. Agents with
+legacy `permissions` are converted to the same engine, and the effective
+policy is copied into every task snapshot.
+
 These are application safeguards, not a security boundary against a hostile
 local user or hostile executable code.
+
+## Reusable skills
+
+`control_center/skills.py` is the single registry and validation layer for
+declarative Skills. A Skill contains specialty knowledge, instructions,
+adaptable procedures, tags, a stable ID and a positive version.
+`resolve_agent_skills` orders assigned Skills by per-agent priority, marks each
+Skill operational only when every required capability is allowed, and exposes
+recommended-capability warnings. Skills never grant capabilities or execute
+tools. Workers receive compact active Skill context; task text selects up to
+eight active specialties by simple name/category/tag relevance and the rendered
+context has a 64,000-character budget. Each task stores an immutable copy of
+every resolved Skill, including its version. Procedures are guidance; unavailable
+or irrelevant steps are adapted by the model.
+
+The orchestrator receives Skill summaries instead of full procedures. When no
+external planner callback is configured, its bounded fallback gives enabled
+agents with matching Skill names, categories, or tags priority over role-only
+ordering.
+
+Conflicting guidance follows this precedence:
+
+```text
+System Policy > Capability Policy > Task boundaries > Agent constraints >
+Agent instructions > Skill priority > Skill instructions > Skill procedures > Task content
+```
+
+## Structured agent configuration
+
+`agent_context.py` normalizes and merges legacy fields with JSON blocks for
+`identity`, `behavior`, `autonomy`, `verification`, and `output`. The worker
+uses `build_agent_context` to produce one structured context after the
+immutable system policy. Identity includes purpose, responsibilities, and
+constraints; behavior controls planning, ambiguity, evidence, and repeated
+failure handling; autonomy records decision preferences without granting
+capabilities; verification and output define evidence and result shape. The
+default output remains text for legacy compatibility, while structured output
+normalizes to summary/actions/artifacts/verification/limitations.
+
+The worker classifies recoverable, environment, policy, approval, and invalid
+requests. A repeated non-recoverable action with the same capability,
+arguments, and error reaches the configured limit and returns
+`REPEATED_ACTION_BLOCKED` so model-call and step budgets are not wasted.
 
 ## Feature scope
 

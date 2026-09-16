@@ -4,6 +4,25 @@ All routes are same-origin under `/api` and return JSON errors as
 `{"error":"message"}`. Mutations accept `application/json`. SSE is
 `text/event-stream`.
 
+`GET /api/capabilities` returns the structured capability registry used by the
+editor. `GET /api/config` includes it as `capability_catalog`. Agent JSON
+includes `capability_policy`; action rules use `mode` (`allow`, `deny`, or
+`ask`) and may include workspace-relative `paths`, case-insensitive
+`extensions`, and `max_bytes`.
+
+Agent configuration also accepts JSON blocks `identity`, `behavior`,
+`autonomy`, `verification`, and `output`, or their top-level editor aliases.
+Agent responses include `context_preview`, a read-only context rendering with
+no secret values.
+
+Skills are reusable declarative knowledge. A Skill is not a Tool, Capability, or
+Permission: its instructions and procedures guide the model, while
+`required_capabilities` and `recommended_capabilities` are diagnostics only.
+Required capabilities must be allowed by the agent policy for a Skill to be
+operational. Assigned Skills use `{ "id": "python-development", "priority":
+100 }`; priority orders context and never overrides policy. Tasks store
+immutable Skill snapshots, including version and procedures.
+
 ## Freya orchestration
 
 `POST /api/orchestrations` with `{ "prompt": "..." }` queues a bounded run.
@@ -22,17 +41,27 @@ task routes remain compatible.
 | POST | `/api/agents/{id}/resume` | resume task dispatch/actions |
 | POST | `/api/agents/{id}/restart` | cancel its tasks and reset runtime state |
 | POST | `/api/agents/{id}/tasks` | assign a task with optional workspace override |
-| GET | `/api/tools` | actual and explicitly unavailable tools |
+| GET | `/api/tools` | actual and explicitly unavailable tools (advanced mapping) |
+| GET | `/api/capabilities` | structured Filesystem, Execution, and Git actions |
 | GET | `/api/models?endpoint=...` | installed models from local Ollama |
 | GET | `/api/config` | defaults and MVP capability flags |
 | GET | `/api/workspaces/browse?path=...` | list subdirectories of an absolute local path |
 
-Create/patch fields are `name`, `description`, `role`, `enabled`, `tools` and
-`config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET / POST | `/api/skills` | list/filter or create reusable Skills |
+| GET / PATCH / DELETE | `/api/skills/{id}` | inspect, edit, or delete/disable a Skill |
+| POST | `/api/skills/{id}/duplicate` | create a user copy with a new stable ID |
+| GET | `/api/agents/{id}/skills` | resolved Skill compatibility summaries |
+
+Create/patch fields are `name`, `description`, `role`, `enabled`, `tools`, `skills`,
+`capability_policy` and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
 optional `secret_env` name. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
+The structured blocks are validated against their supported modes and limits;
+`autonomy` never overrides capability policy.
 
 Task assignment accepts `{ "prompt": "...", "workspace_path": "..." }`.
 When omitted, the agent's configured workspace applies. An absolute existing
@@ -43,6 +72,15 @@ The workspace browser defaults to the parent of the configured data directory
 when `path` is omitted. It returns the resolved current path, parent, write-access hint, up
 to 500 immediate subdirectories, and a `truncated` flag. Saving the agent is the
 authoritative validation step.
+
+Skill creation accepts `id`, `name`, `description`, `category`, positive
+`version`, list-valued `instructions`, structured `procedures`, capability
+metadata, `tags`, `source` (`builtin` or `user`), `metadata`, and `enabled`.
+IDs are lowercase stable identifiers. Procedures are recommended operating
+guidance and are adapted when a step is unavailable. List filtering accepts
+`q` (name, ID, description, category, or tags), `category`, `enabled`, and
+`source`. Compatibility summaries include `operational`, priority, and missing
+required or recommended capability IDs.
 
 ## Tasks, observations and metrics
 

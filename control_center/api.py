@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
+from .capabilities import capability_catalog
 from .security import sanitize
 
 LIVE = {"Queued", "Running", "Paused"}
@@ -68,6 +69,7 @@ class Application:
                     "runtime": {"max_workers": self.runtime.max_workers}, "system": self.system()}
         if parts == ["config"]:
             return {"defaults": DEFAULT_CONFIG, "default_tools": DEFAULT_TOOLS,
+                    "capability_catalog": capability_catalog(),
                     "data_dir": str(self.data_dir), "workspaces_dir": str(self.data_dir / "workspaces"),
                     "capabilities": {"ollama": True, "sse": True, "pause": "between_actions",
                                      "cancel": True, "external_workers": False, "remote_models": False,
@@ -76,8 +78,17 @@ class Application:
             return self._browse_workspaces(query.get("path") or str(self.data_dir.parent))
         if parts == ["tools"]:
             return TOOL_CATALOG
+        if parts == ["capabilities"]:
+            return capability_catalog()
         if parts == ["skills"]:
-            return self.store.list_skills()
+            enabled = query.get("enabled")
+            enabled_value = None if enabled in (None, "") else str(enabled).lower() in {"1", "true", "yes"}
+            return self.store.list_skills(query=query.get("q", ""), category=query.get("category", ""),
+                                          enabled=enabled_value, source=query.get("source", ""))
+        if len(parts) == 2 and parts[0] == "skills":
+            return self.store.get_skill(parts[1])
+        if len(parts) == 3 and parts[0] == "agents" and parts[2] == "skills":
+            return self.store.skill_compatibility(parts[1])
         if parts == ["models"]:
             from .transport import request_json
             endpoint = validate_endpoint(query.get("endpoint", DEFAULT_CONFIG["endpoint"]))
@@ -161,6 +172,8 @@ class Application:
             agent = self.store.create_agent(normalize_agent(body))
             self._agent_event(agent, "agent.created")
             return 201, agent
+        if method == "POST" and parts == ["skills"]:
+            return 201, self.store.create_skill(body)
         if method == "POST" and parts == ["orchestrations"]:
             if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
             prompt = body.get("prompt") if isinstance(body, dict) else None
@@ -192,7 +205,7 @@ class Application:
             if method == "POST" and len(parts) == 3:
                 action = parts[2]
                 if action == "duplicate":
-                    data = {k: agent[k] for k in ("name", "description", "role", "enabled", "config", "tools")}
+                    data = {k: agent[k] for k in ("name", "description", "role", "enabled", "config", "tools", "skills")}
                     data["name"] = data["name"][:92] + " (copy)"
                     new = self.store.create_agent(normalize_agent(data))
                     self._agent_event(new, "agent.created")
@@ -212,6 +225,30 @@ class Application:
                     if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:
                         raise ApiError(409, "Enable and resume the agent before assigning a task.")
                     return 201, self.runtime.submit(agent_id, body["prompt"].strip(), workspace_path)
+        if len(parts) >= 2 and parts[0] == "skills":
+            skill_id = parts[1]
+            if method == "PATCH" and len(parts) == 2:
+                return 200, self.store.update_skill(skill_id, body)
+            if method == "DELETE" and len(parts) == 2:
+                return 200, self.store.delete_skill(skill_id)
+            if method == "POST" and len(parts) == 3 and parts[2] == "duplicate":
+                source = self.store.get_skill(skill_id)
+                duplicate = {key: source[key] for key in ("id", "name", "description", "category", "version", "instructions", "procedures", "recommended_capabilities", "required_capabilities", "tags", "enabled", "metadata")}
+                duplicate.update(body or {})
+                if not (body or {}).get("id"):
+                    existing_ids = {item["id"] for item in self.store.list_skills()}
+                    candidate, suffix = skill_id + "-copy", 2
+                    while candidate in existing_ids:
+                        candidate, suffix = f"{skill_id}-copy-{suffix}", suffix + 1
+                    duplicate["id"] = candidate
+                if not (body or {}).get("name"):
+                    existing_names = {item["name"] for item in self.store.list_skills()}
+                    candidate, suffix = source["name"] + " (copy)", 2
+                    while candidate in existing_names:
+                        candidate, suffix = f"{source['name']} (copy {suffix})", suffix + 1
+                    duplicate["name"] = candidate
+                duplicate["source"] = "user"
+                return 201, self.store.create_skill(duplicate)
         if method == "POST" and len(parts) == 3 and parts[0] == "tasks":
             task = self.store.get_task(parts[1])
             if parts[2] == "cancel":

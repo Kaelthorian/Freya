@@ -1,7 +1,10 @@
 """Freya orchestration service: bounded planning, delegation and integration."""
 from __future__ import annotations
 import json, threading, time
+import re
 from typing import Any, Callable
+from .agent_context import build_effective_agent, capability_summary
+from .skills import skill_summary
 
 class Orchestrator:
     def __init__(self, store, runtime, decide: Callable | None = None, config: dict | None = None):
@@ -27,12 +30,33 @@ class Orchestrator:
         return self.store.get_orchestration(oid)
 
     def _decision(self, prompt, agents, results):
-        if self.decide: return self.decide(prompt, agents, results)
+        candidates = []
+        for agent in agents:
+            try:
+                effective = build_effective_agent(agent)
+                identity = effective["identity"]
+                candidates.append({"id": agent["id"], "name": identity["name"], "role": identity["role"],
+                                   "purpose": identity["purpose"], "description": identity["description"],
+                                   "skills": [skill_summary(item) for item in effective["skills"] if isinstance(item, dict)],
+                                   "capabilities_summary": capability_summary(effective["capability_policy"]),
+                                   "availability": agent.get("status", "Offline"), "enabled": bool(agent.get("enabled"))})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if self.decide: return self.decide(prompt, candidates, results)
         # `enabled` is the durable availability switch. Status can briefly be
         # Offline after recovery/restart while the scheduler is coming back;
         # an enabled agent must still be selectable and Runtime performs the
         # final safety checks.
-        enabled=[a for a in agents if a.get("enabled") is True]
+        enabled = [a for a in candidates if a.get("enabled") is True]
+        words = set(re.findall(r"[a-z0-9_+-]{3,}", str(prompt).casefold()))
+        def score(candidate):
+            value = 0
+            for skill in candidate.get("skills", []):
+                haystack = " ".join([skill.get("name", ""), skill.get("category", ""), *skill.get("tags", [])]).casefold()
+                value += sum(2 if word in haystack else 0 for word in words)
+                value += 1 if skill.get("operational") else 0
+            return value
+        enabled.sort(key=lambda candidate: -score(candidate))
         if not enabled: return {"action":"respond","message":"No enabled agent is available for this request."}
         return {"action":"delegate","tasks":[{"agent_id":enabled[0]["id"],"objective":prompt}]}
 

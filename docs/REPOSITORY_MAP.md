@@ -18,14 +18,18 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
+│   ├── capabilities.py       capability registry and tool-to-action resolver
+│   ├── policy.py             policy schema, legacy migration and engine
+│   ├── skills.py             reusable Skill registry, validation and resolution
+│   ├── agent_context.py      structured agent defaults, effective config and worker context
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
 │   ├── index.html / styles.css
 │   ├── app.js / core.js      routing, state, API and SSE refresh
 │   ├── views.js              dashboard and detail views
-│   ├── dialogs.js            agent, task and workspace-folder forms
+│   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
-├── tests/                    API, storage, runtime, policy and tool tests
+├── tests/                    API, storage, runtime, policy, Skill and tool tests
 ├── data/                     generated database and automatic workspaces
 └── docs/                     architecture, API and operating instructions
 ```
@@ -42,8 +46,9 @@ of this repository merely because an agent selects them.
    selected workspace or creates an automatic one for the task.
 3. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
    waits for a worker slot and exclusive access to the agent and workspace.
-4. `worker.py` calls local Ollama, validates each tool request and dispatches to
-   `tools.py` inside the configured workspace root.
+4. `worker.py` calls local Ollama, resolves each tool request through
+   `capabilities.py`, evaluates the immutable policy in `policy.py`, and only
+   then dispatches to `tools.py` inside the configured workspace root.
 5. The parent persists events, steps, metrics and terminal state. SSE clients
    replay changes using monotonic event IDs.
 
@@ -54,7 +59,10 @@ of this repository merely because an agent selects them.
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
-| Tool implementation or policy | `tools.py`, `worker.py`, runtime/tool tests |
+| Tool implementation | `tools.py`, runtime/tool tests |
+| Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
+| Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
+| Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |
 | Secret handling | `security.py`, security/runtime/storage tests |
 | Web UI | `frontend/app.js`, `views.js`, `dialogs.js`, `styles.css` |

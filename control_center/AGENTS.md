@@ -18,6 +18,14 @@ or bypass tool policy.
   queue and must not write the database.
 - Recheck tool permission and path policy inside `worker.py`; API validation is
   not the worker trust boundary.
+- Keep `capabilities.py` as the tool-to-action registry and `policy.py` as the
+  single decision point. Store effective policies in task snapshots.
+- Keep context assembly in `agent_context.py`; do not add role-specific global
+  prompts to the worker. Repeated non-recoverable tool failures must be
+  bounded before consuming the task step budget.
+- Keep Skill validation, resolution, compatibility diagnostics and compact
+  rendering in `skills.py`; Skills never execute tools or modify policy. Task
+  records must retain immutable Skill snapshots and versions.
 - Preserve spawned-process containment and descendant cleanup for cancel,
   restart, timeout and shutdown.
 - Never persist secret values or private model thinking. `secret_env` contains
@@ -31,6 +39,9 @@ From the repository root:
 
 ```powershell
 python -m unittest tests.test_control_security tests.test_control_storage tests.test_control_runtime tests.test_control_api -v
+python -m unittest tests.test_capabilities -v
+python -m unittest tests.test_agent_context -v
+python -m unittest tests.test_skills -v
 python -m compileall -q control_center
 node --check frontend\app.js
 python -m control_center --help

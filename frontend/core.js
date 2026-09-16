@@ -1,4 +1,4 @@
-export const state = { agents: [], tools: [], tasks: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {} }, tab: 'timeline', chart: 'tasks', connected: false };
+export const state = { agents: [], skills: [], tools: [], tasks: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {}, skills: {} }, tab: 'timeline', chart: 'tasks', connected: false };
 
 export async function api(path, method = 'GET', body) {
   const response = await fetch(`/api${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -18,7 +18,6 @@ export function toast(message, error = false) { const element = document.createE
 export function route() { const [path, search = ''] = location.hash.replace(/^#\/?/, '').split('?'); const parts = path.split('/').filter(Boolean); return { page: parts[0] || 'dashboard', id: parts[1], query: new URLSearchParams(search) }; }
 export function serialize(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
 const LEGACY_COPY = {
-  'Eres un agente de programación. Inspecciona antes de editar, usa las herramientas disponibles y resume los resultados con precisión.': 'You are a coding agent. Inspect before editing, use the available tools, and summarize your results accurately. Always respond to the user in English, regardless of the language used in the task.',
   'Esperar un trabajador y un workspace disponibles; cada agente ejecuta una tarea a la vez.': 'Waiting for an available worker and workspace; each agent runs one task at a time.',
   'Esperar un trabajador disponible; cada agente ejecuta una tarea a la vez.': 'Waiting for an available worker; each agent runs one task at a time.',
   'Pausa solicitada: la llamada en curso termina antes de pausar; el tiempo límite sigue avanzando.': 'Pause requested: the current call must finish before pausing, and the time limit continues to run.',

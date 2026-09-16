@@ -8,6 +8,12 @@ import math
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
+from .policy import validate_policy
+from .agent_context import (DEFAULT_AUTONOMY, DEFAULT_BEHAVIOR, DEFAULT_IDENTITY,
+                             DEFAULT_OUTPUT, DEFAULT_VERIFICATION, normalize_autonomy,
+                             normalize_behavior, normalize_identity, normalize_output,
+                             normalize_verification)
+from .skills import normalize_skill_assignments
 
 TOOL_CATALOG = [
     {"name": name, "description": description, "available": available, "dangerous": dangerous}
@@ -37,12 +43,21 @@ DEFAULT_CONFIG = {
     "max_model_calls": 20,
     "max_tool_calls": 40,
     "retries": 1,
-    "system_prompt": "You are a coding agent. Inspect before editing, use the available tools, and summarize your results accurately. Always respond to the user in English, regardless of the language used in the task.",
+    "system_prompt": "",
     "permissions": "workspace",
     "allowed_directories": ["."],
     "forbidden_commands": [],
     "secret_env": "",
     "workspace_path": "",
+    "capability_policy": None,
+    "identity": DEFAULT_IDENTITY,
+    "behavior": DEFAULT_BEHAVIOR,
+    "autonomy": DEFAULT_AUTONOMY,
+    "verification": DEFAULT_VERIFICATION,
+    # Raw worker callers historically returned text. New normalized agents
+    # receive the structured default below; this keeps direct legacy tasks
+    # compatible while allowing the new contract by default.
+    "output": {"format": "text", "include": DEFAULT_OUTPUT["include"]},
 }
 LIMITS = {
     "context_window": (512, 131072), "max_tokens": (128, 1000000),
@@ -102,14 +117,16 @@ def normalize_workspace_path(value: str, *, allow_empty: bool = True) -> str:
 def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Configuration must be a JSON object.")
-    allowed = {"name", "description", "role", "instructions", "enabled", "config", "tools", "skills"}
+    allowed = {"name", "description", "role", "purpose", "responsibilities", "constraints",
+               "instructions", "enabled", "config", "tools", "skills", "capability_policy",
+               "identity", "behavior", "autonomy", "verification", "output"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError("Unknown fields: " + ", ".join(sorted(unknown)))
     baseline = existing or {}
     result = {key: copy.deepcopy(baseline.get(key, default)) for key, default in (
         ("name", ""), ("description", ""), ("role", ""), ("instructions", ""),
-        ("enabled", True), ("tools", DEFAULT_TOOLS),
+        ("enabled", True), ("tools", DEFAULT_TOOLS), ("skills", []),
     )}
     result.update({key: value for key, value in data.items() if key != "config"})
     for name, maximum, required in (("name", 100, True), ("description", 2000, False), ("role", 100, False), ("instructions", 16000, False)):
@@ -122,6 +139,32 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(incoming, dict) or set(incoming) - set(DEFAULT_CONFIG):
         raise ValueError("config contains unknown fields. Refer to secrets with secret_env.")
     config.update(incoming)
+    if "output" not in incoming and "output" not in (baseline.get("config") or {}):
+        config["output"] = copy.deepcopy(DEFAULT_OUTPUT)
+    # Step 2 blocks live in the JSON config. Top-level aliases keep the API
+    # convenient while preserving the existing agents table shape.
+    for block in ("identity", "behavior", "autonomy", "verification", "output"):
+        if block in data:
+            config[block] = copy.deepcopy(data[block])
+    identity_input = copy.deepcopy(config.get("identity") or {})
+    if not isinstance(identity_input, dict):
+        raise ValueError("identity must be an object")
+    for key in ("purpose", "responsibilities", "constraints"):
+        if key in data:
+            identity_input[key] = data[key]
+    config["identity"] = normalize_identity(identity_input, name=result["name"], role=result["role"], description=result["description"])
+    result["role"] = config["identity"]["role"]
+    if not result["description"] and config["identity"].get("description"):
+        result["description"] = config["identity"]["description"]
+    config["behavior"] = normalize_behavior(config.get("behavior"))
+    config["autonomy"] = normalize_autonomy(config.get("autonomy"))
+    config["verification"] = normalize_verification(config.get("verification"))
+    config["output"] = normalize_output(config.get("output"))
+    # The granular policy is stored with the existing JSON agent config.  A
+    # top-level alias is accepted for API/UI ergonomics and normalized here.
+    policy_input = data.get("capability_policy", config.get("capability_policy"))
+    if policy_input is not None:
+        config["capability_policy"] = validate_policy(policy_input)
     config["model"] = _text(config["model"], "model", 200, True)
     if re.search(r"[\s\x00-\x1f]", config["model"]):
         raise ValueError("model must not contain whitespace or control characters.")
@@ -159,13 +202,11 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(selected, list) or any(not isinstance(x, str) or x not in available for x in selected):
         raise ValueError("tools may only contain names of available tools.")
     result["tools"] = list(dict.fromkeys(selected))
-    skills = result.get("skills", [])
-    if not isinstance(skills, list) or any(not isinstance(x, (str, dict)) for x in skills):
-        raise ValueError("skills must be a list of skill IDs or objects.")
-    result["skills"] = skills
+    result["skills"] = normalize_skill_assignments(result.get("skills", []))
     if config["permissions"] == "read_only" and set(selected) & {"write_file", "edit_file", "run_command"}:
         raise ValueError("The read_only permission does not allow writes or execution.")
     if config["permissions"] != "execute" and "run_command" in selected:
         raise ValueError("run_command requires the execute permission.")
     result["config"] = config
+    result["capability_policy"] = copy.deepcopy(config.get("capability_policy")) if config.get("capability_policy") is not None else None
     return result

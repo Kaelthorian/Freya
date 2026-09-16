@@ -15,6 +15,9 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from .config import TOOL_CATALOG
+from .policy import policy_from_legacy
+from .agent_context import build_agent_context, build_effective_agent
+from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
 
 
@@ -63,12 +66,47 @@ class Store:
                                      ("agent_instructions", "TEXT NOT NULL DEFAULT ''"), ("skills_json", "TEXT NOT NULL DEFAULT '[]'")):
                 if name not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+            skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)")}
+            for name, definition in (
+                ("category", "TEXT NOT NULL DEFAULT 'General'"),
+                ("version", "INTEGER NOT NULL DEFAULT 1"),
+                ("procedures_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("recommended_capabilities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("required_capabilities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("source", "TEXT NOT NULL DEFAULT 'user'"),
+                ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in skill_columns:
+                    connection.execute(f"ALTER TABLE skills ADD COLUMN {name} {definition}")
+            agent_skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_skills)")}
+            if "priority" not in agent_skill_columns:
+                connection.execute("ALTER TABLE agent_skills ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
             connection.executemany(
                 "INSERT INTO tools(name, description, available, dangerous) VALUES(?,?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET description=excluded.description, "
                 "available=excluded.available, dangerous=excluded.dangerous",
                 [(tool["name"], tool["description"], int(tool.get("available", True)),
                   int(tool.get("dangerous", False))) for tool in TOOL_CATALOG],
+            )
+            self._seed_builtin_skills(connection)
+
+    @staticmethod
+    def _seed_builtin_skills(connection: sqlite3.Connection) -> None:
+        """Keep a small editable starter catalogue in new and old databases."""
+        now = utcnow()
+        for raw in BUILTIN_SKILLS:
+            skill = normalize_skill(raw)
+            connection.execute(
+                "INSERT OR IGNORE INTO skills(id,name,description,category,version,instructions,procedures_json,"
+                "recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"],
+                 _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]),
+                 _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]),
+                 int(skill["enabled"]), now, now),
             )
 
     @contextmanager
@@ -101,11 +139,29 @@ class Store:
         agent["tools"] = [item[0] for item in connection.execute(
             "SELECT tool_name FROM agent_tools WHERE agent_id=? ORDER BY tool_name", (agent_id,),
         )]
-        agent["skills"] = [dict(item) for item in connection.execute(
-            "SELECT s.id,s.name,s.description,s.instructions,s.required_tools_json FROM skills s JOIN agent_skills a ON a.skill_id=s.id WHERE a.agent_id=? ORDER BY s.name", (agent_id,)
-        )]
-        for skill in agent["skills"]:
-            skill["required_tools"] = _load(skill.pop("required_tools_json")) or []
+        agent["capability_policy"] = agent["config"].get("capability_policy") or policy_from_legacy(agent["config"], agent["tools"])
+        assigned = []
+        for row_skill in connection.execute(
+            "SELECT s.id,s.name,s.description,s.category,s.version,s.instructions,s.procedures_json,"
+            "s.recommended_capabilities_json,s.required_capabilities_json,s.tags_json,s.source,s.metadata_json,"
+            "s.enabled,a.priority FROM skills s JOIN agent_skills a ON a.skill_id=s.id "
+            "WHERE a.agent_id=? ORDER BY a.priority DESC,s.id", (agent_id,),
+        ):
+            skill = dict(row_skill)
+            for field in ("instructions", "procedures", "recommended_capabilities", "required_capabilities", "tags", "metadata"):
+                encoded = skill.pop(field if field == "instructions" else field + "_json", None)
+                if field == "instructions":
+                    skill[field] = _load(encoded) if isinstance(encoded, str) and encoded.startswith(("[", "\"")) else (encoded or "")
+                else:
+                    skill[field] = _load(encoded) or []
+            skill["enabled"] = bool(skill.get("enabled"))
+            assigned.append(skill)
+        agent["skills"] = resolve_agent_skills(agent, assigned, policy=agent["capability_policy"])
+        try:
+            preview_effective = build_effective_agent(agent)
+            agent["context_preview"] = build_agent_context(preview_effective, "[task preview]", agent["config"].get("workspace_path", ""))
+        except (TypeError, ValueError):
+            agent["context_preview"] = "Context preview unavailable because the configuration is invalid."
         totals = connection.execute(
             "SELECT COUNT(*) AS task_count, SUM(e.status='Success') AS successes, "
             "SUM(e.status IN ('Success','Failed','Cancelled')) AS finished, "
@@ -149,9 +205,13 @@ class Store:
         connection.executemany("INSERT INTO agent_tools(agent_id,tool_name) VALUES(?,?)",
                                [(agent_id, name) for name in dict.fromkeys(data.get("tools", []))])
         connection.execute("DELETE FROM agent_skills WHERE agent_id=?", (agent_id,))
-        for skill in data.get("skills", []):
-            sid = skill.get("id") if isinstance(skill, dict) else skill
-            if sid: connection.execute("INSERT OR IGNORE INTO agent_skills(agent_id,skill_id) VALUES(?,?)", (agent_id, sid))
+        assignments = normalize_skill_assignments(data.get("skills", []))
+        for assignment in assignments:
+            sid = assignment["skill_id"]
+            if connection.execute("SELECT 1 FROM skills WHERE id=?", (sid,)).fetchone() is None:
+                raise ValueError("Unknown skill: " + sid)
+            connection.execute("INSERT INTO agent_skills(agent_id,skill_id,priority) VALUES(?,?,?)",
+                               (agent_id, sid, assignment["priority"]))
 
     def update_agent(self, agent_id: str, data: dict) -> dict:
         clean = sanitize(data)
@@ -200,18 +260,25 @@ class Store:
         if row is None:
             raise KeyError(task_id)
         task = dict(row)
-        for field in ("config", "tools", "result"):
+        for field in ("config", "tools", "result", "skills"):
             task[field] = _load(task.pop(field + "_json"))
+        task["capability_policy"] = task["config"].get("capability_policy")
         return task
 
     def create_task(self, agent_id: str, prompt: str, workspace: str) -> dict:
         task_id, execution_id, now = str(uuid4()), str(uuid4()), utcnow()
         with self._connection(write=True) as connection:
             agent = self._agent(connection, agent_id)
+            effective = build_effective_agent(agent)
+            effective["skills"] = resolve_agent_skills(agent, agent.get("skills", []), prompt,
+                                                        policy=effective["capability_policy"])
+            snapshot_config = dict(agent["config"])
+            snapshot_config.update({key: effective[key] for key in ("identity", "behavior", "autonomy", "verification", "output", "capability_policy")})
+            skill_snapshots = [skill_snapshot(skill) for skill in effective["skills"]]
             connection.execute(
                 "INSERT INTO tasks(id,agent_id,agent_name,prompt,workspace,config_json,tools_json,agent_role,agent_description,agent_instructions,skills_json,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (task_id, agent_id, agent["name"], sanitize(prompt),
-                sanitize(workspace), _dump(agent["config"]), _dump(agent["tools"]), agent.get("role", ""), agent.get("description", ""), agent.get("instructions", ""), _dump(agent.get("skills", [])), now),
+                sanitize(workspace), _dump(snapshot_config), _dump(agent["tools"]), agent.get("role", ""), agent.get("description", ""), agent.get("instructions", ""), _dump(skill_snapshots), now),
             )
             connection.execute("INSERT INTO task_executions(id,task_id) VALUES(?,?)", (execution_id, task_id))
             connection.execute("INSERT INTO metrics(task_id) VALUES(?)", (task_id,))
@@ -253,10 +320,120 @@ class Store:
             ids = [r[0] for r in c.execute("SELECT id FROM orchestration_runs ORDER BY created_at DESC LIMIT ?", (bounded,))]
         return [self.get_orchestration(i) for i in ids]
 
-    def list_skills(self):
+    @staticmethod
+    def _skill(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any]:
+        if row is None:
+            raise KeyError("skill")
+        item = dict(row)
+        for field in ("procedures", "recommended_capabilities", "required_capabilities", "tags", "metadata"):
+            item[field] = _load(item.pop(field + "_json", None)) or ([] if field != "metadata" else {})
+        raw_instructions = item.get("instructions", "")
+        if isinstance(raw_instructions, str) and raw_instructions.startswith(("[", "\"")):
+            try:
+                item["instructions"] = _load(raw_instructions)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(item.get("instructions"), str):
+            item["instructions"] = [line.strip() for line in item["instructions"].splitlines() if line.strip()]
+        item["required_tools"] = _load(item.pop("required_tools_json", "[]")) or []
+        item["enabled"] = bool(item.get("enabled"))
+        item["assigned_agents"] = int(item.pop("assigned_agents", 0) or 0)
+        assigned_ids = item.pop("assigned_agent_ids", "") or ""
+        item["assigned_agent_ids"] = [value for value in str(assigned_ids).split(",") if value]
+        return item
+
+    def list_skills(self, *, query: str = "", category: str = "", enabled: bool | None = None,
+                    source: str = "") -> list[dict[str, Any]]:
+        where, params = [], []
+        if query:
+            where.append("(s.name LIKE ? OR s.id LIKE ? OR s.description LIKE ? OR s.category LIKE ? OR s.tags_json LIKE ?)")
+            pattern = "%" + str(query).strip() + "%"
+            params.extend([pattern] * 5)
+        if category:
+            where.append("s.category=?")
+            params.append(category)
+        if enabled is not None:
+            where.append("s.enabled=?")
+            params.append(int(enabled))
+        if source:
+            where.append("s.source=?")
+            params.append(source)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self._connection() as c:
-            rows=c.execute("SELECT id,name,description,instructions,required_tools_json,enabled FROM skills ORDER BY name").fetchall()
-            return [{**dict(r), "required_tools": _load(r["required_tools_json"]) or []} for r in rows]
+            rows = c.execute(
+                "SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s "
+                "LEFT JOIN agent_skills a ON a.skill_id=s.id" + clause + " GROUP BY s.id ORDER BY s.name,s.id", params,
+            ).fetchall()
+            return [self._skill(row) for row in rows]
+
+    def get_skill(self, skill_id: str) -> dict[str, Any]:
+        with self._connection() as c:
+            row = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
+            if row is None:
+                raise KeyError(skill_id)
+            return self._skill(row)
+
+    def create_skill(self, data: dict[str, Any]) -> dict[str, Any]:
+        skill = normalize_skill(data)
+        now = utcnow()
+        with self._connection(write=True) as c:
+            if c.execute("SELECT 1 FROM skills WHERE id=?", (skill["id"],)).fetchone() is not None:
+                raise ValueError("Skill id already exists: " + skill["id"])
+            if c.execute("SELECT 1 FROM skills WHERE name=?", (skill["name"],)).fetchone() is not None:
+                raise ValueError("Skill name already exists: " + skill["name"])
+            c.execute(
+                "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
+            )
+            created = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill["id"],)).fetchone()
+            return self._skill(created)
+
+    def update_skill(self, skill_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        with self._connection(write=True) as c:
+            row = c.execute("SELECT * FROM skills WHERE id=?", (skill_id,)).fetchone()
+            if row is None:
+                raise KeyError(skill_id)
+            current = self._skill(row)
+            current.pop("assigned_agents", None)
+            current.pop("assigned_agent_ids", None)
+            current.pop("required_tools", None)
+            incoming = dict(data)
+            if "id" in incoming and incoming["id"] != skill_id:
+                raise ValueError("Skill id is stable and cannot be changed")
+            incoming["id"] = skill_id
+            skill = normalize_skill(incoming, current)
+            if c.execute("SELECT 1 FROM skills WHERE name=? AND id<>?", (skill["name"], skill_id)).fetchone() is not None:
+                raise ValueError("Skill name already exists: " + skill["name"])
+            now = utcnow()
+            c.execute(
+                "UPDATE skills SET name=?,description=?,category=?,version=?,instructions=?,procedures_json=?,recommended_capabilities_json=?,required_capabilities_json=?,tags_json=?,source=?,metadata_json=?,enabled=?,updated_at=? WHERE id=?",
+                (skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, skill_id),
+            )
+            updated = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
+            return self._skill(updated)
+
+    def delete_skill(self, skill_id: str) -> dict[str, Any]:
+        with self._connection(write=True) as c:
+            if c.execute("SELECT 1 FROM skills WHERE id=?", (skill_id,)).fetchone() is None:
+                raise KeyError(skill_id)
+            assigned = c.execute("SELECT COUNT(*) FROM agent_skills WHERE skill_id=?", (skill_id,)).fetchone()[0]
+            used = False
+            for row in c.execute("SELECT skills_json FROM tasks"):
+                try:
+                    used = any((item.get("id", item.get("skill_id")) if isinstance(item, dict) else item) == skill_id for item in (_load(row[0]) or []))
+                except (TypeError, ValueError):
+                    continue
+                if used:
+                    break
+            if assigned or used:
+                c.execute("UPDATE skills SET enabled=0,updated_at=? WHERE id=?", (utcnow(), skill_id))
+                disabled = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
+                return self._skill(disabled)
+            c.execute("DELETE FROM skills WHERE id=?", (skill_id,))
+            return {"id": skill_id, "deleted": True}
+
+    def skill_compatibility(self, agent_id: str) -> list[dict[str, Any]]:
+        return [skill_summary(skill) for skill in self.get_agent(agent_id).get("skills", [])]
 
     def update_orchestration(self, oid, **fields):
         allowed={"status","response","error"}; unknown=set(fields)-allowed

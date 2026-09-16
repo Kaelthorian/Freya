@@ -33,6 +33,13 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
+The **Skills** page manages reusable declarative knowledge. Create or edit a
+Skill with a stable lowercase ID, version, instructions, adaptable procedures,
+tags, and required/recommended capabilities. Assign it to an agent with a
+priority from the agent editor. Required capability diagnostics never change
+the agent's policy; a Skill is operational only when its requirements are
+allowed. Tasks snapshot the resolved Skill version and content.
+
 ### Secrets
 
 Set an environment variable beginning with `ACC_SECRET_`, then enter only its
@@ -59,6 +66,12 @@ node --check frontend\dialogs.js
 node --check frontend\icons.js
 python -m control_center --help
 ```
+
+Capability, structured-agent and Skill behavior is covered by
+`tests/test_capabilities.py`, `tests/test_agent_context.py` and
+`tests/test_skills.py`. The worker
+resolves and evaluates a capability before every tool invocation;
+`approval_required` is fail-closed until an approval UI exists.
 
 Runtime tests use a local fake Ollama server and spawned worker processes. The
 symlink regression skips when the Windows account cannot create symlinks. A

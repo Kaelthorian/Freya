@@ -37,6 +37,28 @@ a { color: inherit; text-decoration: none; }
 .nowrap { white-space: nowrap; }
 .text-green { color: var(--green); }
 .text-red { color: var(--red); }
+.skill-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.skill-card { padding: 16px; border: 1px solid var(--border-soft); border-radius: var(--radius); background: linear-gradient(145deg, rgba(18,24,33,.96), rgba(13,18,25,.96)); }
+.skill-card-top, .skill-card-meta, .skill-card-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.skill-card .avatar { display: grid; place-items: center; width: 34px; height: 34px; color: var(--green); background: var(--green-soft); border-radius: 9px; }
+.skill-card .avatar .icon { width: 18px; }
+.skill-name { display: block; margin-top: 13px; color: var(--text); font-size: 17px; font-weight: 650; }
+.skill-card > p { margin: 5px 0; color: var(--muted); }
+.skill-description { min-height: 38px; line-height: 1.45; }
+.skill-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 11px 0; }
+.skill-tags span { padding: 3px 7px; color: var(--muted); border: 1px solid var(--border); border-radius: 20px; font-size: 10px; }
+.skill-card-meta { padding-top: 10px; border-top: 1px solid var(--border-soft); color: var(--muted); font-size: 11px; }
+.skill-card-actions { justify-content: flex-start; margin-top: 12px; }
+.skill-detail { padding: 20px; }
+.skill-detail h3 { margin: 22px 0 8px; }
+.skill-detail li { margin: 6px 0; color: var(--muted); }
+.skill-detail pre, .skill-preview { overflow: auto; padding: 13px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: 7px; white-space: pre-wrap; }
+.skill-assignment-list { display: grid; gap: 8px; }
+.skill-assignment-row { display: grid; grid-template-columns: auto minmax(0, 1fr) 100px auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 7px; background: rgba(255,255,255,.015); }
+.skill-assignment-row span { display: grid; gap: 3px; }
+.skill-assignment-row small, .skill-assignment-row em { color: var(--muted); font-size: 11px; font-style: normal; }
+.skill-assignment-row em { color: var(--amber); }
+.skill-priority { width: 100%; }
 
 .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 20; display: flex; flex-direction: column; width: 236px; border-right: 1px solid var(--border-soft); background: rgba(11,14,20,.98); }
 .brand { display: flex; align-items: center; gap: 11px; height: 72px; padding: 0 20px; font-size: 17px; letter-spacing: -.02em; border-bottom: 1px solid var(--border-soft); }

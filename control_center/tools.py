@@ -35,6 +35,11 @@ class ToolResult:
     success: bool
     duration_seconds: float
     exit_code: int | None = None
+    capability: str = ""
+    policy_decision: str = ""
+    policy_reason: str = ""
+    executed: bool = False
+    error_class: str = ""
 
 
 class Toolbox:
