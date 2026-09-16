@@ -249,6 +249,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(Path(final["workspace"]), selected.resolve())
         self.assertEqual((selected / "created.txt").read_text(), "persistent")
 
+    def test_task_workspace_override_wins_and_empty_override_uses_new_workspace(self):
+        agent_workspace = self.root / "agent-default"
+        task_workspace = self.root / "task-choice"
+        agent_workspace.mkdir()
+        task_workspace.mkdir()
+        agent = self.agent(workspace_path=str(agent_workspace))
+        selected = self.runtime.submit(agent["id"], "Override agent workspace", str(task_workspace))
+        self.assertEqual(Path(selected["workspace"]), task_workspace.resolve())
+        self.runtime.cancel(selected["id"])
+        automatic = self.runtime.submit(agent["id"], "Use a fresh workspace", "")
+        self.assertTrue(Path(automatic["workspace"]).is_relative_to(self.root / "workspaces"))
+        self.runtime.cancel(automatic["id"])
+
     def test_agents_sharing_workspace_are_serialized(self):
         selected = self.root / "shared-project"
         selected.mkdir()

@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from . import __version__
-from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, validate_endpoint
+from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
 from .security import sanitize
 
 LIVE = {"Queued", "Running", "Paused"}
@@ -72,7 +72,7 @@ class Application:
                                      "cancel": True, "external_workers": False, "remote_models": False,
                                      "scheduling": False, "rag": False, "teams": False}}
         if parts == ["workspaces", "browse"]:
-            return self._browse_workspaces(query.get("path", ""))
+            return self._browse_workspaces(query.get("path") or str(self.data_dir.parent))
         if parts == ["tools"]:
             return TOOL_CATALOG
         if parts == ["models"]:
@@ -183,11 +183,15 @@ class Application:
                     self._agent_event(agent, "agent." + action)
                     return 200, agent
                 if action == "tasks":
-                    if set(body) != {"prompt"} or not isinstance(body["prompt"], str) or not body["prompt"].strip() or len(body["prompt"]) > 32000:
+                    if (set(body) - {"prompt", "workspace_path"} or "prompt" not in body
+                            or not isinstance(body["prompt"], str) or not body["prompt"].strip()
+                            or len(body["prompt"]) > 32000):
                         raise ValueError("Envía un prompt no vacío de hasta 32000 caracteres.")
+                    workspace_path = (normalize_workspace_path(body["workspace_path"])
+                                      if "workspace_path" in body else None)
                     if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:
                         raise ApiError(409, "Activa y reanuda el agente antes de asignar una tarea.")
-                    return 201, self.runtime.submit(agent_id, body["prompt"].strip())
+                    return 201, self.runtime.submit(agent_id, body["prompt"].strip(), workspace_path)
         if method == "POST" and len(parts) == 3 and parts[0] == "tasks":
             task = self.store.get_task(parts[1])
             if parts[2] == "cancel":
@@ -201,5 +205,5 @@ class Application:
                 agent = self.store.get_agent(task["agent_id"])
                 if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:
                     raise ApiError(409, "Activa y reanuda el agente antes de reintentar.")
-                return 201, self.runtime.submit(agent["id"], task["prompt"])
+                return 201, self.runtime.submit(agent["id"], task["prompt"], task["workspace"])
         raise ApiError(404, "Ruta o método no disponible.")

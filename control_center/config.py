@@ -78,6 +78,27 @@ def _text(value, name: str, maximum: int, required: bool = False) -> str:
     return value.strip()
 
 
+def normalize_workspace_path(value: str, *, allow_empty: bool = True) -> str:
+    """Resolve and validate a selected existing workspace directory."""
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("workspace_path debe ser una ruta de hasta 2048 caracteres.")
+    value = value.strip()
+    if not value:
+        if allow_empty:
+            return ""
+        raise ValueError("Selecciona una carpeta para el workspace.")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("workspace_path debe ser una ruta absoluta.")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("La carpeta seleccionada como workspace no existe o no es accesible.") from exc
+    if not candidate.is_dir():
+        raise ValueError("workspace_path debe apuntar a una carpeta existente.")
+    return str(candidate)
+
+
 def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(data, dict):
         raise ValueError("La configuración debe ser un objeto JSON.")
@@ -105,20 +126,7 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if re.search(r"[\s\x00-\x1f]", config["model"]):
         raise ValueError("model no debe contener espacios ni caracteres de control.")
     config["system_prompt"] = _text(config["system_prompt"], "system_prompt", 16000)
-    workspace_path = _text(config["workspace_path"], "workspace_path", 2048)
-    if workspace_path:
-        candidate = Path(workspace_path).expanduser()
-        if not candidate.is_absolute():
-            raise ValueError("workspace_path debe ser una ruta absoluta.")
-        try:
-            candidate = candidate.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError("La carpeta seleccionada como workspace no existe o no es accesible.") from exc
-        if not candidate.is_dir():
-            raise ValueError("workspace_path debe apuntar a una carpeta existente.")
-        config["workspace_path"] = str(candidate)
-    else:
-        config["workspace_path"] = ""
+    config["workspace_path"] = normalize_workspace_path(config["workspace_path"])
     config["endpoint"] = validate_endpoint(config["endpoint"])
     temp = config["temperature"]
     if isinstance(temp, bool) or not isinstance(temp, (int, float)) or not math.isfinite(temp) or not 0 <= temp <= 2:

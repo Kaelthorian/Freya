@@ -39,8 +39,7 @@ async function browseWorkspace(path = '') {
   workspaceDialog.querySelector('#workspace-current').textContent = result.writable ? 'La carpeta permite escritura al usuario actual.' : 'La carpeta puede ser de solo lectura.';
   workspaceDialog.querySelector('#workspace-truncated').hidden = !result.truncated;
 }
-async function openWorkspacePicker() {
-  const target = dialog.querySelector('[name="workspace_path"]');
+async function openWorkspacePicker(target = dialog.querySelector('[name="workspace_path"]')) {
   workspaceDialog.innerHTML = `<div class="workspace-browser"><header class="dialog-header"><div><span class="eyebrow">WORKSPACE LOCAL</span><h2 id="workspace-dialog-title">Seleccionar carpeta</h2><p>Elige la raíz donde el agente podrá leer y modificar archivos.</p></div><button type="button" class="icon-button" data-workspace-close aria-label="Cerrar">${icon('close')}</button></header><div class="workspace-browser-toolbar"><button type="button" class="button secondary" id="workspace-up">${icon('back')} Subir</button><input id="workspace-browser-path" type="text" aria-label="Ruta absoluta"><button type="button" class="button secondary" id="workspace-go">Ir</button></div><div class="dialog-error" id="workspace-error" role="alert" hidden></div><div id="workspace-browser-list" class="workspace-browser-list"><span class="spinner"></span></div><p id="workspace-truncated" class="small muted" hidden>Se muestran las primeras 500 carpetas.</p><footer class="dialog-footer workspace-browser-footer"><span><strong id="workspace-current"></strong></span><button type="button" class="button secondary" data-workspace-close>Cancelar</button><button type="button" class="button primary" id="workspace-select-current">Usar esta carpeta</button></footer></div>`;
   workspaceDialog.showModal();
   const showError = error => { const box = workspaceDialog.querySelector('#workspace-error'); box.textContent = error.message; box.hidden = false; };
@@ -70,7 +69,7 @@ export async function agentDialog(id) {
     const saved = await api(id ? `/agents/${id}` : '/agents', id ? 'PATCH' : 'POST', { name: data.get('name'), description: data.get('description'), role: data.get('role'), enabled: data.has('enabled'), config, tools: data.getAll('tools') });
     toast(id ? 'Configuración guardada.' : 'Agente creado.'); if (!id) location.hash = `#/agents/${saved.id}`;
   }, true);
-  dialog.querySelector('#select-workspace').addEventListener('click', openWorkspacePicker);
+  dialog.querySelector('#select-workspace').addEventListener('click', () => openWorkspacePicker());
   dialog.querySelector('#load-models').addEventListener('click', async event => {
     const button = event.currentTarget, status = dialog.querySelector('#model-status'); button.disabled = true; status.textContent = 'Consultando Ollama…';
     try { const result = await api(`/models?${new URLSearchParams({ endpoint: dialog.querySelector('[name="endpoint"]').value })}`); dialog.querySelector('#model-options').innerHTML = (result.models || []).map(model => `<option value="${esc(model.name)}">`).join(''); status.textContent = result.error || `${result.models.length} modelos disponibles. Elige uno en el campo Modelo.`; status.className = `small ${result.error ? 'text-red' : 'text-green'}`; }
@@ -80,11 +79,17 @@ export async function agentDialog(id) {
 
 export function assignDialog(id) {
   if (!state.agents.length) { toast('Primero crea un agente para asignarle una tarea.'); return agentDialog(); }
-  const content = `<div class="form-grid"><label class="form-field full-width"><span>Agente</span><select name="agent_id" required>${state.agents.map(agent => `<option value="${esc(agent.id)}" ${agent.id === id ? 'selected' : ''} ${agent.enabled ? '' : 'disabled'}>${esc(agent.name)} · ${esc(agent.config.model)}${agent.enabled ? '' : ' (desactivado)'}</option>`).join('')}</select></label>${field('Tarea', 'prompt', '', { type: 'textarea', rows: 7, span: true, required: true, placeholder: 'Describe el objetivo, el resultado esperado y las restricciones de la tarea…' })}<div class="notice full-width" id="assigned-workspace"></div></div>`;
-  open('Asignar una tarea', 'El agente usará su configuración y herramientas actuales.', content, 'Iniciar ejecución', async data => { const task = await api(`/agents/${data.get('agent_id')}/tasks`, 'POST', { prompt: data.get('prompt') }); toast('Tarea creada y enviada a la cola.'); location.hash = `#/tasks/${task.id}`; });
-  const select = dialog.querySelector('[name="agent_id"]'), notice = dialog.querySelector('#assigned-workspace');
-  const refreshWorkspace = () => { const agent = state.agents.find(item => item.id === select.value), path = agent?.config?.workspace_path; notice.innerHTML = `${icon('folder')} ${path ? `Esta tarea trabajará directamente en <code>${esc(path)}</code>. Los cambios se conservarán.` : 'Esta tarea usará un workspace aislado nuevo. La ruta aparecerá en el detalle de ejecución.'}`; };
-  select.addEventListener('change', refreshWorkspace); refreshWorkspace();
+  const initialAgent = state.agents.find(agent => agent.id === id && agent.enabled) || state.agents.find(agent => agent.enabled) || state.agents[0];
+  const content = `<div class="form-grid"><label class="form-field full-width"><span>Agente</span><select name="agent_id" required>${state.agents.map(agent => `<option value="${esc(agent.id)}" ${agent.id === initialAgent.id ? 'selected' : ''} ${agent.enabled ? '' : 'disabled'}>${esc(agent.name)} · ${esc(agent.config.model)}${agent.enabled ? '' : ' (desactivado)'}</option>`).join('')}</select></label>${field('Tarea', 'prompt', '', { type: 'textarea', rows: 7, span: true, required: true, placeholder: 'Describe el objetivo, el resultado esperado y las restricciones de la tarea…' })}<label class="form-field full-width"><span>Workspace para esta tarea</span><div class="workspace-input-row"><input type="text" name="workspace_path" value="" placeholder="Workspace nuevo automático"><button type="button" class="button secondary" id="select-task-workspace">${icon('folder')} Seleccionar carpeta</button></div><small id="assigned-workspace-help"></small></label><div class="notice full-width workspace-warning">${icon('shield')} Las herramientas del agente podrán leer y modificar archivos dentro de la carpeta elegida, según sus permisos y directorios autorizados.</div></div>`;
+  open('Asignar una tarea', 'Elige el agente y dónde trabajará esta ejecución.', content, 'Iniciar ejecución', async data => { const task = await api(`/agents/${data.get('agent_id')}/tasks`, 'POST', { prompt: data.get('prompt'), workspace_path: String(data.get('workspace_path') || '').trim() }); toast('Tarea creada y enviada a la cola.'); location.hash = `#/tasks/${task.id}`; });
+  const select = dialog.querySelector('[name="agent_id"]'), workspace = dialog.querySelector('[name="workspace_path"]'), help = dialog.querySelector('#assigned-workspace-help');
+  const refreshWorkspace = resetPath => {
+    const agent = state.agents.find(item => item.id === select.value), path = agent?.config?.workspace_path || '';
+    if (resetPath) workspace.value = path;
+    help.textContent = path ? 'Se propone la carpeta configurada para este agente. Puedes cambiarla para esta tarea; si la vacías, se creará un workspace nuevo.' : 'Elige una carpeta para esta tarea o deja el campo vacío para crear un workspace nuevo.';
+  };
+  select.addEventListener('change', () => refreshWorkspace(true)); refreshWorkspace(true);
+  dialog.querySelector('#select-task-workspace').addEventListener('click', () => openWorkspacePicker(workspace));
 }
 
 export function confirmAction({ title, description, label, action, danger = false }) {

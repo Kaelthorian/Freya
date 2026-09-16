@@ -18,9 +18,11 @@ class StubRuntime:
 
     def __init__(self, store):
         self.store = store
+        self.submissions = []
 
-    def submit(self, agent_id, prompt):
-        return self.store.create_task(agent_id, prompt, "test-workspace")
+    def submit(self, agent_id, prompt, workspace_path=None):
+        self.submissions.append((agent_id, prompt, workspace_path))
+        return self.store.create_task(agent_id, prompt, workspace_path or "test-workspace")
 
 
 class ApiTests(unittest.TestCase):
@@ -28,7 +30,8 @@ class ApiTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.directory = Path(self.temp.name)
         self.store = Store(self.directory / "test.sqlite3")
-        app = Application(self.store, StubRuntime(self.store), self.directory)
+        self.runtime = StubRuntime(self.store)
+        app = Application(self.store, self.runtime, self.directory)
         self.server = ControlServer(("127.0.0.1", 0), app)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -87,6 +90,22 @@ class ApiTests(unittest.TestCase):
         self.assertIn({"name": "Project A", "path": str(child.resolve())}, result["directories"])
         self.assertNotIn("file.txt", [item["name"] for item in result["directories"]])
         self.assertEqual(self.request("GET", "/api/workspaces/browse?path=relative")[0], 400)
+
+    def test_task_workspace_override_is_validated_and_preserved_on_retry(self):
+        agent = self.request("POST", "/api/agents", {"name": "Workspace"})[1]
+        selected = self.directory / "task-project"
+        selected.mkdir()
+        status, task = self.request("POST", f"/api/agents/{agent['id']}/tasks",
+                                    {"prompt": "Work here", "workspace_path": str(selected)})
+        self.assertEqual(status, 201, task)
+        self.assertEqual(task["workspace"], str(selected.resolve()))
+        self.assertEqual(self.runtime.submissions[-1][2], str(selected.resolve()))
+        self.assertEqual(self.request("POST", f"/api/agents/{agent['id']}/tasks",
+                                      {"prompt": "bad", "workspace_path": "relative"})[0], 400)
+        self.store.update_task(task["id"], status="Success")
+        status, retried = self.request("POST", f"/api/tasks/{task['id']}/retry", {})
+        self.assertEqual(status, 201, retried)
+        self.assertEqual(retried["workspace"], str(selected.resolve()))
 
     def test_sse_replays_only_events_after_cursor(self):
         agent = self.request("POST", "/api/agents", {"name": "SSE"})[1]

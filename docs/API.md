@@ -14,16 +14,28 @@ All routes are same-origin under `/api` and return JSON errors as
 | POST | `/api/agents/{id}/pause` | pause between actions |
 | POST | `/api/agents/{id}/resume` | resume task dispatch/actions |
 | POST | `/api/agents/{id}/restart` | cancel its tasks and reset runtime state |
-| POST | `/api/agents/{id}/tasks` | assign `{ "prompt": "..." }` |
+| POST | `/api/agents/{id}/tasks` | assign a task with optional workspace override |
 | GET | `/api/tools` | actual and explicitly unavailable tools |
 | GET | `/api/models?endpoint=...` | installed models from local Ollama |
 | GET | `/api/config` | defaults and MVP capability flags |
+| GET | `/api/workspaces/browse?path=...` | list subdirectories of an absolute local path |
 
 Create/patch fields are `name`, `description`, `role`, `enabled`, `tools` and
 `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
-optional `secret_env` name.
+optional `secret_env` name. Agent `workspace_path` is either empty for a
+generated workspace per task or an absolute existing directory used by default.
+
+Task assignment accepts `{ "prompt": "...", "workspace_path": "..." }`.
+When omitted, the agent's configured workspace applies. An absolute existing
+directory overrides it for that task alone. An explicit empty string requests a
+fresh generated workspace. Task retries reuse the original task's workspace.
+
+The workspace browser defaults to the parent of the configured data directory
+when `path` is omitted. It returns the resolved current path, parent, write-access hint, up
+to 500 immediate subdirectories, and a `truncated` flag. Saving the agent is the
+authoritative validation step.
 
 ## Tasks, observations and metrics
 

@@ -12,11 +12,10 @@ browser → HTTP API → SQLite
              ↓
          scheduler → spawned worker → local Ollama
                          ↓
-                  policy → shared Toolbox → task workspace
+                  policy → platform tools → selected workspace
 ```
 
-`agent.py` remains a separate CLI flow using `ollama_client.py`. The web worker
-uses `control_center/transport.py`, which disables proxies and redirects so an
+The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
 
 ## Persistence and events
@@ -35,8 +34,11 @@ Failed and unfinished steps are closed.
 
 ## Runtime and control semantics
 
-The scheduler supports bounded concurrency and serializes tasks per agent.
-Each task gets a fresh directory under `data/workspaces/` and a spawned process.
+The scheduler supports bounded concurrency and serializes tasks per agent and
+per resolved workspace. An agent can set an existing absolute default directory;
+task submission can override that path for one run, and an explicit empty
+override creates a fresh directory under `data/workspaces/`. Every task records
+the resolved workspace in its immutable snapshot and runs in a spawned process.
 On Windows the worker is assigned to a kill-on-close Job Object before tool
 execution; POSIX uses a process session. Cancel, restart and shutdown terminate
 the worker tree and persist a terminal event.
@@ -65,6 +67,9 @@ prevents later actions from relying on invented tool results.
 - Model filesystem paths resolve inside the task workspace and then inside the
   configured relative allowlist. Absolute paths, traversal and symlink escapes
   are rejected.
+- The folder browser lists directories visible to the local server. Saving an
+  agent validates that its selected workspace is absolute, existing and a
+  directory; task submission checks it again.
 - Tool dispatch is allowlisted. `run_command` uses argv with `shell=False` and
   accepts only workspace Python/tests, Ruff, and scoped read-only Git commands.
 - `execute` is a trust grant, not an OS sandbox. A Python file run inside the

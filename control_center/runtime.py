@@ -16,6 +16,7 @@ from typing import Any
 
 from control_center.worker import process_main
 from control_center.security import sanitize
+from control_center.config import normalize_workspace_path
 
 
 TERMINAL = {"Success", "Failed", "Cancelled"}
@@ -108,7 +109,7 @@ class Runtime:
             self.thread = threading.Thread(target=self._loop, name="control-center-scheduler", daemon=True)
             self.thread.start()
 
-    def submit(self, agent_id: str, prompt: str) -> dict[str, Any]:
+    def submit(self, agent_id: str, prompt: str, workspace_path: str | None = None) -> dict[str, Any]:
         with self.lock:
             if self.closed:
                 raise ValueError("Runtime is shut down.")
@@ -121,14 +122,11 @@ class Runtime:
                 raise ValueError("Resume the agent before submitting a task.")
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
                 raise ValueError("Task prompt must contain 1–32000 characters.")
-            configured = agent.get("config", {}).get("workspace_path", "")
-            if configured:
-                try:
-                    workspace = Path(configured).resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
-                    raise ValueError("The configured workspace no longer exists or is not accessible.") from exc
-                if not workspace.is_dir():
-                    raise ValueError("The configured workspace is not a directory.")
+            configured = (agent.get("config", {}).get("workspace_path", "")
+                          if workspace_path is None else workspace_path)
+            selected = normalize_workspace_path(configured)
+            if selected:
+                workspace = Path(selected)
             else:
                 workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
                 workspace.mkdir(parents=True, exist_ok=False)

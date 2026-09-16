@@ -1,8 +1,8 @@
 # Control Center subsystem
 
 This directory owns the local web API, SQLite state and spawned execution
-runtime. `frontend/` is its browser client; shared model tools remain in root
-`tools.py`.
+runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
+filesystem, command and Git implementations.
 
 ## Boundaries
 

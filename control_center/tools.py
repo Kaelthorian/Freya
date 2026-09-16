@@ -295,16 +295,17 @@ class Toolbox:
                     raise ValueError("Python scripts must be .py files inside the workspace.")
                 normalized = [str(script)] + command[1:]
         elif executable in {"git", "git.exe"}:
+            git_root, pathspec = self._git_scope()
             if command == ["status", "--short"]:
-                normalized = ["-C", str(self.project_root), "status", "--short", "--", self._workspace_git_path()]
+                normalized = ["-C", str(git_root), "status", "--short", "--", pathspec]
             elif command == ["diff"]:
                 normalized = [
-                    "-C", str(self.project_root), "diff", "--no-ext-diff", "--unified=3", "--", self._workspace_git_path()
+                    "-C", str(git_root), "diff", "--no-ext-diff", "--unified=3", "--", pathspec
                 ]
             else:
                 raise ValueError("Only git status --short and git diff for this workspace are allowed.")
             executable = "git"
-            cwd = self.project_root
+            cwd = git_root
         elif executable in {"ruff", "ruff.exe"} and command == ["check", "."]:
             normalized = ["check", "."]
             executable = "ruff"
@@ -346,31 +347,28 @@ class Toolbox:
                 raise ValueError("Only -s workspace-path, -p filename-pattern, -v, and -q are allowed.")
         return normalized
 
-    def _workspace_git_path(self) -> str:
-        try:
-            return self.workspace.relative_to(self.project_root).as_posix()
-        except ValueError as exc:
-            raise ValueError("Git tools require the workspace to be inside the project root.") from exc
-
-    def tool_git_diff(self) -> tuple[str, bool, int | None]:
-        pathspec = self._workspace_git_path()
+    def _git_scope(self) -> tuple[Path, str]:
         try:
             top_level = subprocess.run(
-                ["git", "-C", str(self.project_root), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                shell=False,
+                ["git", "-C", str(self.workspace), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5, shell=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError("Could not inspect Git repository: {}".format(exc)) from exc
         if top_level.returncode != 0:
-            return "The project folder is not inside a Git repository.", True, 0
+            raise ValueError("The workspace is not inside a Git repository.")
         git_root = Path(top_level.stdout.strip()).resolve()
         try:
-            repo_path = self.workspace.relative_to(git_root).as_posix()
+            pathspec = self.workspace.relative_to(git_root).as_posix() or "."
+        except ValueError as exc:
+            raise ValueError("Could not scope Git operations to the workspace.") from exc
+        return git_root, pathspec
+
+    def tool_git_diff(self) -> tuple[str, bool, int | None]:
+        try:
+            git_root, repo_path = self._git_scope()
         except ValueError:
-            return "The task workspace is outside the Git repository.", True, 0
+            return "The workspace is not inside a Git repository.", True, 0
 
         pieces: list[str] = []
         for args in (
@@ -414,7 +412,7 @@ class Toolbox:
                         pieces.append("".join(difflib.unified_diff([], content, fromfile="/dev/null", tofile=relative)))
                 except (ValueError, OSError, UnicodeDecodeError):
                     continue
-        return (_clip("\n".join(pieces) if pieces else "No changes under {}.".format(pathspec)), True, 0)
+        return (_clip("\n".join(pieces) if pieces else "No changes under {}.".format(repo_path)), True, 0)
 
 
 def argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
