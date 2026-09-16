@@ -246,6 +246,21 @@ input:focus, textarea:focus, select:focus { border-color: rgba(123,216,177,.65);
 .task-stats > div { color: var(--faint); font-size: 9px; }
 .task-stats strong { display: block; margin-top: 5px; color: var(--text); font-size: 13px; }
 .workspace-detail { margin-top: 12px; padding: 10px; color: var(--muted); border: 1px solid var(--border-soft); border-radius: 6px; background: rgba(0,0,0,.15); overflow-wrap: anywhere; font-size: 10px; }
+.workspace-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.workspace-input-row .button { white-space: nowrap; }
+.workspace-warning { margin-top: 12px; }
+.workspace-dialog { width: min(760px, calc(100vw - 32px)); }
+.workspace-browser { display: flex; min-height: min(650px, calc(100vh - 48px)); flex-direction: column; }
+.workspace-browser-toolbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; padding: 16px 24px; border-bottom: 1px solid var(--border-soft); }
+.workspace-browser-toolbar input { min-width: 0; }
+.workspace-browser-list { min-height: 240px; max-height: 440px; padding: 8px 16px; overflow: auto; }
+.workspace-folder { display: grid; width: 100%; grid-template-columns: 20px minmax(0, 1fr) 18px; align-items: center; gap: 10px; padding: 11px 10px; border: 0; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.workspace-folder:hover, .workspace-folder:focus-visible { background: rgba(255,255,255,.05); }
+.workspace-folder span { overflow: hidden; text-overflow: ellipsis; }
+.workspace-empty { padding: 40px 12px; color: var(--muted); text-align: center; }
+.workspace-browser > .dialog-error, .workspace-browser > p { margin: 10px 24px 0; }
+.workspace-browser-footer { margin-top: auto; grid-template-columns: minmax(0, 1fr) auto auto; }
+.workspace-browser-footer > span { align-self: center; color: var(--muted); font-size: 11px; }
 .task-result pre { margin: 0; padding: 0 17px 17px; color: #c5d0db; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .config-view, .tool-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; padding: 16px; }
 .config-view > div, .tool-card { padding: 11px; border: 1px solid var(--border-soft); border-radius: 7px; background: rgba(0,0,0,.12); }
@@ -317,6 +332,9 @@ dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(3px); }
   .dashboard-grid, .two-column, .settings-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
+  .workspace-input-row, .workspace-browser-toolbar { grid-template-columns: 1fr; }
+  .workspace-browser-footer { grid-template-columns: 1fr 1fr; }
+  .workspace-browser-footer > span { grid-column: 1 / -1; }
   .sidebar { position: sticky; top: 0; width: 100%; height: auto; flex-direction: row; align-items: center; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--border-soft); }
   .brand { height: 53px; min-width: 155px; padding: 0 12px; border: 0; }
   .brand-mark { width: 29px; height: 29px; }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -70,6 +71,8 @@ class Application:
                     "capabilities": {"ollama": True, "sse": True, "pause": "between_actions",
                                      "cancel": True, "external_workers": False, "remote_models": False,
                                      "scheduling": False, "rag": False, "teams": False}}
+        if parts == ["workspaces", "browse"]:
+            return self._browse_workspaces(query.get("path", ""))
         if parts == ["tools"]:
             return TOOL_CATALOG
         if parts == ["models"]:
@@ -104,6 +107,37 @@ class Application:
         if parts == ["metrics"]:
             return self.store.metrics(agent_id=query.get("agent_id") or None)
         raise ApiError(404, "Ruta no encontrada.")
+
+    @staticmethod
+    def _browse_workspaces(value: str) -> dict:
+        if not isinstance(value, str) or len(value) > 2048 or "\x00" in value:
+            raise ValueError("La ruta de workspace no es válida.")
+        candidate = Path(value).expanduser() if value.strip() else Path.home()
+        if value.strip() and not candidate.is_absolute():
+            raise ValueError("La ruta de workspace debe ser absoluta.")
+        try:
+            current = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("La carpeta no existe o no es accesible.") from exc
+        if not current.is_dir():
+            raise ValueError("La ruta debe apuntar a una carpeta.")
+        directories = []
+        truncated = False
+        try:
+            for entry in sorted(current.iterdir(), key=lambda item: item.name.casefold()):
+                try:
+                    if entry.is_dir():
+                        if len(directories) >= 500:
+                            truncated = True
+                            break
+                        directories.append({"name": entry.name, "path": str(entry.resolve())})
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError) as exc:
+            raise ValueError("No se puede leer la carpeta seleccionada.") from exc
+        parent = None if current.parent == current else str(current.parent)
+        return {"path": str(current), "parent": parent, "writable": os.access(current, os.W_OK),
+                "directories": directories, "truncated": truncated}
 
     @staticmethod
     def _limit(query):

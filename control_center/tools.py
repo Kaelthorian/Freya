@@ -1,4 +1,4 @@
-"""Restricted filesystem, test, search, command, and Git tools for Mini-Coder."""
+"""Restricted filesystem, search, command, and Git tools for the platform."""
 
 from __future__ import annotations
 
@@ -44,12 +44,10 @@ class Toolbox:
         self,
         project_root: Path,
         workspace: Path,
-        evaluator_dir: Path | None = None,
         timeout_seconds: int = 30,
     ) -> None:
         self.project_root = project_root.resolve()
         self.workspace = workspace.resolve()
-        self.evaluator_dir = (evaluator_dir or self.project_root / "evaluator").resolve()
         self.timeout_seconds = timeout_seconds
         self.workspace.mkdir(parents=True, exist_ok=True)
 
@@ -107,12 +105,6 @@ class Toolbox:
                     "regex": {"type": "boolean", "description": "Treat query as a regular expression (default false)."},
                 },
                 ["query"],
-            ),
-            self._schema(
-                "run_tests",
-                "Run the fixed evaluator tests. The evaluator is outside the writable workspace.",
-                {},
-                [],
             ),
             self._schema(
                 "run_command",
@@ -254,35 +246,6 @@ class Toolbox:
                         hits.append("[results capped at {} hits]".format(MAX_SEARCH_HITS))
                         return "\n".join(hits), True, 0
         return ("\n".join(hits) if hits else "No matches found."), True, 0
-
-    def tool_run_tests(self) -> tuple[str, bool, int | None]:
-        if not self.evaluator_dir.is_dir():
-            raise ValueError("Evaluator directory does not exist: {}".format(self.evaluator_dir))
-        env = os.environ.copy()
-        env["AGENT_WORKSPACE"] = str(self.workspace)
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                str(self.evaluator_dir),
-                "-p",
-                "test_*.py",
-                "-v",
-            ],
-            cwd=str(self.project_root),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=self.timeout_seconds,
-            shell=False,
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        return _clip(output), result.returncode == 0, result.returncode
 
     def tool_run_command(
         self,

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools import Toolbox
+from control_center.tools import Toolbox
 
 
 class ToolboxTests(unittest.TestCase):
@@ -12,7 +12,7 @@ class ToolboxTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "workspace"
-        self.toolbox = Toolbox(self.root, self.workspace, self.root / "evaluator")
+        self.toolbox = Toolbox(self.root, self.workspace)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()

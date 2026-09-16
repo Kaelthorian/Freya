@@ -121,12 +121,21 @@ class Runtime:
                 raise ValueError("Resume the agent before submitting a task.")
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
                 raise ValueError("Task prompt must contain 1–32000 characters.")
-            workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
-            workspace.mkdir(parents=True, exist_ok=False)
+            configured = agent.get("config", {}).get("workspace_path", "")
+            if configured:
+                try:
+                    workspace = Path(configured).resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise ValueError("The configured workspace no longer exists or is not accessible.") from exc
+                if not workspace.is_dir():
+                    raise ValueError("The configured workspace is not a directory.")
+            else:
+                workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
+                workspace.mkdir(parents=True, exist_ok=False)
             task = self.store.create_task(agent_id, prompt, str(workspace))
             self.pending.append(task["id"])
             self.store.append_event(task["id"], {"event_type": "task.queued", "level": "info", "status": "Queued",
-                                                   "reason": "Esperar un trabajador disponible; cada agente ejecuta una tarea a la vez."})
+                                                   "reason": "Esperar un trabajador y un workspace disponibles; cada agente ejecuta una tarea a la vez."})
             self._refresh_agent(agent_id)
             self.wake.set()
             return task
@@ -260,7 +269,8 @@ class Runtime:
         started = time.monotonic()
         process.start()
         worker = {"process": process, "queue": outbox, "pause": pause_event, "started": started,
-                  "agent_id": task["agent_id"], "max_seconds": task["config"].get("max_seconds", 600), "job": None}
+                  "agent_id": task["agent_id"], "workspace_key": self._workspace_key(task["workspace"]),
+                  "max_seconds": task["config"].get("max_seconds", 600), "job": None}
         self.active[task["id"]] = worker
         self.store.update_task(task["id"], status="Running", started_at=now())
         try:
@@ -330,6 +340,7 @@ class Runtime:
                         else:
                             worker["exited"] = True
                 busy = {worker["agent_id"] for worker in self.active.values()}
+                busy_workspaces = {worker["workspace_key"] for worker in self.active.values()}
                 for task_id in list(self.pending):
                     if len(self.active) >= self.max_workers:
                         break
@@ -338,13 +349,22 @@ class Runtime:
                     if not agent.get("enabled", True):
                         self._finish(task_id, {"status": "Cancelled", "error": "Agent was disabled before execution."})
                         continue
-                    if task["agent_id"] in busy or task["agent_id"] in self.paused:
+                    workspace_key = self._workspace_key(task["workspace"])
+                    if (task["agent_id"] in busy or task["agent_id"] in self.paused
+                            or workspace_key in busy_workspaces):
                         continue
                     self.pending.remove(task_id)
                     try:
                         self._spawn(task)
                     except Exception as exc:
                         self._finish(task_id, {"status": "Failed", "error": "Worker launch failed: " + str(exc)})
-                    busy.add(task["agent_id"])
+                    if task_id in self.active:
+                        busy.add(task["agent_id"])
+                        busy_workspaces.add(workspace_key)
             self.wake.wait(.05)
             self.wake.clear()
+
+    @staticmethod
+    def _workspace_key(path: str) -> str:
+        """Normalize a persisted workspace so aliases cannot run concurrently."""
+        return os.path.normcase(str(Path(path).resolve()))

@@ -16,7 +16,7 @@ from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.transport import TransportError, request_json
 from control_center.worker import PolicyToolbox, run_task
-from tools import ToolResult
+from control_center.tools import ToolResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -238,6 +238,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(final["total_tokens"], 10)
         self.assertEqual(self.store.list_steps(task["id"])[0]["status"], "Success")
         self.assertFalse(self.runtime.active)
+
+    def test_configured_workspace_is_reused_for_task_files(self):
+        selected = self.root / "selected-project"
+        selected.mkdir()
+        self.server.responses.extend([answer(calls=[("write_file", {"path": "created.txt", "content": "persistent"})]), answer()])
+        task = self.runtime.submit(self.agent(workspace_path=str(selected))["id"], "Use selected workspace")
+        final = self.completed(task)
+        self.assertEqual(final["status"], "Success", final["error"])
+        self.assertEqual(Path(final["workspace"]), selected.resolve())
+        self.assertEqual((selected / "created.txt").read_text(), "persistent")
+
+    def test_agents_sharing_workspace_are_serialized(self):
+        selected = self.root / "shared-project"
+        selected.mkdir()
+        self.server.release.clear()
+        first_agent = self.agent(workspace_path=str(selected))
+        second_agent = self.agent(workspace_path=str(selected))
+        first = self.runtime.submit(first_agent["id"], "First")
+        self.assertTrue(self.server.entered.wait(10))
+        second = self.runtime.submit(second_agent["id"], "Second")
+        time.sleep(.2)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.store.get_task(second["id"])["status"], "Queued")
+        self.server.release.set()
+        self.assertEqual(self.completed(first)["status"], "Success")
+        self.assertEqual(self.completed(second)["status"], "Success")
 
     def test_per_agent_serialization_parallel_agents_and_queued_cancel(self):
         self.server.release.clear()

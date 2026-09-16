@@ -6,7 +6,7 @@ import copy
 import ipaddress
 import math
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 TOOL_CATALOG = [
@@ -18,7 +18,6 @@ TOOL_CATALOG = [
         ("edit_file", "Reemplazar una coincidencia exacta", True, False),
         ("search_code", "Buscar texto en el workspace", True, False),
         ("git_diff", "Consultar cambios de Git en el workspace", True, False),
-        ("run_tests", "Ejecutar el evaluador externo de la calculadora", True, True),
         ("run_command", "Ejecutar Python, tests, Ruff o consultas Git permitidas", True, True),
         ("web_search", "Búsqueda web · integración pendiente", False, False),
         ("browser", "Navegador · integración pendiente", False, False),
@@ -43,6 +42,7 @@ DEFAULT_CONFIG = {
     "allowed_directories": ["."],
     "forbidden_commands": [],
     "secret_env": "",
+    "workspace_path": "",
 }
 LIMITS = {
     "context_window": (512, 131072), "max_tokens": (128, 1000000),
@@ -105,6 +105,20 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if re.search(r"[\s\x00-\x1f]", config["model"]):
         raise ValueError("model no debe contener espacios ni caracteres de control.")
     config["system_prompt"] = _text(config["system_prompt"], "system_prompt", 16000)
+    workspace_path = _text(config["workspace_path"], "workspace_path", 2048)
+    if workspace_path:
+        candidate = Path(workspace_path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("workspace_path debe ser una ruta absoluta.")
+        try:
+            candidate = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("La carpeta seleccionada como workspace no existe o no es accesible.") from exc
+        if not candidate.is_dir():
+            raise ValueError("workspace_path debe apuntar a una carpeta existente.")
+        config["workspace_path"] = str(candidate)
+    else:
+        config["workspace_path"] = ""
     config["endpoint"] = validate_endpoint(config["endpoint"])
     temp = config["temperature"]
     if isinstance(temp, bool) or not isinstance(temp, (int, float)) or not math.isfinite(temp) or not 0 <= temp <= 2:
@@ -137,9 +151,9 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(selected, list) or any(not isinstance(x, str) or x not in available for x in selected):
         raise ValueError("tools debe contener solamente nombres de herramientas disponibles.")
     result["tools"] = list(dict.fromkeys(selected))
-    if config["permissions"] == "read_only" and set(selected) & {"write_file", "edit_file", "run_command", "run_tests"}:
+    if config["permissions"] == "read_only" and set(selected) & {"write_file", "edit_file", "run_command"}:
         raise ValueError("El permiso read_only no admite escritura ni ejecución.")
-    if config["permissions"] != "execute" and set(selected) & {"run_command", "run_tests"}:
-        raise ValueError("run_command y run_tests requieren permiso execute.")
+    if config["permissions"] != "execute" and "run_command" in selected:
+        raise ValueError("run_command requiere permiso execute.")
     result["config"] = config
     return result

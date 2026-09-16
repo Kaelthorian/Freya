@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from control_center.config import normalize_agent, validate_endpoint
@@ -34,6 +36,17 @@ class ControlConfigurationTests(unittest.TestCase):
                          "http://user:secret@localhost:11434", "http://localhost:11434?key=secret"):
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
                 validate_endpoint(endpoint)
+
+    def test_workspace_must_be_an_existing_absolute_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resolved = str(Path(directory).resolve())
+            agent = normalize_agent({"name": "A", "config": {"workspace_path": resolved}})
+            self.assertEqual(agent["config"]["workspace_path"], resolved)
+            file_path = Path(directory) / "file.txt"
+            file_path.write_text("x")
+            for value in ("relative/path", str(Path(directory) / "missing"), str(file_path)):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    normalize_agent({"name": "A", "config": {"workspace_path": value}})
 
 
 class RedactionTests(unittest.TestCase):

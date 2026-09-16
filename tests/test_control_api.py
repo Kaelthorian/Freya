@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.parse import urlencode
 
 from control_center.api import Application
 from control_center.http import ControlServer
@@ -74,6 +75,18 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/agents", {"name": "bad"}, {"Content-Type": "text/plain"})[0], 415)
         self.assertEqual(self.request("POST", "/api/agents", {"name": "bad", "tools": ["browser"]})[0], 400)
         self.assertEqual(self.request("GET", "/api/tasks?limit=99999")[0], 400)
+
+    def test_workspace_browser_lists_directories_and_rejects_bad_paths(self):
+        child = self.directory / "Project A"
+        child.mkdir()
+        (self.directory / "file.txt").write_text("not a folder")
+        encoded = urlencode({"path": str(self.directory)})
+        status, result = self.request("GET", "/api/workspaces/browse?" + encoded)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["path"], str(self.directory.resolve()))
+        self.assertIn({"name": "Project A", "path": str(child.resolve())}, result["directories"])
+        self.assertNotIn("file.txt", [item["name"] for item in result["directories"]])
+        self.assertEqual(self.request("GET", "/api/workspaces/browse?path=relative")[0], 400)
 
     def test_sse_replays_only_events_after_cursor(self):
         agent = self.request("POST", "/api/agents", {"name": "SSE"})[1]
