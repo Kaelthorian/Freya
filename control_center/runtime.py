@@ -127,6 +127,8 @@ class Runtime:
             selected = normalize_workspace_path(configured)
             if selected:
                 workspace = Path(selected)
+                if not os.access(workspace, os.W_OK):
+                    raise ValueError("The selected workspace folder is not writable by the Freya server process. Grant write permission to the folder or choose a writable folder.")
             else:
                 workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
                 workspace.mkdir(parents=True, exist_ok=False)

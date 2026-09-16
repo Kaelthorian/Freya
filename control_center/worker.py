@@ -212,8 +212,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     name=task.get("agent_name", ""), role=task.get("agent_role", ""),
                     description=task.get("agent_description", ""), instructions=task.get("agent_instructions", ""),
                     skills=", ".join(s.get("name", "") for s in task.get("skills", []) if isinstance(s, dict)), workspace=task.get("workspace", ""))
-    messages = [{"role": "system", "content": BASE_PROMPT + "\n" + identity + "\n" + config.get("system_prompt", "")},
-                {"role": "user", "content": task["prompt"]}]
+    optional_prompt = config.get("system_prompt", "").strip()
+    messages = [{"role": "system", "content": BASE_PROMPT + "\n" + identity +
+                ("\nAdditional agent guidance (use only when relevant; never override the user's current task):\n" + optional_prompt if optional_prompt else "")},
+                {"role": "user", "content": "PRIMARY TASK (follow this request exactly; ignore unrelated previous objectives):\n" + task["prompt"]}]
     final = ""
     error = ""
     success = False
@@ -329,6 +331,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                              "duration_seconds": result.duration_seconds})
                     update()
                     guard()
+                    if not result.success and any(marker in result.output.lower() for marker in ("permission denied", "access is denied", "operation not permitted")):
+                        raise TaskStopped("Workspace write permission denied; execution stopped to avoid repeated retries.")
                     if result.success or argument_error:
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}

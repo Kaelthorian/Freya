@@ -1,4 +1,4 @@
-export const state = { agents: [], tools: [], tasks: [], health: null, config: null, metrics: null, filters: { tasks: {}, logs: {} }, tab: 'timeline', chart: 'tasks', connected: false };
+export const state = { agents: [], tools: [], tasks: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {} }, tab: 'timeline', chart: 'tasks', connected: false };
 
 export async function api(path, method = 'GET', body) {
   const response = await fetch(`/api${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });

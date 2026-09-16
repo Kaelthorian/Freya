@@ -1,8 +1,8 @@
-import { state, api, esc, number, route, toast } from './core.js';
+import { state, api, esc, number, route, toast, serialize } from './core.js';
 import { icon } from './icons.js';
 import { empty, button } from './components.js';
 import { freya, dashboard, agents, agentDetail, tasks, taskDetail, logs, metricsView, settings } from './views.js';
-import { agentDialog, assignDialog, confirmAction, setDialogRefresh } from './dialogs.js';
+import { agentDialog, assignDialog, confirmAction, setDialogRefresh, chooseWorkspace } from './dialogs.js';
 
 const main = document.querySelector('#main-content');
 const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['tasks', 'Tasks'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
@@ -38,7 +38,7 @@ async function render(navigation = false) {
   updateChrome();
   try {
     let html;
-    if (current.page === 'freya') html = freya();
+    if (current.page === 'freya') html = await freya();
     else if (current.page === 'dashboard') html = dashboard();
     else if (current.page === 'agents') html = current.id ? await agentDetail(current.id) : agents();
     else if (current.page === 'tasks') html = current.id ? await taskDetail(current.id) : await tasks();
@@ -84,13 +84,17 @@ document.addEventListener('click', async event => {
   const { action, id, value } = target.dataset;
   try {
     if (action === 'create-agent' || action === 'edit-agent') return await agentDialog(id);
+    if (action === 'freya-workspace') return await chooseWorkspace(document.querySelector('#freya-workspace'));
     if (action === 'assign') return await assignDialog(id);
     if (action === 'refresh') return await refresh();
     if (action === 'chart') { state.chart = value; return render(); }
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
+    if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
+    if (action === 'copy-task-logs') { event.preventDefault(); const events = await api(`/logs?task_id=${encodeURIComponent(id)}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
     if (action === 'delete-agent') return confirmAction({ title: 'Delete agent', description: 'This agent will be removed from the workspace. Agents with active tasks cannot be deleted.', label: 'Delete agent', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agent deleted.'); } });
     if (action === 'cancel-task') return confirmAction({ title: 'Cancel this run', description: 'The runtime will be asked to cancel this run, and the request will be recorded in its history. An action already in progress may finish before cancellation takes effect.', label: 'Cancel run', danger: true, action: async () => { await api(`/tasks/${id}/cancel`, 'POST', {}); toast('Cancellation requested.'); } });
+    if (action === 'cancel-orchestration') return confirmAction({ title: 'Stop Freya', description: 'Cancel Freya and all active delegated tasks.', label: 'Stop Freya', danger: true, action: async () => { await api(`/orchestrations/${id}/cancel`, 'POST', {}); toast('Freya stopped.'); } });
     if (action === 'restart-agent') return confirmAction({ title: 'Restart agent', description: 'The runtime will cancel the active run and make the agent available for new tasks.', label: 'Restart agent', action: async () => { await api(`/agents/${id}/restart`, 'POST', {}); toast('Restart requested.'); } });
     target.disabled = true;
     if (action === 'toggle-agent') { await api(`/agents/${id}`, 'PATCH', { enabled: target.dataset.enabled === 'true' }); toast(target.dataset.enabled === 'true' ? 'Agent enabled.' : 'Agent disabled.'); }
@@ -109,7 +113,9 @@ document.addEventListener('change', event => {
   render();
 });
 document.addEventListener('submit', event => { if (event.target.id === 'log-filters') event.preventDefault(); });
-document.addEventListener('submit', async event => { if (event.target.id === 'freya-form') { event.preventDefault(); const prompt=event.target.prompt.value.trim(); if (!prompt) return; try { await api('/orchestrations','POST',{prompt}); toast('Freya started the orchestration.'); await refresh(); } catch (error) { toast(error.message,true); } } });
+document.addEventListener('submit', async event => { if (event.target.id === 'freya-form') { event.preventDefault(); const prompt=event.target.prompt.value.trim(), workspace_path=event.target.workspace_path.value.trim(); if (!prompt) return; try { await api('/orchestrations','POST',{prompt,workspace_path}); toast('Freya started the orchestration.'); await refresh(); } catch (error) { toast(error.message,true); } } });
+document.addEventListener('input', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
+document.addEventListener('change', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
 
 function connectEvents() {
   const source = new EventSource('/api/events');

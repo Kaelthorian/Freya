@@ -10,14 +10,29 @@ class Orchestrator:
         self.config = {"max_rounds": 6, "max_delegated_tasks": 8, "max_model_calls": 12, "max_wallclock_seconds": 900}
         self.config.update(config or {})
 
-    def submit(self, prompt: str) -> dict:
-        run = self.store.create_orchestration(prompt, self.config)
+    def submit(self, prompt: str, workspace_path: str | None = None) -> dict:
+        config = {**self.config, "workspace_path": workspace_path or ""}
+        run = self.store.create_orchestration(prompt, config)
         threading.Thread(target=self._run, args=(run["id"],), daemon=True, name="freya-orchestrator").start()
         return run
 
+    def cancel(self, oid: str) -> dict:
+        run = self.store.get_orchestration(oid)
+        for delegation in run.get("delegations", []):
+            if delegation.get("task_id") and delegation.get("status") in {"Queued", "Running", "Paused"}:
+                try: self.runtime.cancel(delegation["task_id"])
+                except (KeyError, ValueError): pass
+        self.store.update_orchestration(oid, status="Cancelled", error="Cancelled by user.")
+        self.store.add_orchestration_event(oid, {"event_type":"freya.cancelled","status":"Cancelled","message":"Freya orchestration cancelled by user."})
+        return self.store.get_orchestration(oid)
+
     def _decision(self, prompt, agents, results):
         if self.decide: return self.decide(prompt, agents, results)
-        enabled=[a for a in agents if a.get("enabled") and a.get("status") != "Offline"]
+        # `enabled` is the durable availability switch. Status can briefly be
+        # Offline after recovery/restart while the scheduler is coming back;
+        # an enabled agent must still be selectable and Runtime performs the
+        # final safety checks.
+        enabled=[a for a in agents if a.get("enabled") is True]
         if not enabled: return {"action":"respond","message":"No enabled agent is available for this request."}
         return {"action":"delegate","tasks":[{"agent_id":enabled[0]["id"],"objective":prompt}]}
 
@@ -37,8 +52,8 @@ class Orchestrator:
                 for item in tasks:
                     aid=item.get("agent_id"); objective=str(item.get("objective","")).strip()
                     agent=self.store.get_agent(aid)
-                    if not agent.get("enabled") or agent.get("status")=="Offline": raise ValueError("Selected agent is disabled or unavailable.")
-                    task=self.runtime.submit(aid, objective); did=self.store.add_delegation(oid,aid,objective,task["id"]); delegated+=1
+                    if agent.get("enabled") is not True: raise ValueError("Selected agent is disabled or unavailable.")
+                    task=self.runtime.submit(aid, objective, run.get("config", {}).get("workspace_path") or None); did=self.store.add_delegation(oid,aid,objective,task["id"]); delegated+=1
                     self.store.add_orchestration_event(oid,{"event_type":"freya.delegated","status":"Queued","agent_id":aid,"task_id":task["id"],"message":"Delegated objective to agent."})
                     results.append({"delegation_id":did,"task_id":task["id"],"agent_id":aid})
                 # bounded wait for submitted tasks; scheduler remains independent

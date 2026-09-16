@@ -165,7 +165,13 @@ class Application:
             if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
             prompt = body.get("prompt") if isinstance(body, dict) else None
             if not isinstance(prompt, str) or not prompt.strip(): raise ValueError("Enter a non-empty prompt.")
-            return 201, self.orchestrator.submit(prompt.strip())
+            workspace = body.get("workspace_path", "")
+            if workspace:
+                workspace = normalize_workspace_path(workspace)
+            return 201, self.orchestrator.submit(prompt.strip(), workspace)
+        if method == "POST" and len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "cancel":
+            if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
+            return 200, self.orchestrator.cancel(parts[1])
         if len(parts) >= 2 and parts[0] == "agents":
             agent_id = parts[1]
             agent = self.store.get_agent(agent_id)

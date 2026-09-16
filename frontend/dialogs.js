@@ -53,6 +53,7 @@ async function openWorkspacePicker(target = dialog.querySelector('[name="workspa
   workspaceDialog.querySelector('#workspace-browser-path').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); navigate(event.currentTarget.value.trim()); } });
   await navigate(target.value.trim());
 }
+export async function chooseWorkspace(target) { await openWorkspacePicker(target); if (target?.id === 'freya-workspace') { state.freyaDraft.workspace_path = target.value; target.dispatchEvent(new Event('input', { bubbles: true })); } }
 export async function agentDialog(id) {
   const agent = id ? await api(`/agents/${encodeURIComponent(id)}`) : null;
   const c = { ...(state.config?.defaults || {}), ...(agent?.config || {}) }, selectedTools = agent?.tools || state.config?.default_tools || [];

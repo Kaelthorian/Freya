@@ -79,3 +79,6 @@ full end-to-end task additionally requires local Ollama and an installed model.
 
 See [API.md](API.md) for routes and [ARCHITECTURE.md](ARCHITECTURE.md) for trust
 and process boundaries.
+The Freya overview refreshes orchestration cards and shows each delegated
+agent's objective, status, duration, token usage, and model-call count. Keep
+these values sourced from persisted task snapshots when changing the view.
