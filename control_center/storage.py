@@ -17,6 +17,7 @@ from uuid import uuid4
 from .config import TOOL_CATALOG
 from .capabilities import effective_tools_for_policy
 from .policy import policy_from_legacy, validate_policy
+from .planner import PLAN_SCHEMA_VERSION, validate_plan
 from .agent_context import build_agent_context, build_effective_agent
 from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
@@ -26,6 +27,9 @@ from .tools import argument_summary
 TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
 AGENT_STATUSES = {"Idle", "Running", "Waiting", "Paused", "Error", "Offline"}
 ACTIVE_TASK_STATUSES = ("Queued", "Running", "WaitingForApproval", "Paused")
+ORCHESTRATION_ACTIVE_STATUSES = ("Queued", "Planning", "Planned", "Running")
+ORCHESTRATION_TERMINAL_STATUSES = ("Success", "Failed", "Cancelled")
+ORCHESTRATION_STATUSES = set(ORCHESTRATION_ACTIVE_STATUSES + ORCHESTRATION_TERMINAL_STATUSES)
 EXECUTION_FIELDS = {
     "status", "started_at", "finished_at", "duration_seconds", "steps",
     "progress", "result", "verification", "error",
@@ -75,6 +79,15 @@ class Store:
                                      ("agent_instructions", "TEXT NOT NULL DEFAULT ''"), ("skills_json", "TEXT NOT NULL DEFAULT '[]'")):
                 if name not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+            orchestration_columns = {row[1] for row in connection.execute("PRAGMA table_info(orchestration_runs)")}
+            for name, definition in (
+                ("plan_json", "TEXT"),
+                ("plan_schema_version", "INTEGER"),
+                ("plan_created_at", "TEXT"),
+                ("planning_metrics_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in orchestration_columns:
+                    connection.execute(f"ALTER TABLE orchestration_runs ADD COLUMN {name} {definition}")
             skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)")}
             for name, definition in (
                 ("category", "TEXT NOT NULL DEFAULT 'General'"),
@@ -334,6 +347,8 @@ class Store:
             row = c.execute("SELECT * FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
             if row is None: raise KeyError(oid)
             result = dict(row); result["config"] = _load(result.pop("config_json")) or {}
+            result["plan"] = _load(result.pop("plan_json"))
+            result["planning_metrics"] = _load(result.pop("planning_metrics_json")) or {}
             result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
             for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
             result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
@@ -488,11 +503,68 @@ class Store:
     def skill_compatibility(self, agent_id: str) -> list[dict[str, Any]]:
         return [skill_summary(skill) for skill in self.get_agent(agent_id).get("skills", [])]
 
-    def update_orchestration(self, oid, **fields):
-        allowed={"status","response","error"}; unknown=set(fields)-allowed
-        if unknown: raise ValueError("Unknown orchestration fields: " + ", ".join(sorted(unknown)))
+    def transition_orchestration(self, oid: str, expected_statuses, status: str, **fields) -> dict | None:
+        """Atomically update a run only while it remains in an expected state."""
+        expected = ((expected_statuses,) if isinstance(expected_statuses, str)
+                    else tuple(dict.fromkeys(expected_statuses)))
+        if not expected or any(item not in ORCHESTRATION_STATUSES for item in expected):
+            raise ValueError("Expected orchestration statuses are invalid.")
+        if status not in ORCHESTRATION_STATUSES:
+            raise ValueError("Unknown orchestration status.")
+        terminal_expected = [item for item in expected if item in ORCHESTRATION_TERMINAL_STATUSES]
+        if terminal_expected and (len(expected) != 1 or terminal_expected[0] != status):
+            raise ValueError("A terminal orchestration state is final.")
+        allowed = {"response", "error", "planning_metrics"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError("Unknown orchestration fields: " + ", ".join(sorted(unknown)))
+        values = {"status": status}
+        for key, value in fields.items():
+            values["planning_metrics_json" if key == "planning_metrics" else key] = (
+                _dump(value) if key == "planning_metrics" else sanitize(value)
+            )
+        values["updated_at"] = utcnow()
+        placeholders = ",".join(key + "=?" for key in values)
+        expected_placeholders = ",".join("?" for _ in expected)
         with self._connection(write=True) as c:
-            values={**fields,"updated_at":utcnow()}; c.execute("UPDATE orchestration_runs SET "+",".join(k+"=?" for k in values)+" WHERE id=?", [*values.values(),oid])
+            cursor = c.execute(
+                f"UPDATE orchestration_runs SET {placeholders} WHERE id=? AND status IN ({expected_placeholders})",
+                [*values.values(), oid, *expected],
+            )
+            if cursor.rowcount != 1:
+                if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                    raise KeyError(oid)
+                return None
+        return self.get_orchestration(oid)
+
+    def update_orchestration(self, oid, **fields):
+        """Compatibility update that still prevents terminal-state resurrection."""
+        current = self.get_orchestration(oid)
+        status = fields.pop("status", current["status"])
+        updated = self.transition_orchestration(oid, (current["status"],), status, **fields)
+        return updated or self.get_orchestration(oid)
+
+    def save_orchestration_plan(self, oid: str, plan: dict[str, Any], schema_version: int,
+                                planning_metrics: dict[str, Any] | None = None) -> dict | None:
+        """Atomically persist the immutable snapshot and transition Planning to Planned."""
+        if schema_version != PLAN_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported plan schema version: {schema_version}.")
+        normalized = validate_plan(plan)
+        now = utcnow()
+        with self._connection(write=True) as c:
+            cursor = c.execute(
+                "UPDATE orchestration_runs SET plan_json=?,plan_schema_version=?,plan_created_at=?,"
+                "planning_metrics_json=?,status='Planned',updated_at=? "
+                "WHERE id=? AND status='Planning' AND plan_json IS NULL",
+                (_dump(normalized), schema_version, now, _dump(planning_metrics or {}), now, oid),
+            )
+            if cursor.rowcount != 1:
+                row = c.execute("SELECT status,plan_json FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+                if row is None:
+                    raise KeyError(oid)
+                if row["status"] != "Planning":
+                    return None
+                raise ValueError("The orchestration plan snapshot already exists.")
         return self.get_orchestration(oid)
 
     def add_orchestration_event(self, oid, event):
@@ -502,13 +574,50 @@ class Store:
     def add_delegation(self, oid, agent_id, objective, task_id=None):
         did=str(uuid4()); now=utcnow()
         with self._connection(write=True) as c:
+            state = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if state is None:
+                raise KeyError(oid)
+            if state["status"] != "Running":
+                return None
             c.execute("INSERT INTO orchestration_delegations(id,orchestration_id,agent_id,task_id,objective,created_at) VALUES(?,?,?,?,?,?)",(did,oid,agent_id,task_id,sanitize(objective),now))
         return did
 
     def update_delegation(self, did, **fields):
-        allowed={"task_id","status","result_json","finished_at"}; fields={k:v for k,v in fields.items() if k in allowed}
+        if "result" in fields:
+            fields["result_json"] = _dump(fields.pop("result"))
+        allowed={"task_id","status","result_json","finished_at"}; unknown=set(fields)-allowed
+        if unknown:
+            raise ValueError("Unknown delegation fields: " + ", ".join(sorted(unknown)))
+        if not fields:
+            return
         with self._connection(write=True) as c:
             c.execute("UPDATE orchestration_delegations SET "+",".join(k+"=?" for k in fields)+" WHERE id=?", [*fields.values(),did])
+
+    def recover_interrupted_orchestrations(self) -> int:
+        """Atomically fail active orchestration runs once after a server restart."""
+        now = utcnow()
+        message = "Orchestration interrupted by a server restart. Submit a new request to retry."
+        with self._connection(write=True) as c:
+            placeholders = ",".join("?" for _ in ORCHESTRATION_ACTIVE_STATUSES)
+            rows = c.execute(
+                f"SELECT id FROM orchestration_runs WHERE status IN ({placeholders}) ORDER BY created_at,id",
+                ORCHESTRATION_ACTIVE_STATUSES,
+            ).fetchall()
+            for row in rows:
+                cursor = c.execute(
+                    f"UPDATE orchestration_runs SET status='Failed',error=?,updated_at=? "
+                    f"WHERE id=? AND status IN ({placeholders})",
+                    (message, now, row["id"], *ORCHESTRATION_ACTIVE_STATUSES),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                event = {"event_type": "freya.interrupted", "status": "Failed", "message": message}
+                c.execute(
+                    "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,message,payload_json) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (row["id"], now, event["event_type"], event["status"], message, _dump(event)),
+                )
+            return len(rows)
 
     def get_task(self, task_id: str) -> dict:
         with self._connection() as connection:

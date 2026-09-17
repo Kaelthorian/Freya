@@ -8,10 +8,11 @@ bounded task runtime and workspace-scoped programming tools.
 ```text
 .
 ├── control_center/           web API, scheduler, workers, tools and SQLite
-│   ├── __main__.py           loopback server entry point and instance lock
+│   ├── __main__.py           startup recovery, Planner configuration, server and instance lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── orchestrator.py       Freya planning, delegation and result integration
+│   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
+│   ├── orchestrator.py       atomic lifecycle, cancellation, delegation and result integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
 │   ├── transport.py          non-redirecting local Ollama HTTP client
@@ -43,14 +44,17 @@ of this repository merely because an agent selects them.
 
 1. `frontend/` calls `control_center/http.py`, which applies same-origin and
    loopback Host checks before dispatching to `api.py`.
-2. `api.py` validates agents and browses local folders; `runtime.py` resolves the
+2. `api.py` validates agents and browses local folders. Freya requests first go
+   through the loopback Ollama adapter in `planner.py`; `orchestrator.py` stores
+   the validated plan snapshot atomically before delegation.
+3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
-3. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
+4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
    waits for a worker slot and exclusive access to the agent and workspace.
-4. `worker.py` calls local Ollama, resolves each tool request through
+5. `worker.py` calls local Ollama, resolves each tool request through
    `capabilities.py`, evaluates the immutable policy in `policy.py`, and only
    then dispatches to `tools.py` inside the configured workspace root.
-5. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
+6. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
    replay changes using monotonic event IDs; WaitingForApproval blocks the worker
    until a durable once/task/deny resolution arrives.
 
@@ -65,9 +69,10 @@ of this repository merely because an agent selects them.
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
+| Structured plans, lifecycle or recovery | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |
 | Secret handling | `security.py`, security/runtime/storage tests |
-| Web UI | `frontend/app.js`, `views.js`, `dialogs.js`, `styles.css` |
+| Web UI and orchestration status display | `frontend/app.js`, `core.js`, `views.js`, `dialogs.js`, `styles.css` |
 | Commands or architecture | `README.md`, `docs/`, root and scoped `AGENTS.md` |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [DEVELOPMENT.md](DEVELOPMENT.md), and

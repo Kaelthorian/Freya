@@ -8,6 +8,11 @@ Ollama and allowlisted tools → selected agent workspace.
 
 - Keep model-controlled reads and writes inside the task workspace. An agent may
   use an existing absolute folder or a generated per-task folder.
+- Create and persist a validated orchestration plan before delegation. Planner
+  capability declarations are requirements only and never grant access.
+- Keep orchestration state transitions conditional and terminal states final.
+  Cancellation must serialize with delegation creation and include children
+  waiting for approval.
 - Keep tool dispatch allowlisted. Never add `shell=True` or a free-form shell
   tool. `run_command` accepts argv arrays and a small command set.
 - Resolve every tool request to a concrete capability and pass it through the

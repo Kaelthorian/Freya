@@ -149,6 +149,10 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
     response TEXT NOT NULL DEFAULT '',
     error TEXT,
     config_json TEXT NOT NULL DEFAULT '{}',
+    plan_json TEXT,
+    plan_schema_version INTEGER,
+    plan_created_at TEXT,
+    planning_metrics_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

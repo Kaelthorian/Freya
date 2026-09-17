@@ -12,6 +12,8 @@ from .http import ControlServer
 from .runtime import Runtime
 from .storage import Store
 from .orchestrator import Orchestrator
+from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
+                      DEFAULT_PLANNER_TIMEOUT_SECONDS, OllamaPlanner, Planner)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,6 +49,14 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
     parser.add_argument("--workers", type=int, default=2, help="Concurrent worker processes (1-8)")
+    parser.add_argument("--planner-model", default=DEFAULT_PLANNER_MODEL,
+                        help="Ollama model used for structured planning")
+    parser.add_argument("--planner-endpoint", default=DEFAULT_PLANNER_ENDPOINT,
+                        help="Loopback Ollama base URL used by the planner")
+    parser.add_argument("--planner-timeout", type=float, default=DEFAULT_PLANNER_TIMEOUT_SECONDS,
+                        help="Planner Ollama request timeout in seconds (0.1-120)")
+    parser.add_argument("--planner-offline", action="store_true",
+                        help="Explicitly use deterministic one-task fallback planning")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.workers <= 8:
         parser.error("Use a port from 1 to 65535 and between 1 and 8 workers.")
@@ -56,8 +66,12 @@ def main():
     server = None
     try:
         store = Store(data_dir / "control_center.sqlite3")
+        store.recover_interrupted_orchestrations()
         runtime = Runtime(store, data_dir, ROOT, max_workers=args.workers)
-        orchestrator = Orchestrator(store, runtime)
+        planner = (Planner(offline=True) if args.planner_offline else
+                   Planner(OllamaPlanner(args.planner_model, args.planner_endpoint,
+                                         args.planner_timeout)))
+        orchestrator = Orchestrator(store, runtime, planner=planner)
         application = Application(store, runtime, data_dir, orchestrator)
         server = ControlServer(("127.0.0.1", args.port), application)
         runtime.start()

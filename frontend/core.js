@@ -32,5 +32,5 @@ const LEGACY_COPY = {
   'La solicitud falló': 'Request failed',
 };
 export const uiText = value => LEGACY_COPY[String(value ?? '')] || String(value ?? '');
-export function statusClass(status) { return ({ Running: 'running', Idle: 'idle', Waiting: 'waiting', WaitingForApproval: 'waiting', Paused: 'waiting', Queued: 'waiting', Pending: 'muted', Success: 'success', Error: 'error', Failed: 'error', Cancelled: 'muted', Offline: 'muted', Warning: 'waiting' })[status] || 'muted'; }
+export function statusClass(status) { return ({ Planning: 'running', Planned: 'waiting', Running: 'running', Idle: 'idle', Waiting: 'waiting', WaitingForApproval: 'waiting', Paused: 'waiting', Queued: 'waiting', Pending: 'muted', Success: 'success', Error: 'error', Failed: 'error', Cancelled: 'muted', Offline: 'muted', Warning: 'waiting' })[status] || 'muted'; }
 export const liveTask = task => ['Queued', 'Running', 'WaitingForApproval', 'Paused'].includes(task?.status);

@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 
 from control_center.api import Application
 from control_center.http import ControlServer
+from control_center.orchestrator import Orchestrator
+from control_center.planner import MAX_GOAL_CHARS, Planner
 from control_center.storage import Store
 
 
@@ -23,6 +25,18 @@ class StubRuntime:
     def submit(self, agent_id, prompt, workspace_path=None):
         self.submissions.append((agent_id, prompt, workspace_path))
         return self.store.create_task(agent_id, prompt, workspace_path or "test-workspace")
+
+
+class StubOrchestrator:
+    def __init__(self):
+        self.submissions = []
+
+    def submit(self, prompt, workspace_path=None):
+        self.submissions.append((prompt, workspace_path))
+        return {"id": "orchestration", "prompt": prompt, "status": "Queued"}
+
+    def cancel(self, orchestration_id):
+        return {"id": orchestration_id, "status": "Cancelled"}
 
 
 class ApiTests(unittest.TestCase):
@@ -93,6 +107,26 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/agents", {"name": "bad"}, {"Content-Type": "text/plain"})[0], 415)
         self.assertEqual(self.request("POST", "/api/agents", {"name": "bad", "tools": ["browser"]})[0], 400)
         self.assertEqual(self.request("GET", "/api/tasks?limit=99999")[0], 400)
+
+    def test_orchestration_prompt_limit_is_rejected_before_submission(self):
+        orchestrator = StubOrchestrator()
+        self.server.application.orchestrator = orchestrator
+        status, body = self.request("POST", "/api/orchestrations", {
+            "prompt": "x" * (MAX_GOAL_CHARS + 1),
+        })
+        self.assertEqual(status, 400)
+        self.assertIn(str(MAX_GOAL_CHARS), body["error"])
+        self.assertEqual(orchestrator.submissions, [])
+
+    def test_cancelling_terminal_orchestration_is_http_idempotent(self):
+        orchestrator = Orchestrator(self.store, self.runtime, planner=Planner(offline=True))
+        self.server.application.orchestrator = orchestrator
+        run = self.store.create_orchestration("Cancel once")
+        first_status, first = self.request("POST", f"/api/orchestrations/{run['id']}/cancel", {})
+        second_status, second = self.request("POST", f"/api/orchestrations/{run['id']}/cancel", {})
+        self.assertEqual((first_status, second_status), (200, 200))
+        self.assertEqual((first["status"], second["status"]), ("Cancelled", "Cancelled"))
+        self.assertEqual([event["event_type"] for event in second["events"]], ["freya.cancelled"])
 
     def test_workspace_browser_lists_directories_and_rejects_bad_paths(self):
         child = self.directory / "Project A"

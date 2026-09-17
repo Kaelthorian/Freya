@@ -9,6 +9,7 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
 from .capabilities import capability_catalog
+from .planner import MAX_GOAL_CHARS
 from .presets import programmer_agent_payload
 from .security import sanitize
 
@@ -138,6 +139,10 @@ class Application:
             return self.store.list_orchestrations(self._limit(query))
         if len(parts) == 2 and parts[0] == "orchestrations":
             return self.store.get_orchestration(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "plan":
+            run = self.store.get_orchestration(parts[1])
+            return {"plan": run["plan"], "plan_schema_version": run["plan_schema_version"],
+                    "plan_created_at": run["plan_created_at"]}
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "events":
             return self.store.get_orchestration(parts[1])["events"]
         raise ApiError(404, "Route not found.")
@@ -202,7 +207,9 @@ class Application:
         if method == "POST" and parts == ["orchestrations"]:
             if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
             prompt = body.get("prompt") if isinstance(body, dict) else None
-            if not isinstance(prompt, str) or not prompt.strip(): raise ValueError("Enter a non-empty prompt.")
+            if (not isinstance(prompt, str) or not prompt.strip()
+                    or len(prompt.strip()) > MAX_GOAL_CHARS):
+                raise ValueError(f"Orchestration prompt must contain 1-{MAX_GOAL_CHARS} characters.")
             workspace = body.get("workspace_path", "")
             if workspace:
                 workspace = normalize_workspace_path(workspace)

@@ -1,6 +1,13 @@
 # Architecture
 
-Freya includes a first-class orchestration layer. User prompts enter `control_center/orchestrator.py`, which persists a run, selects enabled existing agents, delegates bounded tasks through `Runtime`, and integrates persisted results. Workers remain the only components allowed to invoke tools; each receives a generic policy plus its identity, instructions, skills, workspace, and limits. Orchestration runs, delegations, and events are stored durably, and SQLite migrations preserve existing data.
+Freya includes a first-class orchestration layer. User prompts enter
+`control_center/orchestrator.py`, which asks `control_center/planner.py` for a
+strict structured plan and persists that snapshot before selecting enabled
+existing agents, delegating bounded tasks through `Runtime`, and integrating
+persisted results. Workers remain the only components allowed to invoke tools;
+each receives a generic policy plus its identity, instructions, skills,
+workspace, and limits. Orchestration runs, plans, delegations, and events are
+stored durably, and SQLite migrations preserve existing data.
 
 ## Boundaries
 
@@ -12,10 +19,16 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-         scheduler → spawned worker → local Ollama
+       Planner → Orchestrator → scheduler → spawned worker → local Ollama
                          ↓
                   capability resolver → policy engine → platform tools → selected workspace
 ```
+
+The Planner determines what work exists. The current selector chooses who will
+receive the compatible whole-request delegation. A future Agent Selector will
+use task requirements to choose agents, and a future Execution Graph will decide
+when each dependency-ready task runs. The Worker executes one delegated task.
+Capability Policy remains the sole authority for what that worker may do.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -31,12 +44,79 @@ immutable copy of the agent config, effective capability policy, structured
 agent blocks, verification state, effective policy, and enabled tools. Approval
 requests are durable records linked to the task and agent, with sanitized
 arguments and explicit pending/approved_once/approved_task/denied statuses.
+Every orchestration stores its plan JSON, schema version, creation timestamp and
+planning duration/token counters on `orchestration_runs`. Saving the snapshot
+and changing `Planning → Planned` is one SQLite transaction. The plan can be
+written once, so later edits to agents, Skills, capability definitions or
+planner code cannot alter the plan used by an existing run.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
 `log_events`. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
+
+Planning has explicit `Planning` and `Planned` states and emits
+`freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
+The created event contains only the goal, complexity, task count, task IDs and
+schema version; the complete plan stays in its orchestration snapshot.
+
+Orchestration transitions are conditional on the stored current state:
+
+```text
+Queued → Planning → Planned → Running → Success | Failed | Cancelled
+```
+
+`Queued`, `Planning`, `Planned` and `Running` are active. Terminal states never
+become active again. The orchestrator serializes cancellation with task
+submission; after cancellation returns, no later plan, event or delegation can
+appear. Repeated cancellation of a terminal run is idempotent. Startup atomically
+changes abandoned active runs to `Failed`, preserves their plan and writes one
+`freya.interrupted` event; repeating recovery produces no duplicate event.
+
+## Structured planning
+
+Plan schema version 1 requires a goal, summary, `simple` or `multi_step`
+complexity, global success criteria and one to twenty tasks. Every task has a
+normalized unique ID, objective, description, dependencies, required
+capabilities, preferred Skills and success criteria. Validation rejects unknown
+fields, wrong types, empty or excessive content, unknown capabilities, missing
+dependencies, self-dependencies and cycles. A depth-first traversal validates
+the complete dependency graph before persistence.
+Complexity is canonicalized from task count: one task is `simple`; two or more
+are `multi_step`.
+
+Production uses `OllamaPlanner` through the shared non-redirecting transport.
+It calls the validated loopback endpoint `/api/chat` with no tools,
+`stream=false`, `think=false`, temperature `0.1`, an explicit JSON Schema,
+8192 context tokens, at most 768 generated tokens and a bounded timeout. The
+defaults are model `qwen2.5-coder:7b`, endpoint `http://127.0.0.1:11434` and a
+120-second timeout; command-line options may change them while endpoint
+validation remains loopback-only.
+
+The model receives only the current goal, platform capability catalogue,
+compact agent summaries and compact Skill summaries (bounded to 100 agents and
+200 Skills). It receives no Skill procedures, logs, task outputs, secret
+configuration or previous results. Its output must be a JSON object; one
+controlled repair call is allowed, then planning fails explicitly. Provider
+errors never fall back silently. Deterministic one-task planning exists only for
+tests and the explicit `--planner-offline` mode. Planner calls are serialized per
+orchestrator so concurrent runs cannot mix provider metrics; cancellation uses a
+separate lifecycle lock and remains responsive while a planner call is pending.
+
+Preferred Skills remain unvalidated semantic hints so planning is not coupled
+to the mutable Skill registry. Required capabilities must exist in the platform
+registry, but remain declarations: the planner never edits agent configuration
+or policy. Advanced agent selection, DAG execution and replanning belong to
+later Stage 4 work. Stage 4.1 keeps the existing whole-request delegation after
+the plan is saved.
+
+The orchestration waits while delegated tasks are Queued, Running, Paused or
+WaitingForApproval. It snapshots each child's status, result and finish time.
+Every child must finish with Success before the parent succeeds; Failed or
+unexpectedly Cancelled children fail the parent. The wall-clock deadline starts
+before planning and is never reset. At timeout, active children are cancelled
+before the parent becomes Failed.
 
 ## Runtime and control semantics
 
@@ -118,10 +198,10 @@ context has a 64,000-character budget. Each task stores an immutable copy of
 every resolved Skill, including its version. Procedures are guidance; unavailable
 or irrelevant steps are adapted by the model.
 
-The orchestrator receives Skill summaries instead of full procedures. When no
-external planner callback is configured, its bounded fallback gives enabled
-agents with matching Skill names, categories, or tags priority over role-only
-ordering.
+The orchestrator sends only bounded Skill summaries to the loopback Ollama
+planner; full instructions and procedures remain outside planning context.
+Deterministic fallback planning is available only through the explicit
+`--planner-offline` development mode.
 
 Conflicting guidance follows this precedence:
 

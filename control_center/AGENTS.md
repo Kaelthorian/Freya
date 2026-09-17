@@ -4,9 +4,10 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
-`orchestrator.py` is the Freya-only coordination boundary. It may select and
-delegate to existing agents through `Runtime`, but workers cannot create agents
-or bypass tool policy.
+`planner.py` owns the versioned orchestration-plan contract, normalization and
+DAG validation. `orchestrator.py` persists that snapshot before it selects and
+delegates to existing agents through `Runtime`; workers cannot create agents or
+bypass tool policy.
 
 ## Boundaries
 
@@ -20,6 +21,13 @@ or bypass tool policy.
   not the worker trust boundary.
 - Keep `capabilities.py` as the tool-to-action registry and `policy.py` as the
   single decision point. Store effective policies in task snapshots.
+- Planner `required_capabilities` are declarative requirements. They must use
+  the capability registry but must never mutate or bypass agent policy.
+- Use `storage.py` conditional transitions for orchestration state. Save the
+  plan with `Planning → Planned` atomically, never reactivate a terminal run,
+  and keep cancellation serialized with task submission.
+- The production Planner calls loopback Ollama without tools. Deterministic
+  fallback requires the explicit `--planner-offline` mode.
 - Keep context assembly in `agent_context.py`; do not add role-specific global
   prompts to the worker. Repeated non-recoverable tool failures must be
   bounded before consuming the task step budget.

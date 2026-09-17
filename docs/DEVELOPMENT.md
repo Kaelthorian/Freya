@@ -18,6 +18,18 @@ ollama list
 python -m control_center --port 8765 --workers 2 --data-dir .\data
 ```
 
+Structured planning uses local Ollama by default:
+
+```powershell
+python -m control_center --planner-model qwen2.5-coder:7b `
+  --planner-endpoint http://127.0.0.1:11434 --planner-timeout 120
+```
+
+The planner endpoint must remain loopback-only. Use `--planner-offline` only
+when explicitly choosing the deterministic one-task fallback, such as an
+offline test environment. Provider errors fail planning and do not trigger the
+fallback.
+
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
@@ -62,6 +74,7 @@ credentials, paths, query strings or fragments.
 
 ```powershell
 python -m unittest discover -s tests -v
+python -m unittest discover -s tests -p "test_planner.py" -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -80,6 +93,8 @@ resolves and evaluates a capability before every tool invocation. A policy or au
 Runtime tests use a local fake Ollama server and spawned worker processes. The
 symlink regression skips when the Windows account cannot create symlinks. A
 full end-to-end task additionally requires local Ollama and an installed model.
+Planner tests cover atomic transitions, cancellation races, restart recovery,
+approval waiting, child failure propagation, deadlines and simulated Ollama.
 
 ## Debugging
 
@@ -87,6 +102,10 @@ full end-to-end task additionally requires local Ollama and an installed model.
   has an active task, or another task owns the same workspace.
 - Pause applies after the current call and its deadline still advances.
 - Startup marks unfinished tasks Failed after an unclean server exit.
+- Startup also marks Queued, Planning, Planned and Running orchestrations Failed
+  once and records `freya.interrupted` without changing persisted plans.
+- A planner timeout or invalid repaired response leaves the orchestration Failed;
+  inspect `planning_metrics` and `freya.planning.failed` on the run.
 - A Success record means the model finished and configured verification did not fail. Verification evidence and explicit unavailable/skipped reasons remain in the task result; failed checks produce Failed.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
@@ -98,3 +117,5 @@ and process boundaries.
 The Freya overview refreshes orchestration cards and shows each delegated
 agent's objective, status, duration, token usage, and model-call count. Keep
 these values sourced from persisted task snapshots when changing the view.
+Queued, Planning, Planned and Running orchestrations remain visible while the
+run is active, and recent terminal runs retain their plan and child results.

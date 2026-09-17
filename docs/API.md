@@ -26,9 +26,50 @@ immutable Skill snapshots, including version and procedures.
 ## Freya orchestration
 
 `POST /api/orchestrations` with `{ "prompt": "..." }` queues a bounded run.
+The trimmed prompt must contain 1–2000 characters; oversized input returns HTTP
+400 before a run is created.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
-the run, delegations, and events needed to reconstruct it. Existing agent and
-task routes remain compatible.
+the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
+`planning_metrics`, delegations, and events needed to reconstruct it.
+`GET /api/orchestrations/{id}/plan` returns
+the plan and its version metadata directly. Existing agent and task routes
+remain compatible.
+
+`POST /api/orchestrations/{id}/cancel` is idempotent. It returns the unchanged
+terminal run when the orchestration has already completed; otherwise it stores
+`Cancelled`, prevents further delegation and cancels children in Queued,
+Running, Paused or WaitingForApproval.
+
+The orchestration moves through `Queued`, `Planning`, `Planned`, and `Running`
+before a terminal state. Planning emits `freya.planning.started`, then either
+`freya.plan.created` with a safe goal/complexity/task summary or
+`freya.planning.failed`. A plan uses schema version 1:
+
+```json
+{
+  "goal": "Repair authentication and verify the fix",
+  "summary": "Inspect, diagnose, fix and verify authentication.",
+  "complexity": "multi_step",
+  "tasks": [{
+    "id": "inspect-auth",
+    "objective": "Inspect authentication",
+    "description": "Identify the relevant files and login flow.",
+    "depends_on": [],
+    "required_capabilities": ["filesystem.read", "filesystem.search"],
+    "preferred_skills": ["python-development"],
+    "success_criteria": ["The current login flow is understood."]
+  }],
+  "success_criteria": ["The root cause and verification result are recorded."]
+}
+```
+
+`required_capabilities` are validated registry IDs that describe likely task
+needs; they do not grant permission. `preferred_skills` are non-binding semantic
+hints and may name a Skill that is not currently installed.
+
+The Freya view renders the plan summary, complexity, tasks, dependencies,
+required capabilities and current orchestration state with escaped text. It
+keeps recent terminal runs visible alongside active runs.
 
 ## Agents and catalogue
 
