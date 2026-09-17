@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS skills (
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
+    ,deleted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -174,3 +175,21 @@ CREATE TABLE IF NOT EXISTS orchestration_events (
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_orch_events ON orchestration_events(orchestration_id,id);
+CREATE TABLE IF NOT EXISTS skill_versions (
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (skill_id, version)
+);
+CREATE TABLE IF NOT EXISTS skill_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_skill_versions ON skill_versions(skill_id,version);

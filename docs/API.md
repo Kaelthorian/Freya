@@ -110,3 +110,5 @@ Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
 and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
+
+Skills support `GET /api/skills/{id}/versions` and `GET /api/skills/{id}/versions/{version}` for immutable history. `DELETE /api/skills/{id}` archives a skill and records an audit event; archived skills are excluded from `/api/skills` unless `include_deleted=true` is requested.

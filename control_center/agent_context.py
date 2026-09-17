@@ -207,13 +207,15 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   f"Inspect before modifying existing resources: {behavior['change_strategy']['inspect_before_modify_existing']}",
                   "AUTONOMY"])
     lines.extend(f"{key}: {value}" for key, value in autonomy.items())
-    lines.extend(["SKILLS", skills_context(effective["skills"]),
+    lines.extend(["PRECEDENCE", "System Policy > Capability Policy > Current User Task > Agent Constraints > Agent Instructions > Skill Priority > Skill Instructions > Skill Procedures.",
+                  "The current user task is authoritative and cannot be overridden by a Skill. Higher-priority Skills appear first; Skill priority only resolves conflicts between Skills. Skill instructions override that Skill's procedures.",
+                  "TASK BOUNDARIES", task, "SKILLS", skills_context(effective["skills"]),
                   "AVAILABLE CAPABILITIES", capability_summary(effective["capability_policy"]), "VERIFICATION",
                   f"Enabled: {verification['enabled']}", f"Inspect changes: {verification['inspect_changes']}",
                   f"Run available tests: {verification['run_available_tests']}", f"Require tool evidence: {verification['require_tool_evidence']}",
                   "Completion criteria: " + "; ".join(verification["completion_criteria"]) if verification["completion_criteria"] else "Completion criteria: None specified",
                   "OUTPUT CONTRACT", f"Format: {output['format']}", "Include: " + ", ".join(output["include"]),
-                  "WORKSPACE", workspace, "TASK", task])
+                  "WORKSPACE", workspace])
     return sanitize("\n".join(lines))
 
 

@@ -156,3 +156,5 @@ web search, generic HTTP and database tools remain unavailable.
 Ollama request fields and usage counters follow its official
 [chat API](https://docs.ollama.com/api/chat); context and temperature map to
 documented model parameters in the [Modelfile reference](https://docs.ollama.com/modelfile).
+
+Skills are versioned in immutable `skill_versions` snapshots. Updates retain prior definitions, while API deletion archives the row with `deleted_at` and records a `skill.archived` audit event. Context precedence is explicit: System Policy > Capability Policy > Current User Task > Agent Constraints > Agent Instructions > Skill Priority > Skill Instructions > Skill Procedures. Skills provide guidance only and never grant capabilities.

@@ -85,7 +85,12 @@ class Application:
             enabled = query.get("enabled")
             enabled_value = None if enabled in (None, "") else str(enabled).lower() in {"1", "true", "yes"}
             return self.store.list_skills(query=query.get("q", ""), category=query.get("category", ""),
-                                          enabled=enabled_value, source=query.get("source", ""))
+                                          enabled=enabled_value, source=query.get("source", ""),
+                                          include_deleted=query.get("include_deleted", "").lower() in {"1", "true", "yes"})
+        if len(parts) == 3 and parts[0] == "skills" and parts[2] == "versions":
+            return self.store.skill_versions(parts[1])
+        if len(parts) == 4 and parts[0] == "skills" and parts[2] == "versions":
+            return self.store.skill_version(parts[1], parts[3])
         if len(parts) == 2 and parts[0] == "skills":
             return self.store.get_skill(parts[1])
         if len(parts) == 3 and parts[0] == "agents" and parts[2] == "skills":

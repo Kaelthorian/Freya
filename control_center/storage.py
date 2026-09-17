@@ -86,6 +86,8 @@ class Store:
             ):
                 if name not in skill_columns:
                     connection.execute(f"ALTER TABLE skills ADD COLUMN {name} {definition}")
+            if "deleted_at" not in skill_columns:
+                connection.execute("ALTER TABLE skills ADD COLUMN deleted_at TEXT")
             agent_skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_skills)")}
             if "priority" not in agent_skill_columns:
                 connection.execute("ALTER TABLE agent_skills ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
@@ -111,8 +113,9 @@ class Store:
                 (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"],
                  _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]),
                  _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]),
-                 int(skill["enabled"]), now, now),
+                int(skill["enabled"]), now, now),
             )
+            connection.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial builtin version"))
 
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -219,7 +222,7 @@ class Store:
         assignments = normalize_skill_assignments(data.get("skills", []))
         for assignment in assignments:
             sid = assignment["skill_id"]
-            if connection.execute("SELECT 1 FROM skills WHERE id=?", (sid,)).fetchone() is None:
+            if connection.execute("SELECT 1 FROM skills WHERE id=? AND deleted_at IS NULL AND enabled=1", (sid,)).fetchone() is None:
                 raise ValueError("Unknown skill: " + sid)
             connection.execute("INSERT INTO agent_skills(agent_id,skill_id,priority) VALUES(?,?,?)",
                                (agent_id, sid, assignment["priority"]))
@@ -354,7 +357,7 @@ class Store:
         return item
 
     def list_skills(self, *, query: str = "", category: str = "", enabled: bool | None = None,
-                    source: str = "") -> list[dict[str, Any]]:
+                    source: str = "", include_deleted: bool = False) -> list[dict[str, Any]]:
         where, params = [], []
         if query:
             where.append("(s.name LIKE ? OR s.id LIKE ? OR s.description LIKE ? OR s.category LIKE ? OR s.tags_json LIKE ?)")
@@ -369,7 +372,9 @@ class Store:
         if source:
             where.append("s.source=?")
             params.append(source)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        if not include_deleted:
+            where.append("s.deleted_at IS NULL")
+        clause = " WHERE " + " AND ".join(where)
         with self._connection() as c:
             rows = c.execute(
                 "SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s "
@@ -396,6 +401,8 @@ class Store:
                 "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
             )
+            c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial version"))
+            c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill["id"],skill["version"],now,"skill.created","Skill created",_dump({"id":skill["id"],"version":skill["version"]})))
             created = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill["id"],)).fetchone()
             return self._skill(created)
 
@@ -416,10 +423,14 @@ class Store:
             if c.execute("SELECT 1 FROM skills WHERE name=? AND id<>?", (skill["name"], skill_id)).fetchone() is not None:
                 raise ValueError("Skill name already exists: " + skill["name"])
             now = utcnow()
+            if skill != current:
+                c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, current["version"], _dump(current), now, "Previous version before update"))
             c.execute(
                 "UPDATE skills SET name=?,description=?,category=?,version=?,instructions=?,procedures_json=?,recommended_capabilities_json=?,required_capabilities_json=?,tags_json=?,source=?,metadata_json=?,enabled=?,updated_at=? WHERE id=?",
                 (skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, skill_id),
             )
+            c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, skill["version"], _dump(skill), now, "Updated definition"))
+            c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill_id,skill["version"],now,"skill.updated","Skill updated",_dump({"id":skill_id,"version":skill["version"]})))
             updated = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
             return self._skill(updated)
 
@@ -436,12 +447,24 @@ class Store:
                     continue
                 if used:
                     break
+            now = utcnow()
+            c.execute("UPDATE skills SET enabled=0,deleted_at=?,updated_at=? WHERE id=?", (now,now,skill_id))
+            c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) SELECT id,version,?,?,?,? FROM skills WHERE id=?", (now,"skill.archived","Skill archived",_dump({"id":skill_id}),skill_id))
             if assigned or used:
-                c.execute("UPDATE skills SET enabled=0,updated_at=? WHERE id=?", (utcnow(), skill_id))
                 disabled = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
                 return self._skill(disabled)
-            c.execute("DELETE FROM skills WHERE id=?", (skill_id,))
-            return {"id": skill_id, "deleted": True}
+            return {"id": skill_id, "deleted": True, "archived": True}
+
+    def skill_versions(self, skill_id):
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM skills WHERE id=?", (skill_id,)).fetchone() is None: raise KeyError(skill_id)
+            return [{**dict(r), "snapshot": _load(r["snapshot_json"])} for r in c.execute("SELECT * FROM skill_versions WHERE skill_id=? ORDER BY version", (skill_id,))]
+
+    def skill_version(self, skill_id, version):
+        with self._connection() as c:
+            r=c.execute("SELECT * FROM skill_versions WHERE skill_id=? AND version=?",(skill_id,int(version))).fetchone()
+            if r is None: raise KeyError(f"{skill_id}:{version}")
+            result=dict(r); result["snapshot"]=_load(result.pop("snapshot_json")); return result
 
     def skill_compatibility(self, agent_id: str) -> list[dict[str, Any]]:
         return [skill_summary(skill) for skill in self.get_agent(agent_id).get("skills", [])]
