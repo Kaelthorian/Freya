@@ -35,7 +35,8 @@ that select it fail. Tasks that resolve to the same folder run serially.
 
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
-verification, autonomy, output, and limits are compact expandable sections.
+verification, autonomy, output, and limits are compact expandable sections. The
+Agents page also exposes the generic Programmer preset.
 
 The **Skills** page manages reusable declarative knowledge. Create or edit a
 Skill with a stable lowercase ID, version, instructions, adaptable procedures,
@@ -74,8 +75,7 @@ python -m control_center --help
 Capability, structured-agent and Skill behavior is covered by
 `tests/test_capabilities.py`, `tests/test_agent_context.py` and
 `tests/test_skills.py`. The worker
-resolves and evaluates a capability before every tool invocation;
-`approval_required` is fail-closed until an approval UI exists.
+resolves and evaluates a capability before every tool invocation. A policy or autonomy ask creates a durable approval request, moves the task to WaitingForApproval, and the Approvals page resolves it once, for the task, or denies it.
 
 Runtime tests use a local fake Ollama server and spawned worker processes. The
 symlink regression skips when the Windows account cannot create symlinks. A
@@ -87,8 +87,7 @@ full end-to-end task additionally requires local Ollama and an installed model.
   has an active task, or another task owns the same workspace.
 - Pause applies after the current call and its deadline still advances.
 - Startup marks unfinished tasks Failed after an unclean server exit.
-- A `Success` record means the model finished normally; quality depends on the
-  task's own validation commands and evidence.
+- A Success record means the model finished and configured verification did not fail. Verification evidence and explicit unavailable/skipped reasons remain in the task result; failed checks produce Failed.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
 - `run_command` is allowlisted and uses argv without a shell. Permission

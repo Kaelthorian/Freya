@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS task_executions (
     steps INTEGER NOT NULL DEFAULT 0,
     progress REAL NOT NULL DEFAULT 0,
     result_json TEXT,
+    verification_json TEXT,
     error TEXT
 );
 CREATE TABLE IF NOT EXISTS execution_steps (
@@ -93,6 +94,24 @@ CREATE TABLE IF NOT EXISTS metrics (
     total_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_agent_created ON tasks(agent_id, created_at);
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    capability TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    action_summary TEXT NOT NULL DEFAULT '',
+    resource TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolution TEXT,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_status_created ON approval_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_task ON approval_requests(task_id);
+
 CREATE INDEX IF NOT EXISTS idx_executions_status ON task_executions(status);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON log_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_agent_id ON log_events(agent_id, id);

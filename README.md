@@ -60,7 +60,7 @@ python -m control_center --port 8765 --workers 2 --data-dir .\data
 - CRUD de Skills con IDs estables, versión, instrucciones y procedures adaptables.
 - Diagnósticos de compatibilidad entre Skills y Capability Policy.
 - Procesos independientes con cola, cancelación y pausa cooperativa.
-- Actualizaciones SSE, timeline, logs, métricas e historial persistente.
+- Actualizaciones SSE, timeline, logs, métricas, approvals e historial persistente.
 - Límites de pasos, tiempo, tokens y llamadas al modelo o a tools.
 - Tools de archivos, búsqueda, Git y comandos locales explícitamente permitidos.
 - Sanitización de credenciales mediante referencias `ACC_SECRET_...`.
@@ -68,6 +68,8 @@ python -m control_center --port 8765 --workers 2 --data-dir .\data
 El permiso `execute` permite iniciar Python, tests, Ruff y consultas Git
 permitidas desde el workspace. Es una concesión de confianza local, no un
 sandbox del sistema operativo.
+
+El preset Programmer crea un agente genérico con Skills, Capability Policy, Autonomy y Verification. Capability Policy deriva las tools efectivas desde allow/ask; Autonomy nunca otorga capabilities y las reglas ask se resuelven en Approvals.
 
 ## Validar
 

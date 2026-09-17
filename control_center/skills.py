@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .capabilities import CAPABILITY_REGISTRY
+from .capabilities import CAPABILITY_REGISTRY, effective_tools_for_policy, tool_for_capability
 
 
 SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
@@ -201,7 +201,10 @@ def skill_summary(skill: dict[str, Any]) -> dict[str, Any]:
             "version": skill["version"], "tags": list(skill.get("tags", [])),
             "operational": bool(skill.get("operational", False)),
             "missing_required_capabilities": list(skill.get("missing_required_capabilities", [])),
+            "missing_required_tools": list(skill.get("missing_required_tools", [])),
             "missing_recommended_capabilities": list(skill.get("missing_recommended_capabilities", [])),
+            "missing_recommended_tools": list(skill.get("missing_recommended_tools", [])),
+            "required_tools": list(skill.get("required_tools", [])),
             "priority": int(skill.get("priority", 0))}
 
 
@@ -211,7 +214,8 @@ def skill_snapshot(skill: dict[str, Any]) -> dict[str, Any]:
         "id": "", "name": "", "description": "", "category": "General", "version": 1,
         "instructions": [], "procedures": [], "required_capabilities": [],
         "recommended_capabilities": [], "tags": [], "priority": 0,
-        "operational": False, "missing_required_capabilities": [], "active": True,
+        "operational": False, "missing_required_capabilities": [], "missing_required_tools": [],
+        "missing_recommended_capabilities": [], "missing_recommended_tools": [], "required_tools": [], "active": True,
     }.items()}
 
 
@@ -258,7 +262,8 @@ def _relevance(skill: dict[str, Any], task: str) -> int:
 
 
 def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[str, Any]] | None = None,
-                         task: str = "", policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                         task: str = "", policy: dict[str, Any] | None = None,
+                         available_tools: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """Resolve assigned skills and annotate policy compatibility.
 
     ``assigned_skills`` are complete skill records with an optional
@@ -267,6 +272,13 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
     """
     records = list(assigned_skills if assigned_skills is not None else agent.get("skills", []))
     policy = policy or agent.get("capability_policy") or {"capabilities": {}}
+    if available_tools is None:
+        if "tools" in agent:
+            available = set(agent.get("tools", []))
+        else:
+            available = set(effective_tools_for_policy(policy))
+    else:
+        available = set(available_tools)
     resolved = []
     for index, raw in enumerate(records):
         if not isinstance(raw, dict):
@@ -277,7 +289,8 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
             # fail schema validation.
             definition = {key: value for key, value in raw.items()
                           if key not in {"priority", "skill_priority", "operational", "missing_required_capabilities",
-                                         "missing_recommended_capabilities", "relevance", "assignment_order", "active",
+                                         "missing_recommended_capabilities", "missing_required_tools",
+                                         "missing_recommended_tools", "relevance", "assignment_order", "active",
                                          "assigned_agents", "assigned_agent_ids", "required_tools"}}
             skill = normalize_skill(definition)
         except ValueError:
@@ -287,9 +300,16 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
             priority = 0
         missing = [cap for cap in skill["required_capabilities"] if _policy_mode(policy, cap) != "allow"]
         missing_recommended = [cap for cap in skill["recommended_capabilities"] if _policy_mode(policy, cap) != "allow"]
-        item = {**skill, "priority": priority, "operational": bool(skill["enabled"] and not missing),
-                "missing_required_capabilities": missing, "missing_recommended_capabilities": missing_recommended,
-                "relevance": _relevance(skill, task), "assignment_order": index}
+        missing_tools = [tool_for_capability(cap) or cap for cap in skill["required_capabilities"]
+                         if _policy_mode(policy, cap) == "allow" and (tool_for_capability(cap) or cap) not in available]
+        missing_recommended_tools = [tool_for_capability(cap) or cap for cap in skill["recommended_capabilities"]
+                                     if _policy_mode(policy, cap) == "allow" and (tool_for_capability(cap) or cap) not in available]
+        required_tools = list(dict.fromkeys(tool_for_capability(cap) for cap in skill["required_capabilities"]
+                                            if tool_for_capability(cap)))
+        item = {**skill, "priority": priority, "operational": bool(skill["enabled"] and not missing and not missing_tools),
+                "missing_required_capabilities": missing, "missing_required_tools": missing_tools,
+                "missing_recommended_capabilities": missing_recommended, "missing_recommended_tools": missing_recommended_tools,
+                "required_tools": required_tools, "relevance": _relevance(skill, task), "assignment_order": index}
         resolved.append(item)
     resolved.sort(key=lambda item: (-item["priority"], -item["relevance"], item["assignment_order"], item["id"]))
     active_candidates = [item for item in resolved if item["enabled"]]
@@ -329,8 +349,12 @@ def render_skill(skill: dict[str, Any], *, full: bool = False) -> str:
         lines.append("Recommended capabilities: " + ", ".join(skill["recommended_capabilities"][:12]))
     if skill.get("missing_required_capabilities"):
         lines.append("Missing required capabilities: " + ", ".join(skill["missing_required_capabilities"]))
+    if skill.get("missing_required_tools"):
+        lines.append("Missing tools/runtime support: " + ", ".join(skill["missing_required_tools"]))
     if skill.get("missing_recommended_capabilities"):
         lines.append("Missing recommended capabilities: " + ", ".join(skill["missing_recommended_capabilities"]))
+    if skill.get("missing_recommended_tools"):
+        lines.append("Missing recommended tools/runtime support: " + ", ".join(skill["missing_recommended_tools"]))
     return "\n".join(lines)
 
 

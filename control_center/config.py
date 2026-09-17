@@ -8,7 +8,8 @@ import math
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
-from .policy import validate_policy
+from .capabilities import effective_tools_for_policy
+from .policy import policy_from_legacy, validate_policy
 from .agent_context import (DEFAULT_AUTONOMY, DEFAULT_BEHAVIOR, DEFAULT_IDENTITY,
                              DEFAULT_OUTPUT, DEFAULT_VERIFICATION, normalize_autonomy,
                              normalize_behavior, normalize_identity, normalize_output,
@@ -163,7 +164,9 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     # The granular policy is stored with the existing JSON agent config.  A
     # top-level alias is accepted for API/UI ergonomics and normalized here.
     policy_input = data.get("capability_policy", config.get("capability_policy"))
-    if policy_input is not None:
+    if policy_input is None:
+        config["capability_policy"] = policy_from_legacy(config, result["tools"])
+    else:
         config["capability_policy"] = validate_policy(policy_input)
     config["model"] = _text(config["model"], "model", 200, True)
     if re.search(r"[\s\x00-\x1f]", config["model"]):
@@ -202,11 +205,14 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     if not isinstance(selected, list) or any(not isinstance(x, str) or x not in available for x in selected):
         raise ValueError("tools may only contain names of available tools.")
     result["tools"] = list(dict.fromkeys(selected))
+    # The policy is the authority. Legacy tool selections are only migration
+    # input and cannot expose a tool without an allow/ask capability.
+    result["tools"] = effective_tools_for_policy(config["capability_policy"])
+    # Preserve the legacy configuration contract for agents that have no
+    # explicit capability policy. The policy remains the runtime authority.
+    if policy_input is None and "run_command" in selected and config["permissions"] != "execute":
+        raise ValueError("run_command requires execute permission in legacy configuration.")
     result["skills"] = normalize_skill_assignments(result.get("skills", []))
-    if config["permissions"] == "read_only" and set(selected) & {"write_file", "edit_file", "run_command"}:
-        raise ValueError("The read_only permission does not allow writes or execution.")
-    if config["permissions"] != "execute" and "run_command" in selected:
-        raise ValueError("run_command requires the execute permission.")
     result["config"] = config
     result["capability_policy"] = copy.deepcopy(config.get("capability_policy")) if config.get("capability_policy") is not None else None
     return result

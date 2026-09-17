@@ -1,4 +1,4 @@
-export const state = { agents: [], skills: [], tools: [], tasks: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {}, skills: {} }, tab: 'timeline', chart: 'tasks', connected: false };
+export const state = { agents: [], skills: [], tools: [], tasks: [], approvals: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {}, skills: {} }, tab: 'timeline', chart: 'tasks', connected: false };
 
 export async function api(path, method = 'GET', body) {
   const response = await fetch(`/api${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -32,5 +32,5 @@ const LEGACY_COPY = {
   'La solicitud falló': 'Request failed',
 };
 export const uiText = value => LEGACY_COPY[String(value ?? '')] || String(value ?? '');
-export function statusClass(status) { return ({ Running: 'running', Idle: 'idle', Waiting: 'waiting', Paused: 'waiting', Queued: 'waiting', Pending: 'muted', Success: 'success', Error: 'error', Failed: 'error', Cancelled: 'muted', Offline: 'muted', Warning: 'waiting' })[status] || 'muted'; }
-export const liveTask = task => ['Queued', 'Running', 'Paused'].includes(task?.status);
+export function statusClass(status) { return ({ Running: 'running', Idle: 'idle', Waiting: 'waiting', WaitingForApproval: 'waiting', Paused: 'waiting', Queued: 'waiting', Pending: 'muted', Success: 'success', Error: 'error', Failed: 'error', Cancelled: 'muted', Offline: 'muted', Warning: 'waiting' })[status] || 'muted'; }
+export const liveTask = task => ['Queued', 'Running', 'WaitingForApproval', 'Paused'].includes(task?.status);

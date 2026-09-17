@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .security import sanitize
+
 
 MAX_FILE_BYTES = 512_000
 MAX_WRITE_BYTES = 1_000_000
@@ -427,7 +429,7 @@ def argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
         if key in {"content", "old", "new"}:
             summary[key] = {"redacted": True, "characters": len(value) if isinstance(value, str) else None}
         else:
-            summary[key] = value
+            summary[key] = sanitize({key: value}).get(str(key))
     return summary
 
 

@@ -25,16 +25,18 @@ authorization value cannot be forwarded to another destination.
 SQLite runs in WAL mode with foreign keys, one connection per operation and
 `BEGIN IMMEDIATE` for atomic writes. The schema holds agents, configs, tools,
 agent/tool links, reusable skills and agent/skill links, tasks, executions, steps,
-logs and metrics. Agent deletion is
+logs, approvals and metrics. Agent deletion is
 soft so task history remains readable. Each MVP task has one execution and an
 immutable copy of the agent config, effective capability policy, structured
-agent blocks, and enabled tools.
+agent blocks, verification state, effective policy, and enabled tools. Approval
+requests are durable records linked to the task and agent, with sanitized
+arguments and explicit pending/approved_once/approved_task/denied statuses.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
 `log_events`. SSE accepts `Last-Event-ID`/`after`, replays later events and then
-streams updates. On startup, abandoned Queued, Running or Paused records become
-Failed and unfinished steps are closed.
+streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
+Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
 ## Runtime and control semantics
 
@@ -48,7 +50,10 @@ execution; POSIX uses a process session. Cancel, restart and shutdown terminate
 the worker tree and persist a terminal event.
 
 Pause is cooperative: an in-flight model or tool call can finish, then the
-worker pauses between actions. The total wall-clock deadline continues while
+worker pauses between actions. When a capability or autonomy rule is ask, the
+worker emits approval.requested, the parent persists the request, changes the
+task to WaitingForApproval, and blocks the worker until once/task/deny is
+resolved. Cancellation denies pending requests and terminates the worker. The total wall-clock deadline continues while
 paused. Progress is the greatest fraction of the configured step, model-call,
 tool-call and token budgets and reaches 100 only at termination.
 
@@ -93,8 +98,7 @@ to one concrete action. `write_file` becomes `filesystem.create` or
 `filesystem.overwrite` after inspecting the workspace target; `run_command`
 maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
 actions. `policy.py` validates the per-agent JSON policy and returns explicit
-`allow`, `deny`, or `approval_required` decisions. Deny and approval results
-are returned to the model and never invoke the underlying tool. Agents with
+`allow`, `deny`, or `approval_required` decisions. Allow and ask rules are the only source used to derive the model-visible tool list; stale legacy tool selections cannot expose a capability. Deny and approval results never invoke the underlying tool. Filesystem rules support paths, extensions and max_bytes for every filesystem action. Agents with
 legacy `permissions` are converted to the same engine, and the effective
 policy is copied into every task snapshot.
 
@@ -107,8 +111,7 @@ local user or hostile executable code.
 declarative Skills. A Skill contains specialty knowledge, instructions,
 adaptable procedures, tags, a stable ID and a positive version.
 `resolve_agent_skills` orders assigned Skills by per-agent priority, marks each
-Skill operational only when every required capability is allowed, and exposes
-recommended-capability warnings. Skills never grant capabilities or execute
+Skill operational only when every required capability is allowed and its concrete tool is available; diagnostics distinguish missing capability from missing tool/runtime support and expose recommended-capability warnings. Skills never grant capabilities or execute
 tools. Workers receive compact active Skill context; task text selects up to
 eight active specialties by simple name/category/tag relevance and the rendered
 context has a 64,000-character budget. Each task stores an immutable copy of
@@ -136,8 +139,7 @@ immutable system policy. Identity includes purpose, responsibilities, and
 constraints; behavior controls planning, ambiguity, evidence, and repeated
 failure handling; autonomy records decision preferences without granting
 capabilities; verification and output define evidence and result shape. The
-default output remains text for legacy compatibility, while structured output
-normalizes to summary/actions/artifacts/verification/limitations.
+default output remains text for legacy compatibility, while structured output is strictly validated as summary/actions/artifacts/verification/limitations. A JSON-looking invalid result receives one repair attempt; otherwise an explicit fallback and limitation are returned. Verification state is persisted separately.
 
 The worker classifies recoverable, environment, policy, approval, and invalid
 requests. A repeated non-recoverable action with the same capability,

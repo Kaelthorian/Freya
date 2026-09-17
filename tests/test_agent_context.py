@@ -9,6 +9,7 @@ from control_center.agent_context import (
     build_agent_context,
     build_effective_agent,
     normalize_result_output,
+    validate_structured_output,
 )
 from control_center.config import normalize_agent
 from control_center.storage import Store
@@ -67,6 +68,15 @@ class AgentContextTests(unittest.TestCase):
         self.assertEqual(seen["agents"][0]["purpose"], "Review APIs")
         self.assertIn("capabilities_summary", seen["agents"][0])
 
+
+    def test_structured_output_validator_rejects_unknown_fields(self):
+        valid = validate_structured_output({
+            "summary": "Done", "actions": [], "artifacts": [],
+            "verification": {}, "limitations": [],
+        })
+        self.assertEqual(valid["summary"], "Done")
+        with self.assertRaises(ValueError):
+            validate_structured_output({"summary": "Done", "unexpected": True})
 
 class RepeatedFailureTests(unittest.TestCase):
     def test_repeated_nonrecoverable_action_is_blocked(self):

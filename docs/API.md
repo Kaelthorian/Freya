@@ -41,6 +41,8 @@ task routes remain compatible.
 | POST | `/api/agents/{id}/resume` | resume task dispatch/actions |
 | POST | `/api/agents/{id}/restart` | cancel its tasks and reset runtime state |
 | POST | `/api/agents/{id}/tasks` | assign a task with optional workspace override |
+| GET | `/api/agent-presets` | list safe built-in presets |
+| POST | `/api/agent-presets/programmer` | create a generic Programmer agent |
 | GET | `/api/tools` | actual and explicitly unavailable tools (advanced mapping) |
 | GET | `/api/capabilities` | structured Filesystem, Execution, and Git actions |
 | GET | `/api/models?endpoint=...` | installed models from local Ollama |
@@ -53,6 +55,11 @@ task routes remain compatible.
 | GET / PATCH / DELETE | `/api/skills/{id}` | inspect, edit, or delete/disable a Skill |
 | POST | `/api/skills/{id}/duplicate` | create a user copy with a new stable ID |
 | GET | `/api/agents/{id}/skills` | resolved Skill compatibility summaries |
+| GET | `/api/approvals?status=pending&task_id=` | list durable approval requests |
+| GET | `/api/approvals/{id}` | read one sanitized approval request |
+| POST | `/api/approvals/{id}/approve-once` | approve the exact action once |
+| POST | `/api/approvals/{id}/approve-task` | approve matching actions for this task |
+| POST | `/api/approvals/{id}/deny` | deny the pending action |
 
 Create/patch fields are `name`, `description`, `role`, `enabled`, `tools`, `skills`,
 and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
@@ -62,7 +69,7 @@ optional `secret_env` name. The `capability_policy` belongs inside `config`
 and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
 The structured blocks are validated against their supported modes and limits;
-`autonomy` never overrides capability policy.
+`autonomy` never overrides capability policy. Allow/ask rules derive effective tools; legacy permissions and advanced tool selections do not add authority.
 
 Task assignment accepts `{ "prompt": "...", "workspace_path": "..." }`.
 When omitted, the agent's configured workspace applies. An absolute existing
@@ -80,8 +87,7 @@ metadata, `tags`, `source` (`builtin` or `user`), `metadata`, and `enabled`.
 IDs are lowercase stable identifiers. Procedures are recommended operating
 guidance and are adapted when a step is unavailable. List filtering accepts
 `q` (name, ID, description, category, or tags), `category`, `enabled`, and
-`source`. Compatibility summaries include `operational`, priority, and missing
-required or recommended capability IDs.
+`source`. Compatibility summaries include operational state, priority, missing required or recommended capability IDs, and missing concrete tools/runtime support.
 
 ## Tasks, observations and metrics
 
@@ -97,11 +103,10 @@ required or recommended capability IDs.
 | GET | `/api/events?after=N` | replay/global SSE stream |
 | GET | `/api/tasks/{id}/events?after=N` | replay/task SSE stream |
 
-Task states are `Queued`, `Running`, `Paused`, `Success`, `Failed` and
-`Cancelled`. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
+Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.
 
 Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
-and relevant status/tool/input/output/error/duration fields. Clients should send
+and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.

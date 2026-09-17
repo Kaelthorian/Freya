@@ -89,16 +89,16 @@ def policy_from_legacy(config: dict[str, Any], tools: list[str]) -> dict[str, An
     permission = config.get("permissions", "read_only")
     selected = set(tools or [])
     all_actions = {cap.id: {"mode": "deny"} for cap in CAPABILITY_REGISTRY.values()}
-    for action, tool in (("filesystem.list", "list_files"), ("filesystem.read", "read_file"),
-                         ("filesystem.search", "search_code"), ("filesystem.modify", "edit_file"),
-                         ("filesystem.create", "write_file"), ("filesystem.overwrite", "write_file"),
-                         ("git.diff", "git_diff")):
-        if tool in selected and ((action.startswith("filesystem.") and permission in {"workspace", "execute"})
-                                 or action in {"filesystem.list", "filesystem.read", "filesystem.search", "git.diff"}):
-            all_actions[action] = {"mode": "allow"}
-    if "run_command" in selected and permission == "execute":
-        for action in ("execution.python_script", "execution.pytest", "execution.unittest", "execution.py_compile", "execution.ruff", "git.status"):
-            all_actions[action] = {"mode": "allow"}
+    read_only = {"filesystem.list", "filesystem.read", "filesystem.search", "git.diff"}
+    for capability in CAPABILITY_REGISTRY.values():
+        if capability.tool not in selected:
+            continue
+        if capability.id in read_only:
+            all_actions[capability.id] = {"mode": "allow"}
+        elif capability.category == "filesystem" and permission in {"workspace", "execute"}:
+            all_actions[capability.id] = {"mode": "allow"}
+        elif capability.category in {"execution", "git"} and permission == "execute":
+            all_actions[capability.id] = {"mode": "allow"}
     nested: dict[str, dict[str, Any]] = {}
     for action, rule in all_actions.items():
         category, name = action.split(".", 1)

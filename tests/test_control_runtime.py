@@ -239,6 +239,34 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.store.list_steps(task["id"])[0]["status"], "Success")
         self.assertFalse(self.runtime.active)
 
+    def test_approval_pauses_task_and_resolves_once(self):
+        policy = {"capabilities": {
+            "filesystem": {
+                "create": {"mode": "ask"},
+                "overwrite": {"mode": "ask"},
+            },
+            "execution": {},
+            "git": {},
+        }}
+        self.server.responses.extend([
+            answer(calls=[("write_file", {"path": "approval.txt", "content": "approved-content"})]),
+            answer("Created after approval."),
+        ])
+        agent = self.agent(capability_policy=policy)
+        task = self.runtime.submit(agent["id"], "Create a file after approval")
+        waiting = self.wait_for(lambda: self.store.get_task(task["id"])
+                                if self.store.get_task(task["id"])["status"] == "WaitingForApproval" else None)
+        approvals = self.store.list_approvals(status="pending", task_id=task["id"])
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["capability"], "filesystem.create")
+        self.assertEqual(approvals[0]["arguments"]["content"]["redacted"], True)
+        self.runtime.resolve_approval(approvals[0]["id"], "approved_once")
+        final = self.completed(waiting)
+        self.assertEqual(final["status"], "Success", final["error"])
+        self.assertEqual((Path(final["workspace"]) / "approval.txt").read_text(), "approved-content")
+        self.assertEqual(self.store.get_approval(approvals[0]["id"])["status"], "approved_once")
+        self.assertFalse(self.runtime.active)
+
     def test_configured_workspace_is_reused_for_task_files(self):
         selected = self.root / "selected-project"
         selected.mkdir()

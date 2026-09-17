@@ -32,6 +32,7 @@ or bypass tool policy.
   a variable name only, and allowed names begin with `ACC_SECRET_`.
 - The web server remains loopback-only unless authentication, CSRF, deployment
   and multiuser threat models are designed and documented together.
+- Parent-owned approval requests are durable, sanitized and fail-closed; Autonomy and Skills never grant capabilities.
 
 ## Validation
 

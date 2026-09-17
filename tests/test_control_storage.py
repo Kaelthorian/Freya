@@ -205,6 +205,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(cancelled["error"], "Stopped by user")
         self.assertIsNotNone(cancelled["finished_at"])
 
+    def test_approval_records_are_sanitized_and_resolvable(self):
+        agent = self.agent(config={"capability_policy": {"capabilities": {
+            "filesystem": {"create": {"mode": "ask"}}, "execution": {}, "git": {},
+        }}})
+        task = self.store.create_task(agent["id"], "Create a file", "workspaces/task")
+        approval = self.store.create_approval(
+            task["id"], agent["id"], "filesystem.create", "write_file",
+            {"path": "safe.txt", "content": "local-content"},
+            "Create a file", "safe.txt", "Capability policy requires approval.",
+        )
+        self.assertEqual(approval["status"], "pending")
+        self.assertTrue(approval["arguments"]["content"]["redacted"])
+        resolved = self.store.resolve_approval(approval["id"], "approved_once")
+        self.assertEqual(resolved["status"], "approved_once")
+        with self.assertRaises(ValueError):
+            self.store.resolve_approval(approval["id"], "denied")
+        second = self.store.create_approval(
+            task["id"], agent["id"], "filesystem.create", "write_file",
+            {"path": "other.txt"}, "Create another file", "other.txt", "test",
+        )
+        self.assertEqual(self.store.cancel_pending_approvals(task["id"], "cancelled"), 1)
+        self.assertEqual(self.store.get_approval(second["id"])["status"], "denied")
+
     def test_status_and_update_field_allowlists(self):
         task = self.task()
         with self.assertRaises(ValueError):

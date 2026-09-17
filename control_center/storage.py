@@ -15,23 +15,25 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from .config import TOOL_CATALOG
-from .policy import policy_from_legacy
+from .capabilities import effective_tools_for_policy
+from .policy import policy_from_legacy, validate_policy
 from .agent_context import build_agent_context, build_effective_agent
 from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
+from .tools import argument_summary
 
 
-TASK_STATUSES = {"Queued", "Running", "Paused", "Success", "Failed", "Cancelled"}
+TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
 AGENT_STATUSES = {"Idle", "Running", "Waiting", "Paused", "Error", "Offline"}
-ACTIVE_TASK_STATUSES = ("Queued", "Running", "Paused")
+ACTIVE_TASK_STATUSES = ("Queued", "Running", "WaitingForApproval", "Paused")
 EXECUTION_FIELDS = {
     "status", "started_at", "finished_at", "duration_seconds", "steps",
-    "progress", "result", "error",
+    "progress", "result", "verification", "error",
 }
 METRIC_FIELDS = {"model_calls", "tool_calls", "prompt_tokens", "generated_tokens", "total_tokens"}
 TASK_SELECT = """
 SELECT t.*, e.id AS execution_id, e.status, e.started_at, e.finished_at,
-       e.duration_seconds, e.steps, e.progress, e.result_json, e.error,
+       e.duration_seconds, e.steps, e.progress, e.result_json, e.verification_json, e.error,
        m.model_calls, m.tool_calls, m.prompt_tokens, m.generated_tokens, m.total_tokens
 FROM tasks t JOIN task_executions e ON e.task_id = t.id
 JOIN metrics m ON m.task_id = t.id
@@ -61,6 +63,9 @@ class Store:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(agents)")}
             if "instructions" not in columns:
                 connection.execute("ALTER TABLE agents ADD COLUMN instructions TEXT NOT NULL DEFAULT ''")
+            execution_columns = {row[1] for row in connection.execute("PRAGMA table_info(task_executions)")}
+            if "verification_json" not in execution_columns:
+                connection.execute("ALTER TABLE task_executions ADD COLUMN verification_json TEXT")
             task_columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
             for name, definition in (("agent_role", "TEXT NOT NULL DEFAULT ''"), ("agent_description", "TEXT NOT NULL DEFAULT ''"),
                                      ("agent_instructions", "TEXT NOT NULL DEFAULT ''"), ("skills_json", "TEXT NOT NULL DEFAULT '[]'")):
@@ -136,10 +141,16 @@ class Store:
         agent.pop("deleted_at")
         agent["enabled"] = bool(agent["enabled"])
         agent["config"] = _load(agent.pop("config_json"))
-        agent["tools"] = [item[0] for item in connection.execute(
+        stored_tools = [item[0] for item in connection.execute(
             "SELECT tool_name FROM agent_tools WHERE agent_id=? ORDER BY tool_name", (agent_id,),
         )]
-        agent["capability_policy"] = agent["config"].get("capability_policy") or policy_from_legacy(agent["config"], agent["tools"])
+        policy = agent["config"].get("capability_policy") or policy_from_legacy(agent["config"], stored_tools)
+        policy = validate_policy(policy)
+        # The policy is the authority. Legacy agent_tools is only migration
+        # input; explicit allow/ask rules determine the runtime tool surface.
+        agent["capability_policy"] = policy
+        agent["config"]["capability_policy"] = policy
+        agent["tools"] = effective_tools_for_policy(policy)
         assigned = []
         for row_skill in connection.execute(
             "SELECT s.id,s.name,s.description,s.category,s.version,s.instructions,s.procedures_json,"
@@ -175,7 +186,7 @@ class Store:
         current = connection.execute(
             "SELECT t.id,t.prompt,e.status,e.progress FROM tasks t "
             "JOIN task_executions e ON e.task_id=t.id WHERE t.agent_id=? "
-            "AND e.status IN ('Queued','Running','Paused') "
+            "AND e.status IN ('Queued','Running','WaitingForApproval','Paused') "
             "ORDER BY CASE WHEN e.status='Queued' THEN 1 ELSE 0 END,t.created_at LIMIT 1",
             (agent_id,),
         ).fetchone()
@@ -260,7 +271,7 @@ class Store:
         if row is None:
             raise KeyError(task_id)
         task = dict(row)
-        for field in ("config", "tools", "result", "skills"):
+        for field in ("config", "tools", "result", "verification", "skills"):
             task[field] = _load(task.pop(field + "_json"))
         task["capability_policy"] = task["config"].get("capability_policy")
         return task
@@ -472,8 +483,8 @@ class Store:
             row = connection.execute(TASK_SELECT + "WHERE t.id=?", (task_id,)).fetchone()
             self._task(row, task_id)
             for table, allowed in (("task_executions", EXECUTION_FIELDS), ("metrics", METRIC_FIELDS)):
-                values = {("result_json" if key == "result" else key):
-                          (_dump(value) if key == "result" else value)
+                values = {({"result": "result_json", "verification": "verification_json"}.get(key, key)):
+                          (_dump(value) if key in {"result", "verification"} else value)
                           for key, value in clean.items() if key in allowed}
                 if values:
                     connection.execute("UPDATE " + table + " SET " + ",".join(key + "=?" for key in values)
@@ -633,12 +644,99 @@ class Store:
             result["history"] = list(history.values())
             return result
 
+
+    @staticmethod
+    def _approval(row: sqlite3.Row | None, approval_id: str = "") -> dict:
+        if row is None:
+            raise KeyError(approval_id)
+        item = dict(row)
+        item["arguments"] = _load(item.pop("arguments_json", "{}")) or {}
+        return item
+
+    def create_approval(self, task_id: str, agent_id: str, capability: str, tool: str,
+                        arguments: dict[str, Any] | None = None, action_summary: str = "",
+                        resource: str = "", reason: str = "", approval_id: str | None = None) -> dict:
+        approval_id = approval_id or str(uuid4())
+        now = utcnow()
+        safe_arguments = argument_summary(arguments if isinstance(arguments, dict) else {})
+        with self._connection(write=True) as connection:
+            task = connection.execute("SELECT agent_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if task["agent_id"] != agent_id:
+                raise ValueError("Approval agent does not own the task.")
+            connection.execute(
+                "INSERT INTO approval_requests(id,task_id,agent_id,capability,tool,arguments_json,action_summary,resource,reason,created_at,status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (approval_id, task_id, agent_id, str(capability), str(tool),
+                 _dump(safe_arguments), str(action_summary)[:1000], str(resource)[:1000],
+                 str(reason)[:2000], now, "pending"),
+            )
+            return self._approval(connection.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
+
+    def get_approval(self, approval_id: str) -> dict:
+        with self._connection() as connection:
+            return self._approval(connection.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
+
+    def list_approvals(self, *, status: str | None = None, task_id: str | None = None,
+                       limit: int = 200) -> list[dict]:
+        where, params = [], []
+        if status:
+            where.append("status=?")
+            params.append(str(status))
+        if task_id:
+            where.append("task_id=?")
+            params.append(str(task_id))
+        query = "SELECT * FROM approval_requests"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY created_at DESC,id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._connection() as connection:
+            return [self._approval(row) for row in connection.execute(query, params)]
+
+    def resolve_approval(self, approval_id: str, status: str, resolution: str | None = None) -> dict:
+        if status not in {"approved_once", "approved_task", "denied"}:
+            raise ValueError("Unknown approval status")
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            row = connection.execute("SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+            if row is None:
+                raise KeyError(approval_id)
+            if row["status"] != "pending":
+                raise ValueError("Approval request is already resolved.")
+            task = connection.execute(
+                "SELECT e.status FROM task_executions e WHERE e.task_id=?", (row["task_id"],)
+            ).fetchone()
+            if task is None:
+                raise KeyError(row["task_id"])
+            if task["status"] in {"Success", "Failed", "Cancelled"}:
+                raise ValueError("Cannot resolve approval for a terminal task.")
+            connection.execute(
+                "UPDATE approval_requests SET status=?,resolution=?,resolved_at=? WHERE id=? AND status='pending'",
+                (status, str(resolution or status)[:1000], now, approval_id),
+            )
+            return self._approval(connection.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
+
+    def cancel_pending_approvals(self, task_id: str, reason: str = "cancelled") -> int:
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            cursor = connection.execute(
+                "UPDATE approval_requests SET status='denied',resolution=?,resolved_at=? "
+                "WHERE task_id=? AND status='pending'",
+                (str(reason)[:1000], now, task_id),
+            )
+            return cursor.rowcount
+
     def recover_interrupted(self) -> int:
         """Fail abandoned executions atomically after the local runtime restarts."""
         now = utcnow()
         message = "Execution interrupted by a server restart. Assign a new task to retry."
         with self._connection(write=True) as connection:
-            rows = connection.execute(TASK_SELECT + "WHERE e.status IN ('Queued','Running','Paused')").fetchall()
+            rows = connection.execute(TASK_SELECT + "WHERE e.status IN ('Queued','Running','WaitingForApproval','Paused')").fetchall()
             for row in rows:
                 duration = row["duration_seconds"] or 0
                 if row["started_at"]:
@@ -650,6 +748,10 @@ class Store:
                 connection.execute(
                     "UPDATE execution_steps SET status='Failed',finished_at=?,error=? "
                     "WHERE task_id=? AND status IN ('Pending','Running')", (now, message, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE approval_requests SET status='denied',resolution=?,resolved_at=? "
+                    "WHERE task_id=? AND status='pending'", ("cancelled: " + message, now, row["id"]),
                 )
                 connection.execute("UPDATE agents SET status=CASE WHEN enabled=1 THEN 'Error' ELSE 'Offline' END,"
                                    "updated_at=?,last_activity=? WHERE id=?", (now, now, row["agent_id"]))

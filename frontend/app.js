@@ -1,12 +1,12 @@
 import { state, api, esc, number, route, toast, serialize } from './core.js';
 import { icon } from './icons.js';
 import { empty, button } from './components.js';
-import { freya, dashboard, agents, agentDetail, skills, skillDetail, tasks, taskDetail, logs, metricsView, settings } from './views.js';
+import { freya, dashboard, agents, agentDetail, skills, skillDetail, tasks, taskDetail, logs, metricsView, settings, approvals } from './views.js';
 import { agentDialog, skillDialog, assignDialog, confirmAction, setDialogRefresh, chooseWorkspace } from './dialogs.js';
 
 const main = document.querySelector('#main-content');
-const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['tasks', 'Tasks'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
-document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 4 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 6 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
+const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['tasks', 'Tasks'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
+document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 5 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 7 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
 
 function updateChrome() {
@@ -43,6 +43,7 @@ async function render(navigation = false) {
     else if (current.page === 'agents') html = current.id ? await agentDetail(current.id) : agents();
     else if (current.page === 'skills') html = current.id ? await skillDetail(current.id) : skills();
     else if (current.page === 'tasks') html = current.id ? await taskDetail(current.id) : await tasks();
+    else if (current.page === 'approvals') html = approvals();
     else if (current.page === 'logs') html = await logs();
     else if (current.page === 'metrics') html = metricsView(state.metrics);
     else if (current.page === 'settings') html = settings();
@@ -60,8 +61,8 @@ async function refresh(navigation = false) {
   if (refreshing) { refreshAgain = true; return; }
   refreshing = true;
   try {
-    const [health, agents, skills, tasks, metrics, orchestrations] = await Promise.all([api('/health'), api('/agents'), api('/skills'), api('/tasks'), api('/metrics'), api('/orchestrations')]);
-    Object.assign(state, { health, agents, skills, tasks, metrics, orchestrations });
+    const [health, agents, skills, tasks, approvals, metrics, orchestrations] = await Promise.all([api('/health'), api('/agents'), api('/skills'), api('/tasks'), api('/approvals?status=pending'), api('/metrics'), api('/orchestrations')]);
+    Object.assign(state, { health, agents, skills, tasks, approvals, metrics, orchestrations });
     await render(navigation);
   } catch (error) {
     state.health = null; updateChrome();
@@ -91,6 +92,20 @@ document.addEventListener('click', async event => {
     if (action === 'freya-workspace') return await chooseWorkspace(document.querySelector('#freya-workspace'));
     if (action === 'assign') return await assignDialog(id);
     if (action === 'refresh') return await refresh();
+    if (action === 'approve-once' || action === 'approve-task' || action === 'deny-approval') {
+      const endpoint = action === 'approve-once' ? 'approve-once' : action === 'approve-task' ? 'approve-task' : 'deny';
+      await api('/approvals/' + id + '/' + endpoint, 'POST', {});
+      toast(endpoint === 'deny' ? 'Approval denied.' : 'Approval resolved.');
+      await refresh();
+      return;
+    }
+    if (action === 'create-programmer') {
+      const agent = await api('/agent-presets/programmer', 'POST', {});
+      location.hash = '#/agents/' + agent.id;
+      toast('Programmer agent created.');
+      await refresh();
+      return;
+    }
     if (action === 'chart') { state.chart = value; return render(); }
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }

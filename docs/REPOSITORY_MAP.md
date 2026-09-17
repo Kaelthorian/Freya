@@ -22,6 +22,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── policy.py             policy schema, legacy migration and engine
 │   ├── skills.py             reusable Skill registry, validation and resolution
 │   ├── agent_context.py      structured agent defaults, effective config and worker context
+│   ├── presets.py            safe generic Programmer preset definitions
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
 │   ├── index.html / styles.css
@@ -49,8 +50,9 @@ of this repository merely because an agent selects them.
 4. `worker.py` calls local Ollama, resolves each tool request through
    `capabilities.py`, evaluates the immutable policy in `policy.py`, and only
    then dispatches to `tools.py` inside the configured workspace root.
-5. The parent persists events, steps, metrics and terminal state. SSE clients
-   replay changes using monotonic event IDs.
+5. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
+   replay changes using monotonic event IDs; WaitingForApproval blocks the worker
+   until a durable once/task/deny resolution arrives.
 
 ## Where to make changes
 

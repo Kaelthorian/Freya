@@ -9,9 +9,10 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
 from .capabilities import capability_catalog
+from .presets import programmer_agent_payload
 from .security import sanitize
 
-LIVE = {"Queued", "Running", "Paused"}
+LIVE = {"Queued", "Running", "WaitingForApproval", "Paused"}
 
 
 class ApiError(Exception):
@@ -100,6 +101,14 @@ class Application:
                 return {"models": models, "error": None}
             except Exception as exc:
                 return {"models": [], "error": str(exc)}
+        if parts in (["agent-presets"], ["presets"]):
+            return [{"id": "programmer", "name": "Programmer",
+                     "description": "Generic software engineering agent with Skills, capabilities and verification."}]
+        if parts == ["approvals"]:
+            return self.store.list_approvals(status=query.get("status") or None,
+                                             task_id=query.get("task_id") or None, limit=self._limit(query))
+        if len(parts) == 2 and parts[0] == "approvals":
+            return self.store.get_approval(parts[1])
         if parts == ["agents"]:
             return self.store.list_agents()
         if len(parts) == 2 and parts[0] == "agents":
@@ -168,6 +177,17 @@ class Application:
 
     def _mutate(self, method, path, body):
         parts = path.strip("/").split("/")[1:]
+        if method == "POST" and parts in (["agent-presets", "programmer"], ["presets", "programmer"]):
+            if not isinstance(body, dict):
+                raise ValueError("Preset body must be an object.")
+            agent = self.store.create_agent(programmer_agent_payload(body))
+            self._agent_event(agent, "agent.created")
+            return 201, agent
+        if method == "POST" and len(parts) == 3 and parts[0] == "approvals":
+            action = {"approve-once": "approved_once", "approve-task": "approved_task", "deny": "denied"}.get(parts[2])
+            if action is None:
+                raise ApiError(404, "Approval action not available.")
+            return 200, self.runtime.resolve_approval(parts[1], action)
         if method == "POST" and parts == ["agents"]:
             agent = self.store.create_agent(normalize_agent(body))
             self._agent_event(agent, "agent.created")

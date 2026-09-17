@@ -172,6 +172,33 @@ class Runtime:
             self.wake.set()
             return self.store.get_task(task_id)
 
+    def resolve_approval(self, approval_id: str, status: str) -> dict[str, Any]:
+        with self.lock:
+            approval = self.store.get_approval(approval_id)
+            if status not in {"approved_once", "approved_task", "denied"}:
+                raise ValueError("Unknown approval status")
+            task_id = approval["task_id"]
+            worker = self.active.get(task_id)
+            if worker is None or worker.get("approval_id") != approval_id:
+                raise ValueError("Approval is no longer attached to an active worker.")
+            resolved = self.store.resolve_approval(approval_id, status, status)
+            worker["approval_id"] = None
+            worker["control"].put({"kind": "approval", "id": approval_id, "resolution": status})
+            self.store.update_task(task_id, status="Running")
+            self.store.append_event(task_id, {
+                "event_type": "approval.resolved",
+                "level": "info" if status != "denied" else "warning",
+                "status": status,
+                "tool": approval["tool"],
+                "reason": "Approval resolved by operator.",
+                "capability": approval["capability"],
+                "approval_id": approval_id,
+                "resolution": status,
+            })
+            self._refresh_agent(approval["agent_id"])
+            self.wake.set()
+            return resolved
+
     def restart(self, agent_id: str) -> dict[str, Any]:
         with self.lock:
             self.store.get_agent(agent_id)
@@ -202,6 +229,8 @@ class Runtime:
             state = "Offline"
         elif agent_id in self.paused:
             state = "Paused"
+        elif any(worker["agent_id"] == agent_id and worker.get("approval_id") for worker in self.active.values()):
+            state = "Waiting"
         elif any(worker["agent_id"] == agent_id for worker in self.active.values()):
             state = "Running"
         elif any(self.store.get_task(task_id)["agent_id"] == agent_id for task_id in self.pending):
@@ -231,6 +260,8 @@ class Runtime:
         process.join(timeout=3)
         worker["queue"].close()
         worker["queue"].cancel_join_thread()
+        worker["control"].close()
+        worker["control"].cancel_join_thread()
         if not process.is_alive():
             process.close()
 
@@ -240,6 +271,7 @@ class Runtime:
         if task_id in self.pending:
             self.pending.remove(task_id)
         if worker:
+            self.store.cancel_pending_approvals(task_id, "cancelled: " + str(fields.get("error") or fields.get("status") or "worker stopped"))
             # Capture already emitted counters/events before terminating an in-flight call.
             try:
                 for _ in range(1000):
@@ -252,6 +284,8 @@ class Runtime:
                 pass
             fields["duration_seconds"] = round(time.monotonic() - worker["started"], 3)
             self._stop_worker(worker)
+        else:
+            self.store.cancel_pending_approvals(task_id, "cancelled: task finished before resolution")
         fields.update({"finished_at": now(), "progress": 100})
         self.store.update_task(task_id, **fields)
         self.store.append_event(task_id, {"event_type": "task." + fields["status"].lower(),
@@ -262,14 +296,15 @@ class Runtime:
 
     def _spawn(self, task: dict[str, Any]) -> None:
         outbox = self.context.Queue()
+        control_queue = self.context.Queue()
         pause_event, ready_event, go_event = self.context.Event(), self.context.Event(), self.context.Event()
         process = self.context.Process(target=process_main,
-                                       args=(task, str(self.project_root), outbox, pause_event, ready_event, go_event),
+                                       args=(task, str(self.project_root), outbox, pause_event, ready_event, go_event, control_queue),
                                        name="agent-task-" + task["id"][:12], daemon=False)
         started = time.monotonic()
         process.start()
-        worker = {"process": process, "queue": outbox, "pause": pause_event, "started": started,
-                  "agent_id": task["agent_id"], "workspace_key": self._workspace_key(task["workspace"]),
+        worker = {"process": process, "queue": outbox, "control": control_queue, "pause": pause_event, "started": started,
+                  "approval_id": None, "agent_id": task["agent_id"], "workspace_key": self._workspace_key(task["workspace"]),
                   "max_seconds": task["config"].get("max_seconds", 600), "job": None}
         self.active[task["id"]] = worker
         self.store.update_task(task["id"], status="Running", started_at=now())
@@ -320,6 +355,28 @@ class Runtime:
                             if kind == "done":
                                 self._finish(task_id, message["fields"])
                                 break
+                            if kind == "approval_requested":
+                                request = message.get("request") or {}
+                                approval_id = str(request.get("id") or "")
+                                if not approval_id:
+                                    self._finish(task_id, {"status": "Failed", "error": "Worker emitted an approval without an id."})
+                                    break
+                                approval = self.store.create_approval(
+                                    task_id, worker["agent_id"], str(request.get("capability") or "unknown"),
+                                    str(request.get("tool") or "unknown"), request.get("arguments") or {},
+                                    str(request.get("action_summary") or ""), str(request.get("resource") or "."),
+                                    str(request.get("reason") or "Approval required."), approval_id=approval_id,
+                                )
+                                worker["approval_id"] = approval["id"]
+                                self.store.update_task(task_id, status="WaitingForApproval")
+                                self.store.append_event(task_id, {
+                                    "event_type": "approval.requested", "level": "warning",
+                                    "status": "WaitingForApproval", "tool": approval["tool"],
+                                    "capability": approval["capability"], "approval_id": approval["id"],
+                                    "action_summary": approval["action_summary"], "resource": approval["resource"],
+                                    "reason": approval["reason"], "arguments": approval["arguments"],
+                                })
+                                self._refresh_agent(worker["agent_id"])
                             if kind == "event":
                                 self.store.append_event(task_id, message["event"])
                             elif kind == "update":

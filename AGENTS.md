@@ -20,6 +20,7 @@ Ollama and allowlisted tools → selected agent workspace.
 - Keep Ollama inference loopback-only and preserve token and timing metrics.
 - Keep the web server loopback-only and the worker/database ownership boundary.
 - Preserve serialization per agent and per selected workspace.
+- Preserve durable approvals and WaitingForApproval; never auto-grant a requested or new capability.
 - Keep Python support at 3.10+ and avoid runtime dependencies unless setup and
   documentation are updated.
 

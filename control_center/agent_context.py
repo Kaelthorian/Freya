@@ -5,6 +5,7 @@ import copy
 import json
 from typing import Any
 
+from .capabilities import effective_tools_for_policy
 from .policy import policy_from_legacy, validate_policy
 from .skills import skills_context
 from .security import sanitize
@@ -26,7 +27,7 @@ DEFAULT_BEHAVIOR = {
 DEFAULT_AUTONOMY = {
     "task_decomposition": "automatic", "implementation_choices": "automatic",
     "create_files": "automatic", "modify_files": "automatic", "run_verification": "automatic",
-    "destructive_actions": "ask", "request_missing_capabilities": "automatic", "request_new_capabilities": "automatic", "stop_when_blocked": True,
+    "destructive_actions": "ask", "request_missing_capabilities": "ask", "request_new_capabilities": "ask", "stop_when_blocked": True,
 }
 DEFAULT_VERIFICATION = {
     "enabled": True, "inspect_changes": True, "run_available_tests": True,
@@ -161,8 +162,11 @@ def build_effective_agent(agent: dict[str, Any]) -> dict[str, Any]:
     # their text result shape while normalized/new agents use structured output.
     output = normalize_output(config.get("output") if "output" in config else {"format": "text"})
     tools = list(agent.get("tools") or [])
-    capability_policy = config.get("capability_policy") or policy_from_legacy(config, tools)
+    capability_policy = config.get("capability_policy")
+    if capability_policy is None:
+        capability_policy = policy_from_legacy(config, tools)
     capability_policy = validate_policy(capability_policy)
+    tools = effective_tools_for_policy(capability_policy)
     return {
         "identity": identity, "behavior": behavior, "autonomy": autonomy,
         "verification": verification, "output": output,
@@ -195,8 +199,11 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
     lines.extend(["INSTRUCTIONS", effective["instructions"] or "None specified", "BEHAVIOR"])
     lines.extend([f"Planning: {behavior['planning']['mode']}", f"Ambiguity: {behavior['ambiguity']['mode']}",
                   f"Verbosity: {behavior['communication']['verbosity']}", f"Explain actions: {behavior['communication']['explain_actions']}",
-                  f"Require evidence: {behavior['evidence']['require_evidence']}", f"Retry recoverable errors: {behavior['persistence']['retry_recoverable_errors']}",
+                  f"Require evidence: {behavior['evidence']['require_evidence']}", f"Distinguish assumptions: {behavior['evidence']['distinguish_assumptions']}",
+                  f"Retry recoverable errors: {behavior['persistence']['retry_recoverable_errors']}",
                   f"Repeated failure limit: {behavior['persistence']['repeated_failure_limit']}",
+                  f"Change strategy after failure: {behavior['persistence']['change_strategy_after_failure']}",
+                  f"Prefer minimal changes: {behavior['change_strategy']['prefer_minimal_changes']}",
                   f"Inspect before modifying existing resources: {behavior['change_strategy']['inspect_before_modify_existing']}",
                   "AUTONOMY"])
     lines.extend(f"{key}: {value}" for key, value in autonomy.items())
@@ -210,17 +217,56 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
     return sanitize("\n".join(lines))
 
 
+def parse_structured_output(value: Any) -> dict[str, Any]:
+    # Parse and validate the structured output contract.
+    if isinstance(value, dict):
+        parsed = copy.deepcopy(value)
+    else:
+        text = str(value or "").strip()
+        fence = chr(96) * 3
+        if text.startswith(fence):
+            text = text[3:].lstrip()
+            if text.lower().startswith("json"):
+                text = text[4:].lstrip()
+            if text.endswith(fence):
+                text = text[:-3].rstrip()
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Structured output must be a JSON object.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Structured output must be a JSON object.")
+    unknown = set(parsed) - OUTPUT_FIELDS
+    if unknown:
+        raise ValueError("Structured output contains unknown fields: " + ", ".join(sorted(unknown)))
+    summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("Structured output requires a non-empty summary.")
+    normalized: dict[str, Any] = {"summary": summary.strip()}
+    for field in ("actions", "artifacts", "limitations"):
+        item = parsed.get(field, [])
+        if not isinstance(item, list):
+            raise ValueError("Structured output field " + field + " must be an array.")
+        normalized[field] = copy.deepcopy(item)
+    verification = parsed.get("verification", [])
+    if not isinstance(verification, (dict, list, str)):
+        raise ValueError("Structured output field verification must be an object, array, or text.")
+    normalized["verification"] = copy.deepcopy(verification)
+    return normalized
+
+
+def validate_structured_output(value: Any) -> dict[str, Any]:
+    # Public strict validator used before accepting model output.
+    return parse_structured_output(value)
+
+
 def normalize_result_output(value: Any, contract: dict[str, Any]) -> Any:
-    """Keep text compatibility while providing a stable structured contract."""
+    # Keep text compatibility while providing a stable structured contract.
     if contract.get("format") != "structured":
         return value
-    if isinstance(value, dict):
-        parsed = value
-    else:
-        try:
-            parsed = json.loads(str(value))
-        except (TypeError, ValueError):
-            parsed = {"summary": str(value)}
-    if not isinstance(parsed, dict):
-        parsed = {"summary": str(parsed)}
-    return {key: parsed.get(key, [] if key != "summary" else "") for key in ("summary", "actions", "artifacts", "verification", "limitations")}
+    try:
+        return parse_structured_output(value)
+    except (TypeError, ValueError):
+        summary = str(value or "").strip()
+        return {"summary": summary, "actions": [], "artifacts": [],
+                "verification": [], "limitations": []}

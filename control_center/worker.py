@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import time
 import uuid
@@ -15,12 +16,13 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
-from control_center.tools import IGNORED_DIRECTORIES, Toolbox, ToolResult
+from control_center.tools import IGNORED_DIRECTORIES, Toolbox, ToolResult, argument_summary
 from control_center.transport import request_json
 from control_center.security import register_secret, sanitize, strip_thinking as strip_private_content
-from control_center.capabilities import CapabilityResolver
+from control_center.capabilities import CapabilityResolver, effective_tools_for_policy
 from control_center.policy import PolicyEngine, policy_from_legacy
-from control_center.agent_context import build_agent_context, build_effective_agent, normalize_result_output
+from control_center.agent_context import (build_agent_context, build_effective_agent, normalize_autonomy,
+                                               normalize_result_output, validate_structured_output)
 
 
 READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff"}
@@ -115,10 +117,13 @@ class PolicyToolbox(Toolbox):
                  enabled: list[str]) -> None:
         super().__init__(project_root, workspace)
         self.config = config
-        self.enabled = set(enabled)
-        self.resolver = CapabilityResolver(self.workspace)
         self.policy = PolicyEngine(config.get("capability_policy") or policy_from_legacy(config, enabled), self.workspace,
                                    hard_max_bytes=1_000_000)
+        self.enabled = set(effective_tools_for_policy(self.policy.policy))
+        self.autonomy = normalize_autonomy(config.get("autonomy"))
+        self.once_grants: set[str] = set()
+        self.task_grants: set[str] = set()
+        self.resolver = CapabilityResolver(self.workspace)
         self.roots = []
         for path in config.get("allowed_directories", ["."]):
             candidate = super().safe_path(path)
@@ -135,6 +140,63 @@ class PolicyToolbox(Toolbox):
         return [schema for schema in super().schemas
                 if schema["function"]["name"] in self.enabled]
 
+    @staticmethod
+    def _autonomy_fields(action: str) -> tuple[str, ...]:
+        if action == "filesystem.create":
+            return ("create_files",)
+        if action == "filesystem.modify":
+            return ("modify_files",)
+        if action == "filesystem.overwrite":
+            return ("modify_files", "destructive_actions")
+        if action.startswith("execution."):
+            return ("run_verification",)
+        return ()
+
+    @staticmethod
+    def _grant_key(action: str, arguments: dict[str, Any]) -> str:
+        payload = json.dumps({"capability": action, "arguments": arguments},
+                             sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def grant_approval(self, action: str, arguments: dict[str, Any], *, task: bool = False) -> None:
+        key = self._grant_key(action, arguments)
+        if task:
+            self.task_grants.add(key)
+        else:
+            self.once_grants.add(key)
+
+    def _has_grant(self, action: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+        key = self._grant_key(action, arguments)
+        if key in self.task_grants:
+            return True, "task approval"
+        if key in self.once_grants:
+            self.once_grants.remove(key)
+            return True, "one-time approval"
+        return False, ""
+
+    def _resource_context(self, name: str, resource: str, args: dict[str, Any]) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        if name in {"read_file", "search_code"}:
+            try:
+                target = self.safe_path(resource)
+                if target.is_file():
+                    context["extension"] = target.suffix
+                    context["size_bytes"] = target.stat().st_size
+            except (OSError, ValueError):
+                context["extension"] = Path(resource).suffix
+        elif name == "write_file" and isinstance(args.get("content"), str):
+            context = {"size_bytes": len(args["content"].encode("utf-8")),
+                       "extension": Path(resource).suffix}
+        elif name == "edit_file" and isinstance(args.get("new"), str):
+            try:
+                target = self.safe_path(resource)
+                old_text = target.read_text(encoding="utf-8")
+                context = {"size_bytes": len(old_text.replace(args.get("old", ""), args["new"], 1).encode("utf-8")),
+                           "extension": target.suffix}
+            except (OSError, ValueError):
+                context["extension"] = Path(resource).suffix
+        return context
+
     def invoke(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         args = arguments or {}
         try:
@@ -148,29 +210,35 @@ class PolicyToolbox(Toolbox):
             return ToolResult(name, "Tool {} was not executed.\nCapability:\n{}\nPolicy result:\nDENY\nReason:\n{}".format(name, action, exc),
                               False, 0, capability=action, policy_decision="deny", policy_reason=str(exc), executed=False, error_class="policy_denied")
         resource = str(args.get("path", ".")) if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"} else "."
-        context: dict[str, Any] = {}
-        if name == "write_file" and isinstance(args.get("content"), str):
-            context = {"size_bytes": len(args["content"].encode("utf-8")), "extension": Path(resource).suffix}
-        elif name == "edit_file" and isinstance(args.get("new"), str):
-            try:
-                target = self.safe_path(resource)
-                old_text = target.read_text(encoding="utf-8")
-                context = {"size_bytes": len(old_text.replace(args.get("old", ""), args["new"], 1).encode("utf-8")),
-                           "extension": target.suffix}
-            except (OSError, ValueError):
-                context = {"extension": Path(resource).suffix}
-        decision = self.policy.evaluate(action, resource, context)
-        if decision.outcome != "allow":
-            label = "APPROVAL_REQUIRED" if decision.outcome == "approval_required" else "DENY"
-            message = (f"Tool {name} was not executed.\nCapability:\n{action}\nPolicy result:\n{label}\n"
+        decision = self.policy.evaluate(action, resource, self._resource_context(name, resource, args))
+        if decision.outcome == "deny":
+            message = (f"Tool {name} was not executed.\nCapability:\n{action}\nPolicy result:\nDENY\n"
                        f"Reason:\n{decision.reason}")
             return ToolResult(name, message, False, 0, capability=action,
-                              policy_decision=decision.outcome, policy_reason=decision.reason, executed=False,
-                              error_class="approval_required" if decision.outcome == "approval_required" else "policy_denied")
+                              policy_decision="deny", policy_reason=decision.reason, executed=False,
+                              error_class="policy_denied")
+        fields = self._autonomy_fields(action)
+        modes = [self.autonomy.get(field, "automatic") for field in fields]
+        if "deny" in modes:
+            denied = ", ".join(field for field, mode in zip(fields, modes) if mode == "deny")
+            reason = "Autonomy denied this action: " + denied
+            return ToolResult(name, f"Tool {name} was not executed.\nCapability:\n{action}\nPolicy result:\nDENY\nReason:\n{reason}",
+                              False, 0, capability=action, policy_decision="deny",
+                              policy_reason=reason, executed=False, error_class="autonomy_denied")
+        reasons = []
+        if decision.outcome == "approval_required":
+            reasons.append("Capability policy requires approval.")
+        reasons.extend("Autonomy requires approval for " + field + "." for field, mode in zip(fields, modes) if mode == "ask")
+        granted, grant_reason = self._has_grant(action, args)
+        if reasons and not granted:
+            reason = " ".join(reasons)
+            return ToolResult(name, f"Tool {name} was not executed.\nCapability:\n{action}\nPolicy result:\nAPPROVAL_REQUIRED\nReason:\n{reason}",
+                              False, 0, capability=action, policy_decision="approval_required",
+                              policy_reason=reason, executed=False, error_class="approval_required")
         result = super().invoke(name, args)
         result.capability = action
         result.policy_decision = "allow"
-        result.policy_reason = decision.reason
+        result.policy_reason = decision.reason + (f" ({grant_reason})" if grant_reason else "")
         result.executed = True
         return result
 
@@ -225,7 +293,8 @@ class PolicyToolbox(Toolbox):
 
 def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str, Any]], None],
              checkpoint: Callable[[], None], *, transport: Callable[..., dict[str, Any]] = request_json,
-             token: str = "", toolbox: PolicyToolbox | None = None) -> dict[str, Any]:
+             token: str = "", toolbox: PolicyToolbox | None = None,
+             approval_handler: Callable[[dict[str, Any]], str] | None = None) -> dict[str, Any]:
     """Run synchronously; process control and persistence remain with the parent."""
     config = task["config"]
     box = toolbox or PolicyToolbox(project_root, Path(task["workspace"]), config, task["tools"])
@@ -272,6 +341,13 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     final = ""
     error = ""
     success = False
+    modified = False
+    verification = effective["verification"]
+    verification_state: dict[str, Any] = {
+        "requested": bool(verification["enabled"]), "attempted": False,
+        "passed": False, "failed": False, "unavailable": False,
+        "skipped_with_reason": "", "evidence": [],
+    }
     failure_history: dict[str, int] = {}
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     try:
@@ -383,7 +459,44 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             safe_args["timeout_seconds"] = max(1, min(requested, int(remaining)))
                     result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                               else box.invoke(name, safe_args))
-                    if not result.success and result.policy_decision not in {"deny", "approval_required"} and not argument_error:
+                    if result.policy_decision == "deny" and not argument_error:
+                        request_kind = "request_new_capabilities" if result.capability in {"", "unknown"} else "request_missing_capabilities"
+                        request_mode = effective["autonomy"].get(request_kind, "ask")
+                        if request_mode != "deny":
+                            publish("event", event={
+                                "event_type": "capability.requested", "level": "warning", "status": "Pending",
+                                "step_id": step_id, "tool": name, "capability": result.capability or "unknown",
+                                "requested_capability": result.capability or "unknown",
+                                "reason": result.policy_reason or "The requested capability is not currently available.",
+                                "autonomy_mode": request_mode,
+                                "resolution": "No capability is granted automatically.",
+                            })
+                    if result.policy_decision == "approval_required" and approval_handler and not argument_error:
+                        request = {
+                            "task_id": task.get("id", ""),
+                            "agent_id": task.get("agent_id", ""),
+                            "capability": result.capability or common.get("capability", "unknown"),
+                            "tool": name,
+                            "arguments": argument_summary(safe_args),
+                            "action_summary": REASONS.get(name, "The worker requested a gated tool action."),
+                            "resource": str(safe_args.get("path", ".")),
+                            "reason": result.policy_reason or "The configured policy requires approval.",
+                        }
+                        resolution = approval_handler(request)
+                        if resolution in {"approved_once", "approved_task"} and hasattr(box, "grant_approval"):
+                            box.grant_approval(result.capability or common.get("capability", "unknown"),
+                                               safe_args, task=resolution == "approved_task")
+                            result = box.invoke(name, safe_args)
+                        elif resolution == "denied":
+                            result = ToolResult(
+                                name, "The operator denied this action.", False, 0,
+                                capability=result.capability, policy_decision="denied",
+                                policy_reason="Approval denied by operator.", executed=False,
+                                error_class="approval_denied",
+                            )
+                    if result.success and name in WRITE_TOOLS:
+                        modified = True
+                    if not result.success and result.policy_decision not in {"deny", "approval_required", "denied"} and not argument_error:
                         recoverable = any(marker in result.output.lower() for marker in ("does not exist", "not found", "no matches"))
                         result.error_class = "recoverable" if recoverable else "environment_error"
                         if not recoverable:
@@ -399,8 +512,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     policy_blocked = result.policy_decision in {"deny", "approval_required"} and not legacy_tool_block
                     publish("event", event={**common, "event_type": "step.finished",
                                              "level": "info" if result.success else ("warning" if policy_blocked else "error"),
-                                             "status": "Success" if result.success else ("ApprovalRequired" if result.policy_decision == "approval_required" else ("Denied" if policy_blocked else "Failed")),
-                                             "output": result.output, "error": "" if (result.success or policy_blocked) else result.output,
+                                             "status": "Success" if result.success else ("ApprovalRequired" if result.policy_decision == "approval_required" else ("Denied" if policy_blocked or result.policy_decision in {"denied"} else "Failed")),
+                                             "output": result.output, "error": "" if (result.success or policy_blocked or result.policy_decision == "denied") else result.output,
                                              "duration_seconds": result.duration_seconds,
                                              "capability": result.capability or common.get("capability", "unknown"),
                                              "policy_decision": result.policy_decision or "deny",
@@ -412,15 +525,165 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
                                 if legacy else {"role": "tool", "tool_name": name, "content": result.output})
+        if success and verification_state["requested"]:
+            publish("event", event={"event_type": "verification.started", "level": "info", "status": "Running",
+                                     "reason": "Run configured verification checks with tool evidence."})
+            def verify_tool(name: str, arguments: dict[str, Any], reason: str) -> ToolResult:
+                guard()
+                if metrics["steps"] >= config.get("max_steps", 20) or metrics["tool_calls"] >= config.get("max_tool_calls", 40):
+                    raise TaskStopped("Verification budget is exhausted.")
+                metrics["steps"] += 1
+                metrics["tool_calls"] += 1
+                step_id = uuid.uuid4().hex
+                common = {"step_id": step_id, "step_number": metrics["steps"], "tool": name,
+                          "input": arguments, "attempt": 1, "reason": reason}
+                try:
+                    common["capability"] = box.resolver.resolve(name, arguments)
+                except Exception:
+                    common["capability"] = "unknown"
+                publish("event", event={**common, "event_type": "step.started", "level": "info", "status": "Running"})
+                box.timeout_seconds = max(1, min(30, int(guard())))
+                result = box.invoke(name, arguments)
+                if result.policy_decision == "approval_required" and approval_handler:
+                    resolution = approval_handler({
+                        "task_id": task.get("id", ""), "agent_id": task.get("agent_id", ""),
+                        "capability": result.capability or common["capability"], "tool": name,
+                        "arguments": argument_summary(arguments), "action_summary": reason,
+                        "resource": str(arguments.get("path", ".")),
+                        "reason": result.policy_reason or "Verification requires approval.",
+                    })
+                    if resolution in {"approved_once", "approved_task"} and hasattr(box, "grant_approval"):
+                        box.grant_approval(result.capability or common["capability"], arguments,
+                                           task=resolution == "approved_task")
+                        result = box.invoke(name, arguments)
+                    elif resolution == "denied":
+                        result = ToolResult(name, "The operator denied this verification.", False, 0,
+                                            capability=result.capability, policy_decision="denied",
+                                            policy_reason="Verification approval denied.", executed=False,
+                                            error_class="approval_denied")
+                publish("event", event={**common, "event_type": "step.finished",
+                                         "level": "info" if result.success else "error",
+                                         "status": "Success" if result.success else "Failed",
+                                         "output": result.output, "error": "" if result.success else result.output,
+                                         "duration_seconds": result.duration_seconds,
+                                         "capability": result.capability or common["capability"],
+                                         "policy_decision": result.policy_decision or "deny",
+                                         "policy_reason": result.policy_reason,
+                                         "error_class": result.error_class})
+                return result
+
+            def record_verification(result: ToolResult, label: str) -> None:
+                verification_state["attempted"] = True
+                if result.success:
+                    verification_state["passed"] = True
+                    verification_state["evidence"].append({"check": label, "status": "passed",
+                                                           "output": result.output[:4000]})
+                else:
+                    verification_state["failed"] = True
+                    verification_state["evidence"].append({"check": label, "status": "failed",
+                                                           "output": result.output[:4000]})
+            if modified and verification["inspect_changes"]:
+                if "git_diff" in getattr(box, "enabled", set()):
+                    record_verification(verify_tool("git_diff", {}, "Inspect the resulting workspace changes."),
+                                        "inspect_changes")
+                else:
+                    verification_state["unavailable"] = True
+                    verification_state["skipped_with_reason"] += "Git diff tool is not available. "
+            if verification["run_available_tests"]:
+                workspace_path = Path(task.get("workspace", ""))
+                tests_path = workspace_path / "tests"
+                test_command = None
+                if tests_path.is_dir() and "run_command" in getattr(box, "enabled", set()):
+                    for capability, argv, label in (
+                        ("execution.unittest", ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "unittest"),
+                        ("execution.pytest", ["python", "-m", "pytest"], "pytest"),
+                    ):
+                        decision = box.policy.evaluate(capability, ".")
+                        if decision.outcome in {"allow", "approval_required"}:
+                            test_command = (argv, label)
+                            break
+                if test_command:
+                    argv, label = test_command
+                    record_verification(verify_tool("run_command", {"argv": argv}, "Run the available test suite."),
+                                        "tests:" + label)
+                else:
+                    verification_state["unavailable"] = True
+                    verification_state["skipped_with_reason"] += "No permitted test suite is available. "
+            if not verification_state["attempted"] and not verification_state["unavailable"]:
+                verification_state["skipped_with_reason"] = "No verification check was selected."
+            if verification_state["failed"]:
+                success = False
+                error = error or "Configured verification failed."
+            publish("event", event={"event_type": "verification.finished",
+                                     "level": "info" if not verification_state["failed"] else "error",
+                                     "status": "Failed" if verification_state["failed"] else "Success",
+                                     "output": verification_state})
+        elif not verification_state["requested"]:
+            verification_state["skipped_with_reason"] = "Verification disabled by configuration."
     except Exception as exc:
         error = "{}: {}".format(type(exc).__name__, exc)
+    result_output: Any = final
+    if effective["output"]["format"] == "structured":
+        repaired = None
+        repair_failed = False
+        try:
+            repaired = validate_structured_output(final)
+        except (TypeError, ValueError):
+            # Plain prose remains a compatibility fallback for legacy model
+            # responses. JSON-looking output gets exactly one repair attempt.
+            repair_eligible = str(final or "").lstrip().startswith(("{", chr(96) * 3))
+            if repair_eligible and metrics["model_calls"] < config.get("max_model_calls", 20):
+                metrics["model_calls"] += 1
+                repair_id = uuid.uuid4().hex
+                publish("event", event={"event_type": "model.repair.started", "level": "warning", "status": "Running",
+                                         "step_id": repair_id, "reason": "Repair the structured output contract once."})
+                try:
+                    repair_response = transport(
+                        "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
+                        {"model": config["model"],
+                         "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object or array or string), limitations (array)."},
+                                      {"role": "user", "content": "Repair this final answer into the required JSON contract:\n" + str(final)}],
+                         "tools": [], "stream": False, "think": False,
+                         "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
+                                     "num_predict": min(config.get("max_tokens", 32000) - metrics["total_tokens"],
+                                                       config.get("context_window", 8192))}},
+                        timeout=guard(), token=token,
+                    )
+                    for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
+                        value = repair_response.get(source, 0) or 0
+                        if not isinstance(value, (int, float)) or value < 0:
+                            raise ValueError("Ollama returned invalid repair usage metrics.")
+                        metrics[key] += int(value)
+                    metrics["total_tokens"] = metrics["prompt_tokens"] + metrics["generated_tokens"]
+                    repair_message = repair_response.get("message")
+                    if not isinstance(repair_message, dict):
+                        raise ValueError("Ollama returned no repair message.")
+                    repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
+                    publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
+                                             "step_id": repair_id, "output": {"valid": True}})
+                except Exception as exc:
+                    repair_failed = True
+                    publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",
+                                             "step_id": repair_id, "error": "{}: {}".format(type(exc).__name__, exc)})
+        if repaired is None:
+            result_output = normalize_result_output(final, effective["output"])
+            if isinstance(result_output, dict):
+                result_output["limitations"].append("The model output did not satisfy the structured contract; fallback normalization was used.")
+        else:
+            result_output = repaired
+        if isinstance(result_output, dict):
+            result_output["verification"] = verification_state
+            if verification_state.get("skipped_with_reason"):
+                result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
     update()
-    return sanitize(clean({**metrics, "status": "Success" if success else "Failed", "result": normalize_result_output(final, effective["output"]),
-                  "error": error, "progress": 100, "duration_seconds": round(time.monotonic() - started, 3)}, token))
+    return sanitize(clean({**metrics, "status": "Success" if success else "Failed", "result": result_output,
+                  "verification": verification_state, "error": error, "progress": 100,
+                  "duration_seconds": round(time.monotonic() - started, 3)}, token))
 
 
 def process_main(task: dict[str, Any], project_root: str, outbox: Any,
-                 pause_event: Any, ready_event: Any, go_event: Any) -> None:
+                 pause_event: Any, ready_event: Any, go_event: Any,
+                 control_queue: Any = None) -> None:
     if os.name != "nt":
         os.setsid()
     # Parent assigns the Windows Job Object before tools may start subprocesses.
@@ -434,6 +697,22 @@ def process_main(task: dict[str, Any], project_root: str, outbox: Any,
             os.environ.pop(key, None)
     def emit(event: dict[str, Any]) -> None:
         outbox.put(event)
+    def approval_handler(request: dict[str, Any]) -> str:
+        request = dict(request)
+        request["id"] = uuid.uuid4().hex
+        request["task_id"] = task.get("id", "")
+        request["agent_id"] = task.get("agent_id", "")
+        outbox.put({"kind": "approval_requested", "request": request})
+        if control_queue is None:
+            return "denied"
+        while True:
+            checkpoint()
+            try:
+                message = control_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if isinstance(message, dict) and message.get("kind") == "approval" and message.get("id") == request["id"]:
+                return str(message.get("resolution", "denied"))
     def checkpoint() -> None:
         if pause_event.is_set():
             emit({"kind": "paused"})
@@ -441,7 +720,8 @@ def process_main(task: dict[str, Any], project_root: str, outbox: Any,
                 time.sleep(.05)
             emit({"kind": "resumed"})
     try:
-        result = run_task(task, Path(project_root), emit, checkpoint, token=token)
+        result = run_task(task, Path(project_root), emit, checkpoint, token=token,
+                          approval_handler=approval_handler)
         emit({"kind": "done", "fields": result})
     except BaseException as exc:
         emit({"kind": "done", "fields": clean({"status": "Failed", "error": "{}: {}".format(type(exc).__name__, exc),

@@ -43,6 +43,39 @@ CAPABILITIES: tuple[Capability, ...] = (
 )
 CAPABILITY_REGISTRY = {item.id: item for item in CAPABILITIES}
 
+CAPABILITY_TO_TOOL = {item.id: item.tool for item in CAPABILITIES}
+
+
+def tool_for_capability(capability: str) -> str:
+    '''Return the concrete tool required by one registered capability.'''
+    item = CAPABILITY_REGISTRY.get(capability)
+    return item.tool if item else ""
+
+
+def effective_tools_for_policy(policy: dict[str, Any] | None) -> list[str]:
+    '''Resolve active policy rules to the tools the model may actually see.
+
+    Allow and ask both need a tool transport. Deny deliberately contributes
+    nothing, so a stale advanced-tool selection cannot expose an executable
+    tool without a corresponding capability rule.
+    '''
+    if not isinstance(policy, dict):
+        return []
+    capabilities = policy.get("capabilities", policy)
+    if not isinstance(capabilities, dict):
+        return []
+    active: set[str] = set()
+    for category, actions in capabilities.items():
+        if not isinstance(actions, dict):
+            continue
+        for action, rule in actions.items():
+            capability = action if "." in str(action) else f"{category}.{action}"
+            if isinstance(rule, dict) and rule.get("mode") in {"allow", "ask"}:
+                tool = tool_for_capability(capability)
+                if tool:
+                    active.add(tool)
+    return [item.tool for item in CAPABILITIES if item.tool in active]
+
 
 class CapabilityResolver:
     """Resolve a concrete tool request to one known capability."""
