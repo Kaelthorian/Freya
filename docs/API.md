@@ -112,3 +112,5 @@ and relevant status/tool/input/output/error/duration fields. Approval events inc
 from the JSON route; SSE is a change signal and durable event replay.
 
 Skills support `GET /api/skills/{id}/versions` and `GET /api/skills/{id}/versions/{version}` for immutable history. `DELETE /api/skills/{id}` archives a skill and records an audit event; archived skills are excluded from `/api/skills` unless `include_deleted=true` is requested.
+
+`PATCH /api/skills/{id}` ignores a client-supplied version and assigns the next version when versioned definition fields change. A no-op PATCH preserves the current version and emits no `skill.updated` event. Historical snapshots cannot be overwritten.

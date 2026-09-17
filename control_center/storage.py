@@ -31,6 +31,10 @@ EXECUTION_FIELDS = {
     "progress", "result", "verification", "error",
 }
 METRIC_FIELDS = {"model_calls", "tool_calls", "prompt_tokens", "generated_tokens", "total_tokens"}
+SKILL_DEFINITION_FIELDS = (
+    "id", "name", "description", "category", "version", "instructions", "procedures",
+    "recommended_capabilities", "required_capabilities", "tags", "source", "metadata", "enabled",
+)
 TASK_SELECT = """
 SELECT t.*, e.id AS execution_id, e.status, e.started_at, e.finished_at,
        e.duration_seconds, e.steps, e.progress, e.result_json, e.verification_json, e.error,
@@ -99,6 +103,13 @@ class Store:
                   int(tool.get("dangerous", False))) for tool in TOOL_CATALOG],
             )
             self._seed_builtin_skills(connection)
+            for row in connection.execute("SELECT * FROM skills"):
+                legacy = self._skill(row)
+                snapshot = {key: legacy[key] for key in SKILL_DEFINITION_FIELDS}
+                connection.execute(
+                    "INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)",
+                    (legacy["id"], legacy["version"], _dump(snapshot), legacy.get("updated_at") or utcnow(), "Migrated current definition"),
+                )
 
     @staticmethod
     def _seed_builtin_skills(connection: sqlite3.Connection) -> None:
@@ -374,7 +385,7 @@ class Store:
             params.append(source)
         if not include_deleted:
             where.append("s.deleted_at IS NULL")
-        clause = " WHERE " + " AND ".join(where)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self._connection() as c:
             rows = c.execute(
                 "SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s "
@@ -401,7 +412,7 @@ class Store:
                 "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
             )
-            c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial version"))
+            c.execute("INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial version"))
             c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill["id"],skill["version"],now,"skill.created","Skill created",_dump({"id":skill["id"],"version":skill["version"]})))
             created = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill["id"],)).fetchone()
             return self._skill(created)
@@ -411,25 +422,33 @@ class Store:
             row = c.execute("SELECT * FROM skills WHERE id=?", (skill_id,)).fetchone()
             if row is None:
                 raise KeyError(skill_id)
-            current = self._skill(row)
-            current.pop("assigned_agents", None)
-            current.pop("assigned_agent_ids", None)
-            current.pop("required_tools", None)
+            current_row = self._skill(row)
+            current = {key: current_row[key] for key in SKILL_DEFINITION_FIELDS}
             incoming = dict(data)
             if "id" in incoming and incoming["id"] != skill_id:
                 raise ValueError("Skill id is stable and cannot be changed")
+            incoming.pop("version", None)
             incoming["id"] = skill_id
-            skill = normalize_skill(incoming, current)
+            candidate = normalize_skill(incoming, current)
+            comparable = tuple(key for key in SKILL_DEFINITION_FIELDS if key != "version")
+            if all(candidate[key] == current[key] for key in comparable):
+                return self._skill(c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone())
+            skill = {**candidate, "version": current["version"] + 1}
             if c.execute("SELECT 1 FROM skills WHERE name=? AND id<>?", (skill["name"], skill_id)).fetchone() is not None:
                 raise ValueError("Skill name already exists: " + skill["name"])
             now = utcnow()
-            if skill != current:
-                c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, current["version"], _dump(current), now, "Previous version before update"))
+            historical = c.execute("SELECT snapshot_json FROM skill_versions WHERE skill_id=? AND version=?", (skill_id, current["version"])).fetchone()
+            if historical is None:
+                raise RuntimeError("Current skill version is missing from immutable history")
+            if _load(historical["snapshot_json"]) != current:
+                raise RuntimeError("Immutable skill history conflicts with the current definition")
+            if c.execute("SELECT 1 FROM skill_versions WHERE skill_id=? AND version=?", (skill_id, skill["version"])).fetchone():
+                raise RuntimeError("Next skill version already exists")
             c.execute(
                 "UPDATE skills SET name=?,description=?,category=?,version=?,instructions=?,procedures_json=?,recommended_capabilities_json=?,required_capabilities_json=?,tags_json=?,source=?,metadata_json=?,enabled=?,updated_at=? WHERE id=?",
                 (skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, skill_id),
             )
-            c.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, skill["version"], _dump(skill), now, "Updated definition"))
+            c.execute("INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, skill["version"], _dump(skill), now, "Updated definition"))
             c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill_id,skill["version"],now,"skill.updated","Skill updated",_dump({"id":skill_id,"version":skill["version"]})))
             updated = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone()
             return self._skill(updated)

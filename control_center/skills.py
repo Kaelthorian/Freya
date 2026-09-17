@@ -326,7 +326,7 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
 
 
 def render_skill(skill: dict[str, Any], *, full: bool = False) -> str:
-    lines = [f"## {skill['name']}", f"Version: {skill['version']}", f"Category: {skill.get('category', 'General')}",
+    lines = [f"## {skill['name']}", f"Priority: {int(skill.get('priority', 0))}", f"Version: {skill['version']}", f"Category: {skill.get('category', 'General')}",
              f"Operational: {skill.get('operational', False)}"]
     if skill.get("description"):
         lines.extend(["Purpose:", skill["description"]])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from control_center.agent_context import build_agent_context, build_effective_agent
@@ -155,6 +156,73 @@ class SkillRegistryTests(unittest.TestCase):
             task = store.create_task(agent["id"], "Validate", directory)
             store.update_skill("demo-skill", {"version": 9})
             self.assertEqual(store.get_task(task["id"])["skills"][0]["version"], 2)
+
+    def test_immutable_history_auto_versions_and_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            created = store.create_skill(skill_payload("history-skill", version=1))
+            self.assertEqual([item["version"] for item in store.skill_versions(created["id"])], [1])
+            updated = store.update_skill(created["id"], {"instructions": ["Changed"], "version": 999})
+            updated2 = store.update_skill(created["id"], {"description": "Changed again"})
+            noop = store.update_skill(created["id"], {"description": "Changed again"})
+            self.assertEqual((updated["version"], updated2["version"], noop["version"]), (2, 3, 3))
+            versions = store.skill_versions(created["id"])
+            self.assertEqual([item["version"] for item in versions], [1, 2, 3])
+            self.assertEqual(store.skill_version(created["id"], 1)["snapshot"]["instructions"], ["Use evidence"])
+            self.assertEqual(store.skill_version(created["id"], 2)["snapshot"]["instructions"], ["Changed"])
+            with store._connection() as connection:
+                events = [row[0] for row in connection.execute("SELECT event_type FROM skill_events WHERE skill_id=? ORDER BY id", (created["id"],))]
+            self.assertEqual(events, ["skill.created", "skill.updated", "skill.updated"])
+
+    def test_soft_delete_audit_listing_and_history(self):
+        class Runtime:
+            max_workers = 1
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            app = Application(store, Runtime(), Path(directory))
+            created = store.create_skill(skill_payload("archive-skill", version=1))
+            status, archived = app.dispatch("DELETE", f"/api/skills/{created['id']}", {}, {})
+            self.assertEqual(status, 200)
+            self.assertFalse(store.get_skill(created["id"])["enabled"])
+            self.assertIsNotNone(store.get_skill(created["id"])["deleted_at"])
+            self.assertNotIn(created["id"], {item["id"] for item in store.list_skills()})
+            self.assertIn(created["id"], {item["id"] for item in store.list_skills(include_deleted=True)})
+            self.assertEqual(store.skill_version(created["id"], 1)["version"], 1)
+            with self.assertRaises(ValueError):
+                store.create_agent(normalize_agent({"name": "A", "role": "Tester", "skills": [created["id"]]}))
+            with store._connection() as connection:
+                row = connection.execute("SELECT event_type,version,timestamp,payload_json FROM skill_events WHERE skill_id=? ORDER BY id DESC LIMIT 1", (created["id"],)).fetchone()
+                self.assertEqual(row["event_type"], "skill.archived")
+                self.assertTrue(row["timestamp"])
+                self.assertNotIn("instructions", row["payload_json"])
+
+    def test_priority_is_visible_and_task_precedes_skills(self):
+        high = normalize_skill(skill_payload("high-skill", name="High"))
+        low = normalize_skill(skill_payload("low-skill", name="Low"))
+        assigned = [{**low, "priority": 10}, {**high, "priority": 100}]
+        first = resolve_agent_skills({}, assigned, task="stable")
+        second = resolve_agent_skills({}, assigned, task="stable")
+        self.assertEqual([item["id"] for item in first], ["high-skill", "low-skill"])
+        self.assertEqual([item["id"] for item in first], [item["id"] for item in second])
+        effective = build_effective_agent({"name":"A","role":"Tester","skills":first,"tools":[],"config":{"capability_policy":{"capabilities":{}}}})
+        context = build_agent_context(effective, "Current task", "workspace")
+        self.assertIn("Priority: 100", context)
+        self.assertIn("Priority: 10", context)
+        self.assertLess(context.index("TASK BOUNDARIES"), context.index("SKILLS"))
+        self.assertIn("System Policy > Capability Policy > Current User Task > Agent Constraints > Agent Instructions > Skill Priority > Skill Instructions > Skill Procedures", context)
+
+    def test_legacy_database_migrates_skill_history_and_soft_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE skills(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,description TEXT NOT NULL DEFAULT '',instructions TEXT NOT NULL DEFAULT '',required_tools_json TEXT NOT NULL DEFAULT '[]',enabled INTEGER NOT NULL DEFAULT 1)")
+            connection.execute("INSERT INTO skills(id,name,description,instructions,required_tools_json,enabled) VALUES(?,?,?,?,?,?)", ("legacy-skill","Legacy","old","Inspect first","[]",1))
+            connection.commit(); connection.close()
+            store = Store(path)
+            legacy = store.get_skill("legacy-skill")
+            self.assertEqual(legacy["instructions"], ["Inspect first"])
+            self.assertIsNone(legacy["deleted_at"])
+            self.assertEqual(store.skill_version("legacy-skill", 1)["snapshot"]["name"], "Legacy")
 
 
 if __name__ == "__main__":
