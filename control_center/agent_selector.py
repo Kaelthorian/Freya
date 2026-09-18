@@ -30,7 +30,24 @@ IDLE_POINTS = 10
 APPROVAL_REQUIRED_PENALTY = 15
 ACTIVE_TASK_PENALTY = 5
 
-UNUSABLE_STATUSES = {"offline", "paused", "error", "disabled", "unavailable", "archived"}
+# ``enabled`` is the durable availability control. Agent ``status`` is an
+# operational/ephemeral signal: temporary states affect ranking and warnings,
+# but do not revoke eligibility or capability authorization.
+TRANSIENT_STATUS_ADJUSTMENTS = {
+    "running": 0,
+    "waiting": -2,
+    "paused": -8,
+    "offline": -10,
+    "error": -12,
+}
+TRANSIENT_STATUS_WARNINGS = {
+    "waiting": "Agent is temporarily waiting.",
+    "paused": "Agent is temporarily paused and may need to be resumed before submission.",
+    "offline": "Agent is temporarily offline and may need runtime activation.",
+    "error": "Agent currently reports an operational error state.",
+}
+
+ADMINISTRATIVE_UNUSABLE_STATUSES = {"disabled", "unavailable", "archived"}
 CLASSIFICATION_ORDER = {"eligible": 0, "conditional": 1, "ineligible": 2}
 STOP_WORDS = {
     "agent", "and", "con", "del", "for", "from", "las", "los", "para", "por",
@@ -101,6 +118,15 @@ class AgentSelector:
         task_copy = copy.deepcopy(task)
         agents_copy = copy.deepcopy(list(agents))
         context_copy = copy.deepcopy(context) if isinstance(context, dict) else {}
+        seen_agent_ids: set[str] = set()
+        for raw in agents_copy:
+            raw_id = raw.get("id") if isinstance(raw, dict) else None
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                continue
+            agent_id = raw_id.strip()
+            if agent_id in seen_agent_ids:
+                raise ValueError("Duplicate agent id: " + agent_id)
+            seen_agent_ids.add(agent_id)
         task_id = str(task_copy.get("id") or "").strip()
         required = task_copy.get("required_capabilities", [])
         preferred = task_copy.get("preferred_skills", [])
@@ -148,7 +174,9 @@ class AgentSelector:
         if not isinstance(raw, dict):
             return _ineligible(None, ["Agent does not exist or is not a valid record."])
         agent = raw
-        agent_id = agent.get("id") if isinstance(agent.get("id"), str) and agent.get("id") else None
+        raw_agent_id = agent.get("id")
+        agent_id = (raw_agent_id.strip() if isinstance(raw_agent_id, str)
+                    and raw_agent_id.strip() else None)
         workload = _workload(agent, context)
         hard_warnings: list[str] = []
         if agent_id is None:
@@ -158,7 +186,8 @@ class AgentSelector:
         if agent.get("archived") is True or agent.get("deleted_at"):
             hard_warnings.append("Agent is archived.")
         status = str(agent.get("status", agent.get("availability", "Offline"))).strip()
-        if status.casefold() in UNUSABLE_STATUSES:
+        status_key = status.casefold()
+        if status_key in ADMINISTRATIVE_UNUSABLE_STATUSES:
             hard_warnings.append(f"Agent status {status or 'Offline'} is not usable.")
         if agent.get("usable") is False:
             hard_warnings.append("Agent is explicitly marked as not usable.")
@@ -248,11 +277,13 @@ class AgentSelector:
                                len(relevant_skill_tokens) * TASK_SKILL_RELEVANCE_POINTS)
 
         classification = ("conditional" if capability_status["approval_required"] else "eligible")
+        status_adjustment = TRANSIENT_STATUS_ADJUSTMENTS.get(status_key, 0)
         score = (
             len(operational_matches) * OPERATIONAL_PREFERRED_SKILL_POINTS
             + len(non_operational_matches) * NON_OPERATIONAL_PREFERRED_SKILL_POINTS
             + role_points + relevance_points
             + (IDLE_POINTS if status.casefold() == "idle" and workload == 0 else 0)
+            + status_adjustment
             - len(capability_status["approval_required"]) * APPROVAL_REQUIRED_PENALTY
             - workload * ACTIVE_TASK_PENALTY
         )
@@ -280,10 +311,13 @@ class AgentSelector:
             reasons.append("Agent role and identity are relevant to the task.")
         if relevance_points:
             reasons.append("Operational Skill metadata is relevant to the task.")
-        if status.casefold() == "idle" and workload == 0:
+        if status_key == "idle" and workload == 0:
             reasons.append("Agent is idle.")
         elif workload:
             warnings.append(f"Agent has {workload} active task(s).")
+        status_warning = TRANSIENT_STATUS_WARNINGS.get(status_key)
+        if status_warning:
+            warnings.append(status_warning)
         return {
             "agent_id": agent_id,
             "eligible": classification == "eligible",

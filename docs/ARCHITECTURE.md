@@ -136,9 +136,18 @@ Candidates are classified before scoring:
 - `eligible`: every required capability evaluates to `allow`;
 - `conditional`: no capability is denied or missing runtime support, but at
   least one evaluates to `approval_required` because its policy mode is `ask`;
-- `ineligible`: disabled, archived, invalid, explicitly unusable, in an
-  `Offline`/`Paused`/`Error` status, workspace-incompatible, missing the concrete
-  tool runtime, or denied any required capability.
+- `ineligible`: `enabled=false`, archived/deleted, invalid, explicitly unusable,
+  administratively disabled/unavailable, workspace-incompatible, missing the
+  concrete tool runtime, or denied any required capability.
+
+`enabled` is the durable availability control. `status` is an ephemeral
+operational signal used primarily for ranking and diagnostics. Consequently,
+enabled agents in `Running`, `Waiting`, `Paused`, `Offline`, or `Error` remain
+potential candidates when their configuration and capability requirements are
+valid. `Waiting`, `Paused`, `Offline`, and `Error` receive explicit warnings and
+centralized score penalties; `Running` is primarily represented by workload.
+Selection eligibility does not bypass Runtime lifecycle rules: a selected
+paused agent must still be resumed before Runtime accepts a new task.
 
 Eligibility class is a hard gate: `eligible` always ranks before `conditional`,
 and `ineligible` candidates have a null score and can never be selected. If no
@@ -155,6 +164,10 @@ Selector version 1 centralizes this scoring formula:
  +3  per role/identity token match, plus +5 per shared domain topic (max +15)
  +2  per relevant operational Skill token (max +10)
 +10  when idle with zero active tasks
+ -2  when temporarily Waiting
+ -8  when temporarily Paused
+-10  when temporarily Offline
+-12  when reporting an operational Error
 -15  per required capability needing approval
  -5  per active task
 ```
@@ -164,6 +177,8 @@ substitutes for a required capability. Tie-breaking is deterministic: class,
 score descending, workload ascending, operational preferred-Skill matches
 descending, then `agent_id` ascending. The ranking includes reasons, warnings,
 capability buckets, workload and Skill-match details for every candidate.
+Candidate IDs must be unique; duplicate valid IDs reject the selection input
+before scoring because they make the ranking ambiguous.
 
 Until the Execution Graph stage is implemented, the production Orchestrator
 passes the first planned task to the selector and delegates only that task. It

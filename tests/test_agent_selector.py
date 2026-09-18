@@ -1,5 +1,6 @@
 import copy
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -168,28 +169,67 @@ class AgentSelectorTests(unittest.TestCase):
         self.assertLess(self.candidate(result, first["id"])["score"],
                         self.candidate(result, second["id"])["score"])
 
-    def test_disabled_and_unusable_status_are_ineligible(self):
-        disabled = self.agent("Disabled", modes={"filesystem__read": "allow"}, enabled=False)
-        paused = self.agent("Paused", modes={"filesystem__read": "allow"})
-        self.store.set_agent_state(paused["id"], "Paused")
-        result = self.selector.select_agent(planned_task(),
-                                            [disabled, self.store.get_agent(paused["id"])])
-        self.assertTrue(all(item["classification"] == "ineligible"
-                            for item in result["candidates"]))
+    def test_enabled_offline_agent_remains_eligible_with_warning(self):
+        agent = self.agent("Offline", modes={"filesystem__read": "allow"})
+        self.store.set_agent_state(agent["id"], "Offline")
+        result = self.selector.select_agent(planned_task(), [self.store.get_agent(agent["id"])])
+        candidate = self.candidate(result, agent["id"])
+        self.assertEqual(candidate["classification"], "eligible")
+        self.assertIn("temporarily offline", " ".join(candidate["warnings"]))
 
-    def test_missing_archived_and_invalid_agents_are_ineligible(self):
+    def test_enabled_paused_agent_remains_eligible_with_warning(self):
+        agent = self.agent("Paused", modes={"filesystem__read": "allow"})
+        self.store.set_agent_state(agent["id"], "Paused")
+        result = self.selector.select_agent(planned_task(), [self.store.get_agent(agent["id"])])
+        candidate = self.candidate(result, agent["id"])
+        self.assertEqual(candidate["classification"], "eligible")
+        self.assertIn("temporarily paused", " ".join(candidate["warnings"]))
+
+    def test_disabled_agent_remains_ineligible_even_with_idle_status(self):
+        disabled = self.agent("Disabled", modes={"filesystem__read": "allow"}, enabled=False)
+        disabled["status"] = "Idle"
+        result = self.selector.select_agent(planned_task(), [disabled])
+        self.assertEqual(self.candidate(result, disabled["id"])["classification"],
+                         "ineligible")
+
+    def test_archived_agent_remains_ineligible(self):
         archived = self.agent("Archived", modes={"filesystem__read": "allow"})
         archived["archived"] = True
+        result = self.selector.select_agent(planned_task(), [archived])
+        candidate = self.candidate(result, archived["id"])
+        self.assertEqual(candidate["classification"], "ineligible")
+        self.assertIn("archived", " ".join(candidate["warnings"]))
+
+    def test_missing_and_invalid_agents_are_ineligible(self):
         invalid = self.agent("Invalid", modes={"filesystem__read": "allow"})
         invalid["config"]["identity"] = []
-        result = self.selector.select_agent(planned_task(), [{"enabled": True}, archived, invalid])
+        result = self.selector.select_agent(planned_task(), [{"enabled": True}, invalid])
         self.assertTrue(all(item["classification"] == "ineligible"
                             for item in result["candidates"]))
         rendered = " ".join(warning for item in result["candidates"]
                             for warning in item["warnings"])
         self.assertIn("valid id", rendered)
-        self.assertIn("archived", rendered)
         self.assertIn("configuration is invalid", rendered)
+
+    def test_transient_status_affects_score_without_changing_eligibility(self):
+        agent = self.agent("Transient", modes={"filesystem__read": "allow"})
+        idle = copy.deepcopy(agent)
+        offline = copy.deepcopy(agent)
+        idle["status"], offline["status"] = "Idle", "Offline"
+        idle_result = self.selector.select_agent(planned_task(), [idle])
+        offline_result = self.selector.select_agent(planned_task(), [offline])
+        idle_candidate = self.candidate(idle_result, agent["id"])
+        offline_candidate = self.candidate(offline_result, agent["id"])
+        self.assertEqual(offline_candidate["classification"], "eligible")
+        self.assertLess(offline_candidate["score"], idle_candidate["score"])
+        self.assertTrue(offline_candidate["warnings"])
+
+    def test_duplicate_agent_ids_are_rejected_before_ranking(self):
+        agent = self.agent("Original", modes={"filesystem__read": "allow"})
+        duplicate = copy.deepcopy(agent)
+        duplicate["name"] = "Conflicting copy"
+        with self.assertRaisesRegex(ValueError, "Duplicate agent id: " + agent["id"]):
+            self.selector.select_agent(planned_task(), [agent, duplicate])
 
     def test_no_eligible_agent_returns_no_selection(self):
         agent = self.agent(modes={"filesystem__read": "deny"})
@@ -246,6 +286,50 @@ class AgentSelectorTests(unittest.TestCase):
         self.assertEqual(agent["skills"], before_agent["skills"])
 
 
+class AgentSelectionMigrationTests(unittest.TestCase):
+    def test_pre42_database_adds_selection_storage_without_data_loss(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            path = Path(directory) / "pre-4-2.sqlite3"
+            legacy_plan = single_task_plan(planned_task())
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE orchestration_runs (id TEXT PRIMARY KEY,prompt TEXT NOT NULL,"
+                "status TEXT NOT NULL DEFAULT 'Queued',response TEXT NOT NULL DEFAULT '',error TEXT,"
+                "config_json TEXT NOT NULL DEFAULT '{}',plan_json TEXT,plan_schema_version INTEGER,"
+                "plan_created_at TEXT,planning_metrics_json TEXT NOT NULL DEFAULT '{}',"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO orchestration_runs(id,prompt,status,config_json,plan_json,"
+                "plan_schema_version,plan_created_at,planning_metrics_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("legacy-4-1", "Fix auth", "Planned", "{}", json.dumps(legacy_plan), 1,
+                 "2026-09-17T00:00:00+00:00", "{}", "2026-09-17T00:00:00+00:00",
+                 "2026-09-17T00:00:00+00:00"),
+            )
+            connection.commit()
+            self.assertIsNone(connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='orchestration_selections'"
+            ).fetchone())
+            connection.close()
+
+            store = Store(path)
+            migrated_connection = sqlite3.connect(path)
+            try:
+                self.assertIsNotNone(migrated_connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='orchestration_selections'"
+                ).fetchone())
+            finally:
+                migrated_connection.close()
+            migrated = store.get_orchestration("legacy-4-1")
+            self.assertEqual(migrated["prompt"], "Fix auth")
+            self.assertEqual(migrated["plan"], legacy_plan)
+            self.assertEqual(migrated["plan_schema_version"], 1)
+            self.assertEqual(migrated["selections"], [])
+
+
 class AgentSelectionIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -284,6 +368,11 @@ class AgentSelectionIntegrationTests(unittest.TestCase):
         self.assertEqual(selection["snapshot"]["selected_agent_id"], agent["id"])
         reopened = Store(self.path).get_orchestration(run["id"])
         self.assertEqual(reopened["selections"][0]["snapshot"], selection["snapshot"])
+        before_edit = copy.deepcopy(selection["snapshot"])
+        updated = normalize_agent({"name": "Backend renamed"}, self.store.get_agent(agent["id"]))
+        self.store.update_agent(agent["id"], updated)
+        self.assertEqual(self.store.get_orchestration(run["id"])["selections"][0]["snapshot"],
+                         before_edit)
 
     def test_selection_events_are_emitted(self):
         agent, run = self.run_orchestration()
