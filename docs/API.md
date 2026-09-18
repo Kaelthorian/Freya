@@ -30,7 +30,8 @@ The trimmed prompt must contain 1–2000 characters; oversized input returns HTT
 400 before a run is created.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
-`planning_metrics`, delegations, and events needed to reconstruct it.
+`planning_metrics`, selection snapshots, delegations, and events needed to
+reconstruct it.
 `GET /api/orchestrations/{id}/plan` returns
 the plan and its version metadata directly. Existing agent and task routes
 remain compatible.
@@ -67,9 +68,43 @@ before a terminal state. Planning emits `freya.planning.started`, then either
 needs; they do not grant permission. `preferred_skills` are non-binding semantic
 hints and may name a Skill that is not currently installed.
 
+After planning, `freya.agent_selection.started` marks deterministic local
+ranking. `freya.agent_selected` records the planned task ID, selected agent ID,
+score, classification and selector version; `freya.agent_selection.failed`
+records that ranking could not produce an executable candidate. The
+orchestration response includes immutable `selections` entries. Each entry has
+`planned_task_id`, nullable `selected_agent_id`, `status` (`selected`,
+`approval_required`, or `no_eligible_agent`), nullable `score`,
+`selector_version`, `created_at`, and a `snapshot` with the complete candidate
+ranking.
+
+Within a snapshot, candidates have `classification`/`eligibility` of
+`eligible`, `conditional`, or `ineligible`, an explainable score, reasons,
+warnings, workload, preferred-Skill matches, and capability buckets:
+
+```json
+{
+  "allowed": ["filesystem.read"],
+  "approval_required": ["filesystem.modify"],
+  "denied": [],
+  "runtime_unavailable": []
+}
+```
+
+`allow` satisfies a requirement, `ask` makes the candidate conditional, and
+`deny` makes it ineligible. Eligibility is evaluated before score, so Skill,
+role, or workload relevance cannot override a denied capability. If no eligible
+candidate exists, a conditional candidate may be selected and will still enter
+the existing durable approval flow when it requests the protected action.
+
 The Freya view renders the plan summary, complexity, tasks, dependencies,
 required capabilities and current orchestration state with escaped text. It
 keeps recent terminal runs visible alongside active runs.
+
+Stage 4.2 temporarily selects and delegates only the first planned task. The API
+does not yet promise dependency-ready DAG execution, parallel plan scheduling,
+semantic-model ranking, replanning, automatic agent creation, or direct
+agent-to-agent communication.
 
 ## Agents and catalogue
 

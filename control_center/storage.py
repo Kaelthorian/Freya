@@ -349,6 +349,12 @@ class Store:
             result = dict(row); result["config"] = _load(result.pop("config_json")) or {}
             result["plan"] = _load(result.pop("plan_json"))
             result["planning_metrics"] = _load(result.pop("planning_metrics_json")) or {}
+            result["selections"] = [dict(x) for x in c.execute(
+                "SELECT * FROM orchestration_selections WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+            for selection in result["selections"]:
+                selection["snapshot"] = _load(selection.pop("snapshot_json")) or {}
             result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
             for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
             result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
@@ -570,6 +576,42 @@ class Store:
     def add_orchestration_event(self, oid, event):
         with self._connection(write=True) as c:
             c.execute("INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)", (oid,utcnow(),event.get("event_type","update"),event.get("status"),event.get("agent_id"),event.get("task_id"),event.get("message",event.get("reason","")),_dump(event)))
+
+    def save_agent_selection(self, oid: str, selection: dict[str, Any]) -> str | None:
+        """Persist an immutable selector snapshot while the orchestration is running."""
+        if not isinstance(selection, dict):
+            raise ValueError("Agent selection must be an object.")
+        planned_task_id = selection.get("task_id")
+        selected_agent_id = selection.get("selected_agent_id")
+        status = selection.get("status")
+        version = selection.get("selector_version")
+        score = selection.get("score")
+        if not isinstance(planned_task_id, str) or not planned_task_id.strip():
+            raise ValueError("Agent selection requires a planned task id.")
+        if selected_agent_id is not None and (not isinstance(selected_agent_id, str)
+                                               or not selected_agent_id.strip()):
+            raise ValueError("Selected agent id must be non-empty text or null.")
+        if status not in {"selected", "approval_required", "no_eligible_agent"}:
+            raise ValueError("Unknown agent selection status.")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("Selector version must be a positive integer.")
+        if score is not None and (isinstance(score, bool) or not isinstance(score, int)):
+            raise ValueError("Selection score must be an integer or null.")
+        selection_id, now = str(uuid4()), utcnow()
+        with self._connection(write=True) as c:
+            state = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if state is None:
+                raise KeyError(oid)
+            if state["status"] != "Running":
+                return None
+            c.execute(
+                "INSERT INTO orchestration_selections(id,orchestration_id,planned_task_id,"
+                "selected_agent_id,status,selector_version,score,snapshot_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (selection_id, oid, planned_task_id.strip(), selected_agent_id, status,
+                 version, score, _dump(selection), now),
+            )
+        return selection_id
 
     def add_delegation(self, oid, agent_id, objective, task_id=None):
         did=str(uuid4()); now=utcnow()

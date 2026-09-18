@@ -2,9 +2,10 @@
 
 Freya includes a first-class orchestration layer. User prompts enter
 `control_center/orchestrator.py`, which asks `control_center/planner.py` for a
-strict structured plan and persists that snapshot before selecting enabled
-existing agents, delegating bounded tasks through `Runtime`, and integrating
-persisted results. Workers remain the only components allowed to invoke tools;
+strict structured plan and persists that snapshot before asking
+`control_center/agent_selector.py` to rank compatible existing agents,
+delegating bounded tasks through `Runtime`, and integrating persisted results.
+Workers remain the only components allowed to invoke tools;
 each receives a generic policy plus its identity, instructions, skills,
 workspace, and limits. Orchestration runs, plans, delegations, and events are
 stored durably, and SQLite migrations preserve existing data.
@@ -19,16 +20,19 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-       Planner → Orchestrator → scheduler → spawned worker → local Ollama
-                         ↓
-                  capability resolver → policy engine → platform tools → selected workspace
+       Planner → planned task → Agent Selector → Orchestrator
+                                      ↓              ↓
+                              Capability Policy   scheduler → spawned worker → local Ollama
+                                                            ↓
+                                              capability resolver → policy engine → tools → workspace
 ```
 
-The Planner determines what work exists. The current selector chooses who will
-receive the compatible whole-request delegation. A future Agent Selector will
-use task requirements to choose agents, and a future Execution Graph will decide
-when each dependency-ready task runs. The Worker executes one delegated task.
-Capability Policy remains the sole authority for what that worker may do.
+The Planner determines **what** work exists. The Agent Selector determines
+**who** is the safest and most suitable existing candidate for one planned
+task. A future Execution Graph will determine **when** dependency-ready tasks
+run. The Worker determines **how** one selected task executes. Capability
+Policy remains the sole authority for **whether** each requested action is
+permitted.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -49,6 +53,11 @@ planning duration/token counters on `orchestration_runs`. Saving the snapshot
 and changing `Planning → Planned` is one SQLite transaction. The plan can be
 written once, so later edits to agents, Skills, capability definitions or
 planner code cannot alter the plan used by an existing run.
+Every Agent Selector decision, including `no_eligible_agent`, is stored in
+`orchestration_selections` with the planned task ID, selected agent when any,
+classification status, score, selector version, creation time and complete
+explainable ranking snapshot. Historical decisions therefore retain the exact
+scoring semantics and evidence used at selection time.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
@@ -60,6 +69,10 @@ Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
 The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
+Selection emits `freya.agent_selection.started`, followed by either
+`freya.agent_selected` or `freya.agent_selection.failed`. The selected event
+contains the planned task ID, agent ID, score, classification and selector
+version; the complete ranking stays in the selection snapshot.
 
 Orchestration transitions are conditional on the stored current state:
 
@@ -107,9 +120,55 @@ separate lifecycle lock and remains responsive while a planner call is pending.
 Preferred Skills remain unvalidated semantic hints so planning is not coupled
 to the mutable Skill registry. Required capabilities must exist in the platform
 registry, but remain declarations: the planner never edits agent configuration
-or policy. Advanced agent selection, DAG execution and replanning belong to
-later Stage 4 work. Stage 4.1 keeps the existing whole-request delegation after
-the plan is saved.
+or policy. DAG execution and replanning belong to later Stage 4 work.
+
+## Agent selection
+
+`AgentSelector.select_agent(task, agents, context=None)` is local,
+deterministic and model-free. It deep-copies its inputs, resolves each agent's
+effective structured configuration, evaluates every required capability through
+`PolicyEngine`, and resolves assigned Skills through `resolve_agent_skills`.
+It never changes an agent, assigns a Skill, approves a request, grants a
+capability, invokes a tool, or touches a workspace.
+
+Candidates are classified before scoring:
+
+- `eligible`: every required capability evaluates to `allow`;
+- `conditional`: no capability is denied or missing runtime support, but at
+  least one evaluates to `approval_required` because its policy mode is `ask`;
+- `ineligible`: disabled, archived, invalid, explicitly unusable, in an
+  `Offline`/`Paused`/`Error` status, workspace-incompatible, missing the concrete
+  tool runtime, or denied any required capability.
+
+Eligibility class is a hard gate: `eligible` always ranks before `conditional`,
+and `ineligible` candidates have a null score and can never be selected. If no
+eligible candidate exists, the best conditional candidate may be selected with
+`approval_required=true`. If neither class exists, selection returns
+`selected_agent_id=null` and `status=no_eligible_agent`; it never chooses the
+least-bad denied candidate.
+
+Selector version 1 centralizes this scoring formula:
+
+```text
++20  per operational preferred Skill
+ +4  per assigned but non-operational preferred Skill
+ +3  per role/identity token match, plus +5 per shared domain topic (max +15)
+ +2  per relevant operational Skill token (max +10)
++10  when idle with zero active tasks
+-15  per required capability needing approval
+ -5  per active task
+```
+
+Preferred Skill and identity relevance are ranking signals only. A Skill never
+substitutes for a required capability. Tie-breaking is deterministic: class,
+score descending, workload ascending, operational preferred-Skill matches
+descending, then `agent_id` ascending. The ranking includes reasons, warnings,
+capability buckets, workload and Skill-match details for every candidate.
+
+Until the Execution Graph stage is implemented, the production Orchestrator
+passes the first planned task to the selector and delegates only that task. It
+does not traverse dependencies, run planned tasks in parallel, replan, create
+agents, or enable direct agent-to-agent communication.
 
 The orchestration waits while delegated tasks are Queued, Running, Paused or
 WaitingForApproval. It snapshots each child's status, result and finish time.

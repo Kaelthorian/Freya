@@ -1,12 +1,12 @@
 """Freya orchestration service: structured planning, delegation and integration."""
 from __future__ import annotations
 
-import re
 import threading
 import time
 from typing import Callable
 
 from .agent_context import build_effective_agent, capability_summary
+from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .planner import MAX_GOAL_CHARS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
@@ -19,10 +19,12 @@ ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Pa
 class Orchestrator:
     def __init__(self, store, runtime, decide: Callable | None = None, config: dict | None = None,
                  planner: Planner | None = None, clock: Callable[[], float] | None = None,
-                 wait: Callable[[float], None] | None = None):
+                 wait: Callable[[float], None] | None = None,
+                 selector: AgentSelector | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
+        self.selector = selector or AgentSelector()
         self.clock = clock or time.monotonic
         self.wait = wait or time.sleep
         self.lock = threading.RLock()
@@ -123,22 +125,84 @@ class Orchestrator:
         candidates = self._agent_candidates(agents)
         if self.decide:
             return self.decide(prompt, candidates, results)
-        enabled = [agent for agent in candidates if agent.get("enabled") is True]
-        words = set(re.findall(r"[a-z0-9_+-]{3,}", str(prompt).casefold()))
+        task = (prompt if isinstance(prompt, dict) else {
+            "id": "compatibility-task", "objective": str(prompt), "description": str(prompt),
+            "required_capabilities": [], "preferred_skills": [],
+        })
+        selection = self.selector.select_agent(task, agents)
+        if selection["selected_agent_id"] is None:
+            return {"action": "respond", "message": "No eligible agent is available for this request.",
+                    "selection": selection}
+        return {"action": "delegate", "tasks": [{
+            "agent_id": selection["selected_agent_id"],
+            "objective": task["objective"], "selection": selection,
+        }]}
 
-        def score(candidate):
-            value = 0
-            for skill in candidate.get("skills", []):
-                haystack = " ".join([skill.get("name", ""), skill.get("category", ""),
-                                     *skill.get("tags", [])]).casefold()
-                value += sum(2 if word in haystack else 0 for word in words)
-                value += 1 if skill.get("operational") else 0
-            return value
+    def _selection_context(self, run: dict) -> dict:
+        workloads: dict[str, int] = {}
+        for task in self.store.list_tasks(limit=10000):
+            if task.get("status") in ACTIVE_DELEGATED_TASK_STATUSES:
+                agent_id = task.get("agent_id")
+                if isinstance(agent_id, str):
+                    workloads[agent_id] = workloads.get(agent_id, 0) + 1
+        return {
+            "workspace_path": run.get("config", {}).get("workspace_path") or "",
+            "workloads": workloads,
+        }
 
-        enabled.sort(key=lambda candidate: -score(candidate))
-        if not enabled:
-            return {"action": "respond", "message": "No enabled agent is available for this request."}
-        return {"action": "delegate", "tasks": [{"agent_id": enabled[0]["id"], "objective": prompt}]}
+    def _select_planned_task(self, oid: str, task: dict, run: dict) -> dict | None:
+        planned_task_id = task["id"]
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Running":
+                return None
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_selection.started", "status": "Running",
+                "task_id": planned_task_id,
+                "message": "Freya is ranking existing agents for the planned task.",
+            })
+        try:
+            selection = self.selector.select_agent(
+                task, self.store.list_agents(), self._selection_context(run),
+            )
+        except Exception as exc:
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] == "Running":
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.agent_selection.failed", "status": "Failed",
+                        "task_id": planned_task_id,
+                        "message": "Agent selection failed: " + str(exc),
+                    })
+            raise
+        with self.lock:
+            selection_id = self.store.save_agent_selection(oid, selection)
+            if selection_id is None:
+                return None
+            selected_agent_id = selection["selected_agent_id"]
+            if selected_agent_id is None:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.agent_selection.failed", "status": "Failed",
+                    "task_id": planned_task_id, "selector_version": selection["selector_version"],
+                    "message": "No eligible or conditional agent is available for the planned task.",
+                })
+                self._fail_running(
+                    oid, f"No eligible agent is available for planned task {planned_task_id}.",
+                )
+                return None
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_selected", "status": "Running",
+                "task_id": planned_task_id, "agent_id": selected_agent_id,
+                "score": selection["score"], "selector_version": selection["selector_version"],
+                "classification": selection["classification"],
+                "approval_required": selection["approval_required"],
+                "message": "Freya selected an existing agent for the planned task.",
+            })
+        return {
+            "agent_id": selected_agent_id,
+            "objective": task["objective"],
+            "planned_task_id": planned_task_id,
+            "selection_id": selection_id,
+            "selection": selection,
+        }
 
     def _fail_planning(self, oid: str, exc: Exception,
                        planning_metrics: dict | None = None) -> None:
@@ -242,7 +306,17 @@ class Orchestrator:
                 if self.clock() >= deadline:
                     self._timeout(oid)
                     return
-                decision = self._decision(running["prompt"], self.store.list_agents(), results)
+                if self.decide:
+                    decision = self._decision(running["prompt"], self.store.list_agents(), results)
+                else:
+                    # Stage 4.2 intentionally selects only the first planned task.
+                    # Execution-graph scheduling and dependency traversal belong to 4.3.
+                    selected_task = self._select_planned_task(
+                        oid, running["plan"]["tasks"][0], running,
+                    )
+                    if selected_task is None:
+                        return
+                    decision = {"action": "delegate", "tasks": [selected_task]}
                 action = decision.get("action") if isinstance(decision, dict) else None
                 if action == "respond":
                     with self.lock:
@@ -284,7 +358,9 @@ class Orchestrator:
                         delegated += 1
                         self.store.add_orchestration_event(oid, {
                             "event_type": "freya.delegated", "status": "Queued", "agent_id": agent_id,
-                            "task_id": task["id"], "message": "Delegated objective to agent.",
+                            "task_id": task["id"], "planned_task_id": item.get("planned_task_id"),
+                            "selection_id": item.get("selection_id"),
+                            "message": "Delegated objective to agent.",
                         })
                         results.append({"delegation_id": delegation_id, "task_id": task["id"],
                                         "agent_id": agent_id})

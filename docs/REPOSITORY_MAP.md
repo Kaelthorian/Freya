@@ -12,6 +12,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
+│   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── orchestrator.py       atomic lifecycle, cancellation, delegation and result integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
@@ -46,7 +47,8 @@ of this repository merely because an agent selects them.
    loopback Host checks before dispatching to `api.py`.
 2. `api.py` validates agents and browses local folders. Freya requests first go
    through the loopback Ollama adapter in `planner.py`; `orchestrator.py` stores
-   the validated plan snapshot atomically before delegation.
+   the validated plan snapshot atomically. `agent_selector.py` classifies and
+   ranks existing agents for the first planned task before delegation.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
@@ -70,6 +72,7 @@ of this repository merely because an agent selects them.
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
 | Structured plans, lifecycle or recovery | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
+| Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |
 | Secret handling | `security.py`, security/runtime/storage tests |
 | Web UI and orchestration status display | `frontend/app.js`, `core.js`, `views.js`, `dialogs.js`, `styles.css` |
