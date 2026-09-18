@@ -121,16 +121,16 @@ class ExecutionGraphTests(unittest.TestCase):
         graph.refresh_dependencies()
         self.assertEqual(graph.node("join")["state"], "ready")
 
-    def test_nonaccepted_evaluation_fails_and_blocks_descendants(self):
+    def test_nonaccepted_evaluation_waits_for_recovery_without_blocking_descendants(self):
         graph = ExecutionGraph(self.chain())
         graph.mark_selected("a", "agent", "selection")
         graph.mark_running("a", "runtime", "delegation")
         graph.apply_runtime_status("a", "Success", result="claim")
         graph.apply_evaluation("a", "evaluation", "rejected", "Evidence contradicts claim.")
         graph.refresh_dependencies()
-        self.assertEqual(graph.node("a")["state"], "failed")
+        self.assertEqual(graph.node("a")["state"], "recovery_pending")
         self.assertEqual(graph.node("a")["evaluation_status"], "rejected")
-        self.assertEqual(graph.node("b")["state"], "blocked")
+        self.assertEqual(graph.node("b")["state"], "pending")
 
     def test_evaluation_is_applied_only_once(self):
         graph = ExecutionGraph(execution_plan([planned_task("a")]))

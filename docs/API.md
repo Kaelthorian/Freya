@@ -30,8 +30,8 @@ The trimmed prompt must contain 1–2000 characters; oversized input returns HTT
 400 before a run is created.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
-`planning_metrics`, selection snapshots, delegations, evaluations, and events needed to
-reconstruct it.
+`planning_metrics`, selection snapshots, delegations, execution attempts,
+evaluations, recovery actions, plan revisions, and events needed to reconstruct it.
 `GET /api/orchestrations/{id}/plan` returns
 the plan and its version metadata directly. Existing agent and task routes
 remain compatible.
@@ -47,6 +47,20 @@ metrics and truncation/deterministic flags. It never returns evaluator prompts
 or the private input snapshot.
 
 `POST /api/orchestrations/{id}/cancel` is idempotent. It returns the unchanged
+`GET /api/orchestrations/{id}/attempts` returns each immutable real dispatch,
+including attempt number, selected agent/selection, Runtime/delegation IDs,
+prompt, evaluation/recovery references, state and timestamps.
+`GET /api/orchestrations/{id}/recoveries` returns strict versioned recovery
+decisions. `GET /api/orchestrations/{id}/plan-revisions` returns immutable
+cumulative effective-plan revisions. `GET /api/orchestrations/{id}/effective-plan`
+returns `{ "plan": ..., "revision": N }`; the original route always returns the
+immutable initial plan.
+
+Recovery events are `freya.recovery.started`, `freya.recovery.decided`,
+`freya.recovery.retry_scheduled`, `freya.recovery.replan_created`, and
+`freya.recovery.exhausted`. A cancellation or timeout prevents late recovery
+results from creating a decision, retry, revision, or delegation.
+
 terminal run when the orchestration has already completed; otherwise it stores
 `Cancelled`, prevents further delegation and cancels children in Queued,
 Running, Paused or WaitingForApproval.
@@ -115,14 +129,24 @@ The execution graph runs the complete validated DAG. Dependency-ready tasks use 
 plan-order fairness, selection is persisted once per task, independent branches
 may run in parallel within `max_parallel_tasks`, joins wait for all parents, and
 failure blocks descendants without stopping independent work. Node states are
-`pending`, `ready`, `running`, `waiting_for_approval`, `evaluating`, `blocked`, `success`,
-`failed`, `cancelled`, and `skipped`. The API does not promise semantic-model
-replanning, automatic recovery/reselection, automatic agent creation, or direct
-agent-to-agent communication. Runtime `Success` enters `evaluating`; only an
-`accepted` evaluation becomes node `success`. Evaluation `needs_revision`,
-`rejected`, and `blocked` currently end the node and orchestration as failed.
+`pending`, `ready`, `running`, `waiting_for_approval`, `evaluating`,
+`recovery_pending`, `blocked`, `success`, `failed`, `cancelled`, `skipped`, and
+`superseded`. Runtime `Success` enters `evaluating`; only an `accepted`
+evaluation becomes node `success`. Other semantic outcomes enter
+`recovery_pending` and receive exactly one bounded decision for that attempt.
+Retry decisions create a new selection, Runtime task, delegation, evaluation
+and attempt record. Same-agent retry revalidates the agent; different-agent
+retry hard-excludes prior agents. Replanning preserves the original plan and
+accepted tasks while committing a validated effective plan. Recovery does not
+create agents, auto-approve capabilities, bypass policy, or provide direct
+agent-to-agent messaging.
 The server exposes the bounds through `--max-parallel-tasks` (default 4) and
 `--max-delegated-tasks` (default 20); both accept 1–20.
+Recovery uses `--max-semantic-attempts` (default 3), `--max-plan-revisions`
+(default 2), `--max-recovery-actions` (default 8), and
+`--max-recovery-model-calls` (default 16) across advice and replanning, plus separate
+`--recovery-model`, `--recovery-endpoint`, `--recovery-timeout`, and
+`--recovery-offline` options.
 
 ## Agents and catalogue
 

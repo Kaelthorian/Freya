@@ -153,6 +153,8 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
     plan_schema_version INTEGER,
     plan_created_at TEXT,
     planning_metrics_json TEXT NOT NULL DEFAULT '{}',
+    effective_plan_json TEXT,
+    current_plan_revision INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -164,6 +166,7 @@ CREATE TABLE IF NOT EXISTS orchestration_selections (
     status TEXT NOT NULL,
     selector_version INTEGER NOT NULL,
     score INTEGER,
+    attempt INTEGER NOT NULL DEFAULT 1,
     snapshot_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -181,6 +184,9 @@ CREATE TABLE IF NOT EXISTS orchestration_task_nodes (
     delegation_id TEXT,
     evaluation_id TEXT,
     evaluation_status TEXT,
+    recovery_action_id TEXT,
+    attempt_prompt TEXT NOT NULL DEFAULT '',
+    plan_revision INTEGER NOT NULL DEFAULT 0,
     attempt INTEGER NOT NULL DEFAULT 0,
     waiting_reason TEXT NOT NULL DEFAULT '',
     result_json TEXT,
@@ -215,6 +221,69 @@ CREATE TABLE IF NOT EXISTS orchestration_evaluations (
 );
 CREATE INDEX IF NOT EXISTS idx_orch_evaluations
     ON orchestration_evaluations(orchestration_id,created_at,id);
+CREATE TABLE IF NOT EXISTS orchestration_execution_attempts (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL,
+    plan_task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    selected_agent_id TEXT NOT NULL REFERENCES agents(id),
+    selection_id TEXT NOT NULL REFERENCES orchestration_selections(id),
+    runtime_task_id TEXT NOT NULL REFERENCES tasks(id),
+    delegation_id TEXT NOT NULL,
+    evaluation_id TEXT,
+    recovery_action_id TEXT,
+    status TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    FOREIGN KEY (orchestration_id, plan_task_id)
+        REFERENCES orchestration_task_nodes(orchestration_id, plan_task_id),
+    UNIQUE (orchestration_id, plan_task_id, attempt),
+    UNIQUE (runtime_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_attempts
+    ON orchestration_execution_attempts(orchestration_id,plan_task_id,attempt);
+CREATE TABLE IF NOT EXISTS orchestration_recovery_actions (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL,
+    plan_task_id TEXT NOT NULL,
+    source_attempt INTEGER NOT NULL,
+    source_evaluation_id TEXT NOT NULL REFERENCES orchestration_evaluations(id),
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    instructions TEXT NOT NULL,
+    exclude_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+    affected_task_ids_json TEXT NOT NULL DEFAULT '[]',
+    fingerprint TEXT NOT NULL,
+    recovery_version INTEGER NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    snapshot_json TEXT NOT NULL DEFAULT '{}',
+    plan_revision INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (orchestration_id, plan_task_id)
+        REFERENCES orchestration_task_nodes(orchestration_id, plan_task_id),
+    UNIQUE (orchestration_id, plan_task_id, source_attempt),
+    UNIQUE (source_evaluation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_recoveries
+    ON orchestration_recovery_actions(orchestration_id,created_at,id);
+CREATE TABLE IF NOT EXISTS orchestration_plan_revisions (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    revision INTEGER NOT NULL,
+    source_recovery_action_id TEXT NOT NULL REFERENCES orchestration_recovery_actions(id),
+    source_plan_task_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    superseded_task_ids_json TEXT NOT NULL DEFAULT '[]',
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE (orchestration_id, revision),
+    UNIQUE (source_recovery_action_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_plan_revisions
+    ON orchestration_plan_revisions(orchestration_id,revision);
 CREATE TABLE IF NOT EXISTS orchestration_delegations (
     id TEXT PRIMARY KEY,
     orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),

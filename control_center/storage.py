@@ -86,6 +86,8 @@ class Store:
                 ("plan_schema_version", "INTEGER"),
                 ("plan_created_at", "TEXT"),
                 ("planning_metrics_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("effective_plan_json", "TEXT"),
+                ("current_plan_revision", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in orchestration_columns:
                     connection.execute(f"ALTER TABLE orchestration_runs ADD COLUMN {name} {definition}")
@@ -97,6 +99,18 @@ class Store:
                     connection.execute(
                         f"ALTER TABLE orchestration_task_nodes ADD COLUMN {name} {definition}"
                     )
+            for name, definition in (("recovery_action_id", "TEXT"),
+                                     ("attempt_prompt", "TEXT NOT NULL DEFAULT ''"),
+                                     ("plan_revision", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in node_columns:
+                    connection.execute(
+                        f"ALTER TABLE orchestration_task_nodes ADD COLUMN {name} {definition}"
+                    )
+            selection_columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(orchestration_selections)"
+            )}
+            if "attempt" not in selection_columns:
+                connection.execute("ALTER TABLE orchestration_selections ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
             skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)")}
             for name, definition in (
                 ("category", "TEXT NOT NULL DEFAULT 'General'"),
@@ -357,6 +371,7 @@ class Store:
             if row is None: raise KeyError(oid)
             result = dict(row); result["config"] = _load(result.pop("config_json")) or {}
             result["plan"] = _load(result.pop("plan_json"))
+            result["effective_plan"] = _load(result.pop("effective_plan_json")) or result["plan"]
             result["planning_metrics"] = _load(result.pop("planning_metrics_json")) or {}
             result["selections"] = [dict(x) for x in c.execute(
                 "SELECT * FROM orchestration_selections WHERE orchestration_id=? "
@@ -372,6 +387,18 @@ class Store:
             result["evaluations"] = [self._evaluation(x) for x in c.execute(
                 "SELECT * FROM orchestration_evaluations WHERE orchestration_id=? "
                 "ORDER BY created_at,id", (oid,),
+            )]
+            result["attempts"] = [dict(x) for x in c.execute(
+                "SELECT * FROM orchestration_execution_attempts WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+            result["recoveries"] = [self._recovery(x) for x in c.execute(
+                "SELECT * FROM orchestration_recovery_actions WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+            result["plan_revisions"] = [self._plan_revision(x) for x in c.execute(
+                "SELECT * FROM orchestration_plan_revisions WHERE orchestration_id=? "
+                "ORDER BY revision", (oid,),
             )]
             result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
             for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
@@ -577,10 +604,11 @@ class Store:
         now = utcnow()
         with self._connection(write=True) as c:
             cursor = c.execute(
-                "UPDATE orchestration_runs SET plan_json=?,plan_schema_version=?,plan_created_at=?,"
+                "UPDATE orchestration_runs SET plan_json=?,effective_plan_json=?,plan_schema_version=?,plan_created_at=?,"
                 "planning_metrics_json=?,status='Planned',updated_at=? "
                 "WHERE id=? AND status='Planning' AND plan_json IS NULL",
-                (_dump(normalized), schema_version, now, _dump(planning_metrics or {}), now, oid),
+                (_dump(normalized), _dump(normalized), schema_version, now,
+                 _dump(planning_metrics or {}), now, oid),
             )
             if cursor.rowcount != 1:
                 row = c.execute("SELECT status,plan_json FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
@@ -612,6 +640,58 @@ class Store:
         if include_snapshot:
             item["snapshot"] = snapshot
         return item
+
+    @staticmethod
+    def _recovery(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["exclude_agent_ids"] = _load(item.pop("exclude_agent_ids_json")) or []
+        item["affected_task_ids"] = _load(item.pop("affected_task_ids_json")) or []
+        item["metrics"] = _load(item.pop("metrics_json")) or {}
+        item["snapshot"] = _load(item.pop("snapshot_json")) or {}
+        return item
+
+    @staticmethod
+    def _plan_revision(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["plan"] = _load(item.pop("plan_json"))
+        item["superseded_task_ids"] = _load(item.pop("superseded_task_ids_json")) or []
+        item["metrics"] = _load(item.pop("metrics_json")) or {}
+        return item
+
+    def list_execution_attempts(self, oid: str) -> list[dict[str, Any]]:
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            return [dict(row) for row in c.execute(
+                "SELECT * FROM orchestration_execution_attempts WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+
+    def list_recoveries(self, oid: str) -> list[dict[str, Any]]:
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            return [self._recovery(row) for row in c.execute(
+                "SELECT * FROM orchestration_recovery_actions WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+
+    def get_recovery(self, recovery_id: str) -> dict[str, Any]:
+        with self._connection() as c:
+            row = c.execute("SELECT * FROM orchestration_recovery_actions WHERE id=?",
+                            (recovery_id,)).fetchone()
+            if row is None:
+                raise KeyError(recovery_id)
+            return self._recovery(row)
+
+    def list_plan_revisions(self, oid: str) -> list[dict[str, Any]]:
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            return [self._plan_revision(row) for row in c.execute(
+                "SELECT * FROM orchestration_plan_revisions WHERE orchestration_id=? "
+                "ORDER BY revision", (oid,),
+            )]
 
     def list_evaluations(self, oid: str) -> list[dict[str, Any]]:
         with self._connection() as c:
@@ -661,9 +741,10 @@ class Store:
                     raise ValueError(f"Invalid initial execution node for {task['id']}.")
                 c.execute(
                     "INSERT INTO orchestration_task_nodes("
-                    "orchestration_id,plan_task_id,plan_order,depends_on_json,state,updated_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (oid, task["id"], index, _dump(task["depends_on"]), expected_state, now),
+                    "orchestration_id,plan_task_id,plan_order,depends_on_json,state,"
+                    "attempt_prompt,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (oid, task["id"], index, _dump(task["depends_on"]), expected_state,
+                     sanitize(task["objective"]), now),
                 )
         return self.get_execution_graph(oid)
 
@@ -686,7 +767,7 @@ class Store:
             raise ValueError("Execution graph contains duplicate or invalid task ids.")
         with self._connection(write=True) as c:
             rows = c.execute(
-                "SELECT plan_task_id,state,evaluation_id,evaluation_status FROM orchestration_task_nodes "
+                "SELECT plan_task_id,state,evaluation_id,evaluation_status,recovery_action_id FROM orchestration_task_nodes "
                 "WHERE orchestration_id=? ORDER BY plan_order", (oid,),
             ).fetchall()
             if not rows or {row["plan_task_id"] for row in rows} != set(by_id):
@@ -703,15 +784,23 @@ class Store:
                     raise ValueError(
                         "Evaluation references can only change through atomic evaluation commit."
                     )
+                if node.get("recovery_action_id") != row["recovery_action_id"]:
+                    raise ValueError(
+                        "Recovery references can only change through atomic recovery commit."
+                    )
                 c.execute(
                     "UPDATE orchestration_task_nodes SET state=?,selected_agent_id=?,selection_id=?,"
                     "runtime_task_id=?,delegation_id=?,evaluation_id=?,evaluation_status=?,attempt=?,"
-                    "waiting_reason=?,result_json=?,error=?,"
+                    "recovery_action_id=?,attempt_prompt=?,plan_revision=?,waiting_reason=?,"
+                    "result_json=?,error=?,"
                     "started_at=?,finished_at=?,updated_at=? WHERE orchestration_id=? AND plan_task_id=?",
                     (state, node.get("selected_agent_id"), node.get("selection_id"),
                      node.get("runtime_task_id"), node.get("delegation_id"),
                      node.get("evaluation_id"), node.get("evaluation_status"),
-                     int(node.get("attempt", 0)), sanitize(node.get("waiting_reason") or ""),
+                     int(node.get("attempt", 0)), node.get("recovery_action_id"),
+                     sanitize(node.get("attempt_prompt") or ""),
+                     int(node.get("plan_revision", 0)),
+                     sanitize(node.get("waiting_reason") or ""),
                      _dump(node.get("result")) if node.get("result") is not None else None,
                      sanitize(node.get("error")) if node.get("error") is not None else None,
                      node.get("started_at"), node.get("finished_at"), now,
@@ -728,8 +817,8 @@ class Store:
         status = evaluation.get("status")
         if status not in {"accepted", "needs_revision", "rejected", "blocked", "error"}:
             raise ValueError("Unknown persisted evaluation status.")
-        target = "success" if status == "accepted" else "failed"
-        error = None if target == "success" else {
+        target = "success" if status == "accepted" else "recovery_pending"
+        error = None if status == "accepted" else {
             "needs_revision": "Semantic evaluation requires revision.",
             "rejected": "Semantic evaluation rejected the task result.",
             "blocked": "Semantic evaluation could not determine task success.",
@@ -770,15 +859,248 @@ class Store:
             )
             cursor = c.execute(
                 "UPDATE orchestration_task_nodes SET state=?,evaluation_id=?,evaluation_status=?,"
+                "recovery_action_id=NULL,"
                 "waiting_reason='',error=?,finished_at=?,updated_at=? "
                 "WHERE orchestration_id=? AND plan_task_id=? AND state='evaluating' "
                 "AND evaluation_id IS NULL",
                 (target, evaluation_id, status, sanitize(error) if error else None,
-                 now, now, oid, plan_task_id),
+                 now if target == "success" else None, now, oid, plan_task_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Evaluation node transition lost its atomic precondition.")
+            c.execute(
+                "UPDATE orchestration_execution_attempts SET evaluation_id=?,status=?,"
+                "finished_at=? WHERE orchestration_id=? AND plan_task_id=? AND attempt=? "
+                "AND runtime_task_id=?",
+                (evaluation_id, target, now if target == "success" else None,
+                 oid, plan_task_id, int(attempt), runtime_task_id),
+            )
         return self.get_evaluation(evaluation_id)
+
+    def record_execution_attempt(self, oid: str, plan_task_id: str, *,
+                                 selected_agent_id: str, selection_id: str,
+                                 runtime_task_id: str, delegation_id: str,
+                                 attempt: int, prompt: str,
+                                 recovery_action_id: str | None = None) -> dict[str, Any] | None:
+        """Persist one immutable dispatch snapshot after its graph transition."""
+        attempt_id, now = str(uuid4()), utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            node = c.execute(
+                "SELECT state,selected_agent_id,selection_id,runtime_task_id,delegation_id,attempt "
+                "FROM orchestration_task_nodes WHERE orchestration_id=? AND plan_task_id=?",
+                (oid, plan_task_id),
+            ).fetchone()
+            if (run["status"] != "Running" or node is None or node["state"] != "running"
+                    or node["selected_agent_id"] != selected_agent_id
+                    or node["selection_id"] != selection_id
+                    or node["runtime_task_id"] != runtime_task_id
+                    or node["delegation_id"] != delegation_id
+                    or int(node["attempt"]) != int(attempt)):
+                return None
+            existing = c.execute(
+                "SELECT * FROM orchestration_execution_attempts WHERE orchestration_id=? "
+                "AND plan_task_id=? AND attempt=?", (oid, plan_task_id, int(attempt)),
+            ).fetchone()
+            if existing is not None:
+                if existing["runtime_task_id"] == runtime_task_id:
+                    return dict(existing)
+                raise ValueError("A different execution already exists for this semantic attempt.")
+            c.execute(
+                "INSERT INTO orchestration_execution_attempts("
+                "id,orchestration_id,plan_task_id,attempt,selected_agent_id,selection_id,"
+                "runtime_task_id,delegation_id,recovery_action_id,status,prompt,created_at,started_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (attempt_id, oid, plan_task_id, int(attempt), selected_agent_id, selection_id,
+                 runtime_task_id, delegation_id, recovery_action_id, "running",
+                 sanitize(prompt), now, now),
+            )
+        return next(item for item in self.list_execution_attempts(oid) if item["id"] == attempt_id)
+
+    def update_execution_attempt(self, oid: str, plan_task_id: str, attempt: int, *,
+                                 status: str, finished_at: str | None = None) -> None:
+        if finished_at is None and status in {
+                "success", "failed", "blocked", "cancelled", "skipped", "superseded", "recovered"}:
+            finished_at = utcnow()
+        with self._connection(write=True) as c:
+            c.execute(
+                "UPDATE orchestration_execution_attempts SET status=?,finished_at=? "
+                "WHERE orchestration_id=? AND plan_task_id=? AND attempt=?",
+                (sanitize(status), finished_at, oid, plan_task_id, int(attempt)),
+            )
+
+    def commit_recovery_action(self, recovery_id: str, oid: str, plan_task_id: str, *,
+                               source_attempt: int, source_evaluation_id: str,
+                               decision: dict[str, Any], recovery_version: int,
+                               prompt: str = "", snapshot: dict[str, Any] | None = None
+                               ) -> dict[str, Any] | None:
+        """Persist one decision and atomically fail, retry, or reserve replanning."""
+        action = decision.get("action")
+        if action not in {"retry_same_agent", "retry_different_agent", "replan_subgraph", "fail"}:
+            raise ValueError("Unknown recovery action.")
+        now = utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            node = c.execute(
+                "SELECT state,attempt,evaluation_id,error FROM orchestration_task_nodes "
+                "WHERE orchestration_id=? AND plan_task_id=?", (oid, plan_task_id),
+            ).fetchone()
+            if (run["status"] != "Running" or node is None
+                    or node["state"] != "recovery_pending"
+                    or int(node["attempt"]) != int(source_attempt)
+                    or node["evaluation_id"] != source_evaluation_id):
+                return None
+            c.execute(
+                "INSERT INTO orchestration_recovery_actions("
+                "id,orchestration_id,plan_task_id,source_attempt,source_evaluation_id,action,"
+                "reason,instructions,exclude_agent_ids_json,affected_task_ids_json,fingerprint,"
+                "recovery_version,metrics_json,snapshot_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (recovery_id, oid, plan_task_id, int(source_attempt), source_evaluation_id,
+                 action, sanitize(decision.get("reason") or ""),
+                 sanitize(decision.get("instructions") or ""),
+                 _dump(decision.get("exclude_agent_ids") or []),
+                 _dump(decision.get("affected_task_ids") or []),
+                 sanitize(decision.get("fingerprint") or ""), int(recovery_version),
+                 _dump(decision.get("metrics") or {}), _dump(snapshot or {}), now),
+            )
+            c.execute(
+                "UPDATE orchestration_execution_attempts SET recovery_action_id=?,status='recovered',"
+                "finished_at=? WHERE orchestration_id=? AND plan_task_id=? AND attempt=?",
+                (recovery_id, now, oid, plan_task_id, int(source_attempt)),
+            )
+            if action == "fail":
+                cursor = c.execute(
+                    "UPDATE orchestration_task_nodes SET state='failed',recovery_action_id=?,"
+                    "error=?,waiting_reason='',finished_at=?,updated_at=? WHERE orchestration_id=? "
+                    "AND plan_task_id=? AND state='recovery_pending' AND evaluation_id=?",
+                    (recovery_id, sanitize(" ".join(item for item in (
+                        node["error"] or "", decision.get("reason") or "Recovery exhausted."
+                    ) if item)),
+                     now, now, oid, plan_task_id, source_evaluation_id),
+                )
+            elif action in {"retry_same_agent", "retry_different_agent"}:
+                cursor = c.execute(
+                    "UPDATE orchestration_task_nodes SET state='ready',selected_agent_id=NULL,"
+                    "selection_id=NULL,runtime_task_id=NULL,delegation_id=NULL,evaluation_id=NULL,"
+                    "evaluation_status=NULL,recovery_action_id=?,attempt_prompt=?,waiting_reason='',"
+                    "result_json=NULL,error=NULL,started_at=NULL,finished_at=NULL,updated_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND state='recovery_pending' "
+                    "AND evaluation_id=?",
+                    (recovery_id, sanitize(prompt), now, oid, plan_task_id, source_evaluation_id),
+                )
+            else:
+                cursor = c.execute(
+                    "UPDATE orchestration_task_nodes SET recovery_action_id=?,updated_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND state='recovery_pending' "
+                    "AND evaluation_id=?",
+                    (recovery_id, now, oid, plan_task_id, source_evaluation_id),
+                )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Recovery node transition lost its atomic precondition.")
+        return self.get_recovery(recovery_id)
+
+    def fail_recovery_action(self, recovery_id: str, reason: str) -> bool:
+        now = utcnow()
+        with self._connection(write=True) as c:
+            recovery = c.execute(
+                "SELECT orchestration_id,plan_task_id FROM orchestration_recovery_actions WHERE id=?",
+                (recovery_id,),
+            ).fetchone()
+            if recovery is None:
+                raise KeyError(recovery_id)
+            cursor = c.execute(
+                "UPDATE orchestration_task_nodes SET state='failed',error=?,finished_at=?,updated_at=? "
+                "WHERE orchestration_id=? AND plan_task_id=? AND state='recovery_pending' "
+                "AND recovery_action_id=?",
+                (sanitize(reason), now, now, recovery["orchestration_id"],
+                 recovery["plan_task_id"], recovery_id),
+            )
+            return cursor.rowcount == 1
+
+    def commit_plan_revision(self, revision_id: str, oid: str, recovery_id: str, *,
+                             summary: str, plan: dict[str, Any],
+                             superseded_task_ids: list[str], metrics: dict[str, Any] | None = None
+                             ) -> dict[str, Any] | None:
+        """Persist a validated cumulative effective plan and update its durable graph."""
+        normalized = validate_plan(plan)
+        superseded = list(dict.fromkeys(superseded_task_ids))
+        now = utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute(
+                "SELECT status,effective_plan_json,current_plan_revision FROM orchestration_runs "
+                "WHERE id=?", (oid,),
+            ).fetchone()
+            recovery = c.execute(
+                "SELECT plan_task_id,action FROM orchestration_recovery_actions WHERE id=? "
+                "AND orchestration_id=?", (recovery_id, oid),
+            ).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            if run["status"] != "Running" or recovery is None or recovery["action"] != "replan_subgraph":
+                return None
+            current_nodes = {row["plan_task_id"]: dict(row) for row in c.execute(
+                "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=?", (oid,),
+            )}
+            tasks = {item["id"]: item for item in normalized["tasks"]}
+            if set(current_nodes) - set(tasks):
+                raise ValueError("Effective plan revision cannot delete historical task snapshots.")
+            if any(current_nodes[item]["state"] == "success" for item in superseded
+                   if item in current_nodes):
+                raise ValueError("Accepted tasks cannot be superseded.")
+            revision = int(run["current_plan_revision"] or 0) + 1
+            c.execute(
+                "INSERT INTO orchestration_plan_revisions("
+                "id,orchestration_id,revision,source_recovery_action_id,source_plan_task_id,"
+                "summary,plan_json,superseded_task_ids_json,metrics_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (revision_id, oid, revision, recovery_id, recovery["plan_task_id"],
+                 sanitize(summary), _dump(normalized), _dump(superseded),
+                 _dump(metrics or {}), now),
+            )
+            states = {task_id: row["state"] for task_id, row in current_nodes.items()}
+            for index, task in enumerate(normalized["tasks"]):
+                task_id = task["id"]
+                if task_id in current_nodes:
+                    if task_id in superseded:
+                        state = "superseded"
+                    else:
+                        state = current_nodes[task_id]["state"]
+                        if state in {"pending", "ready"}:
+                            state = ("ready" if all(states.get(dep) == "success"
+                                                    for dep in task["depends_on"]) else "pending")
+                    c.execute(
+                        "UPDATE orchestration_task_nodes SET plan_order=?,depends_on_json=?,state=?,"
+                        "plan_revision=?,finished_at=CASE WHEN ?='superseded' THEN ? ELSE finished_at END,"
+                        "updated_at=? WHERE orchestration_id=? AND plan_task_id=?",
+                        (index, _dump(task["depends_on"]), state, revision, state, now, now,
+                         oid, task_id),
+                    )
+                    states[task_id] = state
+                else:
+                    state = ("ready" if all(states.get(dep) == "success"
+                                            for dep in task["depends_on"]) else "pending")
+                    c.execute(
+                        "INSERT INTO orchestration_task_nodes("
+                        "orchestration_id,plan_task_id,plan_order,depends_on_json,state,"
+                        "attempt_prompt,plan_revision,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (oid, task_id, index, _dump(task["depends_on"]), state,
+                         sanitize(task["objective"]), revision, now),
+                    )
+                    states[task_id] = state
+            c.execute(
+                "UPDATE orchestration_runs SET effective_plan_json=?,current_plan_revision=?,"
+                "updated_at=? WHERE id=? AND status='Running'",
+                (_dump(normalized), revision, now, oid),
+            )
+            c.execute("UPDATE orchestration_recovery_actions SET plan_revision=? WHERE id=?",
+                      (revision, recovery_id))
+        return next(item for item in self.list_plan_revisions(oid) if item["id"] == revision_id)
+
 
     def add_orchestration_event(self, oid, event):
         with self._connection(write=True) as c:
@@ -790,6 +1112,7 @@ class Store:
             raise ValueError("Agent selection must be an object.")
         planned_task_id = selection.get("task_id")
         selected_agent_id = selection.get("selected_agent_id")
+        attempt = selection.get("attempt", 1)
         status = selection.get("status")
         version = selection.get("selector_version")
         score = selection.get("score")
@@ -804,6 +1127,8 @@ class Store:
             raise ValueError("Selector version must be a positive integer.")
         if score is not None and (isinstance(score, bool) or not isinstance(score, int)):
             raise ValueError("Selection score must be an integer or null.")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("Selection attempt must be a positive integer.")
         selection_id, now = str(uuid4()), utcnow()
         with self._connection(write=True) as c:
             state = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
@@ -813,10 +1138,10 @@ class Store:
                 return None
             c.execute(
                 "INSERT INTO orchestration_selections(id,orchestration_id,planned_task_id,"
-                "selected_agent_id,status,selector_version,score,snapshot_json,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "selected_agent_id,status,selector_version,score,attempt,snapshot_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (selection_id, oid, planned_task_id.strip(), selected_agent_id, status,
-                 version, score, _dump(selection), now),
+                 version, score, attempt, _dump(selection), now),
             )
         return selection_id
 
@@ -866,8 +1191,14 @@ class Store:
                     "THEN 'cancelled' ELSE 'skipped' END,"
                     "waiting_reason='',error=?,finished_at=?,updated_at=? "
                     "WHERE orchestration_id=? AND state NOT IN "
-                    "('success','failed','blocked','cancelled','skipped')",
+                    "('success','failed','blocked','cancelled','skipped','superseded')",
                     (message, now, now, row["id"]),
+                )
+                c.execute(
+                    "UPDATE orchestration_execution_attempts SET status='cancelled',finished_at=? "
+                    "WHERE orchestration_id=? AND status IN "
+                    "('running','waiting_for_approval','evaluating','recovery_pending','ready','pending')",
+                    (now, row["id"]),
                 )
                 event = {"event_type": "freya.interrupted", "status": "Failed", "message": message}
                 c.execute(

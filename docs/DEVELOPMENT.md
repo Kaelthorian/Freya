@@ -54,6 +54,27 @@ to be requested, attempted and passed. Runtime result text and agent claims are
 not objective evidence. Missing evidence returns `blocked`, including through
 the Orchestrator's default compatibility fallback.
 
+Semantic recovery has its own local, tool-free model and hard budgets:
+
+```powershell
+python -m control_center --recovery-model qwen2.5-coder:7b `
+  --recovery-endpoint http://127.0.0.1:11434 --recovery-timeout 120 `
+  --max-semantic-attempts 3 --max-plan-revisions 2 --max-recovery-actions 8 `
+  --max-recovery-model-calls 16
+```
+
+The recovery endpoint remains loopback-only. Invalid JSON gets at most one repair
+without exceeding the total model-call budget. The orchestration wall-clock deadline
+is rechecked after each recovery or replanning call before more work starts.
+Use `--recovery-offline` to make no recovery-model call and fail conservatively.
+Retries always create a new persisted attempt and rerun Agent Selector and
+capability-policy checks. Replanning stores an effective-plan revision without
+overwriting the original plan or rerunning accepted tasks.
+
+Operational history is available at `/api/orchestrations/{id}/attempts`,
+`/recoveries`, `/plan-revisions`, and `/effective-plan`. Recovery is not resumed
+after a server restart; unfinished recovery state is closed with the run.
+
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
@@ -105,6 +126,7 @@ python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
 node --check frontend\components.js
+python -m unittest discover -s tests -p "test_recovery.py" -v
 node --check frontend\views.js
 node --check frontend\dialogs.js
 node --check frontend\icons.js
@@ -131,6 +153,12 @@ restart recovery.
 
 ## Debugging
 
+Recovery tests cover strict schema/one repair, offline fallback, budgets,
+failure fingerprints, same- and different-agent retries, immutable attempts,
+API exposure, plan revision constraints, cancellation races and restart cleanup.
+They do not prove behavior of an installed Ollama model; that still requires a
+local end-to-end run.
+
 - An agent remains `Waiting` when worker slots are occupied, the agent already
   has an active task, or another task owns the same workspace.
 - Pause applies after the current call and its deadline still advances.
@@ -148,6 +176,11 @@ restart recovery.
   later actions are regenerated after the actual tool result.
 - `run_command` is allowlisted and uses argv without a shell. Permission
   `execute` still runs code with the local Windows user's privileges.
+- A non-accepted evaluation briefly enters `recovery_pending`. Inspect the
+  recovery action and attempt history before treating it as terminal. Offline
+  mode records a conservative `fail`; online mode may schedule a bounded retry
+  or validated revision. Repeated equivalent failures and exhausted budgets
+  produce `freya.recovery.exhausted`.
 
 See [API.md](API.md) for routes and [ARCHITECTURE.md](ARCHITECTURE.md) for trust
 and process boundaries.

@@ -149,6 +149,15 @@ class Application:
             return self.store.list_evaluations(parts[1])
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "events":
             return self.store.get_orchestration(parts[1])["events"]
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "attempts":
+            return self.store.list_execution_attempts(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "recoveries":
+            return self.store.list_recoveries(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "plan-revisions":
+            return self.store.list_plan_revisions(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "effective-plan":
+            run = self.store.get_orchestration(parts[1])
+            return {"plan": run["effective_plan"], "revision": run["current_plan_revision"]}
         raise ApiError(404, "Route not found.")
 
     @staticmethod

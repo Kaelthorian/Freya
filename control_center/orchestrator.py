@@ -10,6 +10,8 @@ from .agent_context import build_effective_agent, capability_summary
 from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
+from .recovery import (RECOVERY_VERSION, RecoveryController, Replanner,
+                       build_retry_prompt, semantic_failure_fingerprint)
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_GOAL_CHARS, MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
@@ -24,7 +26,9 @@ class Orchestrator:
                  planner: Planner | None = None, clock: Callable[[], float] | None = None,
                  wait: Callable[[float], None] | None = None,
                  selector: AgentSelector | None = None,
-                 evaluator: Evaluator | None = None):
+                 evaluator: Evaluator | None = None,
+                 recovery: RecoveryController | None = None,
+                 replanner: Replanner | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
@@ -34,14 +38,22 @@ class Orchestrator:
         self.evaluator = evaluator or Evaluator(offline=True)
         self.clock = clock or time.monotonic
         self.wait = wait or time.sleep
+        self.recovery = recovery or RecoveryController(offline=True)
+        self.replanner = replanner or Replanner()
         self.lock = threading.RLock()
         self.planner_lock = threading.Lock()
         self.evaluator_lock = threading.Lock()
         self.config = {"max_rounds": 6, "max_delegated_tasks": MAX_PLAN_TASKS,
                        "max_parallel_tasks": 4, "max_model_calls": 12,
-                       "max_wallclock_seconds": 900}
+                       "max_wallclock_seconds": 900,
+                       "max_semantic_attempts_per_task": 3,
+                       "max_plan_revisions": 2, "max_recovery_actions": 8,
+                       "max_recovery_model_calls": 16}
+        self.recovery_lock = threading.Lock()
         self.config.update(config or {})
-        for field in ("max_delegated_tasks", "max_parallel_tasks"):
+        for field in ("max_delegated_tasks", "max_parallel_tasks", "max_semantic_attempts_per_task",
+                      "max_plan_revisions", "max_recovery_actions",
+                      "max_recovery_model_calls"):
             value = self.config[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{field} must be a positive integer.")
@@ -95,9 +107,10 @@ class Orchestrator:
             if cancelled.get("plan"):
                 persisted = self.store.get_execution_graph(oid)
                 if persisted["nodes"]:
-                    graph = ExecutionGraph(cancelled["plan"], persisted["nodes"])
+                    graph = ExecutionGraph(cancelled.get("effective_plan") or cancelled["plan"], persisted["nodes"])
                     graph.cancel_nonterminal(utcnow(), "Cancelled by user.")
                     self.store.save_execution_graph(oid, graph.serialize())
+                    self._close_terminal_attempts(oid, graph)
                     self.store.add_orchestration_event(oid, {
                         "event_type": "freya.graph.completed", "status": "Cancelled",
                         "message": "The execution graph was cancelled by the user.",
@@ -291,6 +304,17 @@ class Orchestrator:
             except (KeyError, ValueError):
                 continue
 
+    def _close_terminal_attempts(self, oid: str, graph: ExecutionGraph) -> None:
+        """Keep the append-only attempt ledger consistent with terminal graph state."""
+        terminal = {"success", "failed", "blocked", "cancelled", "skipped", "superseded"}
+        for node in graph.serialize():
+            attempt = int(node.get("attempt", 0))
+            if attempt > 0 and node.get("state") in terminal:
+                self.store.update_execution_attempt(
+                    oid, node["plan_task_id"], attempt, status=node["state"],
+                    finished_at=node.get("finished_at") or utcnow(),
+                )
+
     def _timeout(self, oid: str) -> None:
         with self.lock:
             run = self.store.get_orchestration(oid)
@@ -299,11 +323,12 @@ class Orchestrator:
             self._cancel_active_children(oid)
             persisted = self.store.get_execution_graph(oid)
             if run.get("plan") and persisted["nodes"]:
-                graph = ExecutionGraph(run["plan"], persisted["nodes"])
+                graph = ExecutionGraph(run.get("effective_plan") or run["plan"], persisted["nodes"])
                 graph.cancel_nonterminal(
                     utcnow(), "Orchestration time limit reached.",
                 )
                 self.store.save_execution_graph(oid, graph.serialize())
+                self._close_terminal_attempts(oid, graph)
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.graph.completed", "status": "Failed",
                     "message": "The execution graph reached its time limit.",
@@ -320,9 +345,10 @@ class Orchestrator:
             self._cancel_active_children(oid)
             persisted = self.store.get_execution_graph(oid)
             if run.get("plan") and persisted["nodes"]:
-                graph = ExecutionGraph(run["plan"], persisted["nodes"])
+                graph = ExecutionGraph(run.get("effective_plan") or run["plan"], persisted["nodes"])
                 graph.cancel_nonterminal(utcnow(), message)
                 self.store.save_execution_graph(oid, graph.serialize())
+                self._close_terminal_attempts(oid, graph)
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.graph.completed", "status": "Failed",
                     "message": "The execution graph stopped after an internal scheduler error.",
@@ -334,17 +360,49 @@ class Orchestrator:
         """Select once for a ready node; cancellation may safely win while ranking."""
         planned_task_id = task["id"]
         with self.lock:
-            if self.store.get_orchestration(oid)["status"] != "Running":
+            current_run = self.store.get_orchestration(oid)
+            if current_run["status"] != "Running":
                 return None
+            node = next(item for item in self.store.get_execution_graph(oid)["nodes"]
+                        if item["plan_task_id"] == planned_task_id)
+            selection_attempt = int(node.get("attempt", 0)) + 1
+            agents = self.store.list_agents()
+            context = self._selection_context(current_run)
+            required_agent_id = None
+            excluded_agent_ids: list[str] = []
+            if node.get("recovery_action_id"):
+                recovery = self.store.get_recovery(node["recovery_action_id"])
+                prior = next((item for item in self.store.list_execution_attempts(oid)
+                              if item["plan_task_id"] == planned_task_id
+                              and int(item["attempt"]) == int(recovery["source_attempt"])), None)
+                prior_agent_id = prior.get("selected_agent_id") if prior else None
+                if recovery["action"] == "retry_same_agent":
+                    required_agent_id = prior_agent_id
+                    agents = [item for item in agents if item.get("id") == required_agent_id]
+                elif recovery["action"] == "retry_different_agent":
+                    prior_agent_ids = [
+                        item.get("selected_agent_id")
+                        for item in self.store.list_execution_attempts(oid)
+                        if item["plan_task_id"] == planned_task_id
+                    ]
+                    excluded_agent_ids = list(dict.fromkeys([
+                        *recovery.get("exclude_agent_ids", []), *prior_agent_ids,
+                    ]))
+                    excluded_agent_ids = [item for item in excluded_agent_ids if item]
+                    context["excluded_agent_ids"] = excluded_agent_ids
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.agent_selection.started", "status": "Running",
                 "task_id": planned_task_id,
                 "message": "Freya is ranking existing agents for the ready planned task.",
             })
         try:
-            selection = self.selector.select_agent(
-                task, self.store.list_agents(), self._selection_context(run),
-            )
+            selection = self.selector.select_agent(task, agents, context)
+            selected = selection.get("selected_agent_id")
+            if ((required_agent_id and selected not in {None, required_agent_id})
+                    or selected in excluded_agent_ids):
+                raise ValueError("Agent selector violated semantic recovery constraints.")
+            selection = dict(selection)
+            selection["attempt"] = selection_attempt
         except Exception as exc:
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] == "Running":
@@ -492,18 +550,174 @@ class Orchestrator:
                 "evaluator_version": EVALUATOR_VERSION,
                 "message": evaluation["summary"],
             })
+            if evaluation["status"] == "accepted":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task.succeeded", "status": "Success",
+                    "task_id": task_id, "plan_task_id": task_id,
+                    "agent_id": target.get("selected_agent_id"),
+                    "runtime_task_id": target.get("runtime_task_id"),
+                    "evaluation_id": evaluation_id,
+                    "evaluation_status": evaluation["status"],
+                    "message": "Semantic evaluation accepted the planned task.",
+                })
+
+
+    def _recover_graph_node(self, oid: str, plan: dict, target: dict,
+                            deadline: float) -> None:
+        """Decide and commit recovery without allowing a late result to reopen state."""
+        task_id = target["plan_task_id"]
+        planned_task = next(task for task in plan["tasks"] if task["id"] == task_id)
+        evaluation = self.store.get_evaluation(target["evaluation_id"])
+        recoveries = self.store.list_recoveries(oid)
+        revisions = self.store.list_plan_revisions(oid)
+        history = [item for item in recoveries
+                   if item["plan_task_id"] == task_id]
+        def recorded_model_calls(item: dict) -> int:
+            value = (item.get("metrics") or {}).get("model_calls", 0)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+        model_calls_used = sum(recorded_model_calls(item) for item in [*recoveries, *revisions])
+        recovery_id = str(uuid4())
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Running":
+                return
             self.store.add_orchestration_event(oid, {
-                "event_type": ("freya.task.succeeded" if evaluation["status"] == "accepted"
-                               else "freya.task.failed"),
-                "status": "Success" if evaluation["status"] == "accepted" else "Failed",
-                "task_id": task_id, "plan_task_id": task_id,
-                "agent_id": target.get("selected_agent_id"),
-                "runtime_task_id": target.get("runtime_task_id"),
-                "evaluation_id": evaluation_id,
-                "evaluation_status": evaluation["status"],
-                "message": ("Semantic evaluation accepted the planned task."
-                            if evaluation["status"] == "accepted" else evaluation["summary"]),
+                "event_type": "freya.recovery.started", "status": "Running",
+                "task_id": task_id, "evaluation_id": target["evaluation_id"],
+                "attempt": target["attempt"], "recovery_id": recovery_id,
+                "message": "Freya started bounded semantic recovery.",
             })
+        limits = {
+            "max_semantic_attempts_per_task": self.config["max_semantic_attempts_per_task"],
+            "max_plan_revisions": self.config["max_plan_revisions"],
+            "max_recovery_actions": self.config["max_recovery_actions"],
+            "max_recovery_model_calls": self.config["max_recovery_model_calls"],
+            "recovery_action_count": len(recoveries),
+            "plan_revision_count": len(revisions),
+            "recovery_model_calls_used": model_calls_used,
+        }
+        try:
+            with self.recovery_lock:
+                decision = self.recovery.decide(
+                    planned_task=planned_task, execution_node=target,
+                    evaluation=evaluation, history=history,
+                    available_agents=self.store.list_agents(), plan=plan, limits=limits,
+                )
+        except Exception as exc:
+            decision = {
+                "action": "fail", "reason": "Recovery decision failed strict validation: " + str(exc),
+                "instructions": "", "exclude_agent_ids": [],
+                "affected_task_ids": [task_id],
+                "fingerprint": semantic_failure_fingerprint(
+                    task_id, target.get("selected_agent_id") or "", evaluation,
+                ),
+                "metrics": dict(getattr(self.recovery, "metrics", {}) or {}),
+            }
+        if self.clock() >= deadline:
+            self._timeout(oid)
+            return
+        retry_prompt = ""
+        if decision["action"] in {"retry_same_agent", "retry_different_agent"}:
+            retry_prompt = build_retry_prompt(
+                planned_task, evaluation, decision["instructions"],
+                attempt=int(target["attempt"]) + 1,
+            )
+        with self.lock:
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
+                return
+            current = next(item for item in self.store.get_execution_graph(oid)["nodes"]
+                           if item["plan_task_id"] == task_id)
+            if (current["state"] != "recovery_pending"
+                    or current.get("evaluation_id") != target.get("evaluation_id")
+                    or int(current.get("attempt", 0)) != int(target.get("attempt", 0))
+                    or current.get("recovery_action_id")):
+                return
+            record = self.store.commit_recovery_action(
+                recovery_id, oid, task_id, source_attempt=int(target["attempt"]),
+                source_evaluation_id=target["evaluation_id"], decision=decision,
+                recovery_version=RECOVERY_VERSION, prompt=retry_prompt,
+                snapshot={"evaluation_status": evaluation.get("status"), "limits": limits},
+            )
+            if record is None:
+                return
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.recovery.decided", "status": "Running",
+                "task_id": task_id, "recovery_id": recovery_id,
+                "action": decision["action"], "reason": decision["reason"],
+                "message": "Freya committed a bounded recovery decision.",
+            })
+            if decision["action"] == "fail":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.recovery.exhausted", "status": "Failed",
+                    "task_id": task_id, "recovery_id": recovery_id,
+                    "message": decision["reason"],
+                })
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task.failed", "status": "Failed",
+                    "task_id": task_id, "evaluation_id": target["evaluation_id"],
+                    "message": decision["reason"],
+                })
+                return
+            if decision["action"] in {"retry_same_agent", "retry_different_agent"}:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.recovery.retry_scheduled", "status": "Running",
+                    "task_id": task_id, "recovery_id": recovery_id,
+                    "action": decision["action"], "next_attempt": int(target["attempt"]) + 1,
+                    "message": "Freya scheduled a new, independently selected execution attempt.",
+                })
+                return
+
+        try:
+            accepted = {item["plan_task_id"] for item in self.store.get_execution_graph(oid)["nodes"]
+                        if item["state"] == "success"}
+            historical = {item["plan_task_id"] for item in self.store.get_execution_graph(oid)["nodes"]}
+            with self.recovery_lock:
+                revision = self.replanner.create_revision(
+                    current_plan=plan, source_task_id=task_id,
+                    affected_task_ids=decision["affected_task_ids"],
+                    accepted_task_ids=accepted, historical_task_ids=historical,
+                    context={"evaluation": evaluation, "instructions": decision["instructions"]},
+                    max_tasks=int(self.config["max_delegated_tasks"]),
+                    max_model_calls=min(
+                        2, int(self.config["max_recovery_model_calls"])
+                        - model_calls_used - recorded_model_calls(decision)
+                    ),
+                )
+            if self.clock() >= deadline:
+                self._timeout(oid)
+                return
+            revision_id = str(uuid4())
+            with self.lock:
+                run = self.store.get_orchestration(oid)
+                current = next(item for item in self.store.get_execution_graph(oid)["nodes"]
+                               if item["plan_task_id"] == task_id)
+                if (run["status"] != "Running" or current["state"] != "recovery_pending"
+                        or current.get("recovery_action_id") != recovery_id):
+                    return
+                saved = self.store.commit_plan_revision(
+                    revision_id, oid, recovery_id, summary=revision["summary"],
+                    plan=revision["plan"], superseded_task_ids=revision["superseded_task_ids"],
+                    metrics=revision.get("metrics"),
+                )
+                if saved is None:
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.recovery.replan_created", "status": "Running",
+                    "task_id": task_id, "recovery_id": recovery_id,
+                    "plan_revision_id": revision_id, "revision": saved["revision"],
+                    "message": "Freya committed a validated effective-plan revision.",
+                })
+        except Exception as exc:
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] == "Running" and self.store.fail_recovery_action(
+                        recovery_id, "Subgraph replanning failed: " + str(exc)):
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.recovery.exhausted", "status": "Failed",
+                        "task_id": task_id, "recovery_id": recovery_id,
+                        "message": "Subgraph replanning failed: " + str(exc),
+                    })
+
     def _finish_graph(self, oid: str, graph: ExecutionGraph) -> None:
         summary = graph.summary()
         unsuccessful = (summary["failed"] + summary["blocked"] + summary["cancelled"]
@@ -531,9 +745,20 @@ class Orchestrator:
         else:
             rendered = []
             for node in graph.serialize():
-                if node.get("result") is not None:
+                if node["state"] == "success" and node.get("result") is not None:
                     rendered.append(f"{node['plan_task_id']}: {node['result']}")
-            response = f"Freya completed and verified all {summary['total']} planned tasks."
+            verified = summary["successful"]
+            response = (
+                f"Freya completed and verified {verified} executable "
+                + ("task." if verified == 1 else "tasks.")
+            )
+            superseded = summary["superseded"]
+            if superseded:
+                response += (
+                    f" {superseded} historical "
+                    + ("task was" if superseded == 1 else "tasks were")
+                    + " superseded by validated replanning."
+                )
             if rendered:
                 response += "\n\n" + "\n\n".join(rendered)
             completed = self.store.transition_orchestration(
@@ -552,7 +777,6 @@ class Orchestrator:
         })
 
     def _run_graph(self, oid: str, running: dict, deadline: float) -> None:
-        plan = running["plan"]
         while True:
             if self.clock() >= deadline:
                 self._timeout(oid)
@@ -560,11 +784,13 @@ class Orchestrator:
 
             selection_target = None
             evaluation_target = None
+            recovery_target = None
             with self.lock:
                 run = self.store.get_orchestration(oid)
                 if run["status"] != "Running":
                     return
                 persisted = self.store.get_execution_graph(oid)
+                plan = run.get("effective_plan") or run["plan"]
                 graph = ExecutionGraph(plan, persisted["nodes"])
                 changed = False
 
@@ -581,6 +807,10 @@ class Orchestrator:
                     if node.get("delegation_id"):
                         self._snapshot_delegation(node["delegation_id"], runtime_task)
                     current = graph.node(node["plan_task_id"])["state"]
+                    self.store.update_execution_attempt(
+                        oid, node["plan_task_id"], int(node.get("attempt", 0)),
+                        status=current,
+                    )
                     if current != previous:
                         event_type = {
                             "waiting_for_approval": "freya.task.waiting_for_approval",
@@ -609,11 +839,18 @@ class Orchestrator:
                     return
 
                 for node in graph.serialize():
-                    if node["state"] == "evaluating" and not node.get("evaluation_id"):
-                        evaluation_target = node
+                    if node["state"] == "recovery_pending" and not node.get("recovery_action_id"):
+                        recovery_target = node
                         break
 
-                if evaluation_target is None:
+                if recovery_target is None:
+                    for node in graph.serialize():
+                        if node["state"] == "evaluating" and not node.get("evaluation_id"):
+                            evaluation_target = node
+                            break
+
+
+                if recovery_target is None and evaluation_target is None:
                     for task in graph.ready_tasks():
                         if not graph.node(task["id"]).get("selection_id"):
                             selection_target = task
@@ -623,8 +860,12 @@ class Orchestrator:
                 self._evaluate_graph_node(oid, plan, evaluation_target, deadline)
                 continue
 
+            if recovery_target is not None:
+                self._recover_graph_node(oid, plan, recovery_target, deadline)
+                continue
+
             if selection_target is not None:
-                selected = self._select_graph_task(oid, selection_target, running)
+                selected = self._select_graph_task(oid, selection_target, run)
                 if selected is None:
                     return
                 with self.lock:
@@ -712,8 +953,8 @@ class Orchestrator:
                         continue
                     try:
                         runtime_task = self.runtime.submit(
-                            agent_id, task["objective"],
-                            running.get("config", {}).get("workspace_path") or None,
+                            agent_id, node.get("attempt_prompt") or task["objective"],
+                            run.get("config", {}).get("workspace_path") or None,
                         )
                     except ValueError as exc:
                         refreshed = self.store.get_agent(agent_id)
@@ -739,7 +980,7 @@ class Orchestrator:
                         continue
                     try:
                         delegation_id = self.store.add_delegation(
-                            oid, agent_id, task["objective"], runtime_task["id"],
+                            oid, agent_id, node.get("attempt_prompt") or task["objective"], runtime_task["id"],
                         )
                         if delegation_id is None:
                             self.runtime.cancel(runtime_task["id"])
@@ -751,6 +992,16 @@ class Orchestrator:
                         # If any post-submit step fails, cancel the created task
                         # and fail closed instead of leaving a ready duplicate.
                         self.store.save_execution_graph(oid, graph.serialize())
+                        attempt_record = self.store.record_execution_attempt(
+                            oid, task["id"], selected_agent_id=agent_id,
+                            selection_id=node["selection_id"],
+                            runtime_task_id=runtime_task["id"], delegation_id=delegation_id,
+                            attempt=int(graph.node(task["id"])["attempt"]),
+                            prompt=graph.node(task["id"]).get("attempt_prompt") or task["objective"],
+                            recovery_action_id=graph.node(task["id"]).get("recovery_action_id"),
+                        )
+                        if attempt_record is None:
+                            raise RuntimeError("Execution attempt persistence lost its precondition.")
                     except Exception:
                         try:
                             self.runtime.cancel(runtime_task["id"])

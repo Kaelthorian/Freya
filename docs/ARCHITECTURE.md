@@ -8,6 +8,8 @@ then uses `control_center/execution_graph.py` to release dependency-ready tasks,
 delegating bounded tasks through `Runtime`, and requiring
 `control_center/evaluator.py` to accept technical successes before integration.
 Workers remain the only components allowed to invoke tools;
+Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
+before a node can fail or a validated effective-plan revision can replace its subgraph.
 each receives a generic policy plus its identity, instructions, skills,
 workspace, and limits. Orchestration runs, plans, delegations, and events are
 stored durably, and SQLite migrations preserve existing data.
@@ -71,8 +73,19 @@ The plan remains the immutable intent; node rows are the durable execution state
 `(orchestration_id, plan_task_id, attempt)`, including the bounded input
 snapshot, criterion-by-criterion result, independent model metrics and
 truncation/deterministic flags. Nodes keep only `evaluation_id` and
-`evaluation_status`. Insertion and the `evaluating → success|failed` transition
+`evaluation_status`. Insertion and the `evaluating → success|recovery_pending` transition
 are one transaction.
+`orchestration_execution_attempts` stores every real dispatch independently,
+including its selection, agent, Runtime task, delegation, prompt, evaluation,
+recovery action, status and timestamps. `orchestration_recovery_actions` stores
+one immutable decision per source evaluation/attempt with strict action,
+instructions, exclusions, affected tasks, fingerprint and metrics.
+`orchestration_plan_revisions` stores cumulative effective plans while the
+original `plan_json` remains immutable. Accepted tasks cannot be modified or
+superseded; revision validation rejects cycles, unknown dependencies,
+historical-ID reuse, task-limit overflow and active dependencies on superseded
+tasks.
+
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
@@ -97,6 +110,12 @@ Semantic review emits `freya.evaluation.started` once and then exactly one
 status metadata, never the full evaluation or internal prompts.
 
 Orchestration transitions are conditional on the stored current state:
+Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
+`freya.recovery.retry_scheduled`, `freya.recovery.replan_created`, or
+`freya.recovery.exhausted`. Full decisions remain in immutable storage. A late
+recovery or replan is discarded if cancellation, timeout, restart, another
+recovery, or a state/attempt change wins first.
+
 
 ```text
 Queued → Planning → Planned → Running → Success | Failed | Cancelled
@@ -142,14 +161,14 @@ separate lifecycle lock and remains responsive while a planner call is pending.
 Preferred Skills remain unvalidated semantic hints so planning is not coupled
 to the mutable Skill registry. Required capabilities must exist in the platform
 registry, but remain declarations: the planner never edits agent configuration
-or policy. Replanning remains outside the current stage.
+or policy. Replanning never grants capabilities and revalidates the complete effective plan.
 
 ## Execution graph and scheduling
 
 `ExecutionGraph` is local, deterministic and model-free. It deep-copies the
 validated plan and maintains `pending`, `ready`, `running`,
-`waiting_for_approval`, `evaluating`, `blocked`, `success`, `failed`, `cancelled`, and
-`skipped` nodes. Only nodes whose dependencies all succeeded become ready.
+`waiting_for_approval`, `evaluating`, `recovery_pending`, `blocked`, `success`, `failed`,
+`cancelled`, `skipped`, and `superseded` nodes. Only successful dependencies release work.
 Failure or cancellation blocks descendants transitively while unrelated
 branches continue. Join nodes wait for every dependency.
 
@@ -170,16 +189,19 @@ do not share stale workload information.
 Paused and Offline are temporary scheduling waits: the selected node remains
 ready with one stable `waiting_reason` and dispatches once after availability
 returns. A selected agent that becomes disabled or is deleted is a durable
-execution failure for that node; descendants are blocked normally and 4.3 does
-not reselect another agent. Recovery/reselection remains future-stage work.
+execution failure for that node. Only an explicit semantic recovery action may
+reselect; ordinary scheduler failures never cause silent reselection.
 
 Runtime `Queued` and `Running` map to graph `running`;
 `WaitingForApproval` maps to `waiting_for_approval`; Runtime `Paused` remains a
 nonterminal `running` node with an explicit reason. Runtime `Success` maps to
 persistent `evaluating`; it never directly produces graph success. Only
 evaluator `accepted` maps to `success`. `needs_revision`, `rejected`, `blocked`,
-and evaluator infrastructure failure map to node `failed` while preserving the
-evaluation status and reference. Other Runtime terminal statuses map to their
+and evaluator infrastructure failure atomically map to `recovery_pending` while
+preserving the evaluation reference. Recovery may retry the same revalidated
+agent, retry with prior agents hard-excluded, create a validated effective-plan
+revision, or fail. Retry clears only current-node references; immutable attempt,
+evaluation, selection and recovery history remains. Other Runtime statuses map to their
 graph equivalents. The parent succeeds only when every node is semantically
 accepted and fails after all reachable work is terminal when any node failed,
 was blocked, cancelled, or skipped. User cancellation remains `Cancelled`.
@@ -191,8 +213,8 @@ saved. Plans larger than configured `max_delegated_tasks` fail during Planning,
 before graph initialization or Runtime submission; the default is aligned with
 the planner's 20-task maximum. Restart recovery preserves graph history but
 changes unfinished running/waiting/evaluating nodes to cancelled and
-undispatched nodes to skipped, so a failed recovered run never exposes ghost
-active nodes.
+recovery-pending or undispatched nodes to skipped. Recovery never resumes after
+restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
@@ -227,8 +249,32 @@ criterion `unknown`. The Orchestrator's compatibility fallback uses this same
 conservative evaluator; it never silently converts an unverified Runtime
 success into semantic success. Cancellation, timeout, or restart wins over a late result;
 the atomic commit rechecks orchestration state, node state, Runtime task and
-attempt before persisting. Stage 4.4 records `needs_revision` but does not retry,
-replan, reselect, create agents, or change dependencies.
+attempt before persisting.
+
+## Semantic recovery and replanning
+
+`RecoveryController` is separate from Planner and Evaluator. Its strict schema
+allows only `retry_same_agent`, `retry_different_agent`, `replan_subgraph`, or
+`fail`; invalid model output gets one repair. Its Ollama adapter is loopback-only,
+tool-free, non-streaming and independently metered. `--recovery-offline` makes
+no model call and fails conservatively.
+
+Defaults allow three semantic attempts per task, two plan revisions, eight
+recovery actions and sixteen total recovery/replanning model calls per orchestration.
+The orchestration wall-clock deadline is rechecked after every recovery call. Stable
+fingerprints stop repeated equivalent
+failures. Same-agent retry revalidates the candidate. Different-agent retry
+passes every prior agent ID as a hard `excluded_agent_ids` constraint; there is
+no silent same-agent fallback. Retry prompts include bounded evaluator issues
+and missing evidence, not raw prior model transcripts or private reasoning.
+
+Replanning produces a complete cumulative effective plan. Accepted and
+superseded historical snapshots remain unchanged, new work uses new task IDs,
+and no active task may depend on a superseded node. The original plan remains
+available separately from the current effective plan. This stage does not
+create agents, auto-approve capabilities, weaken policy, add a free-form shell,
+or implement final-answer synthesis.
+
 
 ## Agent selection
 
@@ -240,6 +286,9 @@ It never changes an agent, assigns a Skill, approves a request, grants a
 capability, invokes a tool, or touches a workspace.
 
 Candidates are classified before scoring:
+`context.excluded_agent_ids` is a hard recovery gate: excluded candidates are
+reported as ineligible and cannot win by score.
+
 
 - `eligible`: every required capability evaluates to `allow`;
 - `conditional`: no capability is denied or missing runtime support, but at
@@ -292,8 +341,8 @@ Selection does not dispatch by itself. The execution graph retains the selected
 agent and waits for both a global slot and per-agent availability. Approval is
 the existing durable Runtime flow and does not fail the graph while pending.
 At timeout, active children are cancelled and all remaining graph nodes become
-terminal before the parent becomes Failed. The orchestrator does not replan,
-create agents, retry semantic revisions, or enable agent-to-agent messaging.
+terminal before the parent becomes Failed. Selection itself does not replan, create
+agents, retry semantic revisions, or enable agent-to-agent messaging.
 
 ## Runtime and control semantics
 

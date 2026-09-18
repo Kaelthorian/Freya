@@ -118,6 +118,13 @@ class AgentSelector:
         task_copy = copy.deepcopy(task)
         agents_copy = copy.deepcopy(list(agents))
         context_copy = copy.deepcopy(context) if isinstance(context, dict) else {}
+        excluded = context_copy.get("excluded_agent_ids", [])
+        if (not isinstance(excluded, list)
+                or any(not isinstance(item, str) or not item.strip() for item in excluded)):
+            raise ValueError("excluded_agent_ids must be a list of non-empty agent ids.")
+        context_copy["excluded_agent_ids"] = list(dict.fromkeys(
+            item.strip() for item in excluded
+        ))
         seen_agent_ids: set[str] = set()
         for raw in agents_copy:
             raw_id = raw.get("id") if isinstance(raw, dict) else None
@@ -179,6 +186,8 @@ class AgentSelector:
                     and raw_agent_id.strip() else None)
         workload = _workload(agent, context)
         hard_warnings: list[str] = []
+        if agent_id in set(context.get("excluded_agent_ids", [])):
+            hard_warnings.append("Agent is excluded by semantic recovery history.")
         if agent_id is None:
             hard_warnings.append("Agent does not have a valid id.")
         if agent.get("enabled") is not True:

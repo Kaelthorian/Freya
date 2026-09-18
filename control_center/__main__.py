@@ -16,6 +16,9 @@ from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
                       DEFAULT_PLANNER_TIMEOUT_SECONDS, OllamaPlanner, Planner)
 from .evaluator import (DEFAULT_EVALUATOR_ENDPOINT, DEFAULT_EVALUATOR_MODEL,
                         DEFAULT_EVALUATOR_TIMEOUT_SECONDS, Evaluator, OllamaEvaluator)
+from .recovery import (DEFAULT_RECOVERY_ENDPOINT, DEFAULT_RECOVERY_MODEL,
+                       DEFAULT_RECOVERY_TIMEOUT_SECONDS, OllamaRecoveryAdvisor,
+                       RecoveryController, Replanner)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,6 +73,23 @@ def main():
                         help="Explicitly use deterministic evidence-only evaluation")
     parser.add_argument("--max-parallel-tasks", type=int, default=4,
                         help="Maximum concurrently active orchestration graph nodes (1-20)")
+    parser.add_argument("--recovery-model", default=DEFAULT_RECOVERY_MODEL,
+                        help="Ollama model used for bounded semantic recovery")
+    parser.add_argument("--recovery-endpoint", default=DEFAULT_RECOVERY_ENDPOINT,
+                        help="Loopback Ollama base URL used by the recovery advisor")
+    parser.add_argument("--recovery-timeout", type=float,
+                        default=DEFAULT_RECOVERY_TIMEOUT_SECONDS,
+                        help="Recovery Ollama request timeout in seconds (0.1-120)")
+    parser.add_argument("--recovery-offline", action="store_true",
+                        help="Fail conservatively instead of calling a recovery model")
+    parser.add_argument("--max-semantic-attempts", type=int, default=3,
+                        help="Maximum execution/evaluation attempts per planned task (1-10)")
+    parser.add_argument("--max-plan-revisions", type=int, default=2,
+                        help="Maximum effective-plan revisions per orchestration (1-10)")
+    parser.add_argument("--max-recovery-actions", type=int, default=8,
+                        help="Maximum recovery decisions per orchestration (1-50)")
+    parser.add_argument("--max-recovery-model-calls", type=int, default=16,
+                        help="Maximum recovery and replanning model calls per orchestration (1-100)")
     parser.add_argument("--max-delegated-tasks", type=int, default=20,
                         help="Maximum planned tasks accepted by one orchestration (1-20)")
     args = parser.parse_args()
@@ -79,6 +99,11 @@ def main():
             or not 1 <= args.max_delegated_tasks <= 20):
         parser.error("Orchestration task limits must be between 1 and 20.")
     data_dir = args.data_dir.resolve()
+    if (not 1 <= args.max_semantic_attempts <= 10
+            or not 1 <= args.max_plan_revisions <= 10
+            or not 1 <= args.max_recovery_actions <= 50
+            or not 1 <= args.max_recovery_model_calls <= 100):
+        parser.error("Recovery limits are outside their supported ranges.")
     lock = InstanceLock(data_dir)
     runtime = None
     server = None
@@ -92,9 +117,20 @@ def main():
         evaluator = (Evaluator(offline=True) if args.evaluator_offline else
                      Evaluator(OllamaEvaluator(args.evaluator_model, args.evaluator_endpoint,
                                                args.evaluator_timeout)))
-        orchestrator = Orchestrator(store, runtime, planner=planner, evaluator=evaluator, config={
+        recovery_adapter = None if args.recovery_offline else OllamaRecoveryAdvisor(
+            args.recovery_model, args.recovery_endpoint, args.recovery_timeout,
+        )
+        recovery = (RecoveryController(offline=True) if recovery_adapter is None else
+                    RecoveryController(recovery_adapter))
+        replanner = Replanner(recovery_adapter)
+        orchestrator = Orchestrator(store, runtime, planner=planner, evaluator=evaluator,
+                                    recovery=recovery, replanner=replanner, config={
             "max_parallel_tasks": args.max_parallel_tasks,
             "max_delegated_tasks": args.max_delegated_tasks,
+            "max_semantic_attempts_per_task": args.max_semantic_attempts,
+            "max_plan_revisions": args.max_plan_revisions,
+            "max_recovery_actions": args.max_recovery_actions,
+            "max_recovery_model_calls": args.max_recovery_model_calls,
         })
         application = Application(store, runtime, data_dir, orchestrator)
         server = ControlServer(("127.0.0.1", args.port), application)

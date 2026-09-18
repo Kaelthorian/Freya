@@ -13,10 +13,11 @@ from .planner import validate_plan
 
 
 NODE_STATES = {
-    "pending", "ready", "running", "waiting_for_approval", "evaluating", "blocked",
-    "success", "failed", "cancelled", "skipped",
+    "pending", "ready", "running", "waiting_for_approval", "evaluating",
+    "recovery_pending", "blocked", "success", "failed", "cancelled", "skipped",
+    "superseded",
 }
-TERMINAL_NODE_STATES = {"blocked", "success", "failed", "cancelled", "skipped"}
+TERMINAL_NODE_STATES = {"blocked", "success", "failed", "cancelled", "skipped", "superseded"}
 DEPENDENCY_FAILURE_STATES = {"blocked", "failed", "cancelled", "skipped"}
 ACTIVE_NODE_STATES = {"running", "waiting_for_approval", "evaluating"}
 
@@ -38,6 +39,7 @@ def graph_summary(nodes: list[dict[str, Any]]) -> dict[str, Any]:
         "blocked": counts["blocked"],
         "cancelled": counts["cancelled"],
         "skipped": counts["skipped"],
+        "superseded": counts["superseded"],
         "active": sum(counts[state] for state in ACTIVE_NODE_STATES),
         "counts": counts,
     }
@@ -63,6 +65,9 @@ class ExecutionGraph:
                     "delegation_id": None,
                     "evaluation_id": None,
                     "evaluation_status": None,
+                    "recovery_action_id": None,
+                    "attempt_prompt": self.tasks[task_id]["objective"],
+                    "plan_revision": 0,
                     "attempt": 0,
                     "waiting_reason": "",
                     "result": None,
@@ -197,22 +202,56 @@ class ExecutionGraph:
         if status == "accepted":
             target, error = "success", None
         elif status == "needs_revision":
-            target, error = "failed", "Semantic evaluation requires revision."
+            target, error = "recovery_pending", "Semantic evaluation requires revision."
         elif status == "rejected":
-            target, error = "failed", "Semantic evaluation rejected the task result."
+            target, error = "recovery_pending", "Semantic evaluation rejected the task result."
         elif status == "blocked":
-            target, error = "failed", "Semantic evaluation could not determine task success."
+            target, error = "recovery_pending", "Semantic evaluation could not determine task success."
         elif status == "error":
-            target, error = "failed", "Semantic evaluator failed."
+            target, error = "recovery_pending", "Semantic evaluator failed."
         else:
             raise ValueError(f"Unknown evaluation status: {status}.")
         node.update(
             state=target, evaluation_id=evaluation_id, evaluation_status=status,
-            waiting_reason="", error=error, finished_at=timestamp, updated_at=timestamp,
+            waiting_reason="", error=error,
+            finished_at=timestamp if target == "success" else None, updated_at=timestamp,
         )
         if error and summary:
             node["error"] += " " + str(summary)
         return True
+
+    def prepare_retry(self, task_id: str, recovery_action_id: str, prompt: str,
+                      timestamp: str | None = None) -> None:
+        """Open a fresh attempt while preserving the prior attempt in durable history."""
+        node = self.node(task_id)
+        if node["state"] != "recovery_pending" or not node.get("evaluation_id"):
+            raise ValueError("Only a recovery-pending evaluated node can be retried.")
+        node.update(
+            state="ready", selected_agent_id=None, selection_id=None,
+            runtime_task_id=None, delegation_id=None, evaluation_id=None,
+            evaluation_status=None, recovery_action_id=recovery_action_id,
+            attempt_prompt=str(prompt), waiting_reason="", result=None, error=None,
+            started_at=None, finished_at=None, updated_at=timestamp,
+        )
+
+    def fail_recovery(self, task_id: str, recovery_action_id: str, reason: str,
+                      timestamp: str | None = None) -> None:
+        node = self.node(task_id)
+        if node["state"] != "recovery_pending":
+            raise ValueError("Only a recovery-pending node can be failed by recovery.")
+        node.update(state="failed", recovery_action_id=recovery_action_id,
+                    waiting_reason="", error=str(reason), finished_at=timestamp,
+                    updated_at=timestamp)
+
+    def mark_superseded(self, task_id: str, recovery_action_id: str,
+                        timestamp: str | None = None) -> None:
+        node = self.node(task_id)
+        if node["state"] == "success":
+            raise ValueError("Accepted nodes cannot be superseded.")
+        if node["state"] in {"running", "waiting_for_approval", "evaluating"}:
+            raise ValueError("Active nodes cannot be superseded.")
+        node.update(state="superseded", recovery_action_id=recovery_action_id,
+                    waiting_reason="", finished_at=timestamp, updated_at=timestamp)
 
     def mark_failed(self, task_id: str, error: str, timestamp: str | None = None) -> bool:
         node = self.node(task_id)

@@ -15,6 +15,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
+│   ├── recovery.py           strict recovery decisions, retry prompts and validated replanning
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
@@ -53,6 +54,9 @@ of this repository merely because an agent selects them.
    tasks in plan order and `agent_selector.py` classifies and ranks an existing
    agent once for each ready task before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
+   A non-accepted evaluation enters bounded recovery; retries are reselected and
+   recorded as new attempts, while replanning commits a validated effective plan
+   without mutating the original snapshot or accepted work.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
@@ -75,7 +79,8 @@ of this repository merely because an agent selects them.
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
-| Structured plans, lifecycle or recovery | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
+| Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
+| Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |
