@@ -255,6 +255,15 @@ class ControlledRuntime:
                 active.append(task)
                 status = outcomes.get(task["prompt"], "Success")
                 fields = {"status": status, "result": task["prompt"] + " result"}
+                if status == "Success":
+                    fields["verification"] = {
+                        "requested": True, "attempted": True, "passed": True,
+                        "failed": False, "unavailable": False,
+                        "skipped_with_reason": "", "evidence": [{
+                            "check": "controlled fixture verification",
+                            "status": "passed", "output": "verified",
+                        }],
+                    }
                 if status == "Failed":
                     fields["error"] = task["prompt"] + " failed"
                 self.store.update_task(task["id"], **fields)
@@ -613,6 +622,32 @@ class SchedulerTests(unittest.TestCase):
         event_types = [item["event_type"] for item in final["events"]]
         self.assertEqual(event_types.count("freya.evaluation.started"), 2)
         self.assertEqual(event_types.count("freya.evaluation.completed"), 2)
+
+    def test_default_evaluator_blocks_unverified_runtime_success(self):
+        agent = self.agent("Unverified")
+        runtime = ControlledRuntime(self.store, {"a": "Success"})
+        final = self.run_graph(
+            execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
+            lambda seconds: None,
+        )
+        graph_node = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(graph_node["state"], "failed")
+        self.assertEqual(graph_node["evaluation_status"], "blocked")
+        self.assertEqual(final["evaluations"][0]["status"], "blocked")
+
+    def test_default_evaluator_accepts_objectively_verified_runtime_success(self):
+        agent = self.agent("Verified")
+        runtime = ControlledRuntime(self.store)
+        final = self.run_graph(
+            execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
+            lambda seconds: runtime.finish_active(),
+        )
+        graph_node = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(final["status"], "Success")
+        self.assertEqual(graph_node["state"], "success")
+        self.assertEqual(graph_node["evaluation_status"], "accepted")
+        self.assertEqual(final["evaluations"][0]["status"], "accepted")
 
     def test_cancellation_during_evaluation_discards_late_result(self):
         agent = self.agent("Cancel evaluation")

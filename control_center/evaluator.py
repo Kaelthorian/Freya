@@ -410,20 +410,28 @@ class Evaluator:
                     "context_truncated": truncated, "deterministic": True,
                     "context_snapshot": bounded}
         if self.offline:
-            if not _normalized(runtime_task.get("result")):
+            verification = bounded["runtime_task"]["verification"]
+            if (verification["requested"] and verification["attempted"]
+                    and verification["passed"] and not verification["failed"]):
+                evidence = ["Configured verification passed."]
+                evidence.extend(
+                    f"{item['check']}: passed" for item in verification["evidence"]
+                    if item.get("status", "").casefold() == "passed"
+                )
                 decision = self._decision(
-                    "blocked", "The Runtime task produced no result to evaluate.",
-                    self._records(criteria, "unknown", "No result evidence is available."),
-                    confidence=1.0, missing=criteria or ["Runtime result."],
+                    "accepted", "Configured objective verification passed.",
+                    self._records(
+                        criteria, "satisfied", "Objective verification passed.", evidence,
+                    ), confidence=1.0,
                 )
             else:
-                evidence = ["Runtime completed successfully."]
-                if bounded["runtime_task"]["verification"]["passed"]:
-                    evidence.append("Configured verification passed.")
                 decision = self._decision(
-                    "accepted", "Offline deterministic checks found no contradictory evidence.",
-                    self._records(criteria, "satisfied", "Available deterministic evidence is consistent.", evidence),
-                    confidence=0.6,
+                    "blocked", "No objective evidence is available to verify semantic success.",
+                    self._records(
+                        criteria, "unknown",
+                        "Agent result text is not objective verification evidence.",
+                    ), confidence=1.0,
+                    missing=criteria or ["Objective evidence."],
                 )
             evaluation = validate_evaluation(decision, criteria)
             return {**evaluation, "metrics": dict(self.metrics),

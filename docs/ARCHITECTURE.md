@@ -218,7 +218,14 @@ Evaluator calls are serialized to one model call at a time. Defaults are the
 separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
 `http://127.0.0.1:11434`, and 120-second timeout. Explicit
 `--evaluator-offline` uses deterministic evidence-only behavior for tests and
-offline operation. Cancellation, timeout, or restart wins over a late result;
+offline operation. It accepts only when configured verification was requested,
+attempted and passed without contradictory evidence. Runtime result text is
+untrusted agent output, not objective verification: a non-empty result, success
+claim, or embedded instruction cannot produce acceptance. Without sufficient
+objective evidence, offline evaluation returns `blocked` and marks every
+criterion `unknown`. The Orchestrator's compatibility fallback uses this same
+conservative evaluator; it never silently converts an unverified Runtime
+success into semantic success. Cancellation, timeout, or restart wins over a late result;
 the atomic commit rechecks orchestration state, node state, Runtime task and
 attempt before persisting. Stage 4.4 records `needs_revision` but does not retry,
 replan, reselect, create agents, or change dependencies.

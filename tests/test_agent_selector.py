@@ -53,6 +53,12 @@ class ImmediateRuntime:
         task = self.store.create_task(agent_id, objective, workspace_path or "workspace")
         return self.store.update_task(
             task["id"], status="Success", result="done",
+            verification={
+                "requested": True, "attempted": True, "passed": True,
+                "failed": False, "unavailable": False, "skipped_with_reason": "",
+                "evidence": [{"check": "selector integration fixture", "status": "passed",
+                              "output": "verified"}],
+            },
             finished_at="2026-09-18T00:00:00+00:00",
         )
 

@@ -29,6 +29,8 @@ class Orchestrator:
         self.decide = decide
         self.planner = planner or Planner()
         self.selector = selector or AgentSelector()
+        # Compatibility fallback is evidence-only: it cannot accept Runtime
+        # Success unless configured objective verification actually passed.
         self.evaluator = evaluator or Evaluator(offline=True)
         self.clock = clock or time.monotonic
         self.wait = wait or time.sleep

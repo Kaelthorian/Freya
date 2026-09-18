@@ -49,6 +49,10 @@ python -m control_center --evaluator-model qwen2.5-coder:7b `
 
 The evaluator endpoint is also loopback-only and the adapter exposes no tools.
 Use `--evaluator-offline` explicitly for deterministic evidence-only evaluation.
+Offline evaluation is conservative: acceptance requires configured verification
+to be requested, attempted and passed. Runtime result text and agent claims are
+not objective evidence. Missing evidence returns `blocked`, including through
+the Orchestrator's default compatibility fallback.
 
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
