@@ -57,9 +57,16 @@ def main():
                         help="Planner Ollama request timeout in seconds (0.1-120)")
     parser.add_argument("--planner-offline", action="store_true",
                         help="Explicitly use deterministic one-task fallback planning")
+    parser.add_argument("--max-parallel-tasks", type=int, default=4,
+                        help="Maximum concurrently active orchestration graph nodes (1-20)")
+    parser.add_argument("--max-delegated-tasks", type=int, default=20,
+                        help="Maximum planned tasks accepted by one orchestration (1-20)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.workers <= 8:
         parser.error("Use a port from 1 to 65535 and between 1 and 8 workers.")
+    if (not 1 <= args.max_parallel_tasks <= 20
+            or not 1 <= args.max_delegated_tasks <= 20):
+        parser.error("Orchestration task limits must be between 1 and 20.")
     data_dir = args.data_dir.resolve()
     lock = InstanceLock(data_dir)
     runtime = None
@@ -71,12 +78,17 @@ def main():
         planner = (Planner(offline=True) if args.planner_offline else
                    Planner(OllamaPlanner(args.planner_model, args.planner_endpoint,
                                          args.planner_timeout)))
-        orchestrator = Orchestrator(store, runtime, planner=planner)
+        orchestrator = Orchestrator(store, runtime, planner=planner, config={
+            "max_parallel_tasks": args.max_parallel_tasks,
+            "max_delegated_tasks": args.max_delegated_tasks,
+        })
         application = Application(store, runtime, data_dir, orchestrator)
         server = ControlServer(("127.0.0.1", args.port), application)
         runtime.start()
         print(f"Agent Control Center: http://127.0.0.1:{args.port}", flush=True)
-        print(f"Data: {data_dir} | Workers: {args.workers} | Ctrl+C to stop", flush=True)
+        print(f"Data: {data_dir} | Workers: {args.workers} | "
+              f"Graph parallelism: {orchestrator.config['max_parallel_tasks']} | Ctrl+C to stop",
+              flush=True)
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:
         print("\nStopping executions and shutting down the server...", flush=True)

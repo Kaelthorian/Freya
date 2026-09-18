@@ -169,6 +169,28 @@ CREATE TABLE IF NOT EXISTS orchestration_selections (
 );
 CREATE INDEX IF NOT EXISTS idx_orch_selections
     ON orchestration_selections(orchestration_id,created_at,id);
+CREATE TABLE IF NOT EXISTS orchestration_task_nodes (
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    plan_task_id TEXT NOT NULL,
+    plan_order INTEGER NOT NULL,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL,
+    selected_agent_id TEXT REFERENCES agents(id),
+    selection_id TEXT REFERENCES orchestration_selections(id),
+    runtime_task_id TEXT REFERENCES tasks(id),
+    delegation_id TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    waiting_reason TEXT NOT NULL DEFAULT '',
+    result_json TEXT,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (orchestration_id, plan_task_id),
+    UNIQUE (runtime_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_task_nodes_state
+    ON orchestration_task_nodes(orchestration_id,state,plan_order);
 CREATE TABLE IF NOT EXISTS orchestration_delegations (
     id TEXT PRIMARY KEY,
     orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),

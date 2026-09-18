@@ -18,6 +18,16 @@ ollama list
 python -m control_center --port 8765 --workers 2 --data-dir .\data
 ```
 
+Graph scheduling defaults to four active nodes and accepts at most the
+planner's twenty tasks. Configure both bounds explicitly when needed:
+
+```powershell
+python -m control_center --max-parallel-tasks 4 --max-delegated-tasks 20
+```
+
+If the total delegated-task limit is below the requested parallel value, the
+effective graph parallelism is clamped to that total limit.
+
 Structured planning uses local Ollama by default:
 
 ```powershell
@@ -75,6 +85,7 @@ credentials, paths, query strings or fragments.
 ```powershell
 python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p "test_planner.py" -v
+python -m unittest discover -s tests -p "test_execution_graph.py" -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -95,6 +106,9 @@ symlink regression skips when the Windows account cannot create symlinks. A
 full end-to-end task additionally requires local Ollama and an installed model.
 Planner tests cover atomic transitions, cancellation races, restart recovery,
 approval waiting, child failure propagation, deadlines and simulated Ollama.
+Execution-graph tests cover pure DAG transitions, sequential and parallel
+scheduling, joins, branch-local failure propagation, approval waits, paused
+agents, per-agent serialization, concurrency limits, cancellation and migration.
 
 ## Debugging
 
@@ -103,7 +117,8 @@ approval waiting, child failure propagation, deadlines and simulated Ollama.
 - Pause applies after the current call and its deadline still advances.
 - Startup marks unfinished tasks Failed after an unclean server exit.
 - Startup also marks Queued, Planning, Planned and Running orchestrations Failed
-  once and records `freya.interrupted` without changing persisted plans.
+  once and records `freya.interrupted` without changing persisted plans. Durable
+  graph nodes are closed as cancelled/skipped so none remain apparently active.
 - A planner timeout or invalid repaired response leaves the orchestration Failed;
   inspect `planning_metrics` and `freya.planning.failed` on the run.
 - A Success record means the model finished and configured verification did not fail. Verification evidence and explicit unavailable/skipped reasons remain in the task result; failed checks produce Failed.

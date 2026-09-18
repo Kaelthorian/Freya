@@ -18,6 +18,7 @@ from .config import TOOL_CATALOG
 from .capabilities import effective_tools_for_policy
 from .policy import policy_from_legacy, validate_policy
 from .planner import PLAN_SCHEMA_VERSION, validate_plan
+from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
 from .agent_context import build_agent_context, build_effective_agent
 from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
@@ -355,6 +356,11 @@ class Store:
             )]
             for selection in result["selections"]:
                 selection["snapshot"] = _load(selection.pop("snapshot_json")) or {}
+            nodes = [self._execution_node(x) for x in c.execute(
+                "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=? "
+                "ORDER BY plan_order,plan_task_id", (oid,),
+            )]
+            result["graph_summary"] = graph_summary(nodes) if nodes else None
             result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
             for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
             result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
@@ -573,6 +579,94 @@ class Store:
                 raise ValueError("The orchestration plan snapshot already exists.")
         return self.get_orchestration(oid)
 
+    @staticmethod
+    def _execution_node(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        node = dict(row)
+        node["depends_on"] = _load(node.pop("depends_on_json")) or []
+        node["result"] = _load(node.pop("result_json"))
+        return node
+
+    def initialize_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict:
+        """Atomically create exactly one durable node for every planned task."""
+        now = utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute(
+                "SELECT status,plan_json FROM orchestration_runs WHERE id=?", (oid,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            if run["status"] != "Planned":
+                raise ValueError("Execution graph can only be initialized for a planned run.")
+            plan = validate_plan(_load(run["plan_json"]))
+            tasks = plan["tasks"]
+            by_id = {node.get("plan_task_id"): node for node in nodes}
+            if len(by_id) != len(nodes) or set(by_id) != {task["id"] for task in tasks}:
+                raise ValueError("Execution graph nodes must match planned tasks exactly once.")
+            existing = c.execute(
+                "SELECT COUNT(*) FROM orchestration_task_nodes WHERE orchestration_id=?", (oid,),
+            ).fetchone()[0]
+            if existing:
+                raise ValueError("Execution graph already exists.")
+            for index, task in enumerate(tasks):
+                node = by_id[task["id"]]
+                expected_state = "ready" if not task["depends_on"] else "pending"
+                if (node.get("state") != expected_state
+                        or list(node.get("depends_on") or []) != task["depends_on"]
+                        or int(node.get("plan_order", -1)) != index):
+                    raise ValueError(f"Invalid initial execution node for {task['id']}.")
+                c.execute(
+                    "INSERT INTO orchestration_task_nodes("
+                    "orchestration_id,plan_task_id,plan_order,depends_on_json,state,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (oid, task["id"], index, _dump(task["depends_on"]), expected_state, now),
+                )
+        return self.get_execution_graph(oid)
+
+    def get_execution_graph(self, oid: str) -> dict[str, Any]:
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            nodes = [self._execution_node(row) for row in c.execute(
+                "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=? "
+                "ORDER BY plan_order,plan_task_id", (oid,),
+            )]
+        return {"orchestration_id": oid, "nodes": nodes,
+                "summary": graph_summary(nodes) if nodes else None}
+
+    def save_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict[str, Any]:
+        """Persist an in-memory graph without allowing terminal nodes to reopen."""
+        now = utcnow()
+        by_id = {node.get("plan_task_id"): node for node in nodes}
+        if len(by_id) != len(nodes) or None in by_id:
+            raise ValueError("Execution graph contains duplicate or invalid task ids.")
+        with self._connection(write=True) as c:
+            rows = c.execute(
+                "SELECT plan_task_id,state FROM orchestration_task_nodes "
+                "WHERE orchestration_id=? ORDER BY plan_order", (oid,),
+            ).fetchall()
+            if not rows or {row["plan_task_id"] for row in rows} != set(by_id):
+                raise ValueError("Execution graph nodes do not match durable graph state.")
+            for row in rows:
+                node = by_id[row["plan_task_id"]]
+                state = node.get("state")
+                if state not in NODE_STATES:
+                    raise ValueError(f"Unknown execution node state: {state}.")
+                if row["state"] in TERMINAL_NODE_STATES and state != row["state"]:
+                    raise ValueError("A terminal execution node state is final.")
+                c.execute(
+                    "UPDATE orchestration_task_nodes SET state=?,selected_agent_id=?,selection_id=?,"
+                    "runtime_task_id=?,delegation_id=?,attempt=?,waiting_reason=?,result_json=?,error=?,"
+                    "started_at=?,finished_at=?,updated_at=? WHERE orchestration_id=? AND plan_task_id=?",
+                    (state, node.get("selected_agent_id"), node.get("selection_id"),
+                     node.get("runtime_task_id"), node.get("delegation_id"),
+                     int(node.get("attempt", 0)), sanitize(node.get("waiting_reason") or ""),
+                     _dump(node.get("result")) if node.get("result") is not None else None,
+                     sanitize(node.get("error")) if node.get("error") is not None else None,
+                     node.get("started_at"), node.get("finished_at"), now,
+                     oid, row["plan_task_id"]),
+                )
+        return self.get_execution_graph(oid)
+
     def add_orchestration_event(self, oid, event):
         with self._connection(write=True) as c:
             c.execute("INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)", (oid,utcnow(),event.get("event_type","update"),event.get("status"),event.get("agent_id"),event.get("task_id"),event.get("message",event.get("reason","")),_dump(event)))
@@ -653,6 +747,14 @@ class Store:
                 )
                 if cursor.rowcount != 1:
                     continue
+                c.execute(
+                    "UPDATE orchestration_task_nodes SET state=CASE "
+                    "WHEN state IN ('running','waiting_for_approval') THEN 'cancelled' ELSE 'skipped' END,"
+                    "waiting_reason='',error=?,finished_at=?,updated_at=? "
+                    "WHERE orchestration_id=? AND state NOT IN "
+                    "('success','failed','blocked','cancelled','skipped')",
+                    (message, now, now, row["id"]),
+                )
                 event = {"event_type": "freya.interrupted", "status": "Failed", "message": message}
                 c.execute(
                     "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,message,payload_json) "

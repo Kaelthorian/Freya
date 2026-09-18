@@ -35,6 +35,10 @@ reconstruct it.
 `GET /api/orchestrations/{id}/plan` returns
 the plan and its version metadata directly. Existing agent and task routes
 remain compatible.
+`GET /api/orchestrations/{id}/graph` returns durable nodes in immutable plan
+order plus a summary with per-state counts, active/terminal totals and a
+`complete` flag. Historical pre-4.3 runs return an empty node list and null
+summary. `GET /api/orchestrations/{id}` includes the same `graph_summary`.
 
 `POST /api/orchestrations/{id}/cancel` is idempotent. It returns the unchanged
 terminal run when the orchestration has already completed; otherwise it stores
@@ -101,10 +105,16 @@ The Freya view renders the plan summary, complexity, tasks, dependencies,
 required capabilities and current orchestration state with escaped text. It
 keeps recent terminal runs visible alongside active runs.
 
-Stage 4.2 temporarily selects and delegates only the first planned task. The API
-does not yet promise dependency-ready DAG execution, parallel plan scheduling,
-semantic-model ranking, replanning, automatic agent creation, or direct
-agent-to-agent communication.
+Stage 4.3 executes the complete validated DAG. Dependency-ready tasks use stable
+plan-order fairness, selection is persisted once per task, independent branches
+may run in parallel within `max_parallel_tasks`, joins wait for all parents, and
+failure blocks descendants without stopping independent work. Node states are
+`pending`, `ready`, `running`, `waiting_for_approval`, `blocked`, `success`,
+`failed`, `cancelled`, and `skipped`. The API does not promise semantic-model
+ranking, replanning, automatic agent creation, or direct agent-to-agent
+communication.
+The server exposes the bounds through `--max-parallel-tasks` (default 4) and
+`--max-delegated-tasks` (default 20); both accept 1–20.
 
 ## Agents and catalogue
 

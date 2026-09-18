@@ -8,9 +8,10 @@ from typing import Callable
 from .agent_context import build_effective_agent, capability_summary
 from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
-from .planner import MAX_GOAL_CHARS, PLAN_SCHEMA_VERSION, Planner
+from .execution_graph import ExecutionGraph
+from .planner import MAX_GOAL_CHARS, MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
-from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES
+from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -29,9 +30,17 @@ class Orchestrator:
         self.wait = wait or time.sleep
         self.lock = threading.RLock()
         self.planner_lock = threading.Lock()
-        self.config = {"max_rounds": 6, "max_delegated_tasks": 8, "max_model_calls": 12,
+        self.config = {"max_rounds": 6, "max_delegated_tasks": MAX_PLAN_TASKS,
+                       "max_parallel_tasks": 4, "max_model_calls": 12,
                        "max_wallclock_seconds": 900}
         self.config.update(config or {})
+        for field in ("max_delegated_tasks", "max_parallel_tasks"):
+            value = self.config[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field} must be a positive integer.")
+        self.config["max_parallel_tasks"] = min(
+            self.config["max_parallel_tasks"], self.config["max_delegated_tasks"],
+        )
 
     def submit(self, prompt: str, workspace_path: str | None = None) -> dict:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > MAX_GOAL_CHARS:
@@ -76,6 +85,17 @@ class Orchestrator:
                         self._snapshot_delegation(delegation["id"], task)
                     except (KeyError, ValueError):
                         pass
+            if cancelled.get("plan"):
+                persisted = self.store.get_execution_graph(oid)
+                if persisted["nodes"]:
+                    graph = ExecutionGraph(cancelled["plan"], persisted["nodes"])
+                    graph.cancel_nonterminal(utcnow(), "Cancelled by user.")
+                    self.store.save_execution_graph(oid, graph.serialize())
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.graph.completed", "status": "Cancelled",
+                        "message": "The execution graph was cancelled by the user.",
+                        "summary": graph.summary(),
+                    })
             return self.store.get_orchestration(oid)
 
     @staticmethod
@@ -246,12 +266,411 @@ class Orchestrator:
 
     def _timeout(self, oid: str) -> None:
         with self.lock:
-            if self.store.get_orchestration(oid)["status"] != "Running":
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
                 return
             self._cancel_active_children(oid)
+            persisted = self.store.get_execution_graph(oid)
+            if run.get("plan") and persisted["nodes"]:
+                graph = ExecutionGraph(run["plan"], persisted["nodes"])
+                graph.cancel_nonterminal(
+                    utcnow(), "Orchestration time limit reached.",
+                )
+                self.store.save_execution_graph(oid, graph.serialize())
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.graph.completed", "status": "Failed",
+                    "message": "The execution graph reached its time limit.",
+                    "summary": graph.summary(),
+                })
             self._fail_running(oid, "Orchestration time limit reached; active delegated tasks were cancelled.")
 
+    def _abort_graph(self, oid: str, message: str) -> None:
+        """Fail closed on an internal scheduler error without ghost-active nodes."""
+        with self.lock:
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
+                return
+            self._cancel_active_children(oid)
+            persisted = self.store.get_execution_graph(oid)
+            if run.get("plan") and persisted["nodes"]:
+                graph = ExecutionGraph(run["plan"], persisted["nodes"])
+                graph.cancel_nonterminal(utcnow(), message)
+                self.store.save_execution_graph(oid, graph.serialize())
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.graph.completed", "status": "Failed",
+                    "message": "The execution graph stopped after an internal scheduler error.",
+                    "summary": graph.summary(),
+                })
+            self._fail_running(oid, message)
+
+    def _select_graph_task(self, oid: str, task: dict, run: dict) -> dict | None:
+        """Select once for a ready node; cancellation may safely win while ranking."""
+        planned_task_id = task["id"]
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Running":
+                return None
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_selection.started", "status": "Running",
+                "task_id": planned_task_id,
+                "message": "Freya is ranking existing agents for the ready planned task.",
+            })
+        try:
+            selection = self.selector.select_agent(
+                task, self.store.list_agents(), self._selection_context(run),
+            )
+        except Exception as exc:
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] == "Running":
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.agent_selection.failed", "status": "Failed",
+                        "task_id": planned_task_id,
+                        "message": "Agent selection failed: " + str(exc),
+                    })
+            return {"error": "Agent selection failed: " + str(exc)}
+        with self.lock:
+            selection_id = self.store.save_agent_selection(oid, selection)
+            if selection_id is None:
+                return None
+            selected_agent_id = selection["selected_agent_id"]
+            if selected_agent_id is None:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.agent_selection.failed", "status": "Failed",
+                    "task_id": planned_task_id, "selector_version": selection["selector_version"],
+                    "selection_id": selection_id,
+                    "message": "No eligible or conditional agent is available for the planned task.",
+                })
+            else:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.agent_selected", "status": "Running",
+                    "task_id": planned_task_id, "agent_id": selected_agent_id,
+                    "selection_id": selection_id, "score": selection["score"],
+                    "selector_version": selection["selector_version"],
+                    "classification": selection["classification"],
+                    "approval_required": selection["approval_required"],
+                    "message": "Freya selected an existing agent for the ready planned task.",
+                })
+        return {"selection_id": selection_id, "selection": selection}
+
+    def _record_graph_transitions(self, oid: str, transitions: list[dict]) -> None:
+        for transition in transitions:
+            task_id = transition["task_id"]
+            if transition["to"] == "ready":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task.ready", "status": "Running", "task_id": task_id,
+                    "message": "All dependencies succeeded; the planned task is ready.",
+                })
+            elif transition["to"] == "blocked":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task.blocked", "status": "Failed", "task_id": task_id,
+                    "message": "The planned task was blocked by a failed dependency.",
+                })
+
+    def _finish_graph(self, oid: str, graph: ExecutionGraph) -> None:
+        summary = graph.summary()
+        unsuccessful = (summary["failed"] + summary["blocked"] + summary["cancelled"]
+                        + summary["skipped"])
+        if unsuccessful:
+            message = ("Execution graph completed with "
+                       f"{summary['failed']} failed, {summary['blocked']} blocked, "
+                       f"{summary['cancelled']} cancelled and {summary['skipped']} skipped nodes.")
+            completed = self.store.transition_orchestration(
+                oid, ("Running",), "Failed", error=message,
+            )
+            status = "Failed"
+        else:
+            rendered = []
+            for node in graph.serialize():
+                if node.get("result") is not None:
+                    rendered.append(f"{node['plan_task_id']}: {node['result']}")
+            response = f"Freya completed all {summary['total']} planned tasks successfully."
+            if rendered:
+                response += "\n\n" + "\n\n".join(rendered)
+            completed = self.store.transition_orchestration(
+                oid, ("Running",), "Success", response=response,
+            )
+            message, status = response, "Success"
+        if completed is None:
+            return
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.graph.completed", "status": status,
+            "message": "The execution graph reached a terminal state.", "summary": summary,
+        })
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.completed" if status == "Success" else "freya.failed",
+            "status": status, "message": message,
+        })
+
+    def _run_graph(self, oid: str, running: dict, deadline: float) -> None:
+        plan = running["plan"]
+        while True:
+            if self.clock() >= deadline:
+                self._timeout(oid)
+                return
+
+            selection_target = None
+            with self.lock:
+                run = self.store.get_orchestration(oid)
+                if run["status"] != "Running":
+                    return
+                persisted = self.store.get_execution_graph(oid)
+                graph = ExecutionGraph(plan, persisted["nodes"])
+                changed = False
+
+                for node in graph.active_nodes():
+                    runtime_task = self.store.get_task(node["runtime_task_id"])
+                    previous = node["state"]
+                    if graph.apply_runtime_status(
+                            node["plan_task_id"], runtime_task["status"],
+                            result=runtime_task.get("result"), error=runtime_task.get("error"),
+                            timestamp=utcnow()):
+                        changed = True
+                    if node.get("delegation_id"):
+                        self._snapshot_delegation(node["delegation_id"], runtime_task)
+                    current = graph.node(node["plan_task_id"])["state"]
+                    if current != previous:
+                        event_type = {
+                            "waiting_for_approval": "freya.task.waiting_for_approval",
+                            "success": "freya.task.succeeded",
+                            "failed": "freya.task.failed",
+                            "cancelled": "freya.task.failed",
+                        }.get(current)
+                        if event_type:
+                            self.store.add_orchestration_event(oid, {
+                                "event_type": event_type,
+                                "status": runtime_task["status"],
+                                "task_id": node["plan_task_id"],
+                                "agent_id": node.get("selected_agent_id"),
+                                "runtime_task_id": node.get("runtime_task_id"),
+                                "message": f"Planned task entered {current}.",
+                            })
+
+                transitions = graph.refresh_dependencies(utcnow())
+                if transitions:
+                    changed = True
+                    self._record_graph_transitions(oid, transitions)
+                if changed:
+                    self.store.save_execution_graph(oid, graph.serialize())
+
+                if graph.summary()["complete"]:
+                    self._finish_graph(oid, graph)
+                    return
+
+                for task in graph.ready_tasks():
+                    if not graph.node(task["id"]).get("selection_id"):
+                        selection_target = task
+                        break
+
+            if selection_target is not None:
+                selected = self._select_graph_task(oid, selection_target, running)
+                if selected is None:
+                    return
+                with self.lock:
+                    if self.store.get_orchestration(oid)["status"] != "Running":
+                        return
+                    graph = ExecutionGraph(
+                        plan, self.store.get_execution_graph(oid)["nodes"],
+                    )
+                    node = graph.node(selection_target["id"])
+                    if node["state"] != "ready" or node.get("selection_id"):
+                        continue
+                    if selected.get("error"):
+                        graph.mark_failed(selection_target["id"], selected["error"], utcnow())
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "freya.task.failed", "status": "Failed",
+                            "task_id": selection_target["id"], "message": selected["error"],
+                        })
+                    else:
+                        selection = selected["selection"]
+                        if selection["selected_agent_id"] is None:
+                            node["selection_id"] = selected["selection_id"]
+                            graph.mark_failed(
+                                selection_target["id"],
+                                "No eligible agent is available for this planned task.", utcnow(),
+                            )
+                            self.store.add_orchestration_event(oid, {
+                                "event_type": "freya.task.failed", "status": "Failed",
+                                "task_id": selection_target["id"],
+                                "message": "No eligible agent is available for this planned task.",
+                            })
+                        else:
+                            graph.mark_selected(
+                                selection_target["id"], selection["selected_agent_id"],
+                                selected["selection_id"], utcnow(),
+                            )
+                    self.store.save_execution_graph(oid, graph.serialize())
+                continue
+
+            dispatched = 0
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] != "Running":
+                    return
+                graph = ExecutionGraph(plan, self.store.get_execution_graph(oid)["nodes"])
+                active_nodes = graph.active_nodes()
+                slots = max(0, int(self.config["max_parallel_tasks"]) - len(active_nodes))
+                active_agents = {node.get("selected_agent_id") for node in active_nodes}
+                active_agents.update(
+                    task.get("agent_id") for task in self.store.list_tasks(limit=10000)
+                    if task.get("status") in ACTIVE_DELEGATED_TASK_STATUSES
+                )
+                for task in graph.ready_tasks():
+                    if slots <= 0:
+                        break
+                    node = graph.node(task["id"])
+                    agent_id = node.get("selected_agent_id")
+                    if not node.get("selection_id") or not agent_id:
+                        continue
+                    try:
+                        agent = self.store.get_agent(agent_id)
+                    except KeyError:
+                        graph.mark_failed(task["id"], "Selected agent no longer exists.", utcnow())
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "freya.task.failed", "status": "Failed",
+                            "task_id": task["id"], "agent_id": agent_id,
+                            "message": "Selected agent no longer exists.",
+                        })
+                        continue
+                    if agent.get("enabled") is not True:
+                        graph.set_waiting_reason(task["id"], "Selected agent is disabled.", utcnow())
+                        continue
+                    if agent.get("status") in {"Paused", "Offline"}:
+                        graph.set_waiting_reason(
+                            task["id"], f"Selected agent is {agent['status']}.", utcnow(),
+                        )
+                        continue
+                    if agent_id in active_agents:
+                        graph.set_waiting_reason(
+                            task["id"], "Selected agent is executing another task.", utcnow(),
+                        )
+                        continue
+                    try:
+                        runtime_task = self.runtime.submit(
+                            agent_id, task["objective"],
+                            running.get("config", {}).get("workspace_path") or None,
+                        )
+                    except ValueError as exc:
+                        refreshed = self.store.get_agent(agent_id)
+                        if refreshed.get("status") in {"Paused", "Offline"}:
+                            graph.set_waiting_reason(
+                                task["id"], f"Selected agent is {refreshed['status']}.", utcnow(),
+                            )
+                        else:
+                            graph.mark_failed(task["id"], str(exc), utcnow())
+                            self.store.add_orchestration_event(oid, {
+                                "event_type": "freya.task.failed", "status": "Failed",
+                                "task_id": task["id"], "agent_id": agent_id,
+                                "message": "Runtime submission failed: " + str(exc),
+                            })
+                        continue
+                    except Exception as exc:
+                        graph.mark_failed(task["id"], str(exc), utcnow())
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "freya.task.failed", "status": "Failed",
+                            "task_id": task["id"], "agent_id": agent_id,
+                            "message": "Runtime submission failed: " + str(exc),
+                        })
+                        continue
+                    delegation_id = self.store.add_delegation(
+                        oid, agent_id, task["objective"], runtime_task["id"],
+                    )
+                    if delegation_id is None:
+                        self.runtime.cancel(runtime_task["id"])
+                        return
+                    graph.mark_running(
+                        task["id"], runtime_task["id"], delegation_id, utcnow(),
+                    )
+                    active_agents.add(agent_id)
+                    slots -= 1
+                    dispatched += 1
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.task.dispatched", "status": runtime_task["status"],
+                        "task_id": task["id"], "runtime_task_id": runtime_task["id"],
+                        "agent_id": agent_id, "selection_id": node["selection_id"],
+                        "message": "Ready planned task was dispatched exactly once.",
+                    })
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.delegated", "status": runtime_task["status"],
+                        "task_id": runtime_task["id"], "planned_task_id": task["id"],
+                        "agent_id": agent_id, "selection_id": node["selection_id"],
+                        "message": "Delegated objective to agent.",
+                    })
+                self.store.save_execution_graph(oid, graph.serialize())
+
+            if self.clock() >= deadline:
+                self._timeout(oid)
+                return
+            self.wait(min(.2, max(0, deadline - self.clock())))
+
     def _run(self, oid):
+        # Explicitly injected decision functions retain the pre-4.3 test and
+        # extension contract. The production path is the durable DAG scheduler.
+        if self.decide is not None:
+            return self._run_legacy(oid)
+        started = self.clock()
+        deadline = started + float(self.config["max_wallclock_seconds"])
+        with self.lock:
+            planning = self.store.transition_orchestration(oid, ("Queued",), "Planning")
+            if planning is None:
+                return
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.planning.started", "status": "Planning",
+                "message": "Freya is creating a structured plan.",
+            })
+        planning_metrics: dict = {}
+        try:
+            context = self._planning_context(self.store.list_agents())
+            with self.planner_lock:
+                try:
+                    plan = self.planner.create_plan(planning["prompt"], context)
+                finally:
+                    planning_metrics = dict(self.planner.metrics)
+            if len(plan["tasks"]) > int(self.config["max_delegated_tasks"]):
+                raise ValueError(
+                    f"Plan contains {len(plan['tasks'])} tasks but max_delegated_tasks is "
+                    f"{self.config['max_delegated_tasks']}.",
+                )
+        except Exception as exc:
+            self._fail_planning(oid, exc, planning_metrics)
+            return
+
+        try:
+            with self.lock:
+                planned = self.store.save_orchestration_plan(
+                    oid, plan, PLAN_SCHEMA_VERSION, planning_metrics,
+                )
+                if planned is None:
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.created", "status": "Planned",
+                    "message": "Freya created and saved the structured plan.",
+                    "goal": plan["goal"], "complexity": plan["complexity"],
+                    "task_count": len(plan["tasks"]),
+                    "task_ids": [task["id"] for task in plan["tasks"]],
+                    "plan_schema_version": PLAN_SCHEMA_VERSION,
+                    "planning_metrics": planning_metrics,
+                })
+                graph = ExecutionGraph(plan)
+                self.store.initialize_execution_graph(oid, graph.serialize())
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.graph.initialized", "status": "Planned",
+                    "message": "Freya initialized the durable execution graph.",
+                    "summary": graph.summary(),
+                })
+                self._record_graph_transitions(oid, [
+                    {"task_id": task["id"], "from": "pending", "to": "ready"}
+                    for task in graph.ready_tasks()
+                ])
+                running = self.store.transition_orchestration(oid, ("Planned",), "Running")
+                if running is None:
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.analyzing", "status": "Running",
+                    "message": "Freya is scheduling ready tasks from the execution graph.",
+                })
+            self._run_graph(oid, running, deadline)
+        except Exception as exc:
+            self._abort_graph(oid, str(exc))
+
+    def _run_legacy(self, oid):
         started = self.clock()
         deadline = started + float(self.config["max_wallclock_seconds"])
         results: list[dict] = []
@@ -309,8 +728,7 @@ class Orchestrator:
                 if self.decide:
                     decision = self._decision(running["prompt"], self.store.list_agents(), results)
                 else:
-                    # Stage 4.2 intentionally selects only the first planned task.
-                    # Execution-graph scheduling and dependency traversal belong to 4.3.
+                    # Compatibility path for explicitly injected legacy decision hooks.
                     selected_task = self._select_planned_task(
                         oid, running["plan"]["tasks"][0], running,
                     )

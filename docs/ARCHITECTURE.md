@@ -4,6 +4,7 @@ Freya includes a first-class orchestration layer. User prompts enter
 `control_center/orchestrator.py`, which asks `control_center/planner.py` for a
 strict structured plan and persists that snapshot before asking
 `control_center/agent_selector.py` to rank compatible existing agents,
+then uses `control_center/execution_graph.py` to release dependency-ready tasks,
 delegating bounded tasks through `Runtime`, and integrating persisted results.
 Workers remain the only components allowed to invoke tools;
 each receives a generic policy plus its identity, instructions, skills,
@@ -20,17 +21,17 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-       Planner → planned task → Agent Selector → Orchestrator
-                                      ↓              ↓
-                              Capability Policy   scheduler → spawned worker → local Ollama
+       Planner → immutable plan → Execution Graph → Agent Selector → Orchestrator
+                                              ↓              ↓              ↓
+                                      dependency state   Capability Policy  scheduler → spawned worker → local Ollama
                                                             ↓
                                               capability resolver → policy engine → tools → workspace
 ```
 
 The Planner determines **what** work exists. The Agent Selector determines
 **who** is the safest and most suitable existing candidate for one planned
-task. A future Execution Graph will determine **when** dependency-ready tasks
-run. The Worker determines **how** one selected task executes. Capability
+task. The deterministic Execution Graph determines **when** dependency-ready
+tasks run. The Worker determines **how** one selected task executes. Capability
 Policy remains the sole authority for **whether** each requested action is
 permitted.
 
@@ -58,6 +59,10 @@ Every Agent Selector decision, including `no_eligible_agent`, is stored in
 classification status, score, selector version, creation time and complete
 explainable ranking snapshot. Historical decisions therefore retain the exact
 scoring semantics and evidence used at selection time.
+`orchestration_task_nodes` stores exactly one evolving node per planned task,
+including immutable dependency/order data, selection and agent IDs, Runtime
+task and delegation IDs, attempts, waiting reason, result/error, and timestamps.
+The plan remains the immutable intent; node rows are the durable execution state.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
@@ -73,6 +78,10 @@ Selection emits `freya.agent_selection.started`, followed by either
 `freya.agent_selected` or `freya.agent_selection.failed`. The selected event
 contains the planned task ID, agent ID, score, classification and selector
 version; the complete ranking stays in the selection snapshot.
+Graph execution emits `freya.graph.initialized`, `freya.task.ready`,
+`freya.task.dispatched`, `freya.task.waiting_for_approval`, terminal task events,
+and `freya.graph.completed`. Together with selection and delegation snapshots,
+these events reconstruct Plan Task → Selection → Agent → Runtime Task → Result.
 
 Orchestration transitions are conditional on the stored current state:
 
@@ -120,7 +129,40 @@ separate lifecycle lock and remains responsive while a planner call is pending.
 Preferred Skills remain unvalidated semantic hints so planning is not coupled
 to the mutable Skill registry. Required capabilities must exist in the platform
 registry, but remain declarations: the planner never edits agent configuration
-or policy. DAG execution and replanning belong to later Stage 4 work.
+or policy. Replanning and semantic evaluation remain outside Stage 4.3.
+
+## Execution graph and scheduling
+
+`ExecutionGraph` is local, deterministic and model-free. It deep-copies the
+validated plan and maintains `pending`, `ready`, `running`,
+`waiting_for_approval`, `blocked`, `success`, `failed`, `cancelled`, and
+`skipped` nodes. Only nodes whose dependencies all succeeded become ready.
+Failure or cancellation blocks descendants transitively while unrelated
+branches continue. Join nodes wait for every dependency.
+
+Ready-node fairness follows the immutable plan order. Selection occurs exactly
+once when a node first becomes ready and its durable snapshot is reused while
+waiting. The scheduler admits at most `max_parallel_tasks` active graph nodes
+(default 4), never submits two tasks concurrently to one agent, and also honors
+Runtime's agent/workspace serialization. A selected disabled, Paused, Offline,
+or busy agent leaves the node ready with a `waiting_reason`; it is not submitted
+repeatedly or silently reselected.
+
+Runtime `Queued` and `Running` map to graph `running`;
+`WaitingForApproval` maps to `waiting_for_approval`; Runtime `Paused` remains a
+nonterminal `running` node with an explicit reason. Runtime terminal statuses
+map to their graph equivalents. The parent succeeds only when every node
+succeeds and fails after all reachable work is terminal when any node failed,
+was blocked, cancelled, or skipped. User cancellation remains `Cancelled`.
+The wall-clock deadline includes planning and bounded polling uses the injected
+orchestrator clock/wait functions.
+
+Graph initialization is one SQLite transaction after the immutable plan is
+saved. Plans larger than configured `max_delegated_tasks` fail during Planning,
+before graph initialization or Runtime submission; the default is aligned with
+the planner's 20-task maximum. Restart recovery preserves graph history but
+changes unfinished running/waiting nodes to cancelled and undispatched nodes to
+skipped, so a failed recovered run never exposes ghost-running nodes.
 
 ## Agent selection
 
@@ -180,17 +222,12 @@ capability buckets, workload and Skill-match details for every candidate.
 Candidate IDs must be unique; duplicate valid IDs reject the selection input
 before scoring because they make the ranking ambiguous.
 
-Until the Execution Graph stage is implemented, the production Orchestrator
-passes the first planned task to the selector and delegates only that task. It
-does not traverse dependencies, run planned tasks in parallel, replan, create
-agents, or enable direct agent-to-agent communication.
-
-The orchestration waits while delegated tasks are Queued, Running, Paused or
-WaitingForApproval. It snapshots each child's status, result and finish time.
-Every child must finish with Success before the parent succeeds; Failed or
-unexpectedly Cancelled children fail the parent. The wall-clock deadline starts
-before planning and is never reset. At timeout, active children are cancelled
-before the parent becomes Failed.
+Selection does not dispatch by itself. The execution graph retains the selected
+agent and waits for both a global slot and per-agent availability. Approval is
+the existing durable Runtime flow and does not fail the graph while pending.
+At timeout, active children are cancelled and all remaining graph nodes become
+terminal before the parent becomes Failed. Stage 4.3 does not replan, create
+agents, perform semantic result evaluation, or enable agent-to-agent messaging.
 
 ## Runtime and control semantics
 
