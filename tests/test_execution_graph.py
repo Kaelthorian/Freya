@@ -6,6 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from control_center.agent_selector import AgentSelector
 from control_center.api import Application
 from control_center.config import normalize_agent
 from control_center.execution_graph import ExecutionGraph
@@ -272,6 +273,31 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn(2, active_counts)
         self.assertEqual(runtime.submissions[-1][0], "join")
 
+    def test_real_selector_distributes_equivalent_parallel_work(self):
+        agents = [self.agent(name) for name in ("Equivalent 1", "Equivalent 2")]
+        runtime = ControlledRuntime(self.store)
+        active_counts = []
+
+        def advance(seconds):
+            active_counts.append(len(runtime.finish_active()))
+
+        run = self.store.create_orchestration("Use both equivalent agents")
+        plan = execution_plan([planned_task("a"), planned_task("b")])
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
+            selector=AgentSelector(), wait=advance,
+            config={"max_wallclock_seconds": 10, "max_parallel_tasks": 2},
+        )
+        orchestrator._run(run["id"])
+        final = self.store.get_orchestration(run["id"])
+
+        self.assertEqual(final["status"], "Success")
+        self.assertIn(2, active_counts)
+        self.assertEqual(len({item[1] for item in runtime.submissions}), 2)
+        self.assertEqual({item[1] for item in runtime.submissions},
+                         {agent["id"] for agent in agents})
+        self.assertEqual(len(final["selections"]), 2)
+
     def test_failure_blocks_descendant_but_independent_branch_completes(self):
         agents = [self.agent(name) for name in ("Bad", "Independent")]
         runtime = ControlledRuntime(self.store)
@@ -342,6 +368,97 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(runtime.submissions), 1)
         self.assertEqual(len(final["selections"]), 1)
 
+    def test_offline_after_selection_waits_then_dispatches_exactly_once(self):
+        agent = self.agent("Offline")
+        runtime = ControlledRuntime(self.store)
+        original_save = self.store.save_agent_selection
+
+        def save_then_offline(oid, selection):
+            selection_id = original_save(oid, selection)
+            if selection_id:
+                self.store.set_agent_state(agent["id"], "Offline")
+                self.store.save_agent_selection = original_save
+            return selection_id
+
+        self.store.save_agent_selection = save_then_offline
+        waits = []
+
+        def advance(seconds):
+            waits.append(True)
+            graph = self.store.get_execution_graph(self.store.list_orchestrations(1)[0]["id"])
+            if len(waits) == 1:
+                self.assertEqual(graph["nodes"][0]["state"], "ready")
+                self.assertIn("Offline", graph["nodes"][0]["waiting_reason"])
+                self.assertEqual(runtime.submissions, [])
+                self.store.set_agent_state(agent["id"], "Idle")
+            else:
+                runtime.finish_active()
+
+        final = self.run_graph(
+            execution_plan([planned_task("offline")]), {"offline": agent["id"]},
+            runtime, advance,
+        )
+        self.assertEqual(final["status"], "Success")
+        self.assertEqual(len(runtime.submissions), 1)
+        self.assertEqual(len(final["selections"]), 1)
+
+    def test_disabled_after_selection_fails_and_blocks_descendant(self):
+        agent = self.agent("Disabled")
+        runtime = ControlledRuntime(self.store)
+        original_save = self.store.save_agent_selection
+
+        def save_then_disable(oid, selection):
+            selection_id = original_save(oid, selection)
+            if selection_id:
+                current = self.store.get_agent(agent["id"])
+                self.store.update_agent(
+                    agent["id"], normalize_agent({"enabled": False}, current),
+                )
+                self.store.save_agent_selection = original_save
+            return selection_id
+
+        self.store.save_agent_selection = save_then_disable
+        final = self.run_graph(
+            execution_plan([planned_task("a"), planned_task("b", ["a"])]),
+            {"a": agent["id"], "b": agent["id"]}, runtime, lambda seconds: None,
+        )
+        nodes = {node["plan_task_id"]: node
+                 for node in self.store.get_execution_graph(final["id"])["nodes"]}
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(nodes["a"]["state"], "failed")
+        self.assertIn("became disabled after selection", nodes["a"]["error"])
+        self.assertEqual(nodes["b"]["state"], "blocked")
+        self.assertEqual(runtime.submissions, [])
+        failures = [event for event in final["events"]
+                    if event["event_type"] == "freya.task.failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("became disabled", failures[0]["message"])
+
+    def test_deleted_after_selection_fails_without_reselection(self):
+        agent = self.agent("Deleted")
+        other = self.agent("Unused")
+        runtime = ControlledRuntime(self.store)
+        original_save = self.store.save_agent_selection
+
+        def save_then_delete(oid, selection):
+            selection_id = original_save(oid, selection)
+            if selection_id:
+                self.store.delete_agent(agent["id"])
+                self.store.save_agent_selection = original_save
+            return selection_id
+
+        self.store.save_agent_selection = save_then_delete
+        final = self.run_graph(
+            execution_plan([planned_task("deleted")]), {"deleted": agent["id"]},
+            runtime, lambda seconds: None,
+        )
+        node = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(node["state"], "failed")
+        self.assertIn("no longer exists", node["error"])
+        self.assertEqual(runtime.submissions, [])
+        self.assertIsNotNone(other["id"])
+
     def test_same_agent_tasks_are_serialized(self):
         agent = self.agent("Shared")
         runtime = ControlledRuntime(self.store)
@@ -357,6 +474,7 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(final["status"], "Success")
         self.assertEqual(max(max_active), 1)
+        self.assertEqual(len(final["selections"]), 2)
 
     def test_global_parallel_limit_is_enforced(self):
         agents = [self.agent(str(index)) for index in range(3)]
@@ -438,6 +556,74 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([node["state"] for node in recovered["nodes"]],
                          ["cancelled", "skipped"])
         self.assertEqual(self.store.get_orchestration(run["id"])["status"], "Failed")
+
+    def test_timeout_cancels_runtime_and_closes_every_graph_node(self):
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        clock = Clock()
+        agent = self.agent("Timeout")
+        runtime = ControlledRuntime(self.store)
+
+        def advance(seconds):
+            clock.value += seconds
+
+        plan = execution_plan([
+            planned_task("forever"), planned_task("dependent", ["forever"]),
+        ])
+        run = self.store.create_orchestration("Timeout graph")
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
+            selector=MappingSelector({"forever": agent["id"], "dependent": agent["id"]}),
+            clock=clock, wait=advance,
+            config={"max_wallclock_seconds": .5, "max_parallel_tasks": 1},
+        )
+        orchestrator._run(run["id"])
+
+        final = self.store.get_orchestration(run["id"])
+        graph = self.store.get_execution_graph(run["id"])
+        self.assertEqual(final["status"], "Failed")
+        self.assertIn("time limit", final["error"])
+        self.assertEqual(len(runtime.cancelled), 1)
+        self.assertEqual(self.store.get_task(runtime.submissions[0][2])["status"], "Cancelled")
+        self.assertTrue(all(node["state"] in {"success", "failed", "blocked", "cancelled", "skipped"}
+                            for node in graph["nodes"]))
+        self.assertFalse(any(node["state"] in {"pending", "ready", "running",
+                                               "waiting_for_approval"}
+                             for node in graph["nodes"]))
+        completed = [event for event in final["events"]
+                     if event["event_type"] == "freya.graph.completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["status"], "Failed")
+
+    def test_post_submit_persistence_failure_cancels_without_duplicate_dispatch(self):
+        agent = self.agent("Atomic dispatch")
+        runtime = ControlledRuntime(self.store)
+        original_add = self.store.add_delegation
+        calls = []
+
+        def fail_once(*args, **kwargs):
+            calls.append(True)
+            self.store.add_delegation = original_add
+            raise RuntimeError("simulated delegation persistence failure")
+
+        self.store.add_delegation = fail_once
+        final = self.run_graph(
+            execution_plan([planned_task("atomic")]), {"atomic": agent["id"]},
+            runtime, lambda seconds: None,
+        )
+        node = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(runtime.submissions), 1)
+        self.assertEqual(len(runtime.cancelled), 1)
+        self.assertEqual(node["state"], "cancelled")
+        self.assertNotIn(node["state"], {"pending", "ready", "running",
+                                         "waiting_for_approval"})
+        self.assertEqual(len(final["selections"]), 1)
 
     def test_graph_api_exposes_nodes_and_summary(self):
         run = self.store.create_orchestration("Historical")

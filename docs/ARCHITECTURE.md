@@ -144,9 +144,21 @@ Ready-node fairness follows the immutable plan order. Selection occurs exactly
 once when a node first becomes ready and its durable snapshot is reused while
 waiting. The scheduler admits at most `max_parallel_tasks` active graph nodes
 (default 4), never submits two tasks concurrently to one agent, and also honors
-Runtime's agent/workspace serialization. A selected disabled, Paused, Offline,
-or busy agent leaves the node ready with a `waiting_reason`; it is not submitted
-repeatedly or silently reselected.
+Runtime's agent/workspace serialization. A selected Paused, Offline, or busy
+agent leaves the node ready with a `waiting_reason`; it is not submitted
+repeatedly or silently reselected. Disabled and deleted agents fail as described
+below.
+Selection and dispatch are interleaved: after selecting a ready task, the
+scheduler reserves and attempts to dispatch it before selecting the next task.
+The next Agent Selector call receives workload from active Runtime tasks,
+active graph nodes, and selected ready-node reservations, so parallel branches
+do not share stale workload information.
+
+Paused and Offline are temporary scheduling waits: the selected node remains
+ready with one stable `waiting_reason` and dispatches once after availability
+returns. A selected agent that becomes disabled or is deleted is a durable
+execution failure for that node; descendants are blocked normally and 4.3 does
+not reselect another agent. Recovery/reselection remains future-stage work.
 
 Runtime `Queued` and `Running` map to graph `running`;
 `WaitingForApproval` maps to `waiting_for_approval`; Runtime `Paused` remains a

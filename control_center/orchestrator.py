@@ -160,10 +160,30 @@ class Orchestrator:
 
     def _selection_context(self, run: dict) -> dict:
         workloads: dict[str, int] = {}
+        active_runtime_task_ids: set[str] = set()
         for task in self.store.list_tasks(limit=10000):
             if task.get("status") in ACTIVE_DELEGATED_TASK_STATUSES:
                 agent_id = task.get("agent_id")
                 if isinstance(agent_id, str):
+                    workloads[agent_id] = workloads.get(agent_id, 0) + 1
+                task_id = task.get("id")
+                if isinstance(task_id, str):
+                    active_runtime_task_ids.add(task_id)
+        # A selected ready node is a scheduling reservation. Active graph nodes
+        # are also included when their Runtime task is not yet visible, while
+        # Runtime task IDs prevent double-counting the normal persisted path.
+        orchestration_id = run.get("id")
+        if isinstance(orchestration_id, str):
+            for node in self.store.get_execution_graph(orchestration_id)["nodes"]:
+                agent_id = node.get("selected_agent_id")
+                if not isinstance(agent_id, str):
+                    continue
+                reserved = (node.get("state") == "ready" and node.get("selection_id"))
+                missing_runtime = (
+                    node.get("state") in {"running", "waiting_for_approval"}
+                    and node.get("runtime_task_id") not in active_runtime_task_ids
+                )
+                if reserved or missing_runtime:
                     workloads[agent_id] = workloads.get(agent_id, 0) + 1
         return {
             "workspace_path": run.get("config", {}).get("workspace_path") or "",
@@ -498,7 +518,6 @@ class Orchestrator:
                                 selected["selection_id"], utcnow(),
                             )
                     self.store.save_execution_graph(oid, graph.serialize())
-                continue
 
             dispatched = 0
             with self.lock:
@@ -530,7 +549,13 @@ class Orchestrator:
                         })
                         continue
                     if agent.get("enabled") is not True:
-                        graph.set_waiting_reason(task["id"], "Selected agent is disabled.", utcnow())
+                        message = "Selected agent became disabled after selection."
+                        graph.mark_failed(task["id"], message, utcnow())
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "freya.task.failed", "status": "Failed",
+                            "task_id": task["id"], "agent_id": agent_id,
+                            "message": message,
+                        })
                         continue
                     if agent.get("status") in {"Paused", "Offline"}:
                         graph.set_waiting_reason(
@@ -569,15 +594,26 @@ class Orchestrator:
                             "message": "Runtime submission failed: " + str(exc),
                         })
                         continue
-                    delegation_id = self.store.add_delegation(
-                        oid, agent_id, task["objective"], runtime_task["id"],
-                    )
-                    if delegation_id is None:
-                        self.runtime.cancel(runtime_task["id"])
-                        return
-                    graph.mark_running(
-                        task["id"], runtime_task["id"], delegation_id, utcnow(),
-                    )
+                    try:
+                        delegation_id = self.store.add_delegation(
+                            oid, agent_id, task["objective"], runtime_task["id"],
+                        )
+                        if delegation_id is None:
+                            self.runtime.cancel(runtime_task["id"])
+                            return
+                        graph.mark_running(
+                            task["id"], runtime_task["id"], delegation_id, utcnow(),
+                        )
+                        # Persist the dispatch before another selection can run.
+                        # If any post-submit step fails, cancel the created task
+                        # and fail closed instead of leaving a ready duplicate.
+                        self.store.save_execution_graph(oid, graph.serialize())
+                    except Exception:
+                        try:
+                            self.runtime.cancel(runtime_task["id"])
+                        except (KeyError, ValueError):
+                            pass
+                        raise
                     active_agents.add(agent_id)
                     slots -= 1
                     dispatched += 1
@@ -598,6 +634,11 @@ class Orchestrator:
             if self.clock() >= deadline:
                 self._timeout(oid)
                 return
+            # Interleave selection and dispatch. A newly dispatched task is now
+            # visible to the next AgentSelector workload calculation, so fill
+            # remaining slots before yielding to the polling wait.
+            if dispatched and slots > 0:
+                continue
             self.wait(min(.2, max(0, deadline - self.clock())))
 
     def _run(self, oid):
