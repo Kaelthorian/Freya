@@ -179,6 +179,8 @@ CREATE TABLE IF NOT EXISTS orchestration_task_nodes (
     selection_id TEXT REFERENCES orchestration_selections(id),
     runtime_task_id TEXT REFERENCES tasks(id),
     delegation_id TEXT,
+    evaluation_id TEXT,
+    evaluation_status TEXT,
     attempt INTEGER NOT NULL DEFAULT 0,
     waiting_reason TEXT NOT NULL DEFAULT '',
     result_json TEXT,
@@ -191,6 +193,28 @@ CREATE TABLE IF NOT EXISTS orchestration_task_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_orch_task_nodes_state
     ON orchestration_task_nodes(orchestration_id,state,plan_order);
+CREATE TABLE IF NOT EXISTS orchestration_evaluations (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL,
+    plan_task_id TEXT NOT NULL,
+    runtime_task_id TEXT NOT NULL REFERENCES tasks(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    attempt INTEGER NOT NULL,
+    evaluator_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evaluation_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    snapshot_json TEXT NOT NULL,
+    context_truncated INTEGER NOT NULL DEFAULT 0,
+    deterministic INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (orchestration_id, plan_task_id)
+        REFERENCES orchestration_task_nodes(orchestration_id, plan_task_id),
+    UNIQUE (orchestration_id, plan_task_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_evaluations
+    ON orchestration_evaluations(orchestration_id,created_at,id);
 CREATE TABLE IF NOT EXISTS orchestration_delegations (
     id TEXT PRIMARY KEY,
     orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),

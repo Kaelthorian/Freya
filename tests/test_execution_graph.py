@@ -10,6 +10,7 @@ from control_center.agent_selector import AgentSelector
 from control_center.api import Application
 from control_center.config import normalize_agent
 from control_center.execution_graph import ExecutionGraph
+from control_center.evaluator import Evaluator
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
 from control_center.storage import Store
@@ -34,6 +35,20 @@ def execution_plan(tasks):
         "complexity": "simple" if len(tasks) == 1 else "multi_step",
         "tasks": tasks,
         "success_criteria": ["The graph reaches a terminal state."],
+    }
+
+
+def evaluation_decision(criteria, status="accepted"):
+    return {
+        "status": status, "confidence": 0.9, "summary": status + " by test evaluator.",
+        "criteria": [{
+            "criterion": item,
+            "status": "satisfied" if status == "accepted" else "unsatisfied",
+            "reason": "Test evidence was evaluated.", "evidence": ["fixture"],
+        } for item in criteria],
+        "issues": [] if status == "accepted" else ["Contradictory evidence."],
+        "missing_evidence": [],
+        "recommended_action": "accept" if status == "accepted" else "reject",
     }
 
 
@@ -85,6 +100,9 @@ class ExecutionGraphTests(unittest.TestCase):
         graph.mark_selected("a", "agent", "selection")
         graph.mark_running("a", "runtime", "delegation")
         graph.apply_runtime_status("a", "Success", result="done")
+        self.assertEqual(graph.node("a")["state"], "evaluating")
+        self.assertEqual(graph.refresh_dependencies(), [])
+        graph.apply_evaluation("a", "evaluation", "accepted", "accepted")
         self.assertEqual(graph.refresh_dependencies(),
                          [{"task_id": "b", "from": "pending", "to": "ready"}])
 
@@ -96,10 +114,31 @@ class ExecutionGraphTests(unittest.TestCase):
             graph.mark_selected(task_id, task_id, "s-" + task_id)
             graph.mark_running(task_id, "r-" + task_id, "d-" + task_id)
         graph.apply_runtime_status("a", "Success")
+        graph.apply_evaluation("a", "e-a", "accepted", "accepted")
         self.assertEqual(graph.refresh_dependencies(), [])
         graph.apply_runtime_status("b", "Success")
+        graph.apply_evaluation("b", "e-b", "accepted", "accepted")
         graph.refresh_dependencies()
         self.assertEqual(graph.node("join")["state"], "ready")
+
+    def test_nonaccepted_evaluation_fails_and_blocks_descendants(self):
+        graph = ExecutionGraph(self.chain())
+        graph.mark_selected("a", "agent", "selection")
+        graph.mark_running("a", "runtime", "delegation")
+        graph.apply_runtime_status("a", "Success", result="claim")
+        graph.apply_evaluation("a", "evaluation", "rejected", "Evidence contradicts claim.")
+        graph.refresh_dependencies()
+        self.assertEqual(graph.node("a")["state"], "failed")
+        self.assertEqual(graph.node("a")["evaluation_status"], "rejected")
+        self.assertEqual(graph.node("b")["state"], "blocked")
+
+    def test_evaluation_is_applied_only_once(self):
+        graph = ExecutionGraph(execution_plan([planned_task("a")]))
+        graph.mark_selected("a", "agent", "selection")
+        graph.mark_running("a", "runtime", "delegation")
+        graph.apply_runtime_status("a", "Success", result="done")
+        self.assertTrue(graph.apply_evaluation("a", "evaluation", "accepted", "accepted"))
+        self.assertFalse(graph.apply_evaluation("a", "evaluation", "accepted", "accepted"))
 
     def test_failure_blocks_all_descendants(self):
         graph = ExecutionGraph(self.chain())
@@ -233,11 +272,12 @@ class SchedulerTests(unittest.TestCase):
     def agent(self, name):
         return self.store.create_agent(normalize_agent({"name": name, "role": "Engineer"}))
 
-    def run_graph(self, plan, mapping, runtime, wait, **config):
+    def run_graph(self, plan, mapping, runtime, wait, evaluator=None, **config):
         run = self.store.create_orchestration("Execute graph")
         orchestrator = Orchestrator(
             self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
             selector=MappingSelector(mapping), wait=wait,
+            evaluator=evaluator,
             config={"max_wallclock_seconds": 10, **config},
         )
         orchestrator._run(run["id"])
@@ -520,6 +560,183 @@ class SchedulerTests(unittest.TestCase):
         states = [node["state"] for node in self.store.get_execution_graph(run["id"])["nodes"]]
         self.assertEqual(states, ["cancelled", "cancelled"])
         self.assertEqual(len(runtime.submissions), 1)
+
+    def test_semantic_rejection_blocks_descendant_while_independent_branch_continues(self):
+        agents = [self.agent(name) for name in ("Rejected", "Independent")]
+        runtime = ControlledRuntime(self.store)
+        calls = []
+
+        def model(prompt, context):
+            task = context["planned_task"]
+            calls.append(task["id"])
+            status = "rejected" if task["id"] == "bad" else "accepted"
+            return evaluation_decision(task["success_criteria"], status)
+
+        final = self.run_graph(
+            execution_plan([
+                planned_task("bad"), planned_task("child", ["bad"]),
+                planned_task("independent"),
+            ]),
+            {"bad": agents[0]["id"], "child": agents[0]["id"],
+             "independent": agents[1]["id"]}, runtime,
+            lambda seconds: runtime.finish_active(), evaluator=Evaluator(model),
+            max_parallel_tasks=2,
+        )
+        nodes = {item["plan_task_id"]: item
+                 for item in self.store.get_execution_graph(final["id"])["nodes"]}
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(nodes["bad"]["evaluation_status"], "rejected")
+        self.assertEqual(nodes["child"]["state"], "blocked")
+        self.assertEqual(nodes["independent"]["state"], "success")
+        self.assertEqual(calls.count("bad"), 1)
+        self.assertEqual(calls.count("independent"), 1)
+        self.assertNotIn("child", calls)
+        self.assertEqual(len(final["evaluations"]), 2)
+
+    def test_accepted_evaluation_runs_once_and_unlocks_dependency(self):
+        agent = self.agent("Accepted")
+        runtime = ControlledRuntime(self.store)
+        calls = []
+
+        def model(prompt, context):
+            calls.append(context["planned_task"]["id"])
+            return evaluation_decision(context["planned_task"]["success_criteria"])
+
+        final = self.run_graph(
+            execution_plan([planned_task("a"), planned_task("b", ["a"])]),
+            {"a": agent["id"], "b": agent["id"]}, runtime,
+            lambda seconds: runtime.finish_active(), evaluator=Evaluator(model),
+        )
+        self.assertEqual(final["status"], "Success")
+        self.assertEqual(calls, ["a", "b"])
+        self.assertEqual(len(final["evaluations"]), 2)
+        event_types = [item["event_type"] for item in final["events"]]
+        self.assertEqual(event_types.count("freya.evaluation.started"), 2)
+        self.assertEqual(event_types.count("freya.evaluation.completed"), 2)
+
+    def test_cancellation_during_evaluation_discards_late_result(self):
+        agent = self.agent("Cancel evaluation")
+        runtime = ControlledRuntime(self.store, {"a": "Success"})
+        entered = threading.Event()
+        release = threading.Event()
+
+        def model(prompt, context):
+            entered.set()
+            release.wait(2)
+            return evaluation_decision(context["planned_task"]["success_criteria"])
+
+        plan = execution_plan([planned_task("a")])
+        run = self.store.create_orchestration("Cancel evaluation")
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
+            selector=MappingSelector({"a": agent["id"]}), evaluator=Evaluator(model),
+            config={"max_wallclock_seconds": 10},
+        )
+        thread = threading.Thread(target=orchestrator._run, args=(run["id"],))
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        cancelled = orchestrator.cancel(run["id"])
+        release.set()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(cancelled["status"], "Cancelled")
+        self.assertEqual(self.store.list_evaluations(run["id"]), [])
+        self.assertEqual(self.store.get_execution_graph(run["id"])["nodes"][0]["state"],
+                         "cancelled")
+
+    def test_timeout_during_evaluation_discards_late_result(self):
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        clock = Clock()
+        agent = self.agent("Timeout evaluation")
+        runtime = ControlledRuntime(self.store, {"a": "Success"})
+
+        def model(prompt, context):
+            clock.value = 2.0
+            return evaluation_decision(context["planned_task"]["success_criteria"])
+
+        plan = execution_plan([planned_task("a")])
+        run = self.store.create_orchestration("Timeout evaluation")
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
+            selector=MappingSelector({"a": agent["id"]}), evaluator=Evaluator(model),
+            clock=clock, wait=lambda seconds: None,
+            config={"max_wallclock_seconds": 1},
+        )
+        orchestrator._run(run["id"])
+        self.assertEqual(self.store.get_orchestration(run["id"])["status"], "Failed")
+        self.assertEqual(self.store.list_evaluations(run["id"]), [])
+        self.assertEqual(self.store.get_execution_graph(run["id"])["nodes"][0]["state"],
+                         "cancelled")
+
+    def test_parallel_runtime_successes_are_persisted_as_evaluating_before_calls(self):
+        agents = [self.agent("Parallel A"), self.agent("Parallel B")]
+        runtime = ControlledRuntime(self.store)
+        plan = execution_plan([planned_task("a"), planned_task("b")])
+        run = self.store.create_orchestration("Parallel evaluation")
+        observed = []
+
+        def model(prompt, context):
+            states = {item["plan_task_id"]: item["state"]
+                      for item in self.store.get_execution_graph(run["id"])["nodes"]}
+            observed.append(states)
+            return evaluation_decision(context["planned_task"]["success_criteria"])
+
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda prompt, context: json.dumps(plan)),
+            selector=MappingSelector({"a": agents[0]["id"], "b": agents[1]["id"]}),
+            evaluator=Evaluator(model), wait=lambda seconds: runtime.finish_active(),
+            config={"max_wallclock_seconds": 10, "max_parallel_tasks": 2},
+        )
+        orchestrator._run(run["id"])
+        self.assertEqual(self.store.get_orchestration(run["id"])["status"], "Success")
+        self.assertEqual(observed[0], {"a": "evaluating", "b": "evaluating"})
+        self.assertEqual(len(observed), 2)
+
+    def test_needs_revision_is_persisted_and_fails_node_without_retry(self):
+        agent = self.agent("Revision")
+        runtime = ControlledRuntime(self.store, {"a": "Success"})
+
+        def model(prompt, context):
+            criteria = context["planned_task"]["success_criteria"]
+            value = evaluation_decision(criteria)
+            value.update(status="needs_revision", recommended_action="revise",
+                         summary="A small part is missing.")
+            value["criteria"][0]["status"] = "partial"
+            return value
+
+        final = self.run_graph(
+            execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
+            lambda seconds: None, evaluator=Evaluator(model),
+        )
+        node_state = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(node_state["state"], "failed")
+        self.assertEqual(node_state["evaluation_status"], "needs_revision")
+        self.assertIn("requires revision", node_state["error"])
+        self.assertEqual(len(runtime.submissions), 1)
+
+    def test_evaluator_technical_failure_is_persisted_and_emits_failed_event(self):
+        agent = self.agent("Broken evaluator")
+        runtime = ControlledRuntime(self.store, {"a": "Success"})
+
+        def broken(prompt, context):
+            raise RuntimeError("adapter unavailable")
+
+        final = self.run_graph(
+            execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
+            lambda seconds: None, evaluator=Evaluator(broken),
+        )
+        evaluation = final["evaluations"][0]
+        node_state = self.store.get_execution_graph(final["id"])["nodes"][0]
+        self.assertEqual(evaluation["status"], "error")
+        self.assertEqual(node_state["evaluation_status"], "error")
+        self.assertIn("freya.evaluation.failed",
+                      [item["event_type"] for item in final["events"]])
 
     def test_configured_delegation_limit_fails_before_graph_or_dispatch(self):
         agent = self.agent("Limited")

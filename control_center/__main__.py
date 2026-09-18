@@ -14,6 +14,8 @@ from .storage import Store
 from .orchestrator import Orchestrator
 from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
                       DEFAULT_PLANNER_TIMEOUT_SECONDS, OllamaPlanner, Planner)
+from .evaluator import (DEFAULT_EVALUATOR_ENDPOINT, DEFAULT_EVALUATOR_MODEL,
+                        DEFAULT_EVALUATOR_TIMEOUT_SECONDS, Evaluator, OllamaEvaluator)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -57,6 +59,15 @@ def main():
                         help="Planner Ollama request timeout in seconds (0.1-120)")
     parser.add_argument("--planner-offline", action="store_true",
                         help="Explicitly use deterministic one-task fallback planning")
+    parser.add_argument("--evaluator-model", default=DEFAULT_EVALUATOR_MODEL,
+                        help="Ollama model used for semantic evaluation")
+    parser.add_argument("--evaluator-endpoint", default=DEFAULT_EVALUATOR_ENDPOINT,
+                        help="Loopback Ollama base URL used by the evaluator")
+    parser.add_argument("--evaluator-timeout", type=float,
+                        default=DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
+                        help="Evaluator Ollama request timeout in seconds (0.1-120)")
+    parser.add_argument("--evaluator-offline", action="store_true",
+                        help="Explicitly use deterministic evidence-only evaluation")
     parser.add_argument("--max-parallel-tasks", type=int, default=4,
                         help="Maximum concurrently active orchestration graph nodes (1-20)")
     parser.add_argument("--max-delegated-tasks", type=int, default=20,
@@ -78,7 +89,10 @@ def main():
         planner = (Planner(offline=True) if args.planner_offline else
                    Planner(OllamaPlanner(args.planner_model, args.planner_endpoint,
                                          args.planner_timeout)))
-        orchestrator = Orchestrator(store, runtime, planner=planner, config={
+        evaluator = (Evaluator(offline=True) if args.evaluator_offline else
+                     Evaluator(OllamaEvaluator(args.evaluator_model, args.evaluator_endpoint,
+                                               args.evaluator_timeout)))
+        orchestrator = Orchestrator(store, runtime, planner=planner, evaluator=evaluator, config={
             "max_parallel_tasks": args.max_parallel_tasks,
             "max_delegated_tasks": args.max_delegated_tasks,
         })

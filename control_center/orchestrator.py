@@ -4,11 +4,13 @@ from __future__ import annotations
 import threading
 import time
 from typing import Callable
+from uuid import uuid4
 
 from .agent_context import build_effective_agent, capability_summary
 from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
+from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_GOAL_CHARS, MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
@@ -21,15 +23,18 @@ class Orchestrator:
     def __init__(self, store, runtime, decide: Callable | None = None, config: dict | None = None,
                  planner: Planner | None = None, clock: Callable[[], float] | None = None,
                  wait: Callable[[float], None] | None = None,
-                 selector: AgentSelector | None = None):
+                 selector: AgentSelector | None = None,
+                 evaluator: Evaluator | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
         self.selector = selector or AgentSelector()
+        self.evaluator = evaluator or Evaluator(offline=True)
         self.clock = clock or time.monotonic
         self.wait = wait or time.sleep
         self.lock = threading.RLock()
         self.planner_lock = threading.Lock()
+        self.evaluator_lock = threading.Lock()
         self.config = {"max_rounds": 6, "max_delegated_tasks": MAX_PLAN_TASKS,
                        "max_parallel_tasks": 4, "max_model_calls": 12,
                        "max_wallclock_seconds": 900}
@@ -180,7 +185,7 @@ class Orchestrator:
                     continue
                 reserved = (node.get("state") == "ready" and node.get("selection_id"))
                 missing_runtime = (
-                    node.get("state") in {"running", "waiting_for_approval"}
+                    node.get("state") in {"running", "waiting_for_approval", "evaluating"}
                     and node.get("runtime_task_id") not in active_runtime_task_ids
                 )
                 if reserved or missing_runtime:
@@ -385,14 +390,138 @@ class Orchestrator:
                     "message": "The planned task was blocked by a failed dependency.",
                 })
 
+    def _evaluate_graph_node(self, oid: str, plan: dict, target: dict,
+                             deadline: float) -> None:
+        """Evaluate one technical success without holding the orchestration lock."""
+        task_id = target["plan_task_id"]
+        planned_task = next(task for task in plan["tasks"] if task["id"] == task_id)
+        evaluation_id = str(uuid4())
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Running":
+                return
+            current = ExecutionGraph(
+                plan, self.store.get_execution_graph(oid)["nodes"],
+            ).node(task_id)
+            if (current["state"] != "evaluating" or current.get("evaluation_id")
+                    or current.get("runtime_task_id") != target.get("runtime_task_id")
+                    or int(current.get("attempt", 0)) != int(target.get("attempt", 0))):
+                return
+            runtime_task = self.store.get_task(target["runtime_task_id"])
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.evaluation.started", "status": "Running",
+                "task_id": task_id, "plan_task_id": task_id,
+                "agent_id": target.get("selected_agent_id"),
+                "runtime_task_id": target.get("runtime_task_id"),
+                "evaluation_id": evaluation_id,
+                "evaluation_status": "evaluating",
+                "evaluator_version": EVALUATOR_VERSION,
+                "message": "Freya started evidence-first semantic evaluation.",
+            })
+        technical_error = None
+        try:
+            with self.evaluator_lock:
+                outcome = self.evaluator.evaluate(
+                    planned_task=planned_task, runtime_task=runtime_task,
+                    execution_node=target,
+                )
+        except Exception as exc:
+            technical_error = str(exc)
+            outcome = technical_failure_evaluation(
+                technical_error, list(planned_task.get("success_criteria") or []),
+            )
+            outcome.update(
+                metrics=dict(getattr(self.evaluator, "metrics", {}) or {}),
+                context_truncated=bool(
+                    getattr(self.evaluator, "last_context", {}).get("context_truncated", False)
+                ),
+                deterministic=False,
+                context_snapshot=dict(getattr(self.evaluator, "last_context", {}) or {}),
+            )
+        if self.clock() >= deadline:
+            self._timeout(oid)
+            return
+
+        evaluation = {key: outcome[key] for key in EVALUATION_FIELDS if key in outcome}
+        if outcome.get("status") == "error":
+            evaluation = {key: outcome[key] for key in (
+                "status", "confidence", "summary", "criteria", "issues",
+                "missing_evidence", "recommended_action",
+            )}
+        metrics = dict(outcome.get("metrics") or {})
+        snapshot = {
+            "evaluator_version": EVALUATOR_VERSION,
+            "input": outcome.get("context_snapshot") or {},
+            "evaluation": evaluation,
+        }
+        with self.lock:
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
+                return
+            graph = ExecutionGraph(plan, self.store.get_execution_graph(oid)["nodes"])
+            current = graph.node(task_id)
+            if (current["state"] != "evaluating" or current.get("evaluation_id")
+                    or current.get("runtime_task_id") != target.get("runtime_task_id")
+                    or int(current.get("attempt", 0)) != int(target.get("attempt", 0))):
+                return
+            graph.apply_evaluation(
+                task_id, evaluation_id, evaluation["status"], evaluation["summary"], utcnow(),
+            )
+            record = self.store.commit_evaluation(
+                evaluation_id, oid, task_id,
+                runtime_task_id=target["runtime_task_id"],
+                agent_id=target["selected_agent_id"], attempt=int(target["attempt"]),
+                evaluator_version=EVALUATOR_VERSION, evaluation=evaluation,
+                metrics=metrics, snapshot=snapshot,
+                context_truncated=bool(outcome.get("context_truncated")),
+                deterministic=bool(outcome.get("deterministic")),
+            )
+            if record is None:
+                return
+            event_type = ("freya.evaluation.failed" if technical_error
+                          else "freya.evaluation.completed")
+            self.store.add_orchestration_event(oid, {
+                "event_type": event_type,
+                "status": "Failed" if evaluation["status"] != "accepted" else "Success",
+                "task_id": task_id, "plan_task_id": task_id,
+                "agent_id": target.get("selected_agent_id"),
+                "runtime_task_id": target.get("runtime_task_id"),
+                "evaluation_id": evaluation_id,
+                "evaluation_status": evaluation["status"],
+                "evaluator_version": EVALUATOR_VERSION,
+                "message": evaluation["summary"],
+            })
+            self.store.add_orchestration_event(oid, {
+                "event_type": ("freya.task.succeeded" if evaluation["status"] == "accepted"
+                               else "freya.task.failed"),
+                "status": "Success" if evaluation["status"] == "accepted" else "Failed",
+                "task_id": task_id, "plan_task_id": task_id,
+                "agent_id": target.get("selected_agent_id"),
+                "runtime_task_id": target.get("runtime_task_id"),
+                "evaluation_id": evaluation_id,
+                "evaluation_status": evaluation["status"],
+                "message": ("Semantic evaluation accepted the planned task."
+                            if evaluation["status"] == "accepted" else evaluation["summary"]),
+            })
     def _finish_graph(self, oid: str, graph: ExecutionGraph) -> None:
         summary = graph.summary()
         unsuccessful = (summary["failed"] + summary["blocked"] + summary["cancelled"]
                         + summary["skipped"])
         if unsuccessful:
-            message = ("Execution graph completed with "
-                       f"{summary['failed']} failed, {summary['blocked']} blocked, "
-                       f"{summary['cancelled']} cancelled and {summary['skipped']} skipped nodes.")
+            semantic_failures = [
+                node for node in graph.serialize()
+                if node.get("evaluation_status") not in (None, "accepted")
+            ]
+            if semantic_failures:
+                message = (
+                    "Execution completed, but semantic evaluation rejected one or more "
+                    "planned tasks. "
+                )
+            else:
+                message = "Execution graph completed unsuccessfully. "
+            message += (
+                f"{summary['failed']} failed, {summary['blocked']} blocked, "
+                f"{summary['cancelled']} cancelled and {summary['skipped']} skipped nodes."
+            )
             completed = self.store.transition_orchestration(
                 oid, ("Running",), "Failed", error=message,
             )
@@ -402,7 +531,7 @@ class Orchestrator:
             for node in graph.serialize():
                 if node.get("result") is not None:
                     rendered.append(f"{node['plan_task_id']}: {node['result']}")
-            response = f"Freya completed all {summary['total']} planned tasks successfully."
+            response = f"Freya completed and verified all {summary['total']} planned tasks."
             if rendered:
                 response += "\n\n" + "\n\n".join(rendered)
             completed = self.store.transition_orchestration(
@@ -428,6 +557,7 @@ class Orchestrator:
                 return
 
             selection_target = None
+            evaluation_target = None
             with self.lock:
                 run = self.store.get_orchestration(oid)
                 if run["status"] != "Running":
@@ -437,6 +567,8 @@ class Orchestrator:
                 changed = False
 
                 for node in graph.active_nodes():
+                    if node["state"] == "evaluating":
+                        continue
                     runtime_task = self.store.get_task(node["runtime_task_id"])
                     previous = node["state"]
                     if graph.apply_runtime_status(
@@ -450,7 +582,6 @@ class Orchestrator:
                     if current != previous:
                         event_type = {
                             "waiting_for_approval": "freya.task.waiting_for_approval",
-                            "success": "freya.task.succeeded",
                             "failed": "freya.task.failed",
                             "cancelled": "freya.task.failed",
                         }.get(current)
@@ -475,10 +606,20 @@ class Orchestrator:
                     self._finish_graph(oid, graph)
                     return
 
-                for task in graph.ready_tasks():
-                    if not graph.node(task["id"]).get("selection_id"):
-                        selection_target = task
+                for node in graph.serialize():
+                    if node["state"] == "evaluating" and not node.get("evaluation_id"):
+                        evaluation_target = node
                         break
+
+                if evaluation_target is None:
+                    for task in graph.ready_tasks():
+                        if not graph.node(task["id"]).get("selection_id"):
+                            selection_target = task
+                            break
+
+            if evaluation_target is not None:
+                self._evaluate_graph_node(oid, plan, evaluation_target, deadline)
+                continue
 
             if selection_target is not None:
                 selected = self._select_graph_task(oid, selection_target, running)

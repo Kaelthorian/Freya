@@ -40,6 +40,16 @@ when explicitly choosing the deterministic one-task fallback, such as an
 offline test environment. Provider errors fail planning and do not trigger the
 fallback.
 
+Semantic evaluation has separate local-model configuration:
+
+```powershell
+python -m control_center --evaluator-model qwen2.5-coder:7b `
+  --evaluator-endpoint http://127.0.0.1:11434 --evaluator-timeout 120
+```
+
+The evaluator endpoint is also loopback-only and the adapter exposes no tools.
+Use `--evaluator-offline` explicitly for deterministic evidence-only evaluation.
+
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
@@ -86,6 +96,7 @@ credentials, paths, query strings or fragments.
 python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p "test_planner.py" -v
 python -m unittest discover -s tests -p "test_execution_graph.py" -v
+python -m unittest discover -s tests -p "test_evaluator.py" -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -109,6 +120,10 @@ approval waiting, child failure propagation, deadlines and simulated Ollama.
 Execution-graph tests cover pure DAG transitions, sequential and parallel
 scheduling, joins, branch-local failure propagation, approval waits, paused
 agents, per-agent serialization, concurrency limits, cancellation and migration.
+Evaluator tests cover hard evidence precedence, prompt injection, strict schema,
+one repair, per-criterion coverage, immutable persistence, API exposure, graph
+gating, duplicate prevention, technical failure, cancellation, timeout and
+restart recovery.
 
 ## Debugging
 
@@ -121,7 +136,10 @@ agents, per-agent serialization, concurrency limits, cancellation and migration.
   graph nodes are closed as cancelled/skipped so none remain apparently active.
 - A planner timeout or invalid repaired response leaves the orchestration Failed;
   inspect `planning_metrics` and `freya.planning.failed` on the run.
-- A Success record means the model finished and configured verification did not fail. Verification evidence and explicit unavailable/skipped reasons remain in the task result; failed checks produce Failed.
+- A Runtime task `Success` means execution finished technically. Its graph node
+  remains `evaluating` until semantic evidence is accepted; failed, missing or
+  contradictory evidence fails closed. Inspect the orchestration evaluations
+  endpoint and `freya.evaluation.*` events.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
 - `run_command` is allowlisted and uses argv without a shell. Permission

@@ -89,6 +89,14 @@ class Store:
             ):
                 if name not in orchestration_columns:
                     connection.execute(f"ALTER TABLE orchestration_runs ADD COLUMN {name} {definition}")
+            node_columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(orchestration_task_nodes)"
+            )}
+            for name, definition in (("evaluation_id", "TEXT"), ("evaluation_status", "TEXT")):
+                if name not in node_columns:
+                    connection.execute(
+                        f"ALTER TABLE orchestration_task_nodes ADD COLUMN {name} {definition}"
+                    )
             skill_columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)")}
             for name, definition in (
                 ("category", "TEXT NOT NULL DEFAULT 'General'"),
@@ -361,6 +369,10 @@ class Store:
                 "ORDER BY plan_order,plan_task_id", (oid,),
             )]
             result["graph_summary"] = graph_summary(nodes) if nodes else None
+            result["evaluations"] = [self._evaluation(x) for x in c.execute(
+                "SELECT * FROM orchestration_evaluations WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
             result["delegations"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_delegations WHERE orchestration_id=? ORDER BY created_at", (oid,))]
             for d in result["delegations"]: d["result"] = _load(d.pop("result_json"))
             result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
@@ -586,6 +598,39 @@ class Store:
         node["result"] = _load(node.pop("result_json"))
         return node
 
+    @staticmethod
+    def _evaluation(row: sqlite3.Row | dict[str, Any], *, include_snapshot: bool = False) -> dict[str, Any]:
+        item = dict(row)
+        evaluation = _load(item.pop("evaluation_json")) or {}
+        item["metrics"] = _load(item.pop("metrics_json")) or {}
+        snapshot = _load(item.pop("snapshot_json")) or {}
+        item["context_truncated"] = bool(item["context_truncated"])
+        item["deterministic"] = bool(item["deterministic"])
+        for field in ("confidence", "criteria", "issues", "missing_evidence",
+                      "recommended_action"):
+            item[field] = evaluation.get(field)
+        if include_snapshot:
+            item["snapshot"] = snapshot
+        return item
+
+    def list_evaluations(self, oid: str) -> list[dict[str, Any]]:
+        with self._connection() as c:
+            if c.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            return [self._evaluation(row) for row in c.execute(
+                "SELECT * FROM orchestration_evaluations WHERE orchestration_id=? "
+                "ORDER BY created_at,id", (oid,),
+            )]
+
+    def get_evaluation(self, evaluation_id: str, *, include_snapshot: bool = False) -> dict[str, Any]:
+        with self._connection() as c:
+            row = c.execute(
+                "SELECT * FROM orchestration_evaluations WHERE id=?", (evaluation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(evaluation_id)
+            return self._evaluation(row, include_snapshot=include_snapshot)
+
     def initialize_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict:
         """Atomically create exactly one durable node for every planned task."""
         now = utcnow()
@@ -641,7 +686,7 @@ class Store:
             raise ValueError("Execution graph contains duplicate or invalid task ids.")
         with self._connection(write=True) as c:
             rows = c.execute(
-                "SELECT plan_task_id,state FROM orchestration_task_nodes "
+                "SELECT plan_task_id,state,evaluation_id,evaluation_status FROM orchestration_task_nodes "
                 "WHERE orchestration_id=? ORDER BY plan_order", (oid,),
             ).fetchall()
             if not rows or {row["plan_task_id"] for row in rows} != set(by_id):
@@ -653,12 +698,19 @@ class Store:
                     raise ValueError(f"Unknown execution node state: {state}.")
                 if row["state"] in TERMINAL_NODE_STATES and state != row["state"]:
                     raise ValueError("A terminal execution node state is final.")
+                if (node.get("evaluation_id") != row["evaluation_id"]
+                        or node.get("evaluation_status") != row["evaluation_status"]):
+                    raise ValueError(
+                        "Evaluation references can only change through atomic evaluation commit."
+                    )
                 c.execute(
                     "UPDATE orchestration_task_nodes SET state=?,selected_agent_id=?,selection_id=?,"
-                    "runtime_task_id=?,delegation_id=?,attempt=?,waiting_reason=?,result_json=?,error=?,"
+                    "runtime_task_id=?,delegation_id=?,evaluation_id=?,evaluation_status=?,attempt=?,"
+                    "waiting_reason=?,result_json=?,error=?,"
                     "started_at=?,finished_at=?,updated_at=? WHERE orchestration_id=? AND plan_task_id=?",
                     (state, node.get("selected_agent_id"), node.get("selection_id"),
                      node.get("runtime_task_id"), node.get("delegation_id"),
+                     node.get("evaluation_id"), node.get("evaluation_status"),
                      int(node.get("attempt", 0)), sanitize(node.get("waiting_reason") or ""),
                      _dump(node.get("result")) if node.get("result") is not None else None,
                      sanitize(node.get("error")) if node.get("error") is not None else None,
@@ -666,6 +718,67 @@ class Store:
                      oid, row["plan_task_id"]),
                 )
         return self.get_execution_graph(oid)
+
+    def commit_evaluation(self, evaluation_id: str, oid: str, plan_task_id: str, *,
+                          runtime_task_id: str, agent_id: str, attempt: int,
+                          evaluator_version: int, evaluation: dict[str, Any],
+                          metrics: dict[str, Any], snapshot: dict[str, Any],
+                          context_truncated: bool, deterministic: bool) -> dict[str, Any] | None:
+        """Atomically persist one immutable evaluation and close its evaluating node."""
+        status = evaluation.get("status")
+        if status not in {"accepted", "needs_revision", "rejected", "blocked", "error"}:
+            raise ValueError("Unknown persisted evaluation status.")
+        target = "success" if status == "accepted" else "failed"
+        error = None if target == "success" else {
+            "needs_revision": "Semantic evaluation requires revision.",
+            "rejected": "Semantic evaluation rejected the task result.",
+            "blocked": "Semantic evaluation could not determine task success.",
+            "error": "Semantic evaluator failed.",
+        }[status]
+        summary = str(evaluation.get("summary") or "").strip()
+        if error and summary:
+            error += " " + summary
+        now = utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute(
+                "SELECT status FROM orchestration_runs WHERE id=?", (oid,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            node = c.execute(
+                "SELECT state,runtime_task_id,selected_agent_id,attempt,evaluation_id "
+                "FROM orchestration_task_nodes WHERE orchestration_id=? AND plan_task_id=?",
+                (oid, plan_task_id),
+            ).fetchone()
+            if node is None:
+                raise KeyError(plan_task_id)
+            if (run["status"] != "Running" or node["state"] != "evaluating"
+                    or node["evaluation_id"] is not None):
+                return None
+            if (node["runtime_task_id"] != runtime_task_id
+                    or node["selected_agent_id"] != agent_id
+                    or int(node["attempt"]) != int(attempt)):
+                return None
+            c.execute(
+                "INSERT INTO orchestration_evaluations("
+                "id,orchestration_id,plan_task_id,runtime_task_id,agent_id,attempt,"
+                "evaluator_version,status,summary,evaluation_json,metrics_json,snapshot_json,"
+                "context_truncated,deterministic,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (evaluation_id, oid, plan_task_id, runtime_task_id, agent_id, int(attempt),
+                 int(evaluator_version), status, sanitize(summary), _dump(evaluation), _dump(metrics),
+                 _dump(snapshot), int(bool(context_truncated)), int(bool(deterministic)), now),
+            )
+            cursor = c.execute(
+                "UPDATE orchestration_task_nodes SET state=?,evaluation_id=?,evaluation_status=?,"
+                "waiting_reason='',error=?,finished_at=?,updated_at=? "
+                "WHERE orchestration_id=? AND plan_task_id=? AND state='evaluating' "
+                "AND evaluation_id IS NULL",
+                (target, evaluation_id, status, sanitize(error) if error else None,
+                 now, now, oid, plan_task_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Evaluation node transition lost its atomic precondition.")
+        return self.get_evaluation(evaluation_id)
 
     def add_orchestration_event(self, oid, event):
         with self._connection(write=True) as c:
@@ -749,7 +862,8 @@ class Store:
                     continue
                 c.execute(
                     "UPDATE orchestration_task_nodes SET state=CASE "
-                    "WHEN state IN ('running','waiting_for_approval') THEN 'cancelled' ELSE 'skipped' END,"
+                    "WHEN state IN ('running','waiting_for_approval','evaluating') "
+                    "THEN 'cancelled' ELSE 'skipped' END,"
                     "waiting_reason='',error=?,finished_at=?,updated_at=? "
                     "WHERE orchestration_id=? AND state NOT IN "
                     "('success','failed','blocked','cancelled','skipped')",

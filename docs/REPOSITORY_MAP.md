@@ -8,12 +8,13 @@ bounded task runtime and workspace-scoped programming tools.
 ```text
 .
 ├── control_center/           web API, scheduler, workers, tools and SQLite
-│   ├── __main__.py           startup recovery, Planner configuration, server and instance lock
+│   ├── __main__.py           recovery, Planner/Evaluator configuration, server and instance lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
+│   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
@@ -50,7 +51,8 @@ of this repository merely because an agent selects them.
    through the loopback Ollama adapter in `planner.py`; `orchestrator.py` stores
    the validated plan snapshot atomically. `execution_graph.py` releases ready
    tasks in plan order and `agent_selector.py` classifies and ranks an existing
-   agent once for each ready task before delegation.
+   agent once for each ready task before delegation. A technical Runtime success
+   enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
@@ -76,6 +78,7 @@ of this repository merely because an agent selects them.
 | Structured plans, lifecycle or recovery | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
+| Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |
 | Secret handling | `security.py`, security/runtime/storage tests |
 | Web UI and orchestration status display | `frontend/app.js`, `core.js`, `views.js`, `dialogs.js`, `styles.css` |

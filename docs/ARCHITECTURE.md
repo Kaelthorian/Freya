@@ -5,7 +5,8 @@ Freya includes a first-class orchestration layer. User prompts enter
 strict structured plan and persists that snapshot before asking
 `control_center/agent_selector.py` to rank compatible existing agents,
 then uses `control_center/execution_graph.py` to release dependency-ready tasks,
-delegating bounded tasks through `Runtime`, and integrating persisted results.
+delegating bounded tasks through `Runtime`, and requiring
+`control_center/evaluator.py` to accept technical successes before integration.
 Workers remain the only components allowed to invoke tools;
 each receives a generic policy plus its identity, instructions, skills,
 workspace, and limits. Orchestration runs, plans, delegations, and events are
@@ -24,6 +25,8 @@ browser → HTTP API → SQLite
        Planner → immutable plan → Execution Graph → Agent Selector → Orchestrator
                                               ↓              ↓              ↓
                                       dependency state   Capability Policy  scheduler → spawned worker → local Ollama
+                                              ↑                                  ↓
+                                       Semantic Evaluator ← evidence/result ← Runtime
                                                             ↓
                                               capability resolver → policy engine → tools → workspace
 ```
@@ -33,7 +36,8 @@ The Planner determines **what** work exists. The Agent Selector determines
 task. The deterministic Execution Graph determines **when** dependency-ready
 tasks run. The Worker determines **how** one selected task executes. Capability
 Policy remains the sole authority for **whether** each requested action is
-permitted.
+permitted. The Evaluator determines **whether the produced result actually
+satisfied** the planned objective and criteria.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -63,6 +67,12 @@ scoring semantics and evidence used at selection time.
 including immutable dependency/order data, selection and agent IDs, Runtime
 task and delegation IDs, attempts, waiting reason, result/error, and timestamps.
 The plan remains the immutable intent; node rows are the durable execution state.
+`orchestration_evaluations` stores one immutable, versioned decision per
+`(orchestration_id, plan_task_id, attempt)`, including the bounded input
+snapshot, criterion-by-criterion result, independent model metrics and
+truncation/deterministic flags. Nodes keep only `evaluation_id` and
+`evaluation_status`. Insertion and the `evaluating → success|failed` transition
+are one transaction.
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in
@@ -82,6 +92,9 @@ Graph execution emits `freya.graph.initialized`, `freya.task.ready`,
 `freya.task.dispatched`, `freya.task.waiting_for_approval`, terminal task events,
 and `freya.graph.completed`. Together with selection and delegation snapshots,
 these events reconstruct Plan Task → Selection → Agent → Runtime Task → Result.
+Semantic review emits `freya.evaluation.started` once and then exactly one
+`freya.evaluation.completed` or `freya.evaluation.failed`; events carry IDs and
+status metadata, never the full evaluation or internal prompts.
 
 Orchestration transitions are conditional on the stored current state:
 
@@ -129,13 +142,13 @@ separate lifecycle lock and remains responsive while a planner call is pending.
 Preferred Skills remain unvalidated semantic hints so planning is not coupled
 to the mutable Skill registry. Required capabilities must exist in the platform
 registry, but remain declarations: the planner never edits agent configuration
-or policy. Replanning and semantic evaluation remain outside Stage 4.3.
+or policy. Replanning remains outside the current stage.
 
 ## Execution graph and scheduling
 
 `ExecutionGraph` is local, deterministic and model-free. It deep-copies the
 validated plan and maintains `pending`, `ready`, `running`,
-`waiting_for_approval`, `blocked`, `success`, `failed`, `cancelled`, and
+`waiting_for_approval`, `evaluating`, `blocked`, `success`, `failed`, `cancelled`, and
 `skipped` nodes. Only nodes whose dependencies all succeeded become ready.
 Failure or cancellation blocks descendants transitively while unrelated
 branches continue. Join nodes wait for every dependency.
@@ -162,9 +175,13 @@ not reselect another agent. Recovery/reselection remains future-stage work.
 
 Runtime `Queued` and `Running` map to graph `running`;
 `WaitingForApproval` maps to `waiting_for_approval`; Runtime `Paused` remains a
-nonterminal `running` node with an explicit reason. Runtime terminal statuses
-map to their graph equivalents. The parent succeeds only when every node
-succeeds and fails after all reachable work is terminal when any node failed,
+nonterminal `running` node with an explicit reason. Runtime `Success` maps to
+persistent `evaluating`; it never directly produces graph success. Only
+evaluator `accepted` maps to `success`. `needs_revision`, `rejected`, `blocked`,
+and evaluator infrastructure failure map to node `failed` while preserving the
+evaluation status and reference. Other Runtime terminal statuses map to their
+graph equivalents. The parent succeeds only when every node is semantically
+accepted and fails after all reachable work is terminal when any node failed,
 was blocked, cancelled, or skipped. User cancellation remains `Cancelled`.
 The wall-clock deadline includes planning and bounded polling uses the injected
 orchestrator clock/wait functions.
@@ -173,8 +190,38 @@ Graph initialization is one SQLite transaction after the immutable plan is
 saved. Plans larger than configured `max_delegated_tasks` fail during Planning,
 before graph initialization or Runtime submission; the default is aligned with
 the planner's 20-task maximum. Restart recovery preserves graph history but
-changes unfinished running/waiting nodes to cancelled and undispatched nodes to
-skipped, so a failed recovered run never exposes ghost-running nodes.
+changes unfinished running/waiting/evaluating nodes to cancelled and
+undispatched nodes to skipped, so a failed recovered run never exposes ghost
+active nodes.
+
+## Semantic evaluation
+
+`Evaluator` is read-only and receives only planned task fields, a bounded
+Runtime result/error/verification record, and selected agent/runtime/attempt
+IDs. Existing sanitization runs before model input and persistence. Result and
+verification output, evidence counts and item lengths are bounded; any clipping
+sets durable `context_truncated=true`. Agent output and verification text are
+explicitly untrusted data and cannot alter the system prompt, schema or
+configuration.
+
+Deterministic checks run before any model call. Failed verification evidence
+forces `rejected`; requested but unavailable or inconclusive verification
+forces `blocked`; and test/lint/build criteria without passing objective
+evidence are `blocked`. These outcomes cannot be overridden by agent claims or
+prompt injection. Otherwise the tool-free `OllamaEvaluator` requests a strict
+JSON schema containing `accepted`, `needs_revision`, `rejected`, or `blocked`,
+with every planned success criterion represented exactly once. Invalid output
+gets one repair attempt and then fails closed as evaluator infrastructure
+`error`.
+
+Evaluator calls are serialized to one model call at a time. Defaults are the
+separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
+`http://127.0.0.1:11434`, and 120-second timeout. Explicit
+`--evaluator-offline` uses deterministic evidence-only behavior for tests and
+offline operation. Cancellation, timeout, or restart wins over a late result;
+the atomic commit rechecks orchestration state, node state, Runtime task and
+attempt before persisting. Stage 4.4 records `needs_revision` but does not retry,
+replan, reselect, create agents, or change dependencies.
 
 ## Agent selection
 
@@ -238,8 +285,8 @@ Selection does not dispatch by itself. The execution graph retains the selected
 agent and waits for both a global slot and per-agent availability. Approval is
 the existing durable Runtime flow and does not fail the graph while pending.
 At timeout, active children are cancelled and all remaining graph nodes become
-terminal before the parent becomes Failed. Stage 4.3 does not replan, create
-agents, perform semantic result evaluation, or enable agent-to-agent messaging.
+terminal before the parent becomes Failed. The orchestrator does not replan,
+create agents, retry semantic revisions, or enable agent-to-agent messaging.
 
 ## Runtime and control semantics
 

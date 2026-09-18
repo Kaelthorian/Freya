@@ -30,7 +30,7 @@ The trimmed prompt must contain 1–2000 characters; oversized input returns HTT
 400 before a run is created.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
-`planning_metrics`, selection snapshots, delegations, and events needed to
+`planning_metrics`, selection snapshots, delegations, evaluations, and events needed to
 reconstruct it.
 `GET /api/orchestrations/{id}/plan` returns
 the plan and its version metadata directly. Existing agent and task routes
@@ -39,6 +39,12 @@ remain compatible.
 order plus a summary with per-state counts, active/terminal totals and a
 `complete` flag. Historical pre-4.3 runs return an empty node list and null
 summary. `GET /api/orchestrations/{id}` includes the same `graph_summary`.
+Nodes expose nullable `evaluation_id` and `evaluation_status` references, not
+the full evaluation. `GET /api/orchestrations/{id}/evaluations` returns the
+immutable evaluation records with status, summary, confidence, per-criterion
+decisions, issues, missing evidence, recommended action, version, independent
+metrics and truncation/deterministic flags. It never returns evaluator prompts
+or the private input snapshot.
 
 `POST /api/orchestrations/{id}/cancel` is idempotent. It returns the unchanged
 terminal run when the orchestration has already completed; otherwise it stores
@@ -105,14 +111,16 @@ The Freya view renders the plan summary, complexity, tasks, dependencies,
 required capabilities and current orchestration state with escaped text. It
 keeps recent terminal runs visible alongside active runs.
 
-Stage 4.3 executes the complete validated DAG. Dependency-ready tasks use stable
+The execution graph runs the complete validated DAG. Dependency-ready tasks use stable
 plan-order fairness, selection is persisted once per task, independent branches
 may run in parallel within `max_parallel_tasks`, joins wait for all parents, and
 failure blocks descendants without stopping independent work. Node states are
-`pending`, `ready`, `running`, `waiting_for_approval`, `blocked`, `success`,
+`pending`, `ready`, `running`, `waiting_for_approval`, `evaluating`, `blocked`, `success`,
 `failed`, `cancelled`, and `skipped`. The API does not promise semantic-model
-ranking, replanning, automatic agent creation, or direct agent-to-agent
-communication.
+replanning, automatic recovery/reselection, automatic agent creation, or direct
+agent-to-agent communication. Runtime `Success` enters `evaluating`; only an
+`accepted` evaluation becomes node `success`. Evaluation `needs_revision`,
+`rejected`, and `blocked` currently end the node and orchestration as failed.
 The server exposes the bounds through `--max-parallel-tasks` (default 4) and
 `--max-delegated-tasks` (default 20); both accept 1–20.
 

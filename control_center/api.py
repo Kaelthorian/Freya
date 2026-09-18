@@ -145,6 +145,8 @@ class Application:
                     "plan_created_at": run["plan_created_at"]}
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "graph":
             return self.store.get_execution_graph(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "evaluations":
+            return self.store.list_evaluations(parts[1])
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "events":
             return self.store.get_orchestration(parts[1])["events"]
         raise ApiError(404, "Route not found.")

@@ -13,12 +13,12 @@ from .planner import validate_plan
 
 
 NODE_STATES = {
-    "pending", "ready", "running", "waiting_for_approval", "blocked",
+    "pending", "ready", "running", "waiting_for_approval", "evaluating", "blocked",
     "success", "failed", "cancelled", "skipped",
 }
 TERMINAL_NODE_STATES = {"blocked", "success", "failed", "cancelled", "skipped"}
 DEPENDENCY_FAILURE_STATES = {"blocked", "failed", "cancelled", "skipped"}
-ACTIVE_NODE_STATES = {"running", "waiting_for_approval"}
+ACTIVE_NODE_STATES = {"running", "waiting_for_approval", "evaluating"}
 
 
 def graph_summary(nodes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -61,6 +61,8 @@ class ExecutionGraph:
                     "selection_id": None,
                     "runtime_task_id": None,
                     "delegation_id": None,
+                    "evaluation_id": None,
+                    "evaluation_status": None,
                     "attempt": 0,
                     "waiting_reason": "",
                     "result": None,
@@ -152,7 +154,11 @@ class ExecutionGraph:
         node = self.node(task_id)
         if node["state"] in TERMINAL_NODE_STATES:
             return False
-        if node["state"] not in ACTIVE_NODE_STATES:
+        if node["state"] == "evaluating":
+            if status != "Success":
+                raise ValueError("A technically successful node cannot leave evaluation through Runtime.")
+            return False
+        if node["state"] not in {"running", "waiting_for_approval"}:
             raise ValueError("Only a dispatched node can receive runtime status.")
         if status in {"Queued", "Running"}:
             target, reason = "running", ""
@@ -161,7 +167,7 @@ class ExecutionGraph:
         elif status == "Paused":
             target, reason = "running", "Runtime task is paused."
         elif status == "Success":
-            target, reason = "success", ""
+            target, reason = "evaluating", "Semantic evaluation is pending."
         elif status == "Failed":
             target, reason = "failed", ""
         elif status == "Cancelled":
@@ -175,6 +181,38 @@ class ExecutionGraph:
         if target in TERMINAL_NODE_STATES:
             node["finished_at"] = timestamp
         return changed
+
+    def apply_evaluation(self, task_id: str, evaluation_id: str, status: str,
+                         summary: str, timestamp: str | None = None) -> bool:
+        """Apply one immutable semantic decision to a technically successful node."""
+        node = self.node(task_id)
+        if node["state"] in TERMINAL_NODE_STATES:
+            return False
+        if node["state"] != "evaluating":
+            raise ValueError("Only an evaluating node can receive semantic evaluation.")
+        if node.get("evaluation_id"):
+            if (node["evaluation_id"], node.get("evaluation_status")) == (evaluation_id, status):
+                return False
+            raise ValueError("A planned task attempt can only be evaluated once.")
+        if status == "accepted":
+            target, error = "success", None
+        elif status == "needs_revision":
+            target, error = "failed", "Semantic evaluation requires revision."
+        elif status == "rejected":
+            target, error = "failed", "Semantic evaluation rejected the task result."
+        elif status == "blocked":
+            target, error = "failed", "Semantic evaluation could not determine task success."
+        elif status == "error":
+            target, error = "failed", "Semantic evaluator failed."
+        else:
+            raise ValueError(f"Unknown evaluation status: {status}.")
+        node.update(
+            state=target, evaluation_id=evaluation_id, evaluation_status=status,
+            waiting_reason="", error=error, finished_at=timestamp, updated_at=timestamp,
+        )
+        if error and summary:
+            node["error"] += " " + str(summary)
+        return True
 
     def mark_failed(self, task_id: str, error: str, timestamp: str | None = None) -> bool:
         node = self.node(task_id)
