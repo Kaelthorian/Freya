@@ -10,6 +10,8 @@ from .agent_context import build_effective_agent, capability_summary
 from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
+from .integration import GlobalVerifier, IntegrationReplanner, ResultIntegrator
+from .integration_orchestrator import IntegrationOrchestrationMixin
 from .recovery import (RECOVERY_VERSION, RecoveryController, Replanner,
                        allowed_replan_scope, build_retry_prompt,
                        semantic_failure_fingerprint)
@@ -22,14 +24,17 @@ from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATU
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
 
 
-class Orchestrator:
+class Orchestrator(IntegrationOrchestrationMixin):
     def __init__(self, store, runtime, decide: Callable | None = None, config: dict | None = None,
                  planner: Planner | None = None, clock: Callable[[], float] | None = None,
                  wait: Callable[[float], None] | None = None,
                  selector: AgentSelector | None = None,
                  evaluator: Evaluator | None = None,
                  recovery: RecoveryController | None = None,
-                 replanner: Replanner | None = None):
+                 replanner: Replanner | None = None,
+                 global_verifier: GlobalVerifier | None = None,
+                 integration_replanner: IntegrationReplanner | None = None,
+                 result_integrator: ResultIntegrator | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
@@ -41,20 +46,26 @@ class Orchestrator:
         self.wait = wait or time.sleep
         self.recovery = recovery or RecoveryController(offline=True)
         self.replanner = replanner or Replanner()
+        self.global_verifier = global_verifier or GlobalVerifier(offline=True)
+        self.integration_replanner = integration_replanner or IntegrationReplanner()
+        self.result_integrator = result_integrator or ResultIntegrator()
         self.lock = threading.RLock()
         self.planner_lock = threading.Lock()
         self.evaluator_lock = threading.Lock()
+        self.integration_lock = threading.Lock()
         self.config = {"max_rounds": 6, "max_delegated_tasks": MAX_PLAN_TASKS,
                        "max_parallel_tasks": 4, "max_model_calls": 12,
                        "max_wallclock_seconds": 900,
                        "max_semantic_attempts_per_task": 3,
                        "max_plan_revisions": 2, "max_recovery_actions": 8,
-                       "max_recovery_model_calls": 16}
+                       "max_recovery_model_calls": 16, "max_integration_rounds": 2,
+                       "max_integration_model_calls": 12}
         self.recovery_lock = threading.Lock()
         self.config.update(config or {})
         for field in ("max_delegated_tasks", "max_parallel_tasks", "max_semantic_attempts_per_task",
                       "max_plan_revisions", "max_recovery_actions",
-                      "max_recovery_model_calls"):
+                      "max_recovery_model_calls", "max_integration_rounds",
+                      "max_integration_model_calls"):
             value = self.config[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{field} must be a positive integer.")
@@ -823,6 +834,7 @@ class Orchestrator:
             selection_target = None
             evaluation_target = None
             recovery_target = None
+            completed_graph = None
             with self.lock:
                 run = self.store.get_orchestration(oid)
                 if run["status"] != "Running":
@@ -873,8 +885,7 @@ class Orchestrator:
                     self.store.save_execution_graph(oid, graph.serialize())
 
                 if graph.summary()["complete"]:
-                    self._finish_graph(oid, graph)
-                    return
+                    completed_graph = graph
 
                 for node in graph.serialize():
                     if node["state"] == "recovery_pending" and not node.get("recovery_action_id"):
@@ -893,6 +904,10 @@ class Orchestrator:
                         if not graph.node(task["id"]).get("selection_id"):
                             selection_target = task
                             break
+
+            if completed_graph is not None:
+                self._complete_or_integrate(oid, completed_graph, deadline)
+                return
 
             if evaluation_target is not None:
                 self._evaluate_graph_node(oid, plan, evaluation_target, deadline)

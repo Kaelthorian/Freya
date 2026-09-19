@@ -268,19 +268,49 @@ CREATE TABLE IF NOT EXISTS orchestration_recovery_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_orch_recoveries
     ON orchestration_recovery_actions(orchestration_id,created_at,id);
+CREATE TABLE IF NOT EXISTS orchestration_integrations (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    round INTEGER NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    integration_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    integration_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    snapshot_json TEXT NOT NULL,
+    graph_fingerprint TEXT NOT NULL,
+    problem_fingerprint TEXT NOT NULL,
+    context_truncated INTEGER NOT NULL DEFAULT 0,
+    deterministic INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE (orchestration_id, round)
+);
+CREATE INDEX IF NOT EXISTS idx_orch_integrations
+    ON orchestration_integrations(orchestration_id,round);
 CREATE TABLE IF NOT EXISTS orchestration_plan_revisions (
     id TEXT PRIMARY KEY,
     orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
     revision INTEGER NOT NULL,
-    source_recovery_action_id TEXT NOT NULL REFERENCES orchestration_recovery_actions(id),
-    source_plan_task_id TEXT NOT NULL,
+    revision_source_type TEXT NOT NULL DEFAULT 'task_recovery',
+    source_recovery_action_id TEXT REFERENCES orchestration_recovery_actions(id),
+    source_integration_id TEXT REFERENCES orchestration_integrations(id),
+    source_plan_task_id TEXT,
     summary TEXT NOT NULL,
     plan_json TEXT NOT NULL,
     superseded_task_ids_json TEXT NOT NULL DEFAULT '[]',
     metrics_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     UNIQUE (orchestration_id, revision),
-    UNIQUE (source_recovery_action_id)
+    UNIQUE (source_recovery_action_id),
+    UNIQUE (source_integration_id),
+    CHECK (
+        (revision_source_type='task_recovery' AND source_recovery_action_id IS NOT NULL
+            AND source_integration_id IS NULL AND source_plan_task_id IS NOT NULL)
+        OR
+        (revision_source_type='integration' AND source_recovery_action_id IS NULL
+            AND source_integration_id IS NOT NULL AND source_plan_task_id IS NULL)
+    )
 );
 CREATE INDEX IF NOT EXISTS idx_orch_plan_revisions
     ON orchestration_plan_revisions(orchestration_id,revision);

@@ -45,8 +45,36 @@ immutable evaluation records with status, summary, confidence, per-criterion
 decisions, issues, missing evidence, recommended action, version, independent
 metrics and truncation/deterministic flags. It never returns evaluator prompts
 or the private input snapshot.
+`GET /api/orchestrations/{id}/integrations` returns immutable global
+verification history ordered by round. Each item exposes `round`, `status`,
+`summary`, criterion decisions, cross-task issues, missing evidence,
+responsible active task IDs, `plan_revision`, integration version, metrics and
+truncation/deterministic flags. The private bounded snapshot is not returned by
+the API. Historical pre-4.6 runs return `[]`.
+
+```json
+[{
+  "round": 1,
+  "status": "accepted",
+  "summary": "The complete objective is satisfied.",
+  "criteria": [{
+    "criterion": "The application works end-to-end",
+    "status": "satisfied",
+    "reason": "The accepted integration evidence covers the complete flow.",
+    "evidence": ["verification:evaluation-id:1"]
+  }],
+  "cross_task_issues": [],
+  "missing_evidence": [],
+  "responsible_task_ids": [],
+  "recommended_action": "accept",
+  "plan_revision": 0
+}]
+```
 
 `POST /api/orchestrations/{id}/cancel` is idempotent. It returns the unchanged
+terminal run when the orchestration has already completed; otherwise it stores
+`Cancelled`, prevents further delegation and cancels children in Queued,
+Running, Paused or WaitingForApproval.
 `GET /api/orchestrations/{id}/attempts` returns each immutable real dispatch,
 including attempt number, selected agent/selection, Runtime/delegation IDs,
 prompt, evaluation/recovery references, state and timestamps.
@@ -60,13 +88,16 @@ Recovery events are `freya.recovery.started`, `freya.recovery.decided`,
 `freya.recovery.retry_scheduled`, `freya.recovery.replan_created`, and
 `freya.recovery.exhausted`. A cancellation or timeout prevents late recovery
 results from creating a decision, retry, revision, or delegation.
+Integration events are `freya.integration.started`,
+`freya.integration.completed`, `freya.integration.failed`,
+`freya.integration.recovery_started`, `freya.integration.replan_created`, and
+`freya.final_response.created`. They contain compact IDs/status/counts, not
+model prompts or complete output.
 
-terminal run when the orchestration has already completed; otherwise it stores
-`Cancelled`, prevents further delegation and cancels children in Queued,
-Running, Paused or WaitingForApproval.
-
-The orchestration moves through `Queued`, `Planning`, `Planned`, and `Running`
-before a terminal state. Planning emits `freya.planning.started`, then either
+The orchestration moves through `Queued`, `Planning`, `Planned`, `Running`, and
+`Integrating` before success. A globally requested append-only revision returns
+it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning emits
+`freya.planning.started`, then either
 `freya.plan.created` with a safe goal/complexity/task summary or
 `freya.planning.failed`. A plan uses schema version 1:
 
@@ -144,6 +175,23 @@ validates this allowed/protected split and Storage recomputes it transactionally
 before updating the effective plan. The original plan and all history remain
 unchanged. Recovery does not create agents, auto-approve capabilities, bypass
 policy, or provide direct agent-to-agent messaging.
+A graph with every active effective task in accepted `success` enters
+`Integrating`; node success alone never produces orchestration `Success`.
+`GlobalVerifier` evaluates the original prompt, immutable original goal/global
+criteria, current effective plan, accepted results/evaluations and bounded
+verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
+or `error`, and each original global criterion appears exactly once.
+
+Only global `accepted` permits final response creation and the conditional
+`Integrating → Success` commit. `needs_work`, and resolvable `blocked`, may ask
+`IntegrationReplanner` for new tasks only. Existing tasks cannot change or
+disappear, accepted tasks cannot rerun, historical IDs cannot be reused, and
+new dependencies may reference only accepted existing work or new tasks in the
+same acyclic revision. New work follows the normal selector, policy, approval,
+Runtime, Evaluator and Recovery pipeline. `error` does not rerun workers.
+Repeated global-problem fingerprints and exhausted round/revision/task/model
+budgets fail the run with a global explanation.
+
 The server exposes the bounds through `--max-parallel-tasks` (default 4) and
 `--max-delegated-tasks` (default 20); both accept 1–20.
 Recovery uses `--max-semantic-attempts` (default 3), `--max-plan-revisions`
@@ -154,6 +202,13 @@ pending node and emits `freya.recovery.exhausted` without persisting an extra
 recovery row. Offline mode performs deterministic retries without a model call.
 Model selection uses the separate `--recovery-model`, `--recovery-endpoint`,
 `--recovery-timeout`, and `--recovery-offline` options.
+Global verification, append-only integration replanning and optional final
+composition share the separately audited `--max-integration-model-calls`
+budget (default 12). `--max-integration-rounds` defaults to 2; integration
+revisions also consume `--max-plan-revisions` and `--max-delegated-tasks`.
+Model configuration uses `--integration-model`, `--integration-endpoint`,
+`--integration-timeout`, and conservative `--integration-offline`. All three
+integration adapters are loopback-only and tool-free.
 
 ## Agents and catalogue
 

@@ -147,6 +147,8 @@ class Application:
             return self.store.get_execution_graph(parts[1])
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "evaluations":
             return self.store.list_evaluations(parts[1])
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "integrations":
+            return self.store.list_integrations(parts[1])
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "events":
             return self.store.get_orchestration(parts[1])["events"]
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "attempts":

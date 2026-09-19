@@ -20,6 +20,7 @@ from .policy import policy_from_legacy, validate_policy
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, validate_plan
 from .recovery import allowed_replan_scope, validate_replan_revision
 from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
+from .integration_storage import IntegrationStoreMixin, migrate_integration_schema
 from .agent_context import build_agent_context, build_effective_agent
 from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
@@ -29,7 +30,7 @@ from .tools import argument_summary
 TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
 AGENT_STATUSES = {"Idle", "Running", "Waiting", "Paused", "Error", "Offline"}
 ACTIVE_TASK_STATUSES = ("Queued", "Running", "WaitingForApproval", "Paused")
-ORCHESTRATION_ACTIVE_STATUSES = ("Queued", "Planning", "Planned", "Running")
+ORCHESTRATION_ACTIVE_STATUSES = ("Queued", "Planning", "Planned", "Running", "Integrating")
 ORCHESTRATION_TERMINAL_STATUSES = ("Success", "Failed", "Cancelled")
 ORCHESTRATION_STATUSES = set(ORCHESTRATION_ACTIVE_STATUSES + ORCHESTRATION_TERMINAL_STATUSES)
 EXECUTION_FIELDS = {
@@ -62,13 +63,14 @@ def _load(value: str | None) -> Any:
     return json.loads(value) if value is not None else None
 
 
-class Store:
+class Store(IntegrationStoreMixin):
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
+            migrate_integration_schema(connection)
             # In-place migrations keep existing local databases usable.
             columns = {row[1] for row in connection.execute("PRAGMA table_info(agents)")}
             if "instructions" not in columns:

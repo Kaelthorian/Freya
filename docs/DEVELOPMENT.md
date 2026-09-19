@@ -76,9 +76,36 @@ overwriting the original plan or rerunning accepted tasks. Its deterministic
 scope contains only the recovery source and never-started descendants; active,
 historical and independent work is protected and revalidated again by Storage.
 
+Global integration uses its own tool-free local-model configuration and
+independent budget:
+
+```powershell
+python -m control_center --integration-model qwen2.5-coder:7b `
+  --integration-endpoint http://127.0.0.1:11434 --integration-timeout 120 `
+  --max-integration-rounds 2 --max-integration-model-calls 12
+```
+
+The integration endpoint is loopback-only. The model-call budget covers global
+verification and its repair, append-only replanning and its repair, and final
+response composition and its repair. Integration revisions also consume the
+shared `--max-plan-revisions` and `--max-delegated-tasks` limits. Use
+`--integration-offline` for conservative evidence-only operation: structurally
+provable criteria may be accepted, but semantic global criteria without enough
+objective evidence remain `blocked`. Offline mode never equates accepted child
+tasks with global success.
+
+After every active effective task is accepted, the run enters `Integrating`.
+An accepted global result creates a grounded final response and then commits
+`Success`. `needs_work`, or safely resolvable `blocked`, appends tasks without
+changing accepted work and sends them through normal selection, policy,
+approval, Runtime, evaluation and recovery. Repeated gaps or exhausted budgets
+fail closed. Cancellation, timeout, restart, revision changes and evaluation
+fingerprint changes invalidate late global results.
+
 Operational history is available at `/api/orchestrations/{id}/attempts`,
-`/recoveries`, `/plan-revisions`, and `/effective-plan`. Recovery is not resumed
-after a server restart; unfinished recovery state is closed with the run.
+`/recoveries`, `/plan-revisions`, `/effective-plan`, and `/integrations`.
+Recovery or integration is not resumed after a server restart; unfinished state
+is closed with the run.
 
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
@@ -127,6 +154,7 @@ python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p "test_planner.py" -v
 python -m unittest discover -s tests -p "test_execution_graph.py" -v
 python -m unittest discover -s tests -p "test_evaluator.py" -v
+python -m unittest discover -s tests -p "test_integration.py" -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -136,6 +164,7 @@ node --check frontend\views.js
 node --check frontend\dialogs.js
 node --check frontend\icons.js
 python -m control_center --help
+python -m pytest -q
 ```
 
 Capability, structured-agent and Skill behavior is covered by
@@ -155,6 +184,13 @@ Evaluator tests cover hard evidence precedence, prompt injection, strict schema,
 one repair, per-criterion coverage, immutable persistence, API exposure, graph
 gating, duplicate prevention, technical failure, cancellation, timeout and
 restart recovery.
+Integration tests cover deterministic preconditions, exact global criteria,
+hard evidence precedence, prompt injection, strict schema/one repair,
+fingerprints, immutable snapshots, duplicate rounds, stale/cancel/timeout
+discard, restart and migration, append-only validation, shared limits, global
+loop detection, normal selector/evaluator execution for appended work, grounded
+final responses, API history, and the invariant that accepted child tasks do
+not imply orchestration success.
 
 ## Debugging
 
@@ -171,8 +207,9 @@ local end-to-end run.
   has an active task, or another task owns the same workspace.
 - Pause applies after the current call and its deadline still advances.
 - Startup marks unfinished tasks Failed after an unclean server exit.
-- Startup also marks Queued, Planning, Planned and Running orchestrations Failed
-  once and records `freya.interrupted` without changing persisted plans. Durable
+- Startup also marks Queued, Planning, Planned, Running and `Integrating`
+  orchestrations Failed once and records `freya.interrupted` without changing persisted
+  plans. Durable
   graph nodes are closed as cancelled/skipped so none remain apparently active.
 - A planner timeout or invalid repaired response leaves the orchestration Failed;
   inspect `planning_metrics` and `freya.planning.failed` on the run.
@@ -195,5 +232,5 @@ and process boundaries.
 The Freya overview refreshes orchestration cards and shows each delegated
 agent's objective, status, duration, token usage, and model-call count. Keep
 these values sourced from persisted task snapshots when changing the view.
-Queued, Planning, Planned and Running orchestrations remain visible while the
+Queued, Planning, Planned, Running and Integrating orchestrations remain visible while the
 run is active, and recent terminal runs retain their plan and child results.

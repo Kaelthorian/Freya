@@ -19,6 +19,11 @@ from .evaluator import (DEFAULT_EVALUATOR_ENDPOINT, DEFAULT_EVALUATOR_MODEL,
 from .recovery import (DEFAULT_RECOVERY_ENDPOINT, DEFAULT_RECOVERY_MODEL,
                        DEFAULT_RECOVERY_TIMEOUT_SECONDS, OllamaRecoveryAdvisor,
                        RecoveryController, Replanner)
+from .integration import (DEFAULT_INTEGRATION_ENDPOINT, DEFAULT_INTEGRATION_MODEL,
+                          DEFAULT_INTEGRATION_TIMEOUT_SECONDS, GlobalVerifier,
+                          IntegrationReplanner, OllamaGlobalVerifier,
+                          OllamaIntegrationReplanner, OllamaResultIntegrator,
+                          ResultIntegrator)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,6 +88,19 @@ def main():
     parser.add_argument("--recovery-offline", action="store_true",
                         help="Use deterministic model-free recovery instead of calling a "
                              "recovery model")
+    parser.add_argument("--integration-model", default=DEFAULT_INTEGRATION_MODEL,
+                        help="Ollama model used for global verification and final integration")
+    parser.add_argument("--integration-endpoint", default=DEFAULT_INTEGRATION_ENDPOINT,
+                        help="Loopback Ollama base URL used by integration components")
+    parser.add_argument("--integration-timeout", type=float,
+                        default=DEFAULT_INTEGRATION_TIMEOUT_SECONDS,
+                        help="Integration Ollama request timeout in seconds (0.1-120)")
+    parser.add_argument("--integration-offline", action="store_true",
+                        help="Use conservative deterministic global verification")
+    parser.add_argument("--max-integration-rounds", type=int, default=2,
+                        help="Maximum global verification rounds that may append work (1-10)")
+    parser.add_argument("--max-integration-model-calls", type=int, default=12,
+                        help="Maximum verification, replanning and composition calls (1-100)")
     parser.add_argument("--max-semantic-attempts", type=int, default=3,
                         help="Maximum execution/evaluation attempts per planned task (1-10)")
     parser.add_argument("--max-plan-revisions", type=int, default=2,
@@ -103,8 +121,10 @@ def main():
     if (not 1 <= args.max_semantic_attempts <= 10
             or not 1 <= args.max_plan_revisions <= 10
             or not 1 <= args.max_recovery_actions <= 50
-            or not 1 <= args.max_recovery_model_calls <= 100):
-        parser.error("Recovery limits are outside their supported ranges.")
+            or not 1 <= args.max_recovery_model_calls <= 100
+            or not 1 <= args.max_integration_rounds <= 10
+            or not 1 <= args.max_integration_model_calls <= 100):
+        parser.error("Recovery or integration limits are outside their supported ranges.")
     lock = InstanceLock(data_dir)
     runtime = None
     server = None
@@ -124,14 +144,33 @@ def main():
         recovery = (RecoveryController(offline=True) if recovery_adapter is None else
                     RecoveryController(recovery_adapter))
         replanner = Replanner(recovery_adapter)
+        if args.integration_offline:
+            global_verifier = GlobalVerifier(offline=True)
+            integration_replanner = IntegrationReplanner()
+            result_integrator = ResultIntegrator()
+        else:
+            global_verifier = GlobalVerifier(OllamaGlobalVerifier(
+                args.integration_model, args.integration_endpoint, args.integration_timeout,
+            ))
+            integration_replanner = IntegrationReplanner(OllamaIntegrationReplanner(
+                args.integration_model, args.integration_endpoint, args.integration_timeout,
+            ))
+            result_integrator = ResultIntegrator(OllamaResultIntegrator(
+                args.integration_model, args.integration_endpoint, args.integration_timeout,
+            ))
         orchestrator = Orchestrator(store, runtime, planner=planner, evaluator=evaluator,
-                                    recovery=recovery, replanner=replanner, config={
+                                    recovery=recovery, replanner=replanner,
+                                    global_verifier=global_verifier,
+                                    integration_replanner=integration_replanner,
+                                    result_integrator=result_integrator, config={
             "max_parallel_tasks": args.max_parallel_tasks,
             "max_delegated_tasks": args.max_delegated_tasks,
             "max_semantic_attempts_per_task": args.max_semantic_attempts,
             "max_plan_revisions": args.max_plan_revisions,
             "max_recovery_actions": args.max_recovery_actions,
             "max_recovery_model_calls": args.max_recovery_model_calls,
+            "max_integration_rounds": args.max_integration_rounds,
+            "max_integration_model_calls": args.max_integration_model_calls,
         })
         application = Application(store, runtime, data_dir, orchestrator)
         server = ControlServer(("127.0.0.1", args.port), application)

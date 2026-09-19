@@ -8,7 +8,7 @@ bounded task runtime and workspace-scoped programming tools.
 ```text
 .
 ├── control_center/           web API, scheduler, workers, tools and SQLite
-│   ├── __main__.py           recovery, Planner/Evaluator configuration, server and instance lock
+│   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
@@ -16,6 +16,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
 │   ├── recovery.py           strict recovery decisions, retry prompts and validated replanning
+│   ├── integration.py        global verifier, append-only replanner and grounded result integrator
+│   ├── integration_orchestrator.py orchestration-level integration lifecycle
+│   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and Git tools
@@ -59,6 +62,12 @@ of this repository merely because an agent selects them.
    the recovery source and never-started descendants. Replanner and Storage both
    reject mutation of active, historical or independent work before committing
    the effective plan, without changing the original plan snapshot.
+   When every active effective task is accepted, the run enters `Integrating`.
+   `integration.py` checks the original global criteria against a bounded,
+   fingerprinted snapshot. Only global `accepted` creates the grounded final
+   response and `Success`. A bounded global gap may append new tasks without
+   changing existing work; those tasks return through the same Selector,
+   policy, Runtime, Evaluator and Recovery path.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
@@ -86,6 +95,7 @@ of this repository merely because an agent selects them.
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |
+| Global integration, append-only recovery or final response | `integration.py`, `integration_orchestrator.py`, `integration_storage.py`, `orchestrator.py`, `schema.sql`, `api.py`, `tests/test_integration.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |
 | Secret handling | `security.py`, security/runtime/storage tests |
 | Web UI and orchestration status display | `frontend/app.js`, `core.js`, `views.js`, `dialogs.js`, `styles.css` |

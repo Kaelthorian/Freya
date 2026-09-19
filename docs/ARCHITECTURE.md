@@ -10,7 +10,12 @@ delegating bounded tasks through `Runtime`, and requiring
 Workers remain the only components allowed to invoke tools;
 Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
 before a node can fail or a validated effective-plan revision can replace its subgraph.
-each receives a generic policy plus its identity, instructions, skills,
+After every active task is accepted, `control_center/integration.py` verifies
+the original goal and every original global criterion against a fingerprinted
+effective-plan snapshot. Only global `accepted` permits final response
+composition and `Success`; `needs_work` or resolvable `blocked` may append
+bounded new tasks through the normal selector/policy/runtime/evaluator/recovery
+pipeline. Each worker receives a generic policy plus its identity, instructions, skills,
 workspace, and limits. Orchestration runs, plans, delegations, and events are
 stored durably, and SQLite migrations preserve existing data.
 
@@ -40,6 +45,13 @@ tasks run. The Worker determines **how** one selected task executes. Capability
 Policy remains the sole authority for **whether** each requested action is
 permitted. The Evaluator determines **whether the produced result actually
 satisfied** the planned objective and criteria.
+The Global Verifier determines **whether the complete accepted effective plan
+satisfies the original objective and global criteria**. The Integration
+Replanner may only append new work for a global gap; it cannot edit, delete,
+supersede, or rerun accepted tasks. The Result Integrator determines **what
+grounded response to present**, but it cannot change correctness. These
+orchestration-level components are tool-free and consume only bounded,
+sanitized evidence.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -85,6 +97,16 @@ original `plan_json` remains immutable. Accepted tasks cannot be modified or
 superseded; revision validation rejects cycles, unknown dependencies,
 historical-ID reuse, task-limit overflow and active dependencies on superseded
 tasks.
+Revision rows identify `task_recovery` or `integration` as their real source;
+integration never fabricates a recovery action. `orchestration_integrations`
+stores one immutable row per `(orchestration_id, round)`: integration version,
+effective-plan revision, strict result, metrics, bounded snapshot, truncation
+flag, deterministic flag, graph fingerprint and global-problem fingerprint.
+The snapshot retains the original goal and criteria, active task IDs, accepted
+evaluation IDs and attempts. Before inserting a result or applying its final
+response/replan, Storage atomically rechecks `Integrating`, the plan revision
+and the current graph fingerprint. Cancellation, timeout or any snapshot change
+therefore wins over late model output.
 
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
@@ -115,13 +137,21 @@ Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
 `freya.recovery.exhausted`. Full decisions remain in immutable storage. A late
 recovery or replan is discarded if cancellation, timeout, restart, another
 recovery, or a state/attempt change wins first.
+Global integration emits `freya.integration.started`,
+`freya.integration.completed`, `freya.integration.failed`,
+`freya.integration.recovery_started`, `freya.integration.replan_created`, and
+`freya.final_response.created`. Event payloads contain IDs, round, revision,
+status and criterion count rather than model prompts or full output.
 
 
 ```text
-Queued → Planning → Planned → Running → Success | Failed | Cancelled
+Queued → Planning → Planned → Running → Integrating → Success
+                                  ↑          │
+                                  └──────────┘ append-only global recovery
+                                             └→ Failed | Cancelled
 ```
 
-`Queued`, `Planning`, `Planned` and `Running` are active. Terminal states never
+`Queued`, `Planning`, `Planned`, `Running` and `Integrating` are active. Terminal states never
 become active again. The orchestrator serializes cancellation with task
 submission; after cancellation returns, no later plan, event or delegation can
 appear. Repeated cancellation of a terminal run is idempotent. Startup atomically
@@ -202,8 +232,9 @@ preserving the evaluation reference. Recovery may retry the same revalidated
 agent, retry with prior agents hard-excluded, create a validated effective-plan
 revision, or fail. Retry clears only current-node references; immutable attempt,
 evaluation, selection and recovery history remains. Other Runtime statuses map to their
-graph equivalents. The parent succeeds only when every node is semantically
-accepted and fails after all reachable work is terminal when any node failed,
+graph equivalents. A fully accepted graph enters `Integrating`; it does not
+directly produce orchestration success. The parent succeeds only after an
+immutable global verification is `accepted`, and fails after all reachable work is terminal when any node failed,
 was blocked, cancelled, or skipped. User cancellation remains `Cancelled`.
 The wall-clock deadline includes planning and bounded polling uses the injected
 orchestrator clock/wait functions.
@@ -290,9 +321,56 @@ also verifies that every previously active Runtime task is still tracked by the
 same graph node and runtime ID. Replanning neither cancels nor mutates active
 work in an independent branch, so evaluation continues against the exact task
 snapshot used to start the attempt. The original plan remains available
-separately from the effective plan. This stage does not create agents,
-auto-approve capabilities, weaken policy, add a free-form shell, or implement
-final-answer synthesis.
+separately from the effective plan. Task recovery does not create agents,
+auto-approve capabilities, weaken policy, or add a free-form shell.
+
+
+## Global integration and result composition
+
+`build_integration_input` runs deterministic preconditions before any global
+model call. Every active effective task (all effective-plan tasks except
+`superseded` history) must be `success`, retain an `accepted` evaluation and
+have no pending, ready, running, approval, evaluating, recovery or failure
+state. The context contains the original prompt/goal/global criteria, current
+effective plan revision, active task objective/result summary, accepted
+evaluation summary/evidence/verification and a compact revision history. Text
+and list bounds set `context_truncated`; the serialized model context is capped
+at 48,000 characters and fails closed if it cannot be reduced safely. Result
+and evidence text are always untrusted data and never instructions.
+
+`GlobalVerifier` first applies evidence-first hard checks. Failed objective
+verification cannot be overridden by an accepting model; unavailable required
+evidence blocks acceptance, and test/integration criteria cannot pass without
+objective passing verification evidence. The tool-free `OllamaGlobalVerifier` uses the
+separate integration model/endpoint/timeout configuration and a strict schema:
+`accepted`, `needs_work`, `blocked`, or `error`, with each original global
+criterion exactly once, bounded known evidence refs and existing responsible
+task IDs. One repair is allowed within `max_integration_model_calls`. Offline
+mode accepts only criteria provable from deterministic accepted records;
+semantic uncertainty remains `blocked`.
+
+For `needs_work`, or `blocked` when a new evidence-producing task is safe,
+`IntegrationReplanner` returns only new tasks. Validation builds `current plan
++ new tasks`, calls normal plan/DAG validation, rejects historical IDs, limits,
+cycles and dependencies on anything except accepted existing work or new work
+in the same revision. The Storage transaction repeats those checks, leaves all
+existing nodes untouched, creates only pending/ready nodes, records an
+`integration` plan revision, and returns the run to `Running`. Those tasks use
+the normal Agent Selector, capability policy, approvals, Runtime, Evaluator and
+4.5 Recovery. Stable global-problem fingerprints, `max_integration_rounds`, the
+shared `max_plan_revisions`, `max_delegated_tasks`, the wall-clock deadline and
+`max_integration_model_calls` prevent unbounded loops.
+
+Only global `accepted` reaches `ResultIntegrator`. Its model may select only
+exact grounded statements derived from accepted active tasks, accepted
+evaluations and the global result. Unsupported or malformed composition gets
+one repair and then a deterministic fallback; a presentation failure never
+changes an accepted correctness result. A final conditional commit rechecks the
+same revision and graph fingerprint before `Integrating → Success`.
+
+This stage does not create agents, grant capabilities, mutate policy, resolve
+approvals, expose tools to verifier/composer models, or implement long-term
+memory.
 
 
 ## Agent selection
