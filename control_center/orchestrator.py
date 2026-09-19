@@ -792,28 +792,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             )
             status = "Failed"
         else:
-            rendered = []
-            for node in graph.serialize():
-                if node["state"] == "success" and node.get("result") is not None:
-                    rendered.append(f"{node['plan_task_id']}: {node['result']}")
-            verified = summary["successful"]
-            response = (
-                f"Freya completed and verified {verified} executable "
-                + ("task." if verified == 1 else "tasks.")
-            )
-            superseded = summary["superseded"]
-            if superseded:
-                response += (
-                    f" {superseded} historical "
-                    + ("task was" if superseded == 1 else "tasks were")
-                    + " superseded by validated replanning."
-                )
-            if rendered:
-                response += "\n\n" + "\n\n".join(rendered)
-            completed = self.store.transition_orchestration(
-                oid, ("Running",), "Success", response=response,
-            )
-            message, status = response, "Success"
+            raise ValueError("Successful graphs must pass through global integration.")
         if completed is None:
             return
         self.store.add_orchestration_event(oid, {
@@ -1229,6 +1208,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         message = str(decision.get("message", ""))
                         completed = self.store.transition_orchestration(
                             oid, ("Running",), "Success", response=message,
+                            legacy_without_graph=True,
                         )
                         if completed is not None:
                             self.store.add_orchestration_event(oid, {
@@ -1309,6 +1289,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         )
                         completed = self.store.transition_orchestration(
                             oid, ("Running",), "Success", response=message,
+                            legacy_without_graph=True,
                         )
                         if completed is not None:
                             self.store.add_orchestration_event(oid, {

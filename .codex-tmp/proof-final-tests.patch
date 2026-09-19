@@ -1,0 +1,57 @@
+diff --git a/tests/test_integration_grounding.py b/tests/test_integration_grounding.py
+--- a/tests/test_integration_grounding.py
++++ b/tests/test_integration_grounding.py
+@@ -140,1 +140,1 @@
++
++    def test_two_criteria_each_require_their_own_proof(self):
++        data = proof_input([GOAL, "Database migration completes."])
++        result = GlobalVerifier(lambda p, c: accepted(c)).verify(data)
++        self.assertEqual(result["status"], "accepted")
++        self.assertEqual(len(result["criteria"]), 2)
++        self.assertNotEqual(result["criteria"][0]["evidence"], result["criteria"][1]["evidence"])
++
++    def test_catalog_covers_every_exposed_reference_and_contains_no_output(self):
++        data = proof_input()
++        self.assertEqual(data["evidence_refs"], set(data["evidence_catalog"]))
++        for metadata in data["evidence_catalog"].values():
++            self.assertNotIn("output", metadata)
++            self.assertNotIn("result", metadata)
++        self.assertEqual(data["snapshot"]["proof_refs_by_criterion"], data["proof_refs_by_criterion"])
++
++    def test_composer_provider_failure_uses_grounded_fallback(self):
++        data = proof_input()
++        def unavailable(prompt, context):
++            raise RuntimeError("Provider unavailable")
++        response, metrics, fallback = ResultIntegrator(unavailable).compose(data, accepted(data["context"]))
++        self.assertTrue(fallback)
++        self.assertEqual(metrics["model_calls"], 1)
++        self.assertIn("verification:e0:1", response)
++
+ class StorageGroundingTests(unittest.TestCase):
+@@ -215,1 +243,1 @@
++
++    def test_success_before_graph_initialization_is_not_a_legacy_default(self):
++        run = self.store.create_orchestration("Production run")
++        with self.assertRaises(ValueError):
++            self.store.transition_orchestration(run["id"], "Queued", "Success")
++        self.assertEqual(self.store.get_orchestration(run["id"])["status"], "Queued")
++
++    def test_explicit_legacy_flag_cannot_finalize_a_graph(self):
++        run, _ = self.accepted_run()
++        with self.assertRaises(ValueError):
++            self.store.transition_orchestration(run["id"], "Integrating", "Success",
++                                               legacy_without_graph=True)
++
++    def test_storage_requires_exact_criterion_coverage(self):
++        run, data = self.accepted_run()
++        for decisions in ([], [fixtures.global_result(run["plan"]["success_criteria"])["criteria"][0]] * 2):
++            result = fixtures.global_result(run["plan"]["success_criteria"])
++            result["criteria"] = decisions
++            with self.assertRaises(ValueError):
++                self.store.commit_integration(
++                    "bad", run["id"], round_number=1, plan_revision=0, integration_version=2,
++                    result=result, metrics={}, snapshot=data["snapshot"], context_truncated=False,
++                    deterministic=False, problem_fingerprint=global_problem_fingerprint(result),
++                )
++
+ class GroundedLifecycleTests(unittest.TestCase):

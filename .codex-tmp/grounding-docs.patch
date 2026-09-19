@@ -1,0 +1,45 @@
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -328,1 +328,8 @@
+ ## Global integration and result composition
++
++Integration version 2 requires criterion-specific grounded proof, not merely
++known evidence refs. The bounded catalog, exact association rules, Storage
++reconstruction and the explicitly isolated legacy exception are specified in
++[Integration proof contract](INTEGRATION_PROOF.md). Generic state updates cannot
++grant production Success; finalization revalidates proof against persisted
++authority in its write transaction.
+diff --git a/docs/API.md b/docs/API.md
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -182,2 +182,10 @@
+ verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
+ or `error`, and each original global criterion appears exactly once.
++
++Version-2 satisfied criteria must cite nonempty criterion-specific permitted
++proof refs. Context refs (`task:*`, `evaluation:*`) cannot authorize acceptance.
++Missing proof is blocked before inference. The private snapshot now includes
++`evidence_catalog` and `proof_refs_by_criterion`; the history API still omits
++the snapshot. Historical version-1 records remain readable. Final-response
++event payloads include composition metrics. See
++[Integration proof contract](INTEGRATION_PROOF.md) for proof and legacy rules.
+diff --git a/docs/DEVELOPMENT.md b/docs/DEVELOPMENT.md
+--- a/docs/DEVELOPMENT.md
++++ b/docs/DEVELOPMENT.md
+@@ -192,2 +192,9 @@
+ final responses, API history, and the invariant that accepted child tasks do
+ not imply orchestration success.
++
++Run `python -m unittest tests.test_integration_grounding -v` for adversarial
++proof, Storage, race, budget, 4.5 retry and policy/approval coverage. Its approval
++test uses a real spawned Runtime and a loopback fake provider with disposable
++workspace data. Run `python -m pytest -q` as well when pytest is installed.
++Fixture model acceptances must cite permitted proof; do not restore empty
++evidence to make a regression pass. See [Integration proof contract](INTEGRATION_PROOF.md).
+diff --git a/docs/REPOSITORY_MAP.md b/docs/REPOSITORY_MAP.md
+--- a/docs/REPOSITORY_MAP.md
++++ b/docs/REPOSITORY_MAP.md
+@@ -19,1 +19,2 @@
+ │   ├── integration.py        global verifier, append-only replanner and grounded result integrator
++│   ├── integration_proof.py  bounded evidence catalog and deterministic criterion-to-proof association

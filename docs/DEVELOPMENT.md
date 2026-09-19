@@ -192,6 +192,13 @@ loop detection, normal selector/evaluator execution for appended work, grounded
 final responses, API history, and the invariant that accepted child tasks do
 not imply orchestration success.
 
+Run `python -m unittest tests.test_integration_grounding -v` for adversarial
+proof, Storage, race, budget, 4.5 retry and policy/approval coverage. Its approval
+test uses a real spawned Runtime and a loopback fake provider with disposable
+workspace data. Run `python -m pytest -q` as well when pytest is installed.
+Fixture model acceptances must cite permitted proof; do not restore empty
+evidence to make a regression pass. See [Integration proof contract](INTEGRATION_PROOF.md).
+
 ## Debugging
 
 Recovery tests cover strict schema/one repair, deterministic offline fallback,

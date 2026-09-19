@@ -94,6 +94,8 @@ def prepared(criteria=None, *, failed=False, injection=False, superseded=False):
 
 def global_result(criteria, status="accepted", *, evidence=None, issue=None, missing=None,
                   responsible=None):
+    if evidence is None and status == "accepted" and criteria == ["The graph reaches a terminal state."]:
+        evidence = ["structural:graph-terminal"]
     criterion_status = {
         "accepted": "satisfied", "needs_work": "unsatisfied",
         "blocked": "unknown", "error": "unknown",
@@ -119,7 +121,8 @@ class GlobalVerifierTests(unittest.TestCase):
         result = GlobalVerifier(lambda p, c: global_result(
             c["global_success_criteria"], "needs_work"
         )).verify(data)
-        self.assertEqual(result["status"], "needs_work")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["missing_evidence"], data["context"]["global_success_criteria"])
 
     def test_global_accept_requires_every_criterion_once(self):
         criteria = ["One", "Two"]
@@ -690,7 +693,7 @@ class IntegrationSchedulerTests(unittest.TestCase):
         self.assertEqual(final["status"], "Failed")
 
     def test_global_error_is_not_success_or_worker_retry(self):
-        semantic = plan(criteria=["Semantic criterion"])
+        semantic = plan()
         final, runtime, _, _ = self.run_orchestration(
             semantic, GlobalVerifier(lambda p, c: "bad"),
         )
@@ -749,7 +752,7 @@ class IntegrationSchedulerTests(unittest.TestCase):
             calls.append([item["id"] for item in context["active_tasks"]])
             return global_result(
                 context["global_success_criteria"],
-                "needs_work" if len(calls) == 1 else "accepted",
+                evidence=context["allowed_proofs"][0]["refs"],
             )
 
         replanner = IntegrationReplanner(lambda p, c: {
@@ -760,14 +763,14 @@ class IntegrationSchedulerTests(unittest.TestCase):
             current_plan, GlobalVerifier(verifier_model), replanner=replanner,
         )
         self.assertEqual(final["status"], "Success")
-        self.assertEqual(calls, [["a", "b"], ["a", "b", "integration-c"]])
+        self.assertEqual(calls, [["a", "b", "integration-c"]])
         self.assertEqual([item[0] for item in runtime.submissions],
                          ["Complete a", "Complete b", "Complete integration-c"])
         self.assertEqual(selector.calls.count("a"), 1)
         self.assertEqual(selector.calls.count("b"), 1)
         self.assertEqual(selector.calls.count("integration-c"), 1)
         self.assertEqual([item["status"] for item in self.store.list_integrations(final["id"])],
-                         ["needs_work", "accepted"])
+                         ["blocked", "accepted"])
         self.assertEqual(len(final["evaluations"]), 3)
 
     def test_repeated_global_gap_stops_loop(self):
@@ -789,7 +792,8 @@ class IntegrationSchedulerTests(unittest.TestCase):
         self.assertIn("repeated", (final["error"] or "").lower())
 
     def test_max_integration_rounds_stops_third_gap(self):
-        current_plan = plan(criteria=["Components work together."])
+        current_plan = plan([task("a", criterion="Components work together.")],
+                            criteria=["Components work together."])
         issue_counter = []
 
         def verifier_model(prompt, context):

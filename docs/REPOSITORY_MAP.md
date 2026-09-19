@@ -17,6 +17,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
 │   ├── recovery.py           strict recovery decisions, retry prompts and validated replanning
 │   ├── integration.py        global verifier, append-only replanner and grounded result integrator
+│   ├── integration_proof.py  bounded evidence catalog and deterministic criterion-to-proof association
 │   ├── integration_orchestrator.py orchestration-level integration lifecycle
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration

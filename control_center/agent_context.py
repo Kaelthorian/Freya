@@ -214,8 +214,15 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   f"Enabled: {verification['enabled']}", f"Inspect changes: {verification['inspect_changes']}",
                   f"Run available tests: {verification['run_available_tests']}", f"Require tool evidence: {verification['require_tool_evidence']}",
                   "Completion criteria: " + "; ".join(verification["completion_criteria"]) if verification["completion_criteria"] else "Completion criteria: None specified",
-                  "OUTPUT CONTRACT", f"Format: {output['format']}", "Include: " + ", ".join(output["include"]),
-                  "WORKSPACE", workspace])
+                  "OUTPUT CONTRACT",
+                  f"Format: {output['format']}",
+                  "Include: " + ", ".join(output["include"]),
+                  "WORKSPACE",
+                  "Root: .",
+                  "All filesystem tool paths are relative to the task workspace.",
+                  "Use '.' to refer to the workspace root.",
+                  "Never use or infer an absolute host filesystem path in tool calls."])
+
     return sanitize("\n".join(lines))
 
 

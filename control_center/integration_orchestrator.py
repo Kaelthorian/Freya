@@ -205,6 +205,7 @@ class IntegrationOrchestrationMixin:
                 "event_type": "freya.final_response.created", "status": "Success",
                 "integration_id": integration_id, "fallback": fallback,
                 "model_calls": metrics.get("model_calls", 0),
+                "metrics": metrics,
                 "message": "Freya created a grounded final response.",
             })
             self.store.add_orchestration_event(oid, {

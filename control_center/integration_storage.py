@@ -6,7 +6,8 @@ import json
 from typing import Any
 
 from .integration import (GLOBAL_STATUSES, stable_graph_fingerprint,
-                          validate_integration_revision)
+                          validate_integration_revision, validate_global_result,
+                          build_integration_input, GlobalVerifier)
 from .planner import MAX_PLAN_TASKS, validate_plan
 from .security import sanitize
 
@@ -122,6 +123,39 @@ class IntegrationStoreMixin:
         )]
         return stable_graph_fingerprint(revision, nodes)
 
+    def _validate_accepted_proof(self, connection, oid, result, snapshot):
+        """Rebuild proof authority from persisted plans/evaluations inside the write transaction."""
+        run = connection.execute("SELECT * FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+        nodes = [self._execution_node(row) for row in connection.execute(
+            "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=? "
+            "ORDER BY plan_order,plan_task_id", (oid,),
+        )]
+        evaluations = {}
+        for node in nodes:
+            if node["state"] == "superseded":
+                continue
+            row = connection.execute(
+                "SELECT * FROM orchestration_evaluations WHERE id=? AND orchestration_id=? "
+                "AND plan_task_id=? AND attempt=?",
+                (node.get("evaluation_id"), oid, node["plan_task_id"], node["attempt"]),
+            ).fetchone()
+            if row is not None:
+                evaluations[row["id"]] = self._evaluation(row, include_snapshot=True)
+        prepared = build_integration_input(
+            original_user_prompt=run["prompt"], original_plan=_load(run["plan_json"]),
+            effective_plan=_load(run["effective_plan_json"]) or _load(run["plan_json"]),
+            plan_revision=int(run["current_plan_revision"] or 0),
+            graph_nodes=nodes, evaluations=evaluations, revision_history=[],
+        )
+        if snapshot != prepared["snapshot"]:
+            raise ValueError("Integration proof snapshot differs from persisted authority.")
+        if GlobalVerifier(offline=True)._hard_check(prepared) is not None:
+            raise ValueError("Accepted integration contradicts deterministic evidence checks.")
+        validate_global_result(
+            result, snapshot["global_criteria"], snapshot["active_task_ids"],
+            set(snapshot["evidence_catalog"]), snapshot["proof_refs_by_criterion"],
+        )
+
     def commit_integration(self, integration_id: str, oid: str, *, round_number: int,
                            plan_revision: int, integration_version: int,
                            result: dict[str, Any], metrics: dict[str, Any],
@@ -145,6 +179,8 @@ class IntegrationStoreMixin:
                     or self._current_integration_fingerprint(connection, oid, plan_revision)
                     != expected_fingerprint):
                 return None
+            if status == "accepted":
+                self._validate_accepted_proof(connection, oid, result, snapshot)
             connection.execute(
                 "INSERT INTO orchestration_integrations("
                 "id,orchestration_id,round,plan_revision,integration_version,status,summary,"
@@ -166,7 +202,7 @@ class IntegrationStoreMixin:
                 "SELECT status,current_plan_revision FROM orchestration_runs WHERE id=?", (oid,),
             ).fetchone()
             integration = connection.execute(
-                "SELECT status,plan_revision,graph_fingerprint FROM orchestration_integrations "
+                "SELECT * FROM orchestration_integrations "
                 "WHERE id=? AND orchestration_id=?", (integration_id, oid),
             ).fetchone()
             if run is None:
@@ -178,6 +214,10 @@ class IntegrationStoreMixin:
                         connection, oid, int(integration["plan_revision"])
                     ) != integration["graph_fingerprint"]):
                 return None
+            self._validate_accepted_proof(
+                connection, oid, _load(integration["integration_json"]),
+                _load(integration["snapshot_json"]),
+            )
             cursor = connection.execute(
                 "UPDATE orchestration_runs SET status='Success',response=?,error=NULL,updated_at=? "
                 "WHERE id=? AND status='Integrating'", (sanitize(response), now, oid),
@@ -219,6 +259,13 @@ class IntegrationStoreMixin:
             nodes = {row["plan_task_id"]: dict(row) for row in connection.execute(
                 "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=?", (oid,),
             )}
+            received_by_id = {task["id"]: task for task in plan["tasks"]}
+            if any(received_by_id.get(task["id"]) != task for task in current_plan["tasks"]):
+                raise ValueError("Integration revision cannot modify or delete an existing task.")
+            for field in ("goal", "summary", "success_criteria"):
+                if normalized[field] != current_plan[field]:
+                    raise ValueError("Integration revision cannot modify existing plan fields.")
+
             accepted = {task_id for task_id, node in nodes.items()
                         if node["state"] == "success" and node["evaluation_status"] == "accepted"}
             normalized = validate_integration_revision(

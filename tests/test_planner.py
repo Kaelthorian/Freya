@@ -398,7 +398,8 @@ class OrchestrationLifecycleTests(unittest.TestCase):
                 self.store.transition_orchestration(run["id"], ("Planned",), "Running")
             runs[status] = run["id"]
         terminal = self.store.create_orchestration("terminal")
-        self.store.transition_orchestration(terminal["id"], ("Queued",), "Success")
+        self.store.transition_orchestration(terminal["id"], ("Queued",), "Success",
+                                            legacy_without_graph=True)
 
         self.assertEqual(self.store.recover_interrupted_orchestrations(), 4)
         for original, oid in runs.items():

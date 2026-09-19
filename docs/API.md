@@ -182,6 +182,14 @@ criteria, current effective plan, accepted results/evaluations and bounded
 verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
 or `error`, and each original global criterion appears exactly once.
 
+Version-2 satisfied criteria must cite nonempty criterion-specific permitted
+proof refs. Context refs (`task:*`, `evaluation:*`) cannot authorize acceptance.
+Missing proof is blocked before inference. The private snapshot now includes
+`evidence_catalog` and `proof_refs_by_criterion`; the history API still omits
+the snapshot. Historical version-1 records remain readable. Final-response
+event payloads include composition metrics. See
+[Integration proof contract](INTEGRATION_PROOF.md) for proof and legacy rules.
+
 Only global `accepted` permits final response creation and the conditional
 `Integrating → Success` commit. `needs_work`, and resolvable `blocked`, may ask
 `IntegrationReplanner` for new tasks only. Existing tasks cannot change or

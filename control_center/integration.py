@@ -17,9 +17,10 @@ from .config import validate_endpoint
 from .planner import (MAX_PLAN_TASKS, TASK_FIELDS, validate_plan)
 from .security import sanitize
 from .transport import request_json
+from .integration_proof import build_proof_metadata, criterion_key
 
 
-INTEGRATION_VERSION = 1
+INTEGRATION_VERSION = 2
 GLOBAL_STATUSES = {"accepted", "needs_work", "blocked", "error"}
 CRITERION_STATUSES = {"satisfied", "unsatisfied", "partial", "unknown"}
 GLOBAL_ACTIONS = {
@@ -160,7 +161,8 @@ def global_problem_fingerprint(result: dict[str, Any]) -> str:
 
 
 def validate_global_result(value: Any, criteria: list[str], active_task_ids: list[str],
-                           evidence_refs: set[str]) -> dict[str, Any]:
+                           evidence_refs: set[str],
+                           proof_refs_by_criterion: dict[str, list[str]] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != GLOBAL_FIELDS:
         raise IntegrationValidationError("Global verification has invalid fields.")
     status = value["status"]
@@ -207,6 +209,13 @@ def validate_global_result(value: Any, criteria: list[str], active_task_ids: lis
             raise IntegrationValidationError("Accepted integration requires every criterion satisfied.")
         if issues or missing:
             raise IntegrationValidationError("Accepted integration cannot retain issues or missing evidence.")
+    for item in normalized_criteria:
+        if item["status"] == "satisfied":
+            allowed = set((proof_refs_by_criterion or {}).get(criterion_key(item["criterion"]), []))
+            if not item["evidence"] or any(ref not in allowed for ref in item["evidence"]):
+                raise IntegrationValidationError(
+                    "Satisfied global criterion requires permitted grounded proof for that criterion."
+                )
     if status == "needs_work" and not (issues or any(
             item["status"] in {"unsatisfied", "partial"} for item in normalized_criteria)):
         raise IntegrationValidationError("needs_work requires a concrete global gap.")
@@ -229,7 +238,8 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
     original = validate_plan(deepcopy(original_plan))
     effective = validate_plan(deepcopy(effective_plan))
     node_by_id = {str(node.get("plan_task_id")): node for node in graph_nodes}
-    if set(node_by_id) != {task["id"] for task in effective["tasks"]}:
+    if (len(node_by_id) != len(graph_nodes)
+            or set(node_by_id) != {task["id"] for task in effective["tasks"]}):
         raise IntegrationPreconditionError("Effective plan and execution graph do not match.")
     active_nodes = [node_by_id[task["id"]] for task in effective["tasks"]
                     if node_by_id[task["id"]].get("state") != "superseded"]
@@ -325,6 +335,21 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
                 ("requested", "attempted", "passed", "failed", "unavailable")
             } | {"items": verification_items},
         })
+        # Hard failures must survive display truncation, including checks beyond item 20.
+        active_tasks[-1]["verification"]["failed"] = bool(verification.get("failed")) or any(
+            isinstance(item, dict) and item.get("status") == "failed"
+            for item in verification.get("evidence") or []
+        )
+    catalog, proofs = build_proof_metadata(
+        original["success_criteria"], effective["tasks"], active_nodes, evaluations,
+    )
+    snapshot["evidence_catalog"] = catalog
+    snapshot["proof_refs_by_criterion"] = proofs
+    evidence_refs = set(catalog)
+    for task in active_tasks:
+        task["evidence"] = [item for item in task["evidence"] if item["ref"] in catalog]
+        task["verification"]["items"] = [
+            item for item in task["verification"]["items"] if item["ref"] in catalog]
     revisions = [{
         "revision": item.get("revision"),
         "source_type": item.get("revision_source_type", "task_recovery"),
@@ -338,6 +363,9 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         "effective_plan_revision": int(plan_revision),
         "active_tasks": active_tasks,
         "plan_revision_history": revisions,
+        "allowed_proofs": [
+            {"criterion_index": index, "refs": proofs[criterion_key(criterion)]}
+            for index, criterion in enumerate(original["success_criteria"])],
     })
     def rendered_size() -> int:
         return len(json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str))
@@ -397,6 +425,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
     return {
         "snapshot": snapshot, "context": context, "context_truncated": context_truncated,
         "evidence_refs": evidence_refs, "active_task_ids": active_ids,
+        "evidence_catalog": catalog, "proof_refs_by_criterion": proofs,
     }
 
 
@@ -602,29 +631,30 @@ class GlobalVerifier(_MeasuredModel):
                 criterion_status="unknown", reason="No passing verification evidence is available.",
                 missing=verification_criteria, responsible=active_ids,
             )
+        missing = [criterion for criterion in criteria if not
+                   prepared["proof_refs_by_criterion"].get(criterion_key(criterion))]
+        if missing:
+            return self._decision(
+                "blocked", criteria, "Global criteria lack permitted grounded proof.",
+                criterion_status="unknown", reason="No permitted proof candidate exists.",
+                missing=missing, responsible=active_ids,
+            )
         return None
 
     @staticmethod
     def _offline(prepared: dict[str, Any]) -> dict[str, Any]:
         context = prepared["context"]
         tasks = context["active_tasks"]
-        task_criteria = {str(item).casefold() for task in tasks
-                         for item in task.get("success_criteria", [])}
-        all_refs = [task["evaluation_ref"] for task in tasks]
+        proofs = prepared["proof_refs_by_criterion"]
         records = []
         missing = []
         for criterion in context["global_success_criteria"]:
-            key = criterion.casefold()
-            structurally_proven = (
-                key in task_criteria
-                or ("graph" in key and "terminal" in key)
-                or ("all" in key and "task" in key and
-                    any(word in key for word in ("accept", "success", "complete")))
-            )
+            key = criterion_key(criterion)
+            structurally_proven = bool(proofs.get(key))
             if structurally_proven:
                 records.append({"criterion": criterion, "status": "satisfied",
                                 "reason": "Accepted task records deterministically prove this criterion.",
-                                "evidence": all_refs})
+                                "evidence": proofs[key]})
             else:
                 records.append({"criterion": criterion, "status": "unknown",
                                 "reason": "Offline verification cannot infer this semantic criterion.",
@@ -646,13 +676,14 @@ class GlobalVerifier(_MeasuredModel):
         criteria = prepared["context"]["global_success_criteria"]
         active_ids = prepared["active_task_ids"]
         refs = set(prepared["evidence_refs"])
+        proofs = prepared["proof_refs_by_criterion"]
         hard = self._hard_check(prepared)
         if hard is not None:
-            result = validate_global_result(hard, criteria, active_ids, refs)
+            result = validate_global_result(hard, criteria, active_ids, refs, proofs)
             return {**result, "metrics": dict(self.metrics), "deterministic": True,
                     "context_truncated": prepared["context_truncated"]}
         if self.offline:
-            result = validate_global_result(self._offline(prepared), criteria, active_ids, refs)
+            result = validate_global_result(self._offline(prepared), criteria, active_ids, refs, proofs)
             return {**result, "metrics": dict(self.metrics), "deterministic": True,
                     "context_truncated": prepared["context_truncated"]}
         if self.model is None:
@@ -662,11 +693,12 @@ class GlobalVerifier(_MeasuredModel):
         prompt = (
             "Determine whether the original goal and every original global success criterion are "
             "satisfied by the complete accepted effective plan. Evaluate each criterion exactly "
-            "once. Objective verification outranks agent claims. Use only supplied evidence refs."
+            "once. Objective verification outranks agent claims. Every satisfied criterion must "
+            "cite only refs from its allowed_proofs entry (zero-based criterion_index)."
         )
         output = self._call(prompt, prepared["context"])
         try:
-            result = validate_global_result(self._json(output), criteria, active_ids, refs)
+            result = validate_global_result(self._json(output), criteria, active_ids, refs, proofs)
         except (IntegrationValidationError, TypeError, ValueError) as first_error:
             if max_model_calls < 2:
                 raise IntegrationGenerationError(
@@ -678,7 +710,7 @@ class GlobalVerifier(_MeasuredModel):
             )
             try:
                 result = validate_global_result(
-                    self._json(self._call(repair, prepared["context"])), criteria, active_ids, refs,
+                    self._json(self._call(repair, prepared["context"])), criteria, active_ids, refs, proofs,
                 )
             except Exception as second_error:
                 raise IntegrationGenerationError(
@@ -787,7 +819,8 @@ class ResultIntegrator(_MeasuredModel):
         evidence = []
         for criterion in integration.get("criteria", []):
             evidence.append(
-                f"Global criterion satisfied: {criterion.get('criterion')} ({criterion.get('reason')})"
+                f"Global criterion satisfied: {criterion['criterion']}. "
+                + "Evidence: " + ", ".join(criterion["evidence"])
             )
         limitations = [str(item) for item in integration.get("missing_evidence", [])]
         return {"completed": completed, "evidence": evidence, "limitations": limitations}
@@ -825,6 +858,13 @@ class ResultIntegrator(_MeasuredModel):
                 max_model_calls: int = 2) -> tuple[str, dict[str, Any], bool]:
         self._reset_metrics()
         allowed = self._grounded_items(prepared, integration)
+        if integration.get("status") != "accepted":
+            raise IntegrationValidationError("Final composition requires accepted integration.")
+        validate_global_result(
+            integration, prepared["context"]["global_success_criteria"],
+            prepared["active_task_ids"], set(prepared["evidence_catalog"]),
+            prepared["proof_refs_by_criterion"],
+        )
         task_count = len(prepared["context"]["active_tasks"])
         summary = (
             f"Freya completed and globally verified {task_count} executable "
@@ -854,4 +894,7 @@ class ResultIntegrator(_MeasuredModel):
                 return self.render(value), dict(self.metrics), False
             except (IntegrationValidationError, TypeError, ValueError):
                 continue
+            except Exception:
+                # A provider failure in presentation cannot invalidate proven work.
+                break
         return self.render(fallback), dict(self.metrics), True

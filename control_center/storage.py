@@ -557,7 +557,8 @@ class Store(IntegrationStoreMixin):
     def skill_compatibility(self, agent_id: str) -> list[dict[str, Any]]:
         return [skill_summary(skill) for skill in self.get_agent(agent_id).get("skills", [])]
 
-    def transition_orchestration(self, oid: str, expected_statuses, status: str, **fields) -> dict | None:
+    def transition_orchestration(self, oid: str, expected_statuses, status: str, *,
+                                 legacy_without_graph: bool = False, **fields) -> dict | None:
         """Atomically update a run only while it remains in an expected state."""
         expected = ((expected_statuses,) if isinstance(expected_statuses, str)
                     else tuple(dict.fromkeys(expected_statuses)))
@@ -581,6 +582,15 @@ class Store(IntegrationStoreMixin):
         placeholders = ",".join(key + "=?" for key in values)
         expected_placeholders = ",".join("?" for _ in expected)
         with self._connection(write=True) as c:
+            if status == "Success":
+                run = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+                graph_exists = c.execute(
+                    "SELECT 1 FROM orchestration_task_nodes WHERE orchestration_id=? LIMIT 1", (oid,),
+                ).fetchone()
+                if run is not None and run["status"] != "Success" and (graph_exists or not legacy_without_graph):
+                    raise ValueError(
+                        "Graph orchestration Success requires finalize_accepted_integration."
+                    )
             cursor = c.execute(
                 f"UPDATE orchestration_runs SET {placeholders} WHERE id=? AND status IN ({expected_placeholders})",
                 [*values.values(), oid, *expected],

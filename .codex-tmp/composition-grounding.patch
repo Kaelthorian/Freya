@@ -1,0 +1,19 @@
+diff --git a/control_center/integration.py b/control_center/integration.py
+--- a/control_center/integration.py
++++ b/control_center/integration.py
+@@ -820,2 +820,9 @@
+         self._reset_metrics()
+         allowed = self._grounded_items(prepared, integration)
++        if integration.get("status") != "accepted":
++            raise IntegrationValidationError("Final composition requires accepted integration.")
++        validate_global_result(
++            integration, prepared["context"]["global_success_criteria"],
++            prepared["active_task_ids"], set(prepared["evidence_catalog"]),
++            prepared["proof_refs_by_criterion"],
++        )
+diff --git a/control_center/integration_orchestrator.py b/control_center/integration_orchestrator.py
+--- a/control_center/integration_orchestrator.py
++++ b/control_center/integration_orchestrator.py
+@@ -207,1 +207,2 @@
+                 "model_calls": metrics.get("model_calls", 0),
++                "metrics": metrics,

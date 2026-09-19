@@ -327,6 +327,13 @@ auto-approve capabilities, weaken policy, or add a free-form shell.
 
 ## Global integration and result composition
 
+Integration version 2 requires criterion-specific grounded proof, not merely
+known evidence refs. The bounded catalog, exact association rules, Storage
+reconstruction and the explicitly isolated legacy exception are specified in
+[Integration proof contract](INTEGRATION_PROOF.md). Generic state updates cannot
+grant production Success; finalization revalidates proof against persisted
+authority in its write transaction.
+
 `build_integration_input` runs deterministic preconditions before any global
 model call. Every active effective task (all effective-plan tasks except
 `superseded` history) must be `success`, retain an `accepted` evaluation and
