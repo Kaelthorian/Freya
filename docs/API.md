@@ -136,17 +136,24 @@ evaluation becomes node `success`. Other semantic outcomes enter
 `recovery_pending` and receive exactly one bounded decision for that attempt.
 Retry decisions create a new selection, Runtime task, delegation, evaluation
 and attempt record. Same-agent retry revalidates the agent; different-agent
-retry hard-excludes prior agents. Replanning preserves the original plan and
-accepted tasks while committing a validated effective plan. Recovery does not
-create agents, auto-approve capabilities, bypass policy, or provide direct
-agent-to-agent messaging.
+retry hard-excludes prior agents. Recovery Advisor `affected_task_ids` are only
+a proposal: deterministic DAG traversal permits the `recovery_pending` source
+and never-started `pending`/`ready` descendants. Independent, active, accepted
+and historically attempted tasks remain structurally immutable. The Replanner
+validates this allowed/protected split and Storage recomputes it transactionally
+before updating the effective plan. The original plan and all history remain
+unchanged. Recovery does not create agents, auto-approve capabilities, bypass
+policy, or provide direct agent-to-agent messaging.
 The server exposes the bounds through `--max-parallel-tasks` (default 4) and
 `--max-delegated-tasks` (default 20); both accept 1–20.
 Recovery uses `--max-semantic-attempts` (default 3), `--max-plan-revisions`
 (default 2), `--max-recovery-actions` (default 8), and
-`--max-recovery-model-calls` (default 16) across advice and replanning, plus separate
-`--recovery-model`, `--recovery-endpoint`, `--recovery-timeout`, and
-`--recovery-offline` options.
+`--max-recovery-model-calls` (default 16) across the initial advice call,
+its optional repair, and replanning. Exhausting the action budget fails the
+pending node and emits `freya.recovery.exhausted` without persisting an extra
+recovery row. Offline mode performs deterministic retries without a model call.
+Model selection uses the separate `--recovery-model`, `--recovery-endpoint`,
+`--recovery-timeout`, and `--recovery-offline` options.
 
 ## Agents and catalogue
 

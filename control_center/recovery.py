@@ -66,6 +66,98 @@ class RecoveryGenerationError(RuntimeError):
     """A configured recovery model could not produce a valid decision."""
 
 
+def allowed_replan_scope(source_task_id: str, effective_plan: dict[str, Any],
+                         graph_nodes: list[dict[str, Any]],
+                         execution_attempts: list[dict[str, Any]]) -> set[str]:
+    """Return the source plus never-started pending/ready descendants."""
+    plan = validate_plan(deepcopy(effective_plan))
+    tasks = {item["id"]: item for item in plan["tasks"]}
+    nodes = {str(item.get("plan_task_id")): item for item in graph_nodes}
+    if source_task_id not in tasks or source_task_id not in nodes:
+        raise RecoveryValidationError("Recovery source task is missing from the effective graph.")
+    if nodes[source_task_id].get("state") != "recovery_pending":
+        raise RecoveryValidationError("Recovery source task must be recovery_pending.")
+    children = {task_id: [] for task_id in tasks}
+    for task in plan["tasks"]:
+        for dependency in task["depends_on"]:
+            children[dependency].append(task["id"])
+    descendants: set[str] = set()
+    pending = list(children[source_task_id])
+    while pending:
+        task_id = pending.pop(0)
+        if task_id in descendants:
+            continue
+        descendants.add(task_id)
+        pending.extend(children[task_id])
+    attempted = {str(item.get("plan_task_id")) for item in execution_attempts}
+    mutable = {source_task_id}
+    for task_id in descendants:
+        node = nodes.get(task_id)
+        if node and node.get("state") in {"pending", "ready"} and task_id not in attempted:
+            mutable.add(task_id)
+    return mutable
+
+
+def validate_replan_revision(*, current_plan: dict[str, Any], revised_plan: dict[str, Any],
+                             source_task_id: str, affected_task_ids: set[str],
+                             superseded_task_ids: set[str], allowed_task_ids: set[str],
+                             protected_task_ids: set[str], accepted_task_ids: set[str],
+                             historical_task_ids: set[str], max_tasks: int) -> dict[str, Any]:
+    """Validate a cumulative revision against deterministic mutable/protected scope."""
+    current_plan = validate_plan(deepcopy(current_plan))
+    revised_plan = validate_plan(deepcopy(revised_plan))
+    if len(revised_plan["tasks"]) > int(max_tasks):
+        raise RecoveryValidationError("Revised plan exceeds the configured task limit.")
+    current = {item["id"]: item for item in current_plan["tasks"]}
+    revised = {item["id"]: item for item in revised_plan["tasks"]}
+    current_ids = set(current)
+    allowed = set(allowed_task_ids)
+    affected = set(affected_task_ids)
+    superseded = set(superseded_task_ids)
+    protected = set(protected_task_ids) | (current_ids - allowed)
+    if source_task_id not in current_ids or source_task_id not in allowed:
+        raise RecoveryValidationError("Recovery source is outside the safe replanning scope.")
+    if source_task_id not in affected or not affected <= allowed:
+        raise RecoveryValidationError("Recovery requested tasks outside the safe replanning scope.")
+    if allowed & protected_task_ids:
+        raise RecoveryValidationError("Allowed and protected replanning scopes overlap.")
+    if current_ids - set(revised):
+        raise RecoveryValidationError("Effective plan revision cannot delete historical tasks.")
+    if source_task_id not in superseded or not superseded <= affected:
+        raise RecoveryValidationError("Revision may supersede only the failed affected subgraph.")
+    if superseded & (accepted_task_ids | protected):
+        raise RecoveryValidationError("Accepted or protected tasks cannot be superseded.")
+    immutable = accepted_task_ids | protected | superseded | (current_ids - affected)
+    for task_id in immutable:
+        if task_id not in current or revised.get(task_id) != current[task_id]:
+            raise RecoveryValidationError("Protected task snapshots must remain unchanged.")
+    current_protected_order = [item["id"] for item in current_plan["tasks"]
+                               if item["id"] in protected]
+    revised_protected_order = [item["id"] for item in revised_plan["tasks"]
+                               if item["id"] in protected]
+    if revised_protected_order != current_protected_order:
+        raise RecoveryValidationError("Protected task order must remain unchanged.")
+    new_ids = set(revised) - current_ids
+    if new_ids & historical_task_ids:
+        raise RecoveryValidationError("Revision reuses a historical task id.")
+    for task in revised_plan["tasks"]:
+        if task["id"] not in superseded and set(task["depends_on"]) & superseded:
+            raise RecoveryValidationError("Active revised tasks cannot depend on superseded tasks.")
+    ancestors: set[str] = set()
+    pending = list(current[source_task_id]["depends_on"])
+    while pending:
+        task_id = pending.pop()
+        if task_id in ancestors:
+            continue
+        ancestors.add(task_id)
+        pending.extend(current[task_id]["depends_on"])
+    permitted_dependencies = allowed | new_ids | (ancestors & accepted_task_ids)
+    for task_id in new_ids:
+        if not set(revised[task_id]["depends_on"]) <= permitted_dependencies:
+            raise RecoveryValidationError("New tasks cannot depend on an independent protected branch.")
+    return revised_plan
+
+
 def _normalized(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -270,6 +362,32 @@ class RecoveryController:
         return {"action": "fail", "reason": reason, "instructions": "",
                 "exclude_agent_ids": [], "affected_task_ids": [task_id]}
 
+    def _offline_decision(self, status: str, task_id: str, current_agent: str,
+                          enabled_ids: set[str]) -> dict[str, Any]:
+        if status in {"needs_revision", "blocked"} and current_agent not in enabled_ids:
+            return self._fail("The current agent is no longer enabled.", task_id)
+        if status == "needs_revision":
+            return {
+                "action": "retry_same_agent", "reason": "Retry the enabled agent with feedback.",
+                "instructions": "Correct the reported issues and produce objective verification evidence.",
+                "exclude_agent_ids": [], "affected_task_ids": [task_id],
+            }
+        if status == "blocked":
+            return {
+                "action": "retry_same_agent", "reason": "Objective evidence is still missing.",
+                "instructions": "Produce the missing objective verification evidence.",
+                "exclude_agent_ids": [], "affected_task_ids": [task_id],
+            }
+        if status == "rejected" and enabled_ids - {current_agent}:
+            return {
+                "action": "retry_different_agent", "reason": "Use a different enabled agent.",
+                "instructions": "Correct the rejected result and produce objective verification evidence.",
+                "exclude_agent_ids": [current_agent], "affected_task_ids": [task_id],
+            }
+        if status == "rejected":
+            return self._fail("No different enabled agent is available.", task_id)
+        return self._fail("Offline recovery cannot safely handle this evaluation status.", task_id)
+
     def decide(self, *, planned_task: dict[str, Any], execution_node: dict[str, Any],
                evaluation: dict[str, Any], history: list[dict[str, Any]],
                available_agents: list[dict[str, Any]], plan: dict[str, Any],
@@ -321,7 +439,13 @@ class RecoveryController:
             decision = self._fail("The same semantic failure repeated; another retry is unsafe.", task_id)
         elif evaluation.get("status") == "error":
             decision = self._fail("Evaluator infrastructure errors are not task retries.", task_id)
-        elif self.offline or self.model is None:
+        elif self.offline:
+            decision = self._offline_decision(
+                str(evaluation.get("status") or ""), task_id, current_agent,
+                {str(item.get("id")) for item in available_agents
+                 if isinstance(item, dict) and item.get("enabled") is True},
+            )
+        elif self.model is None:
             decision = self._fail("No recovery advisor is configured; failing conservatively.", task_id)
         else:
             prompt = (
@@ -394,7 +518,8 @@ class Replanner:
                                                 "revision.superseded_task_ids")}
 
     def create_revision(self, *, current_plan: dict[str, Any], source_task_id: str,
-                        affected_task_ids: list[str], accepted_task_ids: set[str],
+                        affected_task_ids: list[str], allowed_task_ids: set[str],
+                        protected_task_ids: set[str], accepted_task_ids: set[str],
                         historical_task_ids: set[str], context: dict[str, Any] | None = None,
                         max_tasks: int = MAX_PLAN_TASKS, max_model_calls: int = 2) -> dict[str, Any]:
         if self.model is None:
@@ -403,6 +528,8 @@ class Replanner:
             raise RecoveryGenerationError("The replanning model-call budget is exhausted.")
         bounded = sanitize({"current_plan": current_plan, "source_task_id": source_task_id,
                             "affected_task_ids": affected_task_ids,
+                            "allowed_task_ids": sorted(allowed_task_ids),
+                            "protected_task_ids": sorted(protected_task_ids),
                             "accepted_task_ids": sorted(accepted_task_ids),
                             "historical_task_ids": sorted(historical_task_ids),
                             "context": context or {}})
@@ -424,27 +551,12 @@ class Replanner:
                 parsed = None
         if parsed is None:
             raise RecoveryGenerationError("Replanner failed strict validation after one repair.")
-        plan = parsed["plan"]
-        if len(plan["tasks"]) > int(max_tasks):
-            raise RecoveryValidationError("Revised plan exceeds the configured task limit.")
-        current = {item["id"]: item for item in validate_plan(deepcopy(current_plan))["tasks"]}
-        revised = {item["id"]: item for item in plan["tasks"]}
-        superseded = set(parsed["superseded_task_ids"])
-        affected = set(affected_task_ids)
-        if source_task_id not in superseded or not superseded <= affected:
-            raise RecoveryValidationError("Revision may supersede only the failed affected subgraph.")
-        if superseded & accepted_task_ids:
-            raise RecoveryValidationError("Accepted tasks cannot be superseded.")
-        for task_id in accepted_task_ids | superseded:
-            if task_id not in current or revised.get(task_id) != current[task_id]:
-                raise RecoveryValidationError("Accepted and superseded task snapshots must remain unchanged.")
-        for task_id in set(current) - affected:
-            if revised.get(task_id) != current[task_id]:
-                raise RecoveryValidationError("Revision changed a task outside the affected subgraph.")
-        new_ids = set(revised) - set(current)
-        if new_ids & historical_task_ids:
-            raise RecoveryValidationError("Revision reuses a historical task id.")
-        for task in plan["tasks"]:
-            if task["id"] not in superseded and set(task["depends_on"]) & superseded:
-                raise RecoveryValidationError("Active revised tasks cannot depend on superseded tasks.")
+        parsed["plan"] = validate_replan_revision(
+            current_plan=current_plan, revised_plan=parsed["plan"],
+            source_task_id=source_task_id, affected_task_ids=set(affected_task_ids),
+            superseded_task_ids=set(parsed["superseded_task_ids"]),
+            allowed_task_ids=set(allowed_task_ids), protected_task_ids=set(protected_task_ids),
+            accepted_task_ids=set(accepted_task_ids), historical_task_ids=set(historical_task_ids),
+            max_tasks=max_tasks,
+        )
         return {**parsed, "metrics": dict(self.metrics)}

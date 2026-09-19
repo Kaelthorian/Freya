@@ -81,7 +81,8 @@ def main():
                         default=DEFAULT_RECOVERY_TIMEOUT_SECONDS,
                         help="Recovery Ollama request timeout in seconds (0.1-120)")
     parser.add_argument("--recovery-offline", action="store_true",
-                        help="Fail conservatively instead of calling a recovery model")
+                        help="Use deterministic model-free recovery instead of calling a "
+                             "recovery model")
     parser.add_argument("--max-semantic-attempts", type=int, default=3,
                         help="Maximum execution/evaluation attempts per planned task (1-10)")
     parser.add_argument("--max-plan-revisions", type=int, default=2,

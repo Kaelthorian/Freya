@@ -257,7 +257,11 @@ attempt before persisting.
 allows only `retry_same_agent`, `retry_different_agent`, `replan_subgraph`, or
 `fail`; invalid model output gets one repair. Its Ollama adapter is loopback-only,
 tool-free, non-streaming and independently metered. `--recovery-offline` makes
-no model call and fails conservatively.
+no model call and applies deterministic recovery: `needs_revision` retries the
+same enabled agent, `rejected` selects a different enabled agent or fails when
+none exists, `blocked` retries with an explicit objective-evidence instruction,
+and evaluator `error` fails. The normal attempt, action, fingerprint and
+wall-clock limits still apply.
 
 Defaults allow three semantic attempts per task, two plan revisions, eight
 recovery actions and sixteen total recovery/replanning model calls per orchestration.
@@ -269,11 +273,26 @@ no silent same-agent fallback. Retry prompts include bounded evaluator issues
 and missing evidence, not raw prior model transcripts or private reasoning.
 
 Replanning produces a complete cumulative effective plan. Accepted and
-superseded historical snapshots remain unchanged, new work uses new task IDs,
-and no active task may depend on a superseded node. The original plan remains
-available separately from the current effective plan. This stage does not
-create agents, auto-approve capabilities, weaken policy, add a free-form shell,
-or implement final-answer synthesis.
+superseded historical snapshots remain unchanged and new work uses new task IDs.
+The Recovery Advisor may propose `affected_task_ids`, but deterministic DAG logic
+computes `allowed_replan_scope`: the `recovery_pending` source plus only its
+transitive descendants that remain `pending` or `ready` and have no execution
+attempt. Independent branches are never mutable merely because they have not
+started. Every task outside that set is protected and must remain structurally
+identical and in the same protected order. Running, `waiting_for_approval`,
+`evaluating`, `success`, terminal history, and any historically attempted task
+outside the source are immutable across revisions.
+
+The Replanner validates the explicit allowed/protected sets, and Storage
+recomputes and validates them again in the transaction that persists the
+revision, updates the effective plan, and mutates the graph. That transaction
+also verifies that every previously active Runtime task is still tracked by the
+same graph node and runtime ID. Replanning neither cancels nor mutates active
+work in an independent branch, so evaluation continues against the exact task
+snapshot used to start the attempt. The original plan remains available
+separately from the effective plan. This stage does not create agents,
+auto-approve capabilities, weaken policy, add a free-form shell, or implement
+final-answer synthesis.
 
 
 ## Agent selection

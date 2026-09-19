@@ -66,10 +66,15 @@ python -m control_center --recovery-model qwen2.5-coder:7b `
 The recovery endpoint remains loopback-only. Invalid JSON gets at most one repair
 without exceeding the total model-call budget. The orchestration wall-clock deadline
 is rechecked after each recovery or replanning call before more work starts.
-Use `--recovery-offline` to make no recovery-model call and fail conservatively.
-Retries always create a new persisted attempt and rerun Agent Selector and
-capability-policy checks. Replanning stores an effective-plan revision without
-overwriting the original plan or rerunning accepted tasks.
+Use `--recovery-offline` for model-free deterministic behavior: same-agent
+retry for `needs_revision`/`blocked`, different-agent retry for `rejected` when
+an enabled alternative exists, and fail for evaluator errors or unavailable
+alternatives. Retries always create a new persisted attempt and rerun Agent
+Selector and capability-policy checks. Recovery never grants capabilities or
+resolves approvals. Replanning stores an effective-plan revision without
+overwriting the original plan or rerunning accepted tasks. Its deterministic
+scope contains only the recovery source and never-started descendants; active,
+historical and independent work is protected and revalidated again by Storage.
 
 Operational history is available at `/api/orchestrations/{id}/attempts`,
 `/recoveries`, `/plan-revisions`, and `/effective-plan`. Recovery is not resumed
@@ -153,9 +158,12 @@ restart recovery.
 
 ## Debugging
 
-Recovery tests cover strict schema/one repair, offline fallback, budgets,
-failure fingerprints, same- and different-agent retries, immutable attempts,
-API exposure, plan revision constraints, cancellation races and restart cleanup.
+Recovery tests cover strict schema/one repair, deterministic offline fallback,
+exact action/model/revision/task budgets, failure fingerprints, same- and
+different-agent retries, immutable attempts, safe DAG scope, active and
+independent-branch protection, Runtime tracking, API exposure, plan revision
+constraints, policy/approval boundaries, cancellation and timeout races, and
+restart/migration cleanup.
 They do not prove behavior of an installed Ollama model; that still requires a
 local end-to-end run.
 

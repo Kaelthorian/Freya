@@ -55,8 +55,10 @@ of this repository merely because an agent selects them.
    agent once for each ready task before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
    A non-accepted evaluation enters bounded recovery; retries are reselected and
-   recorded as new attempts, while replanning commits a validated effective plan
-   without mutating the original snapshot or accepted work.
+   recorded as new attempts, while deterministic DAG scope limits replanning to
+   the recovery source and never-started descendants. Replanner and Storage both
+   reject mutation of active, historical or independent work before committing
+   the effective plan, without changing the original plan snapshot.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler

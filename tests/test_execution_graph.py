@@ -589,7 +589,7 @@ class SchedulerTests(unittest.TestCase):
             {"bad": agents[0]["id"], "child": agents[0]["id"],
              "independent": agents[1]["id"]}, runtime,
             lambda seconds: runtime.finish_active(), evaluator=Evaluator(model),
-            max_parallel_tasks=2,
+            max_parallel_tasks=2, max_semantic_attempts_per_task=1,
         )
         nodes = {item["plan_task_id"]: item
                  for item in self.store.get_execution_graph(final["id"])["nodes"]}
@@ -629,6 +629,7 @@ class SchedulerTests(unittest.TestCase):
         final = self.run_graph(
             execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
             lambda seconds: None,
+            max_semantic_attempts_per_task=1,
         )
         graph_node = self.store.get_execution_graph(final["id"])["nodes"][0]
         self.assertEqual(final["status"], "Failed")
@@ -747,6 +748,7 @@ class SchedulerTests(unittest.TestCase):
         final = self.run_graph(
             execution_plan([planned_task("a")]), {"a": agent["id"]}, runtime,
             lambda seconds: None, evaluator=Evaluator(model),
+            max_semantic_attempts_per_task=1,
         )
         node_state = self.store.get_execution_graph(final["id"])["nodes"][0]
         self.assertEqual(final["status"], "Failed")

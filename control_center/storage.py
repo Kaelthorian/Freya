@@ -17,7 +17,8 @@ from uuid import uuid4
 from .config import TOOL_CATALOG
 from .capabilities import effective_tools_for_policy
 from .policy import policy_from_legacy, validate_policy
-from .planner import PLAN_SCHEMA_VERSION, validate_plan
+from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, validate_plan
+from .recovery import allowed_replan_scope, validate_replan_revision
 from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
 from .agent_context import build_agent_context, build_effective_agent
 from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
@@ -1004,6 +1005,32 @@ class Store:
                 raise RuntimeError("Recovery node transition lost its atomic precondition.")
         return self.get_recovery(recovery_id)
 
+    def fail_recovery_pending(self, oid: str, plan_task_id: str, *, attempt: int,
+                              evaluation_id: str, reason: str) -> bool:
+        """Fail one exact recovery-pending attempt without creating an action row."""
+        now = utcnow()
+        with self._connection(write=True) as c:
+            run = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            if run["status"] != "Running":
+                return False
+            cursor = c.execute(
+                "UPDATE orchestration_task_nodes SET state='failed',error=?,waiting_reason='',"
+                "finished_at=?,updated_at=? WHERE orchestration_id=? AND plan_task_id=? "
+                "AND state='recovery_pending' AND attempt=? AND evaluation_id=? "
+                "AND recovery_action_id IS NULL",
+                (sanitize(reason), now, now, oid, plan_task_id, int(attempt), evaluation_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            c.execute(
+                "UPDATE orchestration_execution_attempts SET status='failed',finished_at=? "
+                "WHERE orchestration_id=? AND plan_task_id=? AND attempt=?",
+                (now, oid, plan_task_id, int(attempt)),
+            )
+            return True
+
     def fail_recovery_action(self, recovery_id: str, reason: str) -> bool:
         now = utcnow()
         with self._connection(write=True) as c:
@@ -1032,12 +1059,13 @@ class Store:
         now = utcnow()
         with self._connection(write=True) as c:
             run = c.execute(
-                "SELECT status,effective_plan_json,current_plan_revision FROM orchestration_runs "
-                "WHERE id=?", (oid,),
+                "SELECT status,config_json,plan_json,effective_plan_json,current_plan_revision "
+                "FROM orchestration_runs WHERE id=?", (oid,),
             ).fetchone()
             recovery = c.execute(
-                "SELECT plan_task_id,action FROM orchestration_recovery_actions WHERE id=? "
-                "AND orchestration_id=?", (recovery_id, oid),
+                "SELECT plan_task_id,action,affected_task_ids_json "
+                "FROM orchestration_recovery_actions WHERE id=? AND orchestration_id=?",
+                (recovery_id, oid),
             ).fetchone()
             if run is None:
                 raise KeyError(oid)
@@ -1046,12 +1074,32 @@ class Store:
             current_nodes = {row["plan_task_id"]: dict(row) for row in c.execute(
                 "SELECT * FROM orchestration_task_nodes WHERE orchestration_id=?", (oid,),
             )}
-            tasks = {item["id"]: item for item in normalized["tasks"]}
-            if set(current_nodes) - set(tasks):
-                raise ValueError("Effective plan revision cannot delete historical task snapshots.")
-            if any(current_nodes[item]["state"] == "success" for item in superseded
-                   if item in current_nodes):
-                raise ValueError("Accepted tasks cannot be superseded.")
+            attempts = [dict(row) for row in c.execute(
+                "SELECT plan_task_id,attempt FROM orchestration_execution_attempts "
+                "WHERE orchestration_id=?", (oid,),
+            )]
+            current_plan = _load(run["effective_plan_json"]) or _load(run["plan_json"])
+            source_task_id = recovery["plan_task_id"]
+            allowed = allowed_replan_scope(
+                source_task_id, current_plan, list(current_nodes.values()), attempts,
+            )
+            protected = set(current_nodes) - allowed
+            affected = set(_load(recovery["affected_task_ids_json"]) or [])
+            accepted = {task_id for task_id, node in current_nodes.items()
+                        if node["state"] == "success"}
+            normalized = validate_replan_revision(
+                current_plan=current_plan, revised_plan=normalized,
+                source_task_id=source_task_id, affected_task_ids=affected,
+                superseded_task_ids=set(superseded), allowed_task_ids=allowed,
+                protected_task_ids=protected, accepted_task_ids=accepted,
+                historical_task_ids=set(current_nodes),
+                max_tasks=int((_load(run["config_json"]) or {}).get(
+                    "max_delegated_tasks", MAX_PLAN_TASKS)),
+            )
+            active_runtime = {
+                task_id: node["runtime_task_id"] for task_id, node in current_nodes.items()
+                if node["state"] in {"running", "waiting_for_approval", "evaluating"}
+            }
             revision = int(run["current_plan_revision"] or 0) + 1
             c.execute(
                 "INSERT INTO orchestration_plan_revisions("
@@ -1092,6 +1140,15 @@ class Store:
                          sanitize(task["objective"]), revision, now),
                     )
                     states[task_id] = state
+            for task_id, runtime_task_id in active_runtime.items():
+                tracked = list(c.execute(
+                    "SELECT plan_task_id,state FROM orchestration_task_nodes "
+                    "WHERE orchestration_id=? AND runtime_task_id=? AND state IN "
+                    "('running','waiting_for_approval','evaluating')", (oid, runtime_task_id),
+                ))
+                if (len(tracked) != 1 or tracked[0]["plan_task_id"] != task_id
+                        or tracked[0]["state"] != current_nodes[task_id]["state"]):
+                    raise RuntimeError("Plan revision orphaned an active Runtime task.")
             c.execute(
                 "UPDATE orchestration_runs SET effective_plan_json=?,current_plan_revision=?,"
                 "updated_at=? WHERE id=? AND status='Running'",

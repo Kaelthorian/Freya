@@ -11,7 +11,8 @@ from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
 from .recovery import (RECOVERY_VERSION, RecoveryController, Replanner,
-                       build_retry_prompt, semantic_failure_fingerprint)
+                       allowed_replan_scope, build_retry_prompt,
+                       semantic_failure_fingerprint)
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_GOAL_CHARS, MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
@@ -577,6 +578,23 @@ class Orchestrator:
             return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
         model_calls_used = sum(recorded_model_calls(item) for item in [*recoveries, *revisions])
+        if len(recoveries) >= int(self.config["max_recovery_actions"]):
+            reason = "Recovery action budget exhausted."
+            with self.lock:
+                if self.store.fail_recovery_pending(
+                        oid, task_id, attempt=int(target["attempt"]),
+                        evaluation_id=target["evaluation_id"], reason=reason):
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.recovery.exhausted", "status": "Failed",
+                        "task_id": task_id, "evaluation_id": target["evaluation_id"],
+                        "message": reason,
+                    })
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.task.failed", "status": "Failed",
+                        "task_id": task_id, "evaluation_id": target["evaluation_id"],
+                        "message": reason,
+                    })
+            return
         recovery_id = str(uuid4())
         with self.lock:
             if self.store.get_orchestration(oid)["status"] != "Running":
@@ -616,6 +634,24 @@ class Orchestrator:
         if self.clock() >= deadline:
             self._timeout(oid)
             return
+        allowed_scope: set[str] = set()
+        protected_scope: set[str] = set()
+        if decision["action"] == "replan_subgraph":
+            graph_snapshot = self.store.get_execution_graph(oid)["nodes"]
+            try:
+                allowed_scope = allowed_replan_scope(
+                    task_id, plan, graph_snapshot, self.store.list_execution_attempts(oid),
+                )
+                protected_scope = {item["plan_task_id"] for item in graph_snapshot} - allowed_scope
+                requested = set(decision["affected_task_ids"])
+                if task_id not in requested or not requested <= allowed_scope:
+                    raise ValueError("Recovery requested tasks outside the safe replanning scope.")
+            except ValueError as exc:
+                decision = {
+                    **decision, "action": "fail", "instructions": "",
+                    "exclude_agent_ids": [], "affected_task_ids": [task_id],
+                    "reason": str(exc),
+                }
         retry_prompt = ""
         if decision["action"] in {"retry_same_agent", "retry_different_agent"}:
             retry_prompt = build_retry_prompt(
@@ -637,7 +673,8 @@ class Orchestrator:
                 recovery_id, oid, task_id, source_attempt=int(target["attempt"]),
                 source_evaluation_id=target["evaluation_id"], decision=decision,
                 recovery_version=RECOVERY_VERSION, prompt=retry_prompt,
-                snapshot={"evaluation_status": evaluation.get("status"), "limits": limits},
+                snapshot={"evaluation_status": evaluation.get("status"), "limits": limits,
+                          "allowed_replan_scope": sorted(allowed_scope)},
             )
             if record is None:
                 return
@@ -676,6 +713,7 @@ class Orchestrator:
                 revision = self.replanner.create_revision(
                     current_plan=plan, source_task_id=task_id,
                     affected_task_ids=decision["affected_task_ids"],
+                    allowed_task_ids=allowed_scope, protected_task_ids=protected_scope,
                     accepted_task_ids=accepted, historical_task_ids=historical,
                     context={"evaluation": evaluation, "instructions": decision["instructions"]},
                     max_tasks=int(self.config["max_delegated_tasks"]),
