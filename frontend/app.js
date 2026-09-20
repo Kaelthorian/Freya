@@ -8,7 +8,106 @@ const main = document.querySelector('#main-content');
 const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
 document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 4 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 6 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
+function agentExportPayload(agent) {
+  const config = agent.config && typeof agent.config === 'object' ? JSON.parse(JSON.stringify(agent.config)) : {};
+  if (!config.capability_policy && agent.capability_policy) config.capability_policy = agent.capability_policy;
+  return {
+    name: agent.name,
+    description: agent.description || '',
+    role: agent.role || '',
+    instructions: agent.instructions || '',
+    enabled: agent.enabled !== false,
+    skills: (agent.skills || []).map(skill => ({ skill_id: skill.id || skill.skill_id, priority: Number.isInteger(skill.priority) ? skill.priority : 0 })).filter(skill => skill.skill_id),
+    config,
+  };
+}
 
+function downloadAgentJson(agent) {
+  const safeName = String(agent.name || 'agent').trim().replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'agent';
+  const blob = new Blob([JSON.stringify(agentExportPayload(agent), null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href = url; link.download = `${safeName}.json`; document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function importAgentFromFile() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json'; input.hidden = true;
+  const cleanup = () => input.remove();
+  input.addEventListener('cancel', cleanup, { once: true });
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0]; cleanup();
+    if (!file) return;
+    try {
+      const raw = JSON.parse(await file.text());
+      const source = raw && typeof raw === 'object' && raw.agent && typeof raw.agent === 'object' && !Array.isArray(raw.agent) ? raw.agent : raw;
+      if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('The JSON must contain one agent object.');
+      const name = String(source.name || '').trim();
+      if (!name) throw new Error('The imported agent must have a name.');
+      const skills = Array.isArray(source.skills) ? source.skills.map(item => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object') throw new Error('Each imported skill must be an id or assignment object.');
+        const skillId = item.skill_id || item.id;
+        if (!skillId) throw new Error('Each imported skill assignment must have an id.');
+        const priority = item.priority == null ? 0 : Number(item.priority);
+        if (!Number.isInteger(priority)) throw new Error(`Invalid priority for skill ${skillId}.`);
+        return { skill_id: skillId, priority };
+      }) : [];
+      const config = source.config && typeof source.config === 'object' && !Array.isArray(source.config) ? source.config : {};
+      const endpoint = String(config.endpoint || 'http://127.0.0.1:11434').trim();
+      const model = String(config.model || '').trim();
+      if (!model) throw new Error('The imported agent must specify an Ollama model.');
+      const modelCheck = await api('/models?' + new URLSearchParams({ endpoint }).toString());
+      if (modelCheck.error) throw new Error(`Ollama model validation failed: ${modelCheck.error}`);
+      const installedModels = new Set((modelCheck.models || []).map(item => String(item.name || '').trim()).filter(Boolean));
+      if (!installedModels.has(model)) throw new Error(`Model "${model}" is not installed in Ollama.`);
+      const payload = { name, description: source.description ?? '', role: source.role ?? '', instructions: source.instructions ?? '', enabled: source.enabled !== false, skills, config };
+      if (Array.isArray(source.tools)) payload.tools = source.tools;
+      for (const key of ['identity', 'behavior', 'autonomy', 'verification', 'output', 'purpose', 'responsibilities', 'constraints', 'capability_policy']) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) payload[key] = source[key];
+      }
+      const agent = await api('/agents', 'POST', payload);
+      location.hash = `#/agents/${agent.id}`;
+      toast('Agent imported.');
+      await refresh();
+    } catch (error) { toast(error.message || 'Could not import the agent JSON.', true); }
+  }, { once: true });
+  document.body.append(input); input.click();
+}
+
+const SKILL_EXPORT_FIELDS = ['id', 'name', 'description', 'category', 'version', 'instructions', 'procedures', 'recommended_capabilities', 'required_capabilities', 'tags', 'enabled', 'source', 'metadata'];
+
+function skillExportPayload(skill) {
+  return Object.fromEntries(SKILL_EXPORT_FIELDS.filter(key => Object.prototype.hasOwnProperty.call(skill, key)).map(key => [key, JSON.parse(JSON.stringify(skill[key]))]));
+}
+
+function downloadJson(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function importSkillsFromFile() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json'; input.hidden = true;
+  const cleanup = () => input.remove();
+  input.addEventListener('cancel', cleanup, { once: true });
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0]; cleanup();
+    if (!file) return;
+    try {
+      const raw = JSON.parse(await file.text());
+      const skills = Array.isArray(raw) ? raw : Array.isArray(raw?.skills) ? raw.skills : raw?.skill && typeof raw.skill === 'object' ? [raw.skill] : raw && typeof raw === 'object' ? [raw] : [];
+      if (!skills.length) throw new Error('The JSON must contain one Skill object or a skills array.');
+      const response = await api('/skills/import', 'POST', { skills });
+      const importedCount = Number(response.count) || 0, skippedCount = Array.isArray(response.skipped) ? response.skipped.length : 0;
+      toast(importedCount + (importedCount === 1 ? ' Skill imported.' : ' Skills imported.') + (skippedCount ? ' ' + skippedCount + ' already existed and were skipped.' : ''));
+      await refresh();
+    } catch (error) { toast(error.message || 'Could not import the Skill JSON.', true); }
+  }, { once: true });
+  document.body.append(input); input.click();
+}
 function updateChrome() {
   const current = route(), title = pages.find(([page]) => page === current.page)?.[1] || 'Workspace';
   document.querySelector('#breadcrumb').textContent = title;
@@ -85,6 +184,11 @@ document.addEventListener('click', async event => {
   if (!target || target.disabled) return;
   const { action, id, value } = target.dataset;
   try {
+    if (action === 'import-agent') { importAgentFromFile(); return; }
+    if (action === 'import-skills') { importSkillsFromFile(); return; }
+    if (action === 'export-skills') { downloadJson('skills.json', { version: 1, skills: state.skills.map(skillExportPayload) }); toast('Skills exported as JSON.'); return; }
+    if (action === 'export-skill') { const skill = await api('/skills/' + encodeURIComponent(id)); const safeName = String(skill.name || skill.id || 'skill').trim().replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'skill'; downloadJson(safeName + '.json', skillExportPayload(skill)); toast('Skill exported as JSON.'); return; }
+    if (action === 'export-agent') { const agent = await api(`/agents/${encodeURIComponent(id)}`); downloadAgentJson(agent); toast('Agent exported as JSON.'); return; }
     if (action === 'create-agent' || action === 'edit-agent') return await agentDialog(id);
     if (action === 'create-skill' || action === 'edit-skill') return await skillDialog(id);
     if (action === 'duplicate-skill') { const skill = await api(`/skills/${id}/duplicate`, 'POST', {}); location.hash = `#/skills/${skill.id}`; toast('Skill duplicated.'); await refresh(); return; }
@@ -133,7 +237,20 @@ document.addEventListener('change', event => {
   render();
 });
 document.addEventListener('submit', event => { if (event.target.id === 'log-filters') event.preventDefault(); });
-document.addEventListener('submit', async event => { if (event.target.id === 'freya-form') { event.preventDefault(); const prompt=event.target.prompt.value.trim(), workspace_path=event.target.workspace_path.value.trim(); if (!prompt) return; try { await api('/orchestrations','POST',{prompt,workspace_path}); toast('Freya started the orchestration.'); await refresh(); } catch (error) { toast(error.message,true); } } });
+document.addEventListener('submit', async event => {
+  if (event.target.id !== 'freya-form') return;
+  event.preventDefault();
+  const prompt = event.target.prompt.value.trim(), workspace_path = event.target.workspace_path.value.trim();
+  if (!prompt) return;
+  try {
+    const run = await api('/orchestrations', 'POST', { prompt, workspace_path });
+    state.freyaHistory = [];
+    state.freyaSessionStartedAt = run.created_at || new Date().toISOString();
+    state.freyaRunId = run.id || null;
+    toast('Freya started the orchestration.');
+    await refresh();
+  } catch (error) { toast(error.message, true); }
+});
 document.addEventListener('input', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
 document.addEventListener('change', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
 

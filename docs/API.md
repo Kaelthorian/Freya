@@ -240,6 +240,7 @@ integration adapters are loopback-only and tool-free.
 | Method | Route | Purpose |
 | --- | --- | --- |
 | GET / POST | `/api/skills` | list/filter or create reusable Skills |
+| POST | `/api/skills/import` | atomically import one or many Skills from a JSON array |
 | GET / PATCH / DELETE | `/api/skills/{id}` | inspect, edit, or delete/disable a Skill |
 | POST | `/api/skills/{id}/duplicate` | create a user copy with a new stable ID |
 | GET | `/api/agents/{id}/skills` | resolved Skill compatibility summaries |
@@ -300,5 +301,7 @@ and relevant status/tool/input/output/error/duration fields. Approval events inc
 from the JSON route; SSE is a change signal and durable event replay.
 
 Skills support `GET /api/skills/{id}/versions` and `GET /api/skills/{id}/versions/{version}` for immutable history. `DELETE /api/skills/{id}` archives a skill and records an audit event; archived skills are excluded from `/api/skills` unless `include_deleted=true` is requested.
+
+`POST /api/skills/import` accepts { "skills": [ ... ] } (optionally with a version field), validates every definition with the same registry schema, rejects conflicting duplicate IDs or case-insensitive names, skips identical existing definitions, and commits the full batch atomically. The frontend exports a single definition as a JSON object and bulk exports as { "version": 1, "skills": [ ... ] }.
 
 `PATCH /api/skills/{id}` ignores a client-supplied version and assigns the next version when versioned definition fields change. A no-op PATCH preserves the current version and emits no `skill.updated` event. Historical snapshots cannot be overwritten.

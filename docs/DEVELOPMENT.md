@@ -137,6 +137,8 @@ priority from the agent editor. Required capability diagnostics never change
 the agent's policy; a Skill is operational only when its requirements are
 allowed. Tasks snapshot the resolved Skill version and content.
 
+The Skills page can export one Skill or the whole visible catalogue as JSON. Import accepts either one Skill object or a skills array; the server validates the complete batch, skips identical existing definitions, rejects conflicting IDs or names, and never partially applies a failing import.
+
 ### Secrets
 
 Set an environment variable beginning with `ACC_SECRET_`, then enter only its

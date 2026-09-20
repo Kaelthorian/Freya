@@ -18,46 +18,109 @@ function skillContextPreview(skill) {
   return lines.join('\n');
 }
 
+const FREYA_ACTIVE_STATUSES = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating', 'WaitingForApproval', 'Paused']);
+const FREYA_ORCHESTRATION_ACTIVE = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating']);
+
+function freyaHistoryEntry(kind, id, data, agent) {
+  const existing = state.freyaHistory.find(item => item.kind === kind && item.id === id);
+  if (existing) {
+    if (kind === 'task') existing.task = { ...existing.task, ...data };
+    else existing.run = { ...existing.run, ...data };
+    if (agent) existing.agent = agent;
+    return existing;
+  }
+  const item = kind === 'task' ? { kind, id, task: data, agent: agent || null } : { kind, id, run: data };
+  state.freyaHistory.push(item);
+  return item;
+}
+
+function freyaStartedAt(item) {
+  const value = item.kind === 'task' ? (item.task.started_at || item.task.created_at) : item.run.created_at;
+  const timestamp = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function freyaIsInCurrentSession(item) {
+  if (!state.freyaSessionStartedAt) return false;
+  if (item.id === state.freyaRunId) return true;
+  const start = new Date(state.freyaSessionStartedAt).getTime();
+  return Number.isFinite(start) && freyaStartedAt(item) >= start - 1000;
+}
+
+function freyaTaskRow(item) {
+  const task = item.task || {}, id = String(task.id || item.id), active = FREYA_ACTIVE_STATUSES.has(task.status);
+  const agent = item.agent || {}, agentId = agent.id || task.agent_id, agentName = agent.name || task.agent_name || 'Agent';
+  const startedAt = task.started_at || task.created_at;
+  const elapsed = active ? (startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : 0) : Number(task.duration_seconds) || 0;
+  const title = taskTitle(task.prompt);
+  return [
+    '<tr>',
+    '<td>' + badge(task.status || 'Pending') + '</td>',
+    '<td><a class="table-title" title="' + esc(task.prompt || '') + '" href="#/logs?task_id=' + esc(id) + '">' + esc(title) + '</a><span class="table-sub mono">' + esc(id.slice(0, 12)) + '</span></td>',
+    '<td><a class="table-agent" href="#/agents/' + esc(agentId || '') + '"><span class="avatar avatar-small">' + icon('agents') + '</span>' + esc(agentName) + '</a><span class="table-sub">' + esc(agent.role || task.agent_role || 'Agent') + '</span></td>',
+    '<td class="nowrap muted">' + date(startedAt) + '</td>',
+    '<td class="mono nowrap">' + duration(elapsed) + '</td>',
+    '<td class="mono">' + compact(task.total_tokens) + '</td>',
+    '<td class="mono">' + number(task.model_calls) + '</td>',
+    '<td><a class="text-link" href="#/logs?task_id=' + esc(id) + '">Details ' + icon('arrow') + '</a></td>',
+    '</tr>'
+  ].join('');
+}
+
+function freyaRunRow(item) {
+  const run = item.run || {}, active = FREYA_ORCHESTRATION_ACTIVE.has(run.status);
+  const startedAt = run.created_at, elapsed = active && startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : Number(run.duration_seconds) || 0;
+  const action = active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<span class="muted">—</span>';
+  return [
+    '<tr>',
+    '<td>' + badge(run.status || 'Pending') + '</td>',
+    '<td><strong class="table-title">' + esc(taskTitle(run.prompt)) + '</strong><span class="table-sub">' + (active ? 'Waiting for a delegated task to start' : 'Orchestration completed') + '</span></td>',
+    '<td><strong>Freya</strong><span class="table-sub">Orchestrator</span></td>',
+    '<td class="nowrap muted">' + date(startedAt) + '</td>',
+    '<td class="mono nowrap">' + duration(elapsed) + '</td>',
+    '<td class="mono">—</td>',
+    '<td class="mono">—</td>',
+    '<td>' + action + '</td>',
+    '</tr>'
+  ].join('');
+}
+
 export async function freya() {
-  const activeTaskStatuses = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating', 'WaitingForApproval', 'Paused']);
   const activeAgents = (await Promise.all(state.agents.filter(agent => agent.current_task).map(async agent => {
-    try { return { agent, task: await api(`/tasks/${agent.current_task.id}`) }; } catch { return null; }
-  }))).filter(item => item && activeTaskStatuses.has(item.task.status)).sort((a, b) => {
+    try { return { agent, task: await api('/tasks/' + agent.current_task.id) }; } catch { return null; }
+  }))).filter(item => item && FREYA_ACTIVE_STATUSES.has(item.task.status)).sort((a, b) => {
     const rank = { Running: 0, Integrating: 1, WaitingForApproval: 2, Paused: 3, Planning: 4, Planned: 5, Queued: 6 };
     const priority = (rank[a.task.status] ?? 99) - (rank[b.task.status] ?? 99);
     if (priority) return priority;
-    const left = new Date(a.task.started_at || a.task.created_at || 0).getTime();
-    const right = new Date(b.task.started_at || b.task.created_at || 0).getTime();
-    return right - left;
+    return new Date(b.task.started_at || b.task.created_at || 0).getTime() - new Date(a.task.started_at || a.task.created_at || 0).getTime();
   });
-  const current = activeAgents[0] || null;
-  const activeRun = (state.orchestrations || []).find(run => ['Queued', 'Planning', 'Planned', 'Running', 'Integrating'].includes(run.status)) || null;
-  const currentTask = current?.task || null;
-  const startedAt = currentTask?.started_at || currentTask?.created_at || activeRun?.created_at;
-  const elapsed = startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : 0;
-  const currentRow = current ? `<tr>
-      <td>${badge(currentTask.status)}</td>
-      <td><a class="table-title" title="${esc(currentTask.prompt)}" href="#/logs?task_id=${esc(currentTask.id)}">${esc(taskTitle(currentTask.prompt))}</a><span class="table-sub mono">${esc(currentTask.id.slice(0, 12))}</span></td>
-      <td><a class="table-agent" href="#/agents/${esc(current.agent.id)}"><span class="avatar avatar-small">${icon('agents')}</span>${esc(current.agent.name)}</a><span class="table-sub">${esc(current.agent.role || 'Agent')}</span></td>
-      <td class="nowrap muted">${date(currentTask.started_at || currentTask.created_at)}</td>
-      <td class="mono nowrap">${duration(elapsed)}</td>
-      <td class="mono">${compact(currentTask.total_tokens)}</td>
-      <td class="mono">${number(currentTask.model_calls)}</td>
-      <td><a class="text-link" href="#/logs?task_id=${esc(currentTask.id)}">Details ${icon('arrow')}</a></td>
-    </tr>` : activeRun ? `<tr>
-      <td>${badge(activeRun.status)}</td>
-      <td><strong class="table-title">${esc(taskTitle(activeRun.prompt))}</strong><span class="table-sub">Waiting for a delegated task to start</span></td>
-      <td><strong>Freya</strong><span class="table-sub">Orchestrator</span></td>
-      <td class="nowrap muted">${date(activeRun.created_at)}</td>
-      <td class="mono nowrap">${duration(elapsed)}</td>
-      <td class="mono">—</td>
-      <td class="mono">—</td>
-      <td>${button('Stop', 'cancel-orchestration', 'stop', `data-id="${esc(activeRun.id)}"`, 'small-button danger-quiet')}</td>
-    </tr>` : '';
-  const hasCurrent = Boolean(current || activeRun);
-  return `${heading('Freya', 'Tell Freya what you need and it will coordinate the available agents.', '', 'ORCHESTRATOR')}
-    <section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want...">${esc(state.freyaDraft.prompt || '')}</textarea><label for="freya-workspace">Workspace folder</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="${esc(state.freyaDraft.workspace_path || '')}" placeholder="Choose a folder or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><button class="button primary" type="submit">Ask Freya</button></form></section>
-    <section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Current task</h2><p>Only the task Freya is processing right now, with live execution metrics.</p></div><span class="subtle-tag">${hasCurrent ? '1 active task' : 'Idle'}</span></div>${hasCurrent ? `<div class="table-wrap"><table class="freya-current-table" aria-label="Current Freya task"><thead><tr><th>STATUS</th><th>TASK</th><th>AGENT</th><th>STARTED</th><th>ELAPSED</th><th>TOKENS</th><th>MODEL CALLS</th><th></th></tr></thead><tbody>${currentRow}</tbody></table></div>` : '<div class="freya-empty-live">No task is running right now. Assign a task to start live activity.</div>'}</section>`;
+
+  state.tasks.forEach(task => {
+    const existing = state.freyaHistory.find(item => item.kind === 'task' && item.id === task.id);
+    if (existing || freyaIsInCurrentSession({ kind: 'task', id: task.id, task })) freyaHistoryEntry('task', task.id, task);
+  });
+  state.orchestrations.forEach(run => {
+    if (run.id === state.freyaRunId || freyaIsInCurrentSession({ kind: 'orchestration', id: run.id, run })) freyaHistoryEntry('orchestration', run.id, run);
+  });
+  activeAgents.forEach(item => freyaHistoryEntry('task', item.task.id, item.task, item.agent));
+
+  const activeRuns = state.orchestrations.filter(run => FREYA_ORCHESTRATION_ACTIVE.has(run.status));
+  const activeRun = (state.freyaRunId && activeRuns.find(run => run.id === state.freyaRunId)) || activeRuns[0];
+  if (activeRun) freyaHistoryEntry('orchestration', activeRun.id, activeRun);
+
+  const taskHistory = state.freyaHistory.filter(item => item.kind === 'task');
+  const rows = (taskHistory.length ? taskHistory : state.freyaHistory).slice().sort((a, b) => {
+    const activeA = a.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(a.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(a.run.status);
+    const activeB = b.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(b.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(b.run.status);
+    if (activeA !== activeB) return activeA ? -1 : 1;
+    return freyaStartedAt(b) - freyaStartedAt(a);
+  });
+  const activeCount = rows.filter(item => item.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(item.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(item.run.status)).length;
+  const table = rows.length ? '<div class="table-wrap"><table class="freya-current-table" aria-label="Freya task history"><thead><tr><th>STATUS</th><th>TASK</th><th>AGENT</th><th>STARTED</th><th>ELAPSED</th><th>TOKENS</th><th>MODEL CALLS</th><th></th></tr></thead><tbody>' + rows.map(item => item.kind === 'task' ? freyaTaskRow(item) : freyaRunRow(item)).join('') + '</tbody></table></div>' : '<div class="freya-empty-live">No task is running right now. Assign a task to start live activity.</div>';
+  const label = activeCount ? activeCount + ' active · ' + rows.length + ' total' : rows.length ? rows.length + ' completed' : 'Idle';
+  return heading('Freya', 'Tell Freya what you need and it will coordinate the available agents.', '', 'ORCHESTRATOR') +
+    '<section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want...">' + esc(state.freyaDraft.prompt || '') + '</textarea><label for="freya-workspace">Workspace folder</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="' + esc(state.freyaDraft.workspace_path || '') + '" placeholder="Choose a folder or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><button class="button primary" type="submit">Ask Freya</button></form></section>' +
+    '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>';
 }
 export function dashboard() {
   const m = state.metrics || {}, h = state.health || {}, system = h.system || {};
@@ -74,16 +137,17 @@ export function skills() {
   const items = (state.skills || []).filter(skill => !query || [skill.id, skill.name, skill.category, skill.description, ...(skill.tags || [])].join(' ').toLowerCase().includes(query)).filter(skill => filter.enabled === '' || filter.enabled == null || String(skill.enabled) === String(filter.enabled)).filter(skill => !filter.source || skill.source === filter.source);
   const filters = `<section class="panel skill-toolbar"><div class="filter-bar"><div class="filter-label">${icon('filter')} Filter</div><input name="q" data-filter="skills" value="${esc(filter.q || '')}" placeholder="Search name, category or tags"><select name="enabled" data-filter="skills"><option value="">All</option><option value="true" ${filter.enabled === 'true' ? 'selected' : ''}>Enabled</option><option value="false" ${filter.enabled === 'false' ? 'selected' : ''}>Disabled</option></select><select name="source" data-filter="skills"><option value="">All sources</option><option value="builtin" ${filter.source === 'builtin' ? 'selected' : ''}>Built-in</option><option value="user" ${filter.source === 'user' ? 'selected' : ''}>User</option></select></div></section>`;
   const cards = items.length ? `<div class="skill-grid">${items.map(skill => `<article class="skill-card"><div class="skill-card-top"><span class="avatar">${icon('spark')}</span><span class="badge ${skill.enabled ? 'success' : 'muted'}">${skill.enabled ? 'Enabled' : 'Disabled'}</span></div><a class="skill-name" href="#/skills/${esc(skill.id)}">${esc(skill.name)}</a><p>${esc(skill.category || 'General')} · v${number(skill.version)}</p><p class="skill-description">${esc(skill.description || 'No description')}</p><div class="skill-tags">${(skill.tags || []).slice(0, 6).map(tag => `<span>${esc(tag)}</span>`).join('')}</div><div class="skill-card-meta"><span>Assigned <b>${number(skill.assigned_agents)}</b></span><span>${esc(skill.source || 'user')}</span></div><div class="skill-card-actions"><button class="button small-button secondary" data-action="edit-skill" data-id="${esc(skill.id)}">Edit</button><button class="button small-button secondary" data-action="duplicate-skill" data-id="${esc(skill.id)}">Duplicate</button></div></article>`).join('')}</div>` : empty('spark', 'No skills match', 'Create or enable a reusable skill to specialize an agent.', button('New skill', 'create-skill', 'plus', '', 'primary'));
-  return `${heading('Skills', 'Reusable knowledge and procedures that never grant permissions.', button('New skill', 'create-skill', 'plus', '', 'primary'), 'WORKSPACE / SKILLS')}${filters}<div class="section-toolbar"><div class="counter-label">Available skills <span>${number(items.length)}</span></div><span class="muted small">Assigned skills remain snapshot based per task</span></div>${cards}`;
+  return `${heading('Skills', 'Reusable knowledge and procedures that never grant permissions.', button('Import JSON', 'import-skills', 'upload', '', 'secondary') + button('Export JSON', 'export-skills', 'download', '', 'secondary') + button('New skill', 'create-skill', 'plus', '', 'primary'), 'WORKSPACE / SKILLS')}${filters}<div class="section-toolbar"><div class="counter-label">Available skills <span>${number(items.length)}</span></div><span class="muted small">Assigned skills remain snapshot based per task</span></div>${cards}`;
 }
 
 export async function skillDetail(id) {
   const skill = await api(`/skills/${encodeURIComponent(id)}`);
-  return `<a class="back-link" href="#/skills">${icon('back')} All skills</a>${heading(skill.name, `${skill.category || 'General'} · version ${skill.version}`, button('Edit skill', 'edit-skill', 'edit', `data-id="${esc(skill.id)}"`, 'secondary') + button('Duplicate', 'duplicate-skill', 'copy', `data-id="${esc(skill.id)}"`, 'secondary') + button('Delete', 'delete-skill', 'trash', `data-id="${esc(skill.id)}"`, 'small-button danger-quiet'), 'SKILL DETAIL')}<section class="panel skill-detail"><div class="key-values"><span>ID</span><code>${esc(skill.id)}</code><span>Source</span><span>${esc(skill.source || 'user')}</span><span>Assigned agents</span><span>${number(skill.assigned_agents)}${skill.assigned_agent_ids?.length ? ` · ${esc(skill.assigned_agent_ids.join(', '))}` : ''}</span><span>Required</span><code>${esc((skill.required_capabilities || []).join(', ') || 'None')}</code><span>Recommended</span><code>${esc((skill.recommended_capabilities || []).join(', ') || 'None')}</code></div><p>${esc(skill.description || '')}</p><h3>Instructions</h3><ul>${(skill.instructions || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>None specified</li>'}</ul><h3>Procedures</h3><pre>${esc(JSON.stringify(skill.procedures || [], null, 2))}</pre><details open><summary>Effective context preview</summary><pre>${esc(skillContextPreview(skill))}</pre></details></section>`;
+  const attrs = 'data-id="' + esc(id) + '"';
+  return `<a class="back-link" href="#/skills">${icon('back')} All skills</a>${heading(skill.name, `${skill.category || 'General'} · version ${skill.version}`, button('Import JSON', 'import-skills', 'upload', '', 'secondary') + button('Export JSON', 'export-skill', 'download', attrs, 'secondary') + button('Edit skill', 'edit-skill', 'edit', `data-id="${esc(skill.id)}"`, 'secondary') + button('Duplicate', 'duplicate-skill', 'copy', `data-id="${esc(skill.id)}"`, 'secondary') + button('Delete', 'delete-skill', 'trash', `data-id="${esc(skill.id)}"`, 'small-button danger-quiet'), 'SKILL DETAIL')}<section class="panel skill-detail"><div class="key-values"><span>ID</span><code>${esc(skill.id)}</code><span>Source</span><span>${esc(skill.source || 'user')}</span><span>Assigned agents</span><span>${number(skill.assigned_agents)}${skill.assigned_agent_ids?.length ? ` · ${esc(skill.assigned_agent_ids.join(', '))}` : ''}</span><span>Required</span><code>${esc((skill.required_capabilities || []).join(', ') || 'None')}</code><span>Recommended</span><code>${esc((skill.recommended_capabilities || []).join(', ') || 'None')}</code></div><p>${esc(skill.description || '')}</p><h3>Instructions</h3><ul>${(skill.instructions || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>None specified</li>'}</ul><h3>Procedures</h3><pre>${esc(JSON.stringify(skill.procedures || [], null, 2))}</pre><details open><summary>Effective context preview</summary><pre>${esc(skillContextPreview(skill))}</pre></details></section>`;
 }
 
 export function agents() {
-  return `${heading('Agents', 'Configure and coordinate your AI agents.', button('Create agent', 'create-agent', 'plus', '', 'primary'), 'WORKSPACE / AGENTS')}<div class="section-toolbar"><div class="counter-label">All agents <span>${number(state.agents.length)}</span></div><span class="muted small">${number(state.agents.filter(a => a.enabled).length)} active · local execution</span></div>${state.agents.length ? `<div class="agent-grid">${state.agents.map(agentCard).join('')}</div>` : `<section class="panel big-empty">${empty('agents', 'Create your first agent', 'Name it, connect your Ollama model, and choose the tools it can use.', button('Create agent', 'create-agent', 'plus', '', 'primary'))}<div class="setup-steps"><span><b>01</b> Configure a model</span><span><b>02</b> Choose its tools</span><span><b>03</b> Assign a task</span></div></section>`}`;
+  return `${heading('Agents', 'Configure and coordinate your AI agents.', button('Import agent', 'import-agent', 'upload', '', 'secondary') + button('Create agent', 'create-agent', 'plus', '', 'primary'), 'WORKSPACE / AGENTS')}<div class="section-toolbar"><div class="counter-label">All agents <span>${number(state.agents.length)}</span></div><span class="muted small">${number(state.agents.filter(a => a.enabled).length)} active · local execution</span></div>${state.agents.length ? `<div class="agent-grid">${state.agents.map(agentCard).join('')}</div>` : `<section class="panel big-empty">${empty('agents', 'Create your first agent', 'Name it, connect your Ollama model, and choose the tools it can use.', button('Create agent', 'create-agent', 'plus', '', 'primary'))}<div class="setup-steps"><span><b>01</b> Configure a model</span><span><b>02</b> Choose its tools</span><span><b>03</b> Assign a task</span></div></section>`}`;
 }
 
 export async function agentDetail(id) {
@@ -97,7 +161,7 @@ export async function agentDetail(id) {
   else if (state.tab === 'logs') content = `<section class="panel">${panelHeading('Agent logs', 'Tasks and events for this agent', `<a class="text-link" href="#/logs?agent_id=${esc(id)}">Open filters ${icon('arrow')}</a>`)}${groupedLogTable(await api(`/logs?agent_id=${encodeURIComponent(id)}&limit=200`), tasks)}</section>`;
   else if (state.tab === 'capabilities' || state.tab === 'tools') { const policy = agent.capability_policy || agent.config.capability_policy || {}; const rows = Object.entries(policy.capabilities || {}).flatMap(([category, actions]) => Object.entries(actions).map(([action, rule]) => `<div class="tool-card ${rule.mode === 'allow' ? 'enabled' : ''}"><div><strong>${esc(category)}.${esc(action)}</strong><span class="badge ${rule.mode === 'allow' ? 'success' : rule.mode === 'ask' ? 'warning' : ''}">${esc(rule.mode || 'deny')}</span></div><p>${esc((rule.paths || []).join(', ') || 'Workspace scope')}${rule.extensions?.length ? ` · ${esc(rule.extensions.join(', '))}` : ''}${rule.max_bytes != null ? ` · max ${number(rule.max_bytes)} bytes` : ''}</p></div>`)); content = `<section class="panel">${panelHeading('Capabilities', 'The runtime resolves each tool request to one action before execution.', button('Configure capabilities', 'edit-agent', 'settings', attrs, 'secondary'))}<div class="tool-grid">${rows.join('')}</div></section>`; }
   else content = `<section class="panel">${panelHeading('Agent configuration', 'Changes apply to future tasks.', button('Edit configuration', 'edit-agent', 'edit', attrs, 'secondary'))}<div class="config-view"><div class="key-values"><span>ID</span><code>${esc(agent.id)}</code><span>Role</span><span>${esc(agent.role || '—')}</span><span>Purpose</span><span>${esc(agent.config.identity?.purpose || '—')}</span><span>Created</span><span>${date(agent.created_at, true)}</span>${Object.entries(agent.config).filter(([key]) => !['system_prompt', 'capability_policy', 'identity', 'behavior', 'autonomy', 'verification', 'output'].includes(key)).map(([key, value]) => `<span>${esc(key)}</span><code>${esc(Array.isArray(value) ? value.join(', ') : value)}</code>`).join('')}</div><h3>Additional instructions</h3><pre>${esc(uiText(agent.instructions || 'No additional instructions'))}</pre><details class="context-preview"><summary>Effective Agent Context</summary><pre>${esc(agent.context_preview || 'Preview unavailable')}</pre></details></div></section>`;
-  return `<a class="back-link" href="#/agents">${icon('back')} All agents</a>${heading(agent.name, agent.description || agent.role || 'General-purpose local agent', button('Configure', 'edit-agent', 'settings', attrs, 'secondary') + button('Assign task', 'assign', 'play', attrs, 'primary'), 'AGENT DETAIL')}<div class="agent-detail-summary"><div class="agent-detail-identity"><div class="avatar">${icon('agents')}</div><div>${badge(agent.status)}<span class="mono muted">${esc(agent.config.model)}</span></div></div><div class="agent-detail-controls">${button(agent.enabled ? 'Disable' : 'Enable', 'toggle-agent', '', `${attrs} data-enabled="${!agent.enabled}"`, 'small-button')}${button(agent.status === 'Paused' ? 'Resume' : 'Pause', agent.status === 'Paused' ? 'resume-agent' : 'pause-agent', agent.status === 'Paused' ? 'play' : 'pause', attrs, 'small-button')}${button('Restart', 'restart-agent', 'refresh', attrs, 'small-button')}${button('Duplicate', 'duplicate-agent', 'copy', attrs, 'small-button')}${button('Delete', 'delete-agent', 'trash', attrs, 'small-button danger-quiet')}</div></div><div class="current-task-card"><div><span class="eyebrow">CURRENT TASK</span><h3>${current ? `<a href="#/logs?task_id=${esc(current.id)}">${esc(taskTitle(current.prompt))}</a>` : 'No task running'}</h3><p class="small muted">${current ? `${badge(current.status)} · ${duration(current.duration_seconds)} · ${number(current.tool_calls)} tool calls` : 'Assign a task whenever you want to start a new run.'}</p></div>${current ? `<div class="current-progress">${progress(current)}${button('Cancel task', 'cancel-task', 'stop', `data-id="${esc(current.id)}"`, 'small-button danger-quiet')}</div>` : ''}</div>${agent.status === 'Paused' ? '<div class="notice">Pausing takes effect between actions. An in-progress model or tool call may finish first.</div>' : ''}${tabs(allTabs, state.tab, 'agent-tab')}<div class="tab-content">${content}</div>`;
+  return `<a class="back-link" href="#/agents">${icon('back')} All agents</a>${heading(agent.name, agent.description || agent.role || 'General-purpose local agent', button('Export JSON', 'export-agent', 'download', attrs, 'secondary') + button('Configure', 'edit-agent', 'settings', attrs, 'secondary') + button('Assign task', 'assign', 'play', attrs, 'primary'), 'AGENT DETAIL')}<div class="agent-detail-summary"><div class="agent-detail-identity"><div class="avatar">${icon('agents')}</div><div>${badge(agent.status)}<span class="mono muted">${esc(agent.config.model)}</span></div></div><div class="agent-detail-controls">${button(agent.enabled ? 'Disable' : 'Enable', 'toggle-agent', '', `${attrs} data-enabled="${!agent.enabled}"`, 'small-button')}${button(agent.status === 'Paused' ? 'Resume' : 'Pause', agent.status === 'Paused' ? 'resume-agent' : 'pause-agent', agent.status === 'Paused' ? 'play' : 'pause', attrs, 'small-button')}${button('Restart', 'restart-agent', 'refresh', attrs, 'small-button')}${button('Duplicate', 'duplicate-agent', 'copy', attrs, 'small-button')}${button('Delete', 'delete-agent', 'trash', attrs, 'small-button danger-quiet')}</div></div><div class="current-task-card"><div><span class="eyebrow">CURRENT TASK</span><h3>${current ? `<a href="#/logs?task_id=${esc(current.id)}">${esc(taskTitle(current.prompt))}</a>` : 'No task running'}</h3><p class="small muted">${current ? `${badge(current.status)} · ${duration(current.duration_seconds)} · ${number(current.tool_calls)} tool calls` : 'Assign a task whenever you want to start a new run.'}</p></div>${current ? `<div class="current-progress">${progress(current)}${button('Cancel task', 'cancel-task', 'stop', `data-id="${esc(current.id)}"`, 'small-button danger-quiet')}</div>` : ''}</div>${agent.status === 'Paused' ? '<div class="notice">Pausing takes effect between actions. An in-progress model or tool call may finish first.</div>' : ''}${tabs(allTabs, state.tab, 'agent-tab')}<div class="tab-content">${content}</div>`;
 }
 
 export async function tasks() {

@@ -1,4 +1,4 @@
-export const state = { agents: [], skills: [], tools: [], tasks: [], approvals: [], health: null, config: null, metrics: null, orchestrations: [], freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {}, skills: {} }, tab: 'timeline', chart: 'tasks', connected: false };
+export const state = { agents: [], skills: [], tools: [], tasks: [], approvals: [], health: null, config: null, metrics: null, orchestrations: [], freyaHistory: [], freyaSessionStartedAt: null, freyaRunId: null, freyaDraft: { prompt: '', workspace_path: '' }, filters: { tasks: {}, logs: {}, skills: {} }, tab: 'timeline', chart: 'tasks', connected: false };
 
 export async function api(path, method = 'GET', body) {
   const response = await fetch(`/api${path}`, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });

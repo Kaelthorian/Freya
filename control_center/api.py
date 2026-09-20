@@ -56,6 +56,10 @@ class Application:
                                      "level": "INFO", "status": agent["status"],
                                      "output": {"name": agent["name"]}})
 
+    def _ensure_agent_name_available(self, name: str, *, exclude_id: str | None = None) -> None:
+        if self.store.agent_name_exists(name, exclude_id=exclude_id):
+            raise ApiError(409, "An active agent with this name already exists.")
+
     def dispatch(self, method: str, path: str, query: dict, body: dict) -> tuple[int, object]:
         """Mutations serialize validation and dispatch; readers use SQLite snapshots."""
         if method == "GET":
@@ -205,7 +209,9 @@ class Application:
         if method == "POST" and parts in (["agent-presets", "programmer"], ["presets", "programmer"]):
             if not isinstance(body, dict):
                 raise ValueError("Preset body must be an object.")
-            agent = self.store.create_agent(programmer_agent_payload(body))
+            payload = programmer_agent_payload(body)
+            self._ensure_agent_name_available(payload["name"])
+            agent = self.store.create_agent(payload)
             self._agent_event(agent, "agent.created")
             return 201, agent
         if method == "POST" and len(parts) == 3 and parts[0] == "approvals":
@@ -214,9 +220,17 @@ class Application:
                 raise ApiError(404, "Approval action not available.")
             return 200, self.runtime.resolve_approval(parts[1], action)
         if method == "POST" and parts == ["agents"]:
-            agent = self.store.create_agent(normalize_agent(body))
+            payload = normalize_agent(body)
+            self._ensure_agent_name_available(payload["name"])
+            agent = self.store.create_agent(payload)
             self._agent_event(agent, "agent.created")
             return 201, agent
+        if method == "POST" and parts == ["skills", "import"]:
+            if (not isinstance(body, dict) or set(body) - {"skills", "version"}
+                    or not isinstance(body.get("skills"), list)):
+                raise ValueError("Skill import expects an object with a skills array.")
+            imported = self.store.import_skills(body["skills"])
+            return 201, {"count": len(imported["created"]), "skipped": imported["skipped"], "skills": imported["created"]}
         if method == "POST" and parts == ["skills"]:
             return 201, self.store.create_skill(body)
         if method == "POST" and parts == ["orchestrations"]:
@@ -238,6 +252,7 @@ class Application:
             if method == "PATCH" and len(parts) == 2:
                 self._idle_required(agent_id)
                 updated = normalize_agent(body, agent)
+                self._ensure_agent_name_available(updated["name"], exclude_id=agent_id)
                 agent = self.store.update_agent(agent_id, updated)
                 if "enabled" in body:
                     self.runtime.resume(agent_id)
@@ -252,9 +267,11 @@ class Application:
             if method == "POST" and len(parts) == 3:
                 action = parts[2]
                 if action == "duplicate":
-                    data = {k: agent[k] for k in ("name", "description", "role", "enabled", "config", "tools", "skills")}
+                    data = {k: agent[k] for k in ("name", "description", "role", "instructions", "enabled", "config", "tools", "skills")}
                     data["name"] = data["name"][:92] + " (copy)"
-                    new = self.store.create_agent(normalize_agent(data))
+                    payload = normalize_agent(data)
+                    self._ensure_agent_name_available(payload["name"])
+                    new = self.store.create_agent(payload)
                     self._agent_event(new, "agent.created")
                     return 201, new
                 if action in {"pause", "resume", "restart"}:
@@ -283,15 +300,15 @@ class Application:
                 duplicate = {key: source[key] for key in ("id", "name", "description", "category", "version", "instructions", "procedures", "recommended_capabilities", "required_capabilities", "tags", "enabled", "metadata")}
                 duplicate.update(body or {})
                 if not (body or {}).get("id"):
-                    existing_ids = {item["id"] for item in self.store.list_skills()}
+                    existing_ids = {item["id"] for item in self.store.list_skills(include_deleted=True)}
                     candidate, suffix = skill_id + "-copy", 2
                     while candidate in existing_ids:
                         candidate, suffix = f"{skill_id}-copy-{suffix}", suffix + 1
                     duplicate["id"] = candidate
                 if not (body or {}).get("name"):
-                    existing_names = {item["name"] for item in self.store.list_skills()}
+                    existing_names = {item["name"].casefold() for item in self.store.list_skills(include_deleted=True)}
                     candidate, suffix = source["name"] + " (copy)", 2
-                    while candidate in existing_names:
+                    while candidate.casefold() in existing_names:
                         candidate, suffix = f"{source['name']} (copy {suffix})", suffix + 1
                     duplicate["name"] = candidate
                 duplicate["source"] = "user"

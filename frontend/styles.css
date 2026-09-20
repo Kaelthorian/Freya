@@ -319,6 +319,8 @@ input:focus, textarea:focus, select:focus { border-color: rgba(123,216,177,.65);
 .log-group-body { border-top:1px solid var(--border-soft); }.log-group-body .log-list { padding:0; }
 .log-task-summary { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; padding:11px 16px; border-bottom:1px solid var(--border-soft); color:var(--muted); font-size:10px; }
 .log-task-summary .text-link { margin-left:auto; }
+.log-task-prompt { padding-top: 0; padding-bottom: 12px; }
+.log-task-prompt .key-values pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 900px) { .freya-current-table { min-width: 780px; } }
 @media (max-width: 720px) { .freya-overview { padding:18px; } .freya-current-table { min-width: 760px; } }
 .workspace-warning { margin-top: 12px; }

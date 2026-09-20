@@ -56,6 +56,43 @@ class SkillRegistryTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(summaries[0]["operational"])
 
+    def test_duplicate_skips_archived_ids_and_names(self):
+        class Runtime:
+            max_workers = 1
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            app = Application(store, Runtime(), Path(directory))
+            store.create_skill(skill_payload("archive-source"))
+            status, first = app.dispatch("POST", "/api/skills/archive-source/duplicate", {}, {})
+            self.assertEqual(status, 201)
+            app.dispatch("DELETE", "/api/skills/" + first["id"], {}, {})
+            status, second = app.dispatch("POST", "/api/skills/archive-source/duplicate", {}, {})
+            self.assertEqual(status, 201)
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertNotEqual(second["name"].casefold(), first["name"].casefold())
+
+    def test_skill_import_is_atomic_and_rejects_case_insensitive_duplicates(self):
+        class Runtime:
+            max_workers = 1
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            app = Application(store, Runtime(), Path(directory))
+            first = skill_payload("bulk-one", name="Bulk One")
+            second = skill_payload("bulk-two", name="Bulk Two")
+            status, result = app.dispatch("POST", "/api/skills/import", {}, {"skills": [first, second]})
+            self.assertEqual(status, 201)
+            self.assertEqual(result["count"], 2)
+            self.assertEqual({item["id"] for item in result["skills"]}, {"bulk-one", "bulk-two"})
+            status, repeat = app.dispatch("POST", "/api/skills/import", {}, {"version": 1, "skills": [first]})
+            self.assertEqual(status, 201)
+            self.assertEqual(repeat["count"], 0)
+            self.assertEqual(repeat["skipped"], ["bulk-one"])
+            with self.assertRaises(ValueError):
+                app.dispatch("POST", "/api/skills/import", {}, {"skills": [skill_payload("bulk-three", name="Bulk Three"), skill_payload("bulk-one", name="Another Name")]})
+            self.assertNotIn("bulk-three", {item["id"] for item in store.list_skills()})
+            with self.assertRaises(ValueError):
+                store.create_skill(skill_payload("case-duplicate", name="bulk one"))
+
     def test_validation_and_stable_id(self):
         skill = normalize_skill(skill_payload())
         self.assertEqual(skill["id"], "demo-skill")

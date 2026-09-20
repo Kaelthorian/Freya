@@ -18,6 +18,7 @@ SECRET_FIELD_RE = re.compile(r"(?:secret|token|password|passwd|credential|api[_-
 SECRET_VALUE_RE = re.compile(r"(?:secret|token|password|passwd|credential|api[_-]?key|private[_-]?key|authorization)\s*[:=]\s*[^\s]+", re.I)
 CONTROL_FIELD_RE = re.compile(r"^(?:permissions?|capability_policy|tools?|allowed_tools|allowed_directories|forbidden_commands|workspace(?:_path)?|commands?|grant(?:s)?|allowlist|denylist)$", re.I)
 MAX_SKILLS_PER_AGENT = 100
+MAX_SKILLS_IMPORT = 500
 MAX_PROCEDURES = 30
 MAX_STEPS = 50
 MAX_TAGS = 30

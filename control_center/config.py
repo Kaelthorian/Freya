@@ -150,13 +150,28 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     identity_input = copy.deepcopy(config.get("identity") or {})
     if not isinstance(identity_input, dict):
         raise ValueError("identity must be an object")
+    incoming_identity = incoming.get("identity") if isinstance(incoming.get("identity"), dict) else {}
+    # Keep the legacy columns and structured identity synchronized while they
+    # remain in the storage shape for backwards compatibility.
+    if "name" in data:
+        identity_input["name"] = result["name"]
+    elif "name" in incoming_identity:
+        result["name"] = incoming_identity["name"]
+    if "role" in data:
+        identity_input["role"] = result["role"]
+    elif "role" in incoming_identity:
+        result["role"] = incoming_identity["role"]
+    if "description" in data:
+        identity_input["description"] = result["description"]
+    elif "description" in incoming_identity:
+        result["description"] = incoming_identity["description"]
     for key in ("purpose", "responsibilities", "constraints"):
         if key in data:
             identity_input[key] = data[key]
     config["identity"] = normalize_identity(identity_input, name=result["name"], role=result["role"], description=result["description"])
+    result["name"] = config["identity"]["name"]
     result["role"] = config["identity"]["role"]
-    if not result["description"] and config["identity"].get("description"):
-        result["description"] = config["identity"]["description"]
+    result["description"] = config["identity"].get("description", "")
     config["behavior"] = normalize_behavior(config.get("behavior"))
     config["autonomy"] = normalize_autonomy(config.get("autonomy"))
     config["verification"] = normalize_verification(config.get("verification"))

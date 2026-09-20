@@ -22,7 +22,7 @@ from .recovery import allowed_replan_scope, validate_replan_revision
 from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
 from .integration_storage import IntegrationStoreMixin, migrate_integration_schema
 from .agent_context import build_agent_context, build_effective_agent
-from .skills import BUILTIN_SKILLS, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
+from .skills import BUILTIN_SKILLS, MAX_SKILLS_IMPORT, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
 from .security import sanitize
 from .tools import argument_summary
 
@@ -304,6 +304,18 @@ class Store(IntegrationStoreMixin):
             ids = connection.execute("SELECT id FROM agents WHERE deleted_at IS NULL ORDER BY created_at,id").fetchall()
             return [self._agent(connection, row["id"]) for row in ids]
 
+    def agent_name_exists(self, name: str, *, exclude_id: str | None = None) -> bool:
+        """Return whether an active agent already uses this display name."""
+        normalized = str(name or "").strip().casefold()
+        if not normalized:
+            return False
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id,name FROM agents WHERE deleted_at IS NULL"
+            ).fetchall()
+        return any(row["id"] != exclude_id and str(row["name"]).strip().casefold() == normalized
+                   for row in rows)
+
     def delete_agent(self, agent_id: str) -> None:
         with self._connection(write=True) as connection:
             self._agent(connection, agent_id)
@@ -475,7 +487,7 @@ class Store(IntegrationStoreMixin):
         with self._connection(write=True) as c:
             if c.execute("SELECT 1 FROM skills WHERE id=?", (skill["id"],)).fetchone() is not None:
                 raise ValueError("Skill id already exists: " + skill["id"])
-            if c.execute("SELECT 1 FROM skills WHERE name=?", (skill["name"],)).fetchone() is not None:
+            if c.execute("SELECT 1 FROM skills WHERE lower(name)=lower(?)", (skill["name"],)).fetchone() is not None:
                 raise ValueError("Skill name already exists: " + skill["name"])
             c.execute(
                 "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -486,6 +498,62 @@ class Store(IntegrationStoreMixin):
             created = c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill["id"],)).fetchone()
             return self._skill(created)
 
+    def import_skills(self, data: list[dict[str, Any]]) -> dict[str, Any]:
+        """Validate and atomically create a batch of independent Skills."""
+        if not isinstance(data, list):
+            raise ValueError("skills must be a JSON array")
+        if not data:
+            raise ValueError("skills must contain at least one Skill")
+        if len(data) > MAX_SKILLS_IMPORT:
+            raise ValueError(f"skills cannot contain more than {MAX_SKILLS_IMPORT} items")
+        normalized = [normalize_skill(item) for item in data]
+        ids = [skill["id"] for skill in normalized]
+        names = [skill["name"].casefold() for skill in normalized]
+        if len(set(ids)) != len(ids):
+            raise ValueError("The import contains duplicate Skill ids.")
+        if len(set(names)) != len(names):
+            raise ValueError("The import contains duplicate Skill names.")
+        skipped: list[str] = []
+        created_ids: list[str] = []
+        with self._connection(write=True) as c:
+            existing_rows = c.execute("SELECT * FROM skills").fetchall()
+            existing = {}
+            for row in existing_rows:
+                definition = self._skill(row)
+                existing[definition["id"]] = definition
+            existing_names = {str(skill["name"]).casefold(): skill["id"] for skill in existing.values()}
+            for skill in normalized:
+                current = existing.get(skill["id"])
+                if current is not None:
+                    if all(current[key] == skill[key] for key in SKILL_DEFINITION_FIELDS):
+                        skipped.append(skill["id"])
+                        continue
+                    raise ValueError("Skill id already exists with a different definition: " + skill["id"])
+                name_owner = existing_names.get(skill["name"].casefold())
+                if name_owner is not None:
+                    raise ValueError("Skill name already exists: " + skill["name"])
+                existing_names[skill["name"].casefold()] = skill["id"]
+                created_ids.append(skill["id"])
+            now = utcnow()
+            try:
+                for skill in normalized:
+                    if skill["id"] in skipped:
+                        continue
+                    c.execute(
+                        "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
+                    )
+                    c.execute(
+                        "INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)",
+                        (skill["id"], skill["version"], _dump(skill), now, "Imported definition"),
+                    )
+                    c.execute(
+                        "INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)",
+                        (skill["id"], skill["version"], now, "skill.imported", "Skill imported", _dump({"id": skill["id"], "version": skill["version"]})),
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("The import contains a Skill that already exists.") from exc
+        return {"created": [self.get_skill(skill_id) for skill_id in created_ids], "skipped": skipped}
     def update_skill(self, skill_id: str, data: dict[str, Any]) -> dict[str, Any]:
         with self._connection(write=True) as c:
             row = c.execute("SELECT * FROM skills WHERE id=?", (skill_id,)).fetchone()
@@ -503,7 +571,7 @@ class Store(IntegrationStoreMixin):
             if all(candidate[key] == current[key] for key in comparable):
                 return self._skill(c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone())
             skill = {**candidate, "version": current["version"] + 1}
-            if c.execute("SELECT 1 FROM skills WHERE name=? AND id<>?", (skill["name"], skill_id)).fetchone() is not None:
+            if c.execute("SELECT 1 FROM skills WHERE lower(name)=lower(?) AND id<>?", (skill["name"], skill_id)).fetchone() is not None:
                 raise ValueError("Skill name already exists: " + skill["name"])
             now = utcnow()
             historical = c.execute("SELECT snapshot_json FROM skill_versions WHERE skill_id=? AND version=?", (skill_id, current["version"])).fetchone()

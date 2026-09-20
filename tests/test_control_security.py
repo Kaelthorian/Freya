@@ -12,6 +12,17 @@ from control_center.security import sanitize
 
 
 class ControlConfigurationTests(unittest.TestCase):
+    def test_legacy_identity_columns_stay_synchronized(self):
+        agent = normalize_agent({
+            "name": "Atlas",
+            "role": "Engineer",
+            "description": "First description",
+            "config": {"identity": {"description": "stale description"}},
+        })
+        self.assertEqual(agent["config"]["identity"]["description"], "First description")
+        updated = normalize_agent({"description": "Updated description"}, agent)
+        self.assertEqual(updated["description"], "Updated description")
+        self.assertEqual(updated["config"]["identity"]["description"], "Updated description")
     def test_merge_configuration_does_not_reset_tools_or_other_limits(self):
         agent = normalize_agent({"name": "Reader", "tools": ["read_file"], "config": {"max_steps": 8}})
         updated = normalize_agent({"config": {"temperature": 0.7}}, agent)

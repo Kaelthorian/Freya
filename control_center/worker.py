@@ -94,30 +94,46 @@ def fallback_action(content: str) -> tuple[dict[str, Any] | None, str | None]:
     Some Ollama models emit several newline-separated action objects in one
     answer. Executing all of them would trust invented observations, so the
     runtime executes the first action and asks the model again with the real
-    tool result.
+    tool result. Models also sometimes preface a valid action with prose; in
+    that case only a recognized tool object is extracted.
     """
     value = content.strip()
     if value.startswith("```"):
         value = value[3:].lstrip()
         if value.lower().startswith("json"):
             value = value[4:].lstrip()
-    try:
-        action, _ = json.JSONDecoder().raw_decode(value)
-    except (ValueError, TypeError):
-        return None, None
-    if not isinstance(action, dict):
-        return None, None
-    name = action.get("action") or action.get("name")
-    if not isinstance(name, str):
-        return None, None
-    if name == "finish":
-        return None, strip_thinking(str(action.get("message", "")))
-    if "name" in action:
-        arguments = action.get("arguments", {})
-    else:
-        arguments = {key: value for key, value in action.items() if key != "action"}
-    return {"function": {"name": name, "arguments": arguments}}, None
 
+    def decode(raw: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
+        try:
+            action, _ = json.JSONDecoder().raw_decode(raw)
+        except (ValueError, TypeError):
+            return None, None, None
+        if not isinstance(action, dict):
+            return None, None, None
+        name = action.get("action") or action.get("name")
+        if not isinstance(name, str):
+            return None, None, None
+        if name == "finish":
+            return None, strip_thinking(str(action.get("message", ""))), name
+        if "name" in action:
+            arguments = action.get("arguments", {})
+        else:
+            arguments = {key: value for key, value in action.items() if key != "action"}
+        return {"function": {"name": name, "arguments": arguments}}, None, name
+
+    call, finish, name = decode(value)
+    if call is not None or finish is not None:
+        return call, finish
+
+    # A model may explain what it is about to do and then emit the JSON action.
+    # Scan only for known tools so arbitrary JSON mentioned in prose is never
+    # dispatched. The first recognized object is the only one executed.
+    known_tools = READ_TOOLS | WRITE_TOOLS | EXEC_TOOLS
+    for match in re.finditer(r"\x7b", value):
+        call, _finish, name = decode(value[match.start():])
+        if call is not None and name in known_tools:
+            return call, None
+    return None, None
 
 class PolicyToolbox(Toolbox):
     """Additional per-agent restrictions layered on the existing tools."""

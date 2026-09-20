@@ -86,6 +86,19 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("hidden", json.dumps(detail))
         self.assertEqual(self.request("GET", "/api/agents")[1], [])
 
+    def test_duplicate_agent_preserves_instructions_and_names_remain_unique(self):
+        status, agent = self.request("POST", "/api/agents", {
+            "name": "Original",
+            "role": "Engineer",
+            "instructions": "Keep this instruction",
+        })
+        self.assertEqual(status, 201, agent)
+        status, duplicate = self.request("POST", f"/api/agents/{agent['id']}/duplicate", {})
+        self.assertEqual(status, 201, duplicate)
+        self.assertEqual(duplicate["instructions"], "Keep this instruction")
+        status, body = self.request("POST", "/api/agents", {"name": "original"})
+        self.assertEqual(status, 409)
+        self.assertIn("already exists", body["error"])
     def test_agent_creation_accepts_editor_capability_policy_inside_config(self):
         status, agent = self.request("POST", "/api/agents", {
             "name": "Policy editor",

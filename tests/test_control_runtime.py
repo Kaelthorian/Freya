@@ -123,6 +123,15 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(errors[0]["event"]["tool"], "write_file")
         self.assertIn("disabled", errors[0]["event"]["error"])
 
+    def test_prose_wrapped_json_action_is_executed(self):
+        wrapped = ('I will inspect the workspace and then create the requested file.\n'
+                   '{"name":"write_file","arguments":{"path":"wrapped.py","content":"print(2 + 2)"}}')
+        result = self.run_worker([answer(wrapped), answer('{"action":"finish","message":"Created wrapped.py"}')])
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual((self.workspace / "wrapped.py").read_text(), "print(2 + 2)")
+        finished = [event["event"] for event in self.events
+                    if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual(finished[0]["tool"], "write_file")
     def test_concatenated_json_actions_execute_only_after_real_observations(self):
         batched = ('{"name":"write_file","arguments":{"path":"verified.txt","content":"OK"}}\n'
                    '{"name":"read_file","arguments":{"path":"verified.txt"}}\n'
