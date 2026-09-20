@@ -260,9 +260,14 @@ configuration.
 Deterministic checks run before any model call. Failed verification evidence
 forces `rejected`; requested but unavailable or inconclusive verification
 forces `blocked`; and test/lint/build criteria without passing objective
-evidence are `blocked`. These outcomes cannot be overridden by agent claims or
-prompt injection. Otherwise the tool-free `OllamaEvaluator` requests a strict
-JSON schema containing `accepted`, `needs_revision`, `rejected`, or `blocked`,
+evidence are `blocked`. These outcomes cannot be overridden by agent claims or prompt injection.
+For filesystem-only tasks, when Git diff and a permitted test suite are not
+available, the Worker can use a policy-allowed `read_file` read-back for every
+modified path as objective evidence. `write_file` content is compared exactly;
+all modified paths must pass, otherwise the verification remains unavailable or
+failed and the evaluator still fails closed. Otherwise the tool-free
+`OllamaEvaluator` requests a strict JSON schema containing `accepted`,
+`needs_revision`, `rejected`, or `blocked`,
 with every planned success criterion represented exactly once. Invalid output
 gets one repair attempt and then fails closed as evaluator infrastructure
 `error`.

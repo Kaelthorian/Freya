@@ -5,8 +5,8 @@ import { freya, dashboard, agents, agentDetail, skills, skillDetail, tasks, task
 import { agentDialog, skillDialog, assignDialog, confirmAction, setDialogRefresh, chooseWorkspace } from './dialogs.js';
 
 const main = document.querySelector('#main-content');
-const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['tasks', 'Tasks'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
-document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 5 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 7 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
+const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
+document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 4 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 6 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
 
 function updateChrome() {
@@ -42,7 +42,7 @@ async function render(navigation = false) {
     else if (current.page === 'dashboard') html = dashboard();
     else if (current.page === 'agents') html = current.id ? await agentDetail(current.id) : agents();
     else if (current.page === 'skills') html = current.id ? await skillDetail(current.id) : skills();
-    else if (current.page === 'tasks') html = current.id ? await taskDetail(current.id) : await tasks();
+    else if (current.page === 'tasks') { location.hash = current.id ? `#/logs?task_id=${encodeURIComponent(current.id)}` : '#/logs'; return; }
     else if (current.page === 'approvals') html = approvals();
     else if (current.page === 'logs') html = await logs();
     else if (current.page === 'metrics') html = metricsView(state.metrics);
@@ -76,7 +76,7 @@ window.addEventListener('hashchange', () => {
   const current = route(), key = `${current.page}/${current.id || ''}`;
   if (key !== currentKey) state.tab = 'timeline';
   currentKey = key;
-  if (current.page === 'logs' && current.query.has('agent_id')) state.filters.logs.agent_id = current.query.get('agent_id');
+  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; }
   render(true);
 });
 
@@ -111,6 +111,7 @@ document.addEventListener('click', async event => {
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
     if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
     if (action === 'copy-task-logs') { event.preventDefault(); const events = await api(`/logs?task_id=${encodeURIComponent(id)}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
+    if (action === 'copy-task-details') { const task = await api(`/tasks/${encodeURIComponent(id)}`); await navigator.clipboard.writeText(serialize(task)); toast('Task details copied to the clipboard.'); return; }
     if (action === 'delete-agent') return confirmAction({ title: 'Delete agent', description: 'This agent will be removed from the workspace. Agents with active tasks cannot be deleted.', label: 'Delete agent', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agent deleted.'); } });
     if (action === 'cancel-task') return confirmAction({ title: 'Cancel this run', description: 'The runtime will be asked to cancel this run, and the request will be recorded in its history. An action already in progress may finish before cancellation takes effect.', label: 'Cancel run', danger: true, action: async () => { await api(`/tasks/${id}/cancel`, 'POST', {}); toast('Cancellation requested.'); } });
     if (action === 'cancel-orchestration') return confirmAction({ title: 'Stop Freya', description: 'Cancel Freya and all active delegated tasks.', label: 'Stop Freya', danger: true, action: async () => { await api(`/orchestrations/${id}/cancel`, 'POST', {}); toast('Freya stopped.'); } });
@@ -119,7 +120,7 @@ document.addEventListener('click', async event => {
     if (action === 'toggle-agent') { await api(`/agents/${id}`, 'PATCH', { enabled: target.dataset.enabled === 'true' }); toast(target.dataset.enabled === 'true' ? 'Agent enabled.' : 'Agent disabled.'); }
     else if (action === 'duplicate-agent') { const agent = await api(`/agents/${id}/duplicate`, 'POST', {}); location.hash = `#/agents/${agent.id}`; toast('Agent duplicated.'); }
     else if (action === 'pause-agent' || action === 'resume-agent') { await api(`/agents/${id}/${action === 'pause-agent' ? 'pause' : 'resume'}`, 'POST', {}); toast(action === 'pause-agent' ? 'Pause requested. It takes effect between actions.' : 'Agent resumed.'); }
-    else if (action === 'retry-task') { const task = await api(`/tasks/${id}/retry`, 'POST', {}); location.hash = `#/tasks/${task.id}`; toast('New run created.'); }
+    else if (action === 'retry-task') { const task = await api(`/tasks/${id}/retry`, 'POST', {}); location.hash = `#/logs?task_id=${task.id}`; toast('New run created.'); }
     await refresh();
   } catch (error) { toast(error.message, true); }
   finally { target.disabled = false; }
@@ -153,7 +154,7 @@ async function boot() {
   try { const [tools, config, skills] = await Promise.all([api('/tools'), api('/config'), api('/skills')]); Object.assign(state, { tools, config, skills }); }
   catch (error) { toast(error.message, true); }
   const current = route();
-  if (current.page === 'logs' && current.query.has('agent_id')) state.filters.logs.agent_id = current.query.get('agent_id');
+  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; }
   await refresh(true); currentKey = `${current.page}/${current.id || ''}`;
   connectEvents(); setInterval(() => refresh(), 10000);
 }

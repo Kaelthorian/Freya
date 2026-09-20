@@ -17,6 +17,16 @@ export function query(values) { return new URLSearchParams(Object.entries(values
 export function toast(message, error = false) { const element = document.createElement('div'); element.className = `toast ${error ? 'toast-error' : ''}`; element.textContent = message; document.querySelector('#toasts').append(element); setTimeout(() => element.remove(), error ? 9000 : 4500); }
 export function route() { const [path, search = ''] = location.hash.replace(/^#\/?/, '').split('?'); const parts = path.split('/').filter(Boolean); return { page: parts[0] || 'dashboard', id: parts[1], query: new URLSearchParams(search) }; }
 export function serialize(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+export function taskTitle(value, maxLength = 88) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return 'Untitled task';
+  if (text.length <= maxLength) return text;
+  const sentenceEnd = text.search(/[.!?](?:\s|$)/);
+  if (sentenceEnd >= 0 && sentenceEnd + 1 <= maxLength) return text.slice(0, sentenceEnd + 1);
+  const clipped = text.slice(0, Math.max(1, maxLength - 1)).trimEnd();
+  const wordEnd = clipped.lastIndexOf(' ');
+  return `${(wordEnd > Math.floor(maxLength * 0.55) ? clipped.slice(0, wordEnd) : clipped)}…`;
+}
 const LEGACY_COPY = {
   'Esperar un trabajador y un workspace disponibles; cada agente ejecuta una tarea a la vez.': 'Waiting for an available worker and workspace; each agent runs one task at a time.',
   'Esperar un trabajador disponible; cada agente ejecuta una tarea a la vez.': 'Waiting for an available worker; each agent runs one task at a time.',

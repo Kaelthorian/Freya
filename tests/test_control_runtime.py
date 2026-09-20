@@ -106,7 +106,11 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((self.workspace / "hello.py").read_text(), "print('hello')")
         self.assertEqual(result["total_tokens"], 10)
         self.assertEqual(result["model_calls"], 2)
-        self.assertEqual(result["tool_calls"], 1)
+        self.assertEqual(result["tool_calls"], 2)
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertFalse(result["verification"]["unavailable"])
+        self.assertIn("filesystem:read_file:hello.py", [item["check"] for item in result["verification"]["evidence"]])
         self.assertNotIn("PRIVATE_INTERNAL", json.dumps(self.events) + json.dumps(result))
         self.assertNotIn("thinking", self.payloads[-1]["messages"][2])
 

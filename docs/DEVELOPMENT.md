@@ -53,6 +53,9 @@ Offline evaluation is conservative: acceptance requires configured verification
 to be requested, attempted and passed. Runtime result text and agent claims are
 not objective evidence. Missing evidence returns `blocked`, including through
 the Orchestrator's default compatibility fallback.
+For filesystem-only tasks without Git or tests, the Worker may instead verify
+each modified file with an allowed `read_file` read-back; missing or mismatched
+read-back evidence remains blocked or failed.
 
 Semantic recovery has its own local, tool-free model and hard budgets:
 

@@ -351,6 +351,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     error = ""
     success = False
     modified = False
+    modified_paths: dict[str, str | None] = {}
+    observed_files: dict[str, tuple[bool, str]] = {}
     verification = effective["verification"]
     verification_state: dict[str, Any] = {
         "requested": bool(verification["enabled"]), "attempted": False,
@@ -504,7 +506,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 error_class="approval_denied",
                             )
                     if result.success and name in WRITE_TOOLS:
+                        path = safe_args.get("path")
+                        if isinstance(path, str) and path.strip():
+                            modified_paths[path] = (safe_args.get("content")
+                                                     if name == "write_file" and isinstance(safe_args.get("content"), str)
+                                                     else None)
+                            observed_files.pop(path, None)
                         modified = True
+                    if result.success and name == "read_file":
+                        path = safe_args.get("path")
+                        if isinstance(path, str) and path in modified_paths:
+                            expected = modified_paths[path]
+                            observed_files[path] = (expected is None or result.output == expected, result.output)
                     if not result.success and result.policy_decision not in {"deny", "approval_required", "denied"} and not argument_error:
                         recoverable = any(marker in result.output.lower() for marker in ("does not exist", "not found", "no matches"))
                         result.error_class = "recoverable" if recoverable else "environment_error"
@@ -625,6 +638,52 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 else:
                     verification_state["unavailable"] = True
                     verification_state["skipped_with_reason"] += "No permitted test suite is available. "
+            if modified_paths and not verification_state["attempted"] and not verification_state["failed"]:
+                read_tool_available = "read_file" in getattr(box, "enabled", set())
+                readback_passed = bool(modified_paths)
+                for path, expected in modified_paths.items():
+                    if path in observed_files:
+                        matches, output = observed_files[path]
+                        if matches:
+                            record_verification(ToolResult("read_file", output, True, 0),
+                                                "filesystem:read_file:" + path)
+                        else:
+                            record_verification(
+                                ToolResult("read_file", "Read-back content did not match the requested file content.", False, 0),
+                                "filesystem:read_file:" + path,
+                            )
+                            readback_passed = False
+                        continue
+                    if not read_tool_available:
+                        readback_passed = False
+                        continue
+                    try:
+                        capability = box.resolver.resolve("read_file", {"path": path})
+                        decision = box.policy.evaluate(capability, path)
+                    except (AttributeError, TypeError, ValueError):
+                        readback_passed = False
+                        continue
+                    if decision.outcome != "allow" and not (decision.outcome == "approval_required" and approval_handler):
+                        readback_passed = False
+                        continue
+                    result = verify_tool("read_file", {"path": path},
+                                         "Read back the modified file to verify the resulting workspace state.")
+                    if not result.success:
+                        record_verification(result, "filesystem:read_file:" + path)
+                        readback_passed = False
+                        continue
+                    matches = expected is None or result.output == expected
+                    if matches:
+                        record_verification(result, "filesystem:read_file:" + path)
+                    else:
+                        record_verification(
+                            ToolResult("read_file", "Read-back content did not match the requested file content.", False, 0),
+                            "filesystem:read_file:" + path,
+                        )
+                        readback_passed = False
+                if readback_passed:
+                    verification_state["unavailable"] = False
+                    verification_state["skipped_with_reason"] += "Used read-back filesystem evidence."
             if not verification_state["attempted"] and not verification_state["unavailable"]:
                 verification_state["skipped_with_reason"] = "No verification check was selected."
             if verification_state["failed"]:
