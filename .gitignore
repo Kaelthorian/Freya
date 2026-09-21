@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Local database, logs, lock and automatic task workspaces.
-/data/
+# Local database, logs, lock and automatic task workspaces. Versioned agent
+# definitions are the only shareable files allowed below data/.
+/data/*
+!/data/agents/
+!/data/agents/*.json
 /test-artifacts/
