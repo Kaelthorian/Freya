@@ -160,13 +160,25 @@ class Toolbox:
             output, success, exit_code = handler(**args)
         except Exception as exc:  # Keep a tool failure observable to the model.
             output, success, exit_code = "ERROR: {}".format(exc), False, None
+        error_class = ""
+        if name == "git_diff" and not success and "not inside a Git repository" in str(output):
+            error_class = "not_applicable"
         return ToolResult(
             name=name,
             output=_clip(str(output)),
             success=bool(success),
             duration_seconds=time.perf_counter() - start,
             exit_code=exit_code,
+            error_class=error_class,
         )
+
+    def git_repository_available(self) -> bool:
+        """Return whether the task workspace is inside a usable Git repository."""
+        try:
+            self._git_scope()
+        except (OSError, ValueError):
+            return False
+        return True
 
     def tool_list_files(self, path: str = ".") -> tuple[str, bool, int | None]:
         directory = self.safe_path(path)
@@ -375,7 +387,7 @@ class Toolbox:
         try:
             git_root, repo_path = self._git_scope()
         except ValueError:
-            return "The workspace is not inside a Git repository.", True, 0
+            return "The workspace is not inside a Git repository.", False, None
 
         pieces: list[str] = []
         for args in (

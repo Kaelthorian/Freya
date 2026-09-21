@@ -394,6 +394,8 @@ class AgentSelectionIntegrationTests(unittest.TestCase):
     def test_failed_selection_is_persisted_and_emits_failed_event(self):
         _, run = self.run_orchestration("deny")
         self.assertEqual(run["status"], "Failed")
+        self.assertIn("Required capability filesystem.read is denied", run["error"])
+        self.assertIn("Failure diagnosis", run["response"])
         self.assertEqual(run["selections"][0]["status"], "no_eligible_agent")
         self.assertIsNone(run["selections"][0]["selected_agent_id"])
         event_types = [event["event_type"] for event in run["events"]]

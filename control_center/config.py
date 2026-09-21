@@ -34,6 +34,9 @@ TOOL_CATALOG = [
 ]
 DEFAULT_TOOLS = ["list_files", "read_file", "write_file", "edit_file", "search_code"]
 DEFAULT_CONFIG = {
+    # Optional orchestration role. ``worker`` keeps the normal selector path;
+    # ``task_analyst`` marks the agent that may interpret prompts before planning.
+    "orchestration_role": "worker",
     "model": "qwen2.5-coder:7b",
     "endpoint": "http://127.0.0.1:11434",
     "temperature": 0.0,
@@ -185,6 +188,8 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     else:
         config["capability_policy"] = validate_policy(policy_input)
     config["model"] = _text(config["model"], "model", 200, True)
+    if config.get("orchestration_role") not in {"worker", "task_analyst", "planner", "auditor"}:
+        raise ValueError("orchestration_role must be worker, task_analyst, planner, or auditor.")
     if re.search(r"[\s\x00-\x1f]", config["model"]):
         raise ValueError("model must not contain whitespace or control characters.")
     config["system_prompt"] = _text(config["system_prompt"], "system_prompt", 16000)

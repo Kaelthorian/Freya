@@ -135,11 +135,19 @@ class StoreTests(unittest.TestCase):
         self.store.add_delegation(run["id"], second["id"], "Review", second_task["id"])
         self.store.append_event(first_task["id"], {"event_type": "step.finished", "status": "Success"})
         self.store.append_event(second_task["id"], {"event_type": "step.finished", "status": "Success"})
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "freya.task_analysis.completed", "status": "Planning",
+            "agent_id": first["id"], "task_analysis": {"task_type": "general_task"},
+            "message": "Task Analyst interpretation",
+        })
 
         grouped = self.store.list_events(orchestration_id=run["id"])
-        self.assertEqual(len(grouped), 2)
+        self.assertEqual(len([item for item in grouped if item.get("source") != "orchestration"]), 2)
+        analyst_events = [item for item in grouped if item.get("event_type") == "freya.task_analysis.completed"]
+        self.assertEqual(len(analyst_events), 1)
+        self.assertEqual(analyst_events[0]["task_analysis"]["task_type"], "general_task")
         self.assertEqual({item["orchestration_id"] for item in grouped}, {run["id"]})
-        self.assertEqual({item["agent_name"] for item in grouped}, {"Coder", "Auditor"})
+        self.assertEqual({item["agent_name"] for item in grouped if item.get("source") != "orchestration"}, {"Coder", "Auditor"})
     def test_metrics_agent_aggregation_and_history_use_stored_execution_data(self):
         first, second = self.agent("One"), self.agent("Two", enabled=False)
         passed, failed, running = self.task(first), self.task(first), self.task(second)

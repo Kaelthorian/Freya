@@ -20,9 +20,11 @@ from .transport import request_json
 
 
 RECOVERY_VERSION = 1
+FAILURE_ANALYSIS_VERSION = 1
 RECOVERY_ACTIONS = {"retry_same_agent", "retry_different_agent", "replan_subgraph", "fail"}
 RECOVERY_FIELDS = {"action", "reason", "instructions", "exclude_agent_ids", "affected_task_ids"}
 REVISION_FIELDS = {"summary", "plan", "superseded_task_ids"}
+FAILURE_ANALYSIS_FIELDS = {"cause", "evidence_log_ids", "retryable", "recommended_action"}
 
 DEFAULT_RECOVERY_MODEL = "qwen2.5-coder:7b"
 DEFAULT_RECOVERY_ENDPOINT = "http://127.0.0.1:11434"
@@ -57,6 +59,18 @@ REVISION_RESPONSE_FORMAT = {
     "additionalProperties": False,
 }
 
+FAILURE_ANALYSIS_RESPONSE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "cause": {"type": "string"},
+        "evidence_log_ids": {"type": "array", "items": {"type": "string"}},
+        "retryable": {"type": "boolean"},
+        "recommended_action": {"type": "string"},
+    },
+    "required": sorted(FAILURE_ANALYSIS_FIELDS),
+    "additionalProperties": False,
+}
+
 
 class RecoveryValidationError(ValueError):
     """Recovery output does not satisfy the strict versioned contract."""
@@ -64,6 +78,10 @@ class RecoveryValidationError(ValueError):
 
 class RecoveryGenerationError(RuntimeError):
     """A configured recovery model could not produce a valid decision."""
+
+
+class FailureAnalysisError(RuntimeError):
+    """Persisted failure logs could not produce a grounded diagnosis."""
 
 
 def allowed_replan_scope(source_task_id: str, effective_plan: dict[str, Any],
@@ -220,6 +238,221 @@ def validate_recovery_decision(value: Any, *, source_task_id: str | None = None,
         "exclude_agent_ids": excluded,
         "affected_task_ids": affected,
     }
+
+
+def validate_failure_diagnosis(value: Any, *, known_log_ids: set[str]) -> dict[str, Any]:
+    """Validate a diagnosis and require every cited item to exist in the supplied logs."""
+    if not isinstance(value, dict):
+        raise RecoveryValidationError("Failure analysis output must be an object.")
+    missing = FAILURE_ANALYSIS_FIELDS - value.keys()
+    unknown = value.keys() - FAILURE_ANALYSIS_FIELDS
+    if missing:
+        raise RecoveryValidationError(
+            "Failure analysis output is missing fields: " + ", ".join(sorted(missing))
+        )
+    if unknown:
+        raise RecoveryValidationError(
+            "Failure analysis output has unknown fields: " + ", ".join(sorted(unknown))
+        )
+    cause = _text(value["cause"], "failure_analysis.cause")
+    recommended = _text(
+        value["recommended_action"], "failure_analysis.recommended_action"
+    )
+    evidence = _ids(value["evidence_log_ids"], "failure_analysis.evidence_log_ids")
+    if not evidence:
+        raise RecoveryValidationError("Failure analysis must cite at least one supplied log.")
+    if any(item not in known_log_ids for item in evidence):
+        raise RecoveryValidationError("Failure analysis cited a log that was not supplied.")
+    if not isinstance(value["retryable"], bool):
+        raise RecoveryValidationError("failure_analysis.retryable must be boolean.")
+    return {
+        "cause": cause,
+        "evidence_log_ids": evidence,
+        "retryable": value["retryable"],
+        "recommended_action": recommended,
+    }
+
+
+def _failure_text(event: dict[str, Any]) -> str:
+    for key in ("error", "message", "reason"):
+        value = _normalized(event.get(key))
+        if value:
+            return value[:MAX_RECOVERY_TEXT_CHARS]
+    return ""
+
+
+def deterministic_failure_diagnosis(logs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a conservative report from persisted events without a model call."""
+    if not isinstance(logs, list) or not logs:
+        raise FailureAnalysisError("No persisted failure logs are available for diagnosis.")
+    failure_events = [event for event in logs if isinstance(event, dict) and (
+        str(event.get("status", "")).casefold() in {"failed", "denied"}
+        or str(event.get("level", "")).casefold() in {"error", "critical"}
+        or any(marker in str(event.get("event_type", "")).casefold()
+               for marker in ("failed", "blocked", "denied", "interrupted"))
+    )]
+    if not failure_events:
+        failure_events = [event for event in logs if isinstance(event, dict)]
+    if not failure_events:
+        raise FailureAnalysisError("Persisted logs contain no usable events.")
+
+    root_types = (
+        "freya.agent_selection.failed", "model.failed", "step.finished",
+        "task.failed", "execution.interrupted", "freya.evaluation.failed",
+        "freya.integration.failed", "freya.planning.failed", "freya.task.failed",
+    )
+    root = next(
+        (event for event in failure_events
+         if str(event.get("event_type", "")).casefold() in root_types
+         and _failure_text(event)),
+        next((event for event in failure_events if _failure_text(event)), failure_events[0]),
+    )
+    cause = _failure_text(root) or "The persisted logs record a failure without a specific error message."
+    normalized = cause.casefold()
+    if "no_progress" in normalized or "noprogress" in normalized or "no progress" in normalized:
+        retryable = True
+        action = (
+            "Change the worker strategy: stop repeating read-only actions, create or modify the "
+            "requested artifact, and validate it directly. Increasing the step limit would not "
+            "resolve this no-progress condition."
+        )
+    elif "maximum steps" in normalized:
+        retryable = False
+        action = (
+            "Inspect the repeated action sequence and correct the plan or tool applicability; do "
+            "not increase the step limit without removing the loop cause."
+        )
+    elif "denied" in normalized or "no eligible" in normalized or "capability" in normalized:
+        retryable = False
+        action = (
+            "Revise the plan to use allowed capabilities or explicitly configure an eligible "
+            "agent; Freya will not grant a denied capability automatically."
+        )
+    elif any(marker in normalized for marker in ("timeout", "temporar", "connection", "unavailable")):
+        retryable = True
+        action = "Correct the reported transient condition and submit a new orchestration."
+    else:
+        retryable = False
+        action = "Correct the reported cause, then submit a new orchestration."
+    evidence = [str(root.get("log_id"))]
+    for event in failure_events:
+        log_id = str(event.get("log_id") or "")
+        if log_id and log_id not in evidence and len(evidence) < 5:
+            evidence.append(log_id)
+    return validate_failure_diagnosis({
+        "cause": cause,
+        "evidence_log_ids": evidence,
+        "retryable": retryable,
+        "recommended_action": action,
+    }, known_log_ids={str(event.get("log_id")) for event in logs})
+
+
+class OllamaFailureAnalyzer:
+    """One tool-free diagnosis call whose only task data is persisted sanitized logs."""
+
+    def __init__(self, model: str = DEFAULT_RECOVERY_MODEL,
+                 endpoint: str = DEFAULT_RECOVERY_ENDPOINT,
+                 timeout_seconds: float = DEFAULT_RECOVERY_TIMEOUT_SECONDS,
+                 request: Callable[..., dict[str, Any]] = request_json):
+        if not isinstance(model, str) or not model.strip() or len(model.strip()) > 200:
+            raise ValueError("Failure analysis model must contain 1-200 characters.")
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not 0.1 <= float(timeout_seconds) <= 120):
+            raise ValueError("Failure analysis timeout must be between 0.1 and 120 seconds.")
+        self.model = model.strip()
+        self.endpoint = validate_endpoint(endpoint)
+        self.timeout_seconds = float(timeout_seconds)
+        self.request = request
+        self.last_call_metrics: dict[str, Any] = {}
+
+    def __call__(self, logs: list[dict[str, Any]]) -> str:
+        started = time.monotonic()
+        self.last_call_metrics = {}
+        try:
+            response = self.request(
+                "POST", self.endpoint + "/api/chat",
+                {"model": self.model, "messages": [
+                    {"role": "system", "content": (
+                        "You are Freya's tool-free failure analyst. Diagnose only from the "
+                        "persisted sanitized log entries supplied by the runtime. Do not infer "
+                        "facts absent from those logs. Cite only supplied log_id values. Never "
+                        "grant capabilities, execute tools, or claim that a retry occurred. "
+                        "Return only the requested strict JSON object."
+                    )},
+                    {"role": "user", "content": (
+                        "Explain the root cause of this failed orchestration and the safest next "
+                        "action using only these logs:\n" +
+                        json.dumps(logs, ensure_ascii=False, separators=(",", ":"))
+                    )},
+                ], "tools": [], "format": FAILURE_ANALYSIS_RESPONSE_FORMAT,
+                 "stream": False, "think": False,
+                 "options": {"temperature": 0, "num_ctx": DEFAULT_RECOVERY_CONTEXT_WINDOW,
+                             "num_predict": DEFAULT_RECOVERY_MAX_TOKENS}},
+                timeout=self.timeout_seconds,
+            )
+            message = response.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+                raise FailureAnalysisError("Ollama returned no failure analysis content.")
+            for target, source in (("prompt_tokens", "prompt_eval_count"),
+                                   ("generated_tokens", "eval_count")):
+                metric = response.get(source, 0) or 0
+                if isinstance(metric, bool) or not isinstance(metric, (int, float)) or metric < 0:
+                    raise FailureAnalysisError("Ollama returned invalid failure analysis metrics.")
+                self.last_call_metrics[target] = int(metric)
+            self.last_call_metrics["total_tokens"] = (
+                self.last_call_metrics["prompt_tokens"] +
+                self.last_call_metrics["generated_tokens"]
+            )
+            return message["content"]
+        finally:
+            self.last_call_metrics["duration_seconds"] = round(time.monotonic() - started, 4)
+
+
+class FailureAnalyzer:
+    """Run exactly one grounded post-failure review, with deterministic offline fallback."""
+
+    def __init__(self, model: Callable[[list[dict[str, Any]]], Any] | None = None,
+                 *, offline: bool = False):
+        self.model = model
+        self.offline = bool(offline)
+        self.metrics: dict[str, Any] = {}
+        self.deterministic = self.offline or model is None
+        self.last_logs: list[dict[str, Any]] = []
+
+    def analyze(self, logs: list[dict[str, Any]]) -> dict[str, Any]:
+        self.last_logs = deepcopy(logs)
+        known_log_ids = {
+            str(event.get("log_id")) for event in logs
+            if isinstance(event, dict) and event.get("log_id")
+        }
+        if not known_log_ids:
+            raise FailureAnalysisError("No persisted failure log identifiers are available.")
+        self.metrics = {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
+                        "total_tokens": 0, "duration_seconds": 0.0}
+        self.deterministic = self.offline or self.model is None
+        if self.deterministic:
+            return deterministic_failure_diagnosis(logs)
+        started = time.monotonic()
+        self.metrics["model_calls"] = 1
+        value = self.model(logs)
+        self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
+        reported = getattr(self.model, "last_call_metrics", {})
+        if isinstance(reported, dict):
+            for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
+                metric = reported.get(key, 0)
+                if isinstance(metric, (int, float)) and not isinstance(metric, bool) and metric >= 0:
+                    self.metrics[key] = int(metric)
+            duration = reported.get("duration_seconds")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                self.metrics["duration_seconds"] = round(float(duration), 4)
+        if isinstance(value, str):
+            if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
+                raise FailureAnalysisError("Failure analysis output is too large.")
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise FailureAnalysisError("Failure analysis output is not valid JSON.") from exc
+        return validate_failure_diagnosis(value, known_log_ids=known_log_ids)
 
 
 def semantic_failure_fingerprint(plan_task_id: str, agent_id: str,

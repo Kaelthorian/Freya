@@ -13,6 +13,7 @@ from .agent_context import build_effective_agent
 from .capabilities import tool_for_capability
 from .policy import PolicyEngine
 from .skills import resolve_agent_skills
+from .task_analyst import is_task_analyst
 
 
 AGENT_SELECTOR_VERSION = 1
@@ -200,6 +201,8 @@ class AgentSelector:
             hard_warnings.append(f"Agent status {status or 'Offline'} is not usable.")
         if agent.get("usable") is False:
             hard_warnings.append("Agent is explicitly marked as not usable.")
+        if is_task_analyst(agent):
+            hard_warnings.append("Task Analyst is reserved for prompt interpretation and cannot execute work.")
         compatibility = context.get("workspace_compatibility", {})
         if agent.get("workspace_compatible") is False or (
                 isinstance(compatibility, dict) and agent_id in compatibility

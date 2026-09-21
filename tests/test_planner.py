@@ -532,6 +532,36 @@ class OrchestrationLifecycleTests(unittest.TestCase):
         self.assertEqual(final["delegations"][0]["status"], "Cancelled")
 
 
+class TaskAnalysisPlannerTests(unittest.TestCase):
+    def test_windows_script_analysis_prevents_python_only_plan(self):
+        generated = plan(tasks=[task(
+            required_capabilities=["execution.python_script"],
+            preferred_skills=["python-development"],
+        )])
+        planner = Planner(lambda prompt, context: generated)
+        analysis = {
+            "task_type": "windows_command_script",
+            "task_characteristics": {"requires_filesystem_write": True},
+        }
+        result = planner.create_plan("Create a calculator CMD script", {"task_analysis": analysis})
+        first = result["tasks"][0]
+        self.assertIn("filesystem.create", first["required_capabilities"])
+        self.assertNotIn("execution.python_script", first["required_capabilities"])
+        self.assertNotIn("python-development", first["preferred_skills"])
+        self.assertRegex(first["description"], r"CMD/BAT|\.cmd|\.bat")
+
+    def test_task_analysis_is_sent_to_planner_prompt(self):
+        seen = {}
+        def decide(prompt, context):
+            seen["prompt"] = prompt
+            return plan()
+        planner = Planner(decide)
+        analysis = {"task_type": "windows_command_script", "task_characteristics": {"requires_filesystem_write": True}}
+        planner.create_plan("Create a .bat file", {"task_analysis": analysis})
+        self.assertIn("Task Analyst interpretation", seen["prompt"])
+        self.assertIn("windows_command_script", seen["prompt"])
+
+
 class OllamaPlannerTests(unittest.TestCase):
     def test_simulated_ollama_produces_multi_step_plan_without_tools(self):
         requests = []

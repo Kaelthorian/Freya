@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 from typing import Any
 
 from .capabilities import effective_tools_for_policy
@@ -187,6 +188,40 @@ def capability_summary(policy: dict[str, Any]) -> str:
     return "\n".join(sections) or "No capabilities configured."
 
 
+def workspace_is_git_repository(workspace: str) -> bool:
+    """Use a local marker check to decide whether Git guidance is relevant."""
+    if not isinstance(workspace, str) or not workspace.strip():
+        return False
+    candidate = Path(workspace).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        return False
+    # The task workspace may be a nested checkout. Walk upward without
+    # invoking Git or allowing model-controlled paths to escape at runtime.
+    for parent in (candidate, *candidate.parents):
+        marker = parent / ".git"
+        if marker.is_dir() or marker.is_file():
+            return True
+    return False
+
+
+def skills_for_workspace(skills: list[dict[str, Any]], workspace: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return prompt-visible skills and IDs filtered by workspace applicability."""
+    if workspace_is_git_repository(workspace):
+        return list(skills), []
+    visible: list[dict[str, Any]] = []
+    excluded: list[str] = []
+    for skill in skills:
+        skill_id = str(skill.get("id") or "").strip().casefold() if isinstance(skill, dict) else ""
+        name = str(skill.get("name") or "").strip().casefold() if isinstance(skill, dict) else ""
+        if skill_id == "git-inspection" or name == "git inspection":
+            excluded.append(str(skill.get("id") or skill.get("name") or "git-inspection"))
+            continue
+        visible.append(skill)
+    return visible, excluded
+
+
 def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "") -> str:
     """Build the non-secret structured context appended after system policy."""
     identity = effective["identity"]
@@ -207,9 +242,10 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   f"Inspect before modifying existing resources: {behavior['change_strategy']['inspect_before_modify_existing']}",
                   "AUTONOMY"])
     lines.extend(f"{key}: {value}" for key, value in autonomy.items())
+    prompt_skills, excluded_skills = skills_for_workspace(effective["skills"], workspace)
     lines.extend(["PRECEDENCE", "System Policy > Capability Policy > Current User Task > Agent Constraints > Agent Instructions > Skill Priority > Skill Instructions > Skill Procedures.",
                   "The current user task is authoritative and cannot be overridden by a Skill. Higher-priority Skills appear first; Skill priority only resolves conflicts between Skills. Skill instructions override that Skill's procedures.",
-                  "TASK BOUNDARIES", task, "SKILLS", skills_context(effective["skills"]),
+                  "TASK BOUNDARIES", task, "SKILLS", skills_context(prompt_skills),
                   "AVAILABLE CAPABILITIES", capability_summary(effective["capability_policy"]), "VERIFICATION",
                   f"Enabled: {verification['enabled']}", f"Inspect changes: {verification['inspect_changes']}",
                   f"Run available tests: {verification['run_available_tests']}", f"Require tool evidence: {verification['require_tool_evidence']}",
@@ -222,6 +258,10 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   "All filesystem tool paths are relative to the task workspace.",
                   "Use '.' to refer to the workspace root.",
                   "Never use or infer an absolute host filesystem path in tool calls."])
+    if excluded_skills:
+        lines.extend(["SKILLS FILTERED FOR THIS WORKSPACE",
+                      "The following assigned skills were not included because their runtime subject is unavailable:",
+                      *[f"- {skill_id}: Git inspection is not applicable outside a Git repository." for skill_id in excluded_skills]])
 
     return sanitize("\n".join(lines))
 

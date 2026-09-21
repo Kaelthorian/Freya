@@ -23,7 +23,8 @@ from control_center.security import register_secret, sanitize, strip_thinking as
 from control_center.capabilities import CapabilityResolver, effective_tools_for_policy
 from control_center.policy import PolicyEngine, policy_from_legacy
 from control_center.agent_context import (build_agent_context, build_effective_agent, normalize_autonomy,
-                                               normalize_result_output, validate_structured_output)
+                                               normalize_result_output, skills_for_workspace,
+                                               validate_structured_output)
 
 
 READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff"}
@@ -61,6 +62,10 @@ Use native tool calls or a JSON action in this form:
 
 class TaskStopped(RuntimeError):
     pass
+
+
+class NoProgressDetected(TaskStopped):
+    """The worker repeated read-only actions without changing the workspace."""
 
 
 def _parse_tool_arguments(value: Any) -> dict[str, Any]:
@@ -146,6 +151,12 @@ class PolicyToolbox(Toolbox):
         self.policy = PolicyEngine(config.get("capability_policy") or policy_from_legacy(config, enabled), self.workspace,
                                    hard_max_bytes=1_000_000)
         self.enabled = set(effective_tools_for_policy(self.policy.policy))
+        self._git_available = super().git_repository_available()
+        if not self._git_available:
+            # A capability can be configured globally while still being
+            # inapplicable to an isolated task workspace. Do not advertise a
+            # tool that cannot produce meaningful evidence for this task.
+            self.enabled.discard("git_diff")
         self.autonomy = normalize_autonomy(config.get("autonomy"))
         self.once_grants: set[str] = set()
         self.task_grants: set[str] = set()
@@ -225,6 +236,18 @@ class PolicyToolbox(Toolbox):
 
     def invoke(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         args = arguments or {}
+        if name == "git_diff" and not self._git_available:
+            return ToolResult(
+                name,
+                "Tool git_diff is not applicable: the workspace is not inside a Git repository.",
+                False,
+                0,
+                capability="git.diff",
+                policy_decision="not_applicable",
+                policy_reason="The task workspace is not inside a Git repository.",
+                executed=False,
+                error_class="not_applicable",
+            )
         try:
             action = self.resolver.resolve(name, args)
         except (ValueError, TypeError) as exc:
@@ -356,6 +379,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                        "skills": task.get("skills", []), "tools": task.get("tools", []),
                                        "config": config})
     agent_context = build_agent_context(effective, task["prompt"], task.get("workspace", ""))
+    _visible_skills, filtered_skill_ids = skills_for_workspace(effective["skills"], task.get("workspace", ""))
     if effective["skills"]:
         publish("event", event={"event_type": "agent.skills_resolved", "level": "info", "status": "Running",
                                  "reason": "Resolved the immutable skill snapshot for this task.",
@@ -363,6 +387,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                              "version": skill.get("version"), "operational": skill.get("operational", False),
                                              "active": skill.get("active", True)} for skill in effective["skills"]
                                             if skill.get("active", True)]})
+        if filtered_skill_ids:
+            publish("event", event={"event_type": "agent.skills_filtered", "level": "info", "status": "Running",
+                                     "reason": "Excluded skills whose runtime subject is unavailable in this workspace.",
+                                     "output": {"filtered": filtered_skill_ids, "cause": "workspace_not_inside_git_repository"}})
     optional_prompt = config.get("system_prompt", "").strip()
     planning_hint = "\nFor explicit planning, produce a short operational plan before relevant actions; never expose private reasoning." if effective["behavior"]["planning"]["mode"] == "explicit" else ""
     messages = [{"role": "system", "content": BASE_PROMPT + "\n\n" + agent_context + planning_hint +
@@ -374,6 +402,13 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     modified = False
     modified_paths: dict[str, str | None] = {}
     workspace_diffs: list[dict[str, Any]] = []
+    telemetry: dict[str, Any] = {
+        "workspace_changes": 0,
+        "no_progress_actions": 0,
+        "no_progress_detected": False,
+        "stop_reason": "",
+        "failure_class": "",
+    }
 
     def publish_workspace_diff(name: str, arguments: dict[str, Any], existing_before: bool = False) -> None:
         """Persist a bounded unified diff for every successful file mutation."""
@@ -428,6 +463,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     last_success_signature = ""
     repeated_success_count = 0
     auto_completed = False
+    action_history: list[str] = []
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     try:
         while True:
@@ -545,6 +581,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             existing_before = False
                     result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                               else box.invoke(name, safe_args))
+                    no_progress_reason = ""
                     if result.policy_decision == "deny" and not argument_error:
                         request_kind = "request_new_capabilities" if result.capability in {"", "unknown"} else "request_missing_capabilities"
                         request_mode = effective["autonomy"].get(request_kind, "ask")
@@ -582,6 +619,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             )
                     if result.success and name in WRITE_TOOLS:
                         publish_workspace_diff(name, safe_args, existing_before)
+                        telemetry["workspace_changes"] += 1
                         successful_validation_streak = 0
                         repeated_success_count = 0
                         last_success_signature = ""
@@ -625,6 +663,37 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         signature = hashlib.sha256(json.dumps({"tool": name, "arguments": {key: value for key, value in safe_args.items() if key != "timeout_seconds"}}, sort_keys=True, default=str).encode()).hexdigest()
                         repeated_success_count = repeated_success_count + 1 if signature == last_success_signature else 1
                         last_success_signature = signature
+                        if name in READ_TOOLS and not modified:
+                            action_history.append(signature)
+                            telemetry["no_progress_actions"] += 1
+                            same_action_count = action_history.count(signature)
+                            alternating_cycle = (
+                                len(action_history) >= 6 and
+                                action_history[-6] == action_history[-4] == action_history[-2] and
+                                action_history[-5] == action_history[-3] == action_history[-1] and
+                                action_history[-6] != action_history[-5]
+                            )
+                            if same_action_count >= 3 or alternating_cycle:
+                                pattern = "the same read-only action" if same_action_count >= 3 else "an alternating read-only action cycle"
+                                no_progress_reason = (
+                                    "NoProgressDetected: {} was repeated without a workspace change "
+                                    "({} read-only actions, {} steps)."
+                                ).format(pattern, telemetry["no_progress_actions"], metrics["steps"])
+                                telemetry["no_progress_detected"] = True
+                                telemetry["stop_reason"] = no_progress_reason
+                                publish("event", event={
+                                    "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                    "step_id": step_id, "tool": name,
+                                    "reason": "The worker stopped after repeated successful read-only actions produced no workspace progress.",
+                                    "output": {"pattern": pattern, "repeat_count": same_action_count,
+                                               "read_only_actions": telemetry["no_progress_actions"],
+                                               "steps": metrics["steps"], "workspace_changes": telemetry["workspace_changes"]},
+                                    "error_class": "no_progress",
+                                })
+                            else:
+                                no_progress_reason = ""
+                        else:
+                            no_progress_reason = ""
                         if modified and (successful_validation_streak >= 10 or repeated_success_count >= 10):
                             final = "Completed after repeated successful validation actions."
                             success = True
@@ -645,6 +714,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                              "error_class": result.error_class})
                     update()
                     guard()
+                    if no_progress_reason:
+                        raise NoProgressDetected(no_progress_reason)
                     if result.success or argument_error or result.error_class == "repeated_action_blocked":
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
@@ -796,6 +867,9 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             verification_state["skipped_with_reason"] = "Verification disabled by configuration."
     except Exception as exc:
         error = "{}: {}".format(type(exc).__name__, exc)
+        telemetry["failure_class"] = "no_progress" if isinstance(exc, NoProgressDetected) else type(exc).__name__
+        if not telemetry.get("stop_reason"):
+            telemetry["stop_reason"] = error
     result_output: Any = final
     if effective["output"]["format"] == "structured":
         repaired = None
@@ -851,7 +925,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             if verification_state.get("skipped_with_reason"):
                 result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
     update()
-    return sanitize(clean({**metrics, "status": "Success" if success else "Failed", "result": result_output,
+    return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,
                   "duration_seconds": round(time.monotonic() - started, 3)}, token))
 

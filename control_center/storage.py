@@ -1518,7 +1518,58 @@ class Store(IntegrationStoreMixin):
                     payload["orchestration_status"] = row["orchestration_status"] or ""
                     payload["orchestration_created_at"] = row["orchestration_created_at"] or ""
                 result.append(payload)
-            return result
+            orchestration_id = filters.get("orchestration_id")
+            if orchestration_id:
+                orchestration_where = ["oe.orchestration_id=?"]
+                orchestration_params: list[Any] = [str(orchestration_id)]
+                if filters.get("agent_id"):
+                    orchestration_where.append("oe.agent_id=?")
+                    orchestration_params.append(str(filters["agent_id"]))
+                if filters.get("date_from"):
+                    orchestration_where.append("oe.timestamp >= ?")
+                    orchestration_params.append(filters["date_from"])
+                if filters.get("date_to"):
+                    end = str(filters["date_to"])
+                    if len(end) == 10:
+                        end = (datetime.fromisoformat(end) + timedelta(days=1)).date().isoformat()
+                        orchestration_where.append("oe.timestamp < ?")
+                    else:
+                        orchestration_where.append("oe.timestamp <= ?")
+                    orchestration_params.append(end)
+                if filters.get("error_only"):
+                    orchestration_where.append(
+                        "(oe.status IN ('Failed','Denied') OR lower(oe.event_type) LIKE '%failed%' "
+                        "OR lower(oe.event_type) LIKE '%blocked%' OR lower(oe.event_type) LIKE '%denied%')"
+                    )
+                orchestration_rows = connection.execute(
+                    "SELECT oe.*,a.name AS orchestration_agent_name "
+                    "FROM orchestration_events oe LEFT JOIN agents a ON a.id=oe.agent_id "
+                    "WHERE " + " AND ".join(orchestration_where) + " ORDER BY oe.id ASC",
+                    orchestration_params,
+                )
+                for row in orchestration_rows:
+                    payload = _load(row["payload_json"])
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    payload.update({
+                        "id": "orchestration:" + str(row["id"]),
+                        "log_id": "orchestration:" + str(row["id"]),
+                        "source": "orchestration",
+                        "orchestration_id": row["orchestration_id"],
+                        "timestamp": row["timestamp"],
+                        "event_type": row["event_type"],
+                        "status": row["status"] or payload.get("status") or "INFO",
+                        "level": str(payload.get("level") or
+                                     ("ERROR" if str(row["status"] or "").casefold() in {"failed", "denied"} else "INFO")).upper(),
+                        "agent_id": row["agent_id"] or payload.get("agent_id"),
+                        "agent_name": row["orchestration_agent_name"] or payload.get("agent_name") or row["agent_id"] or "—",
+                        "task_id": row["task_id"] or payload.get("task_id"),
+                        "message": row["message"] or payload.get("message") or payload.get("reason") or "",
+                    })
+                    result.append(payload)
+            result.sort(key=lambda item: (str(item.get("timestamp") or ""), str(item.get("id") or "")),
+                        reverse=bool(filters.get("newest")))
+            return result[:max(1, min(int(limit), 10000))]
 
     def metrics(self, agent_id: str | None = None) -> dict:
         where, params = (" WHERE t.agent_id=?", [agent_id]) if agent_id else ("", [])
@@ -1583,7 +1634,8 @@ class Store(IntegrationStoreMixin):
 
     def create_approval(self, task_id: str, agent_id: str, capability: str, tool: str,
                         arguments: dict[str, Any] | None = None, action_summary: str = "",
-                        resource: str = "", reason: str = "", approval_id: str | None = None) -> dict:
+                        resource: str = "", reason: str = "", approval_id: str | None = None,
+                        mark_waiting: bool = False) -> dict:
         approval_id = approval_id or str(uuid4())
         now = utcnow()
         safe_arguments = argument_summary(arguments if isinstance(arguments, dict) else {})
@@ -1600,6 +1652,11 @@ class Store(IntegrationStoreMixin):
                  _dump(safe_arguments), str(action_summary)[:1000], str(resource)[:1000],
                  str(reason)[:2000], now, "pending"),
             )
+            if mark_waiting:
+                connection.execute(
+                    "UPDATE task_executions SET status='WaitingForApproval' WHERE task_id=? AND status IN ('Queued','Running','Paused')",
+                    (task_id,),
+                )
             return self._approval(connection.execute(
                 "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
 

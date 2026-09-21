@@ -88,6 +88,13 @@ Recovery events are `freya.recovery.started`, `freya.recovery.decided`,
 `freya.recovery.retry_scheduled`, `freya.recovery.replan_created`, and
 `freya.recovery.exhausted`. A cancellation or timeout prevents late recovery
 results from creating a decision, retry, revision, or delegation.
+Terminal task-graph failure diagnosis emits `freya.failure_analysis.started`
+and `freya.failure_analysis.completed`. The completed payload contains
+`analysis_version`, `analysis_mode`, `cause`, cited `evidence_log_ids`,
+`retryable`, `recommended_action`, and bounded metrics. The final run `error`
+and `response` expose the same cause and report. The analyzer receives only
+sanitized events already persisted for that run, executes no tools, performs
+no retry, and cannot change policy or permissions.
 Integration events are `freya.integration.started`,
 `freya.integration.completed`, `freya.integration.failed`,
 `freya.integration.recovery_started`, `freya.integration.replan_created`, and
@@ -97,7 +104,9 @@ model prompts or complete output.
 The orchestration moves through `Queued`, `Planning`, `Planned`, `Running`, and
 `Integrating` before success. A globally requested append-only revision returns
 it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning emits
-`freya.planning.started`, then either
+`freya.planning.started`. Before the planner, configured Task Analyst runs emit
+`freya.task_analysis.started` and `freya.task_analysis.completed`; when none is
+configured, `freya.task_analysis.skipped` is emitted. Planning then emits either
 `freya.plan.created` with a safe goal/complexity/task summary or
 `freya.planning.failed`. A plan uses schema version 1:
 
@@ -154,7 +163,8 @@ the existing durable approval flow when it requests the protected action.
 
 The Freya view renders the plan summary, complexity, tasks, dependencies,
 required capabilities and current orchestration state with escaped text. It
-keeps recent terminal runs visible alongside active runs.
+keeps recent terminal runs visible alongside active runs. Failed run rows show
+the persisted cause and a **Diagnosis** link to the run's generated logs.
 
 The execution graph runs the complete validated DAG. Dependency-ready tasks use stable
 plan-order fairness, selection is persisted once per task, independent branches
@@ -254,7 +264,9 @@ Create/patch fields are `name`, `description`, `role`, `enabled`, `tools`, `skil
 and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
-optional `secret_env` name. The `capability_policy` belongs inside `config`
+optional `secret_env` name. `config.orchestration_role` may be `worker`,
+`task_analyst`, `planner`, or `auditor`; `task_analyst` runs before planning and
+does not grant any capability. The `capability_policy` belongs inside `config`
 and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
 The structured blocks are validated against their supported modes and limits;
@@ -295,8 +307,8 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.
 
-Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
-and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
+Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. `GET /api/logs?orchestration_id=...` also merges the persisted orchestration timeline (for example `freya.task_analysis.completed` and failure-analysis events); those rows use a string `id` such as `orchestration:12` and `source=orchestration`. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
+and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
 

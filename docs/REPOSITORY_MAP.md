@@ -11,18 +11,19 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
+│   ├── task_analyst.py       tool-free prompt interpretation contract and deterministic fallback
 │   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
-│   ├── recovery.py           strict recovery decisions, retry prompts and validated replanning
+│   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and deterministic criterion-to-proof association
 │   ├── integration_orchestrator.py orchestration-level integration lifecycle
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
-│   ├── worker.py             bounded Ollama/tool loop and per-agent policy
-│   ├── tools.py              workspace-scoped filesystem, command and Git tools
+│   ├── worker.py             bounded Ollama/tool loop, progress guard and per-agent policy
+│   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── transport.py          non-redirecting local Ollama HTTP client
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
@@ -52,9 +53,12 @@ of this repository merely because an agent selects them.
 
 1. `frontend/` calls `control_center/http.py`, which applies same-origin and
    loopback Host checks before dispatching to `api.py`.
-2. `api.py` validates agents and browses local folders. Freya requests first go
-   through the loopback Ollama adapter in `planner.py`; `orchestrator.py` stores
-   the validated plan snapshot atomically. `execution_graph.py` releases ready
+2. `api.py` validates agents and browses local folders. If an enabled Task Analyst
+   exists, `orchestrator.py` first interprets the original prompt through
+   `task_analyst.py` without tools; the bounded result is advisory context. Freya
+   then sends the original prompt and that context through the loopback Ollama
+   adapter in `planner.py`; `orchestrator.py` stores the validated plan snapshot
+   atomically. `execution_graph.py` releases ready
    tasks in plan order and `agent_selector.py` classifies and ranks an existing
    agent once for each ready task before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
@@ -69,6 +73,10 @@ of this repository merely because an agent selects them.
    response and `Success`. A bounded global gap may append new tasks without
    changing existing work; those tasks return through the same Selector,
    policy, Runtime, Evaluator and Recovery path.
+   If a task graph still terminates with a failure, `orchestrator.py` performs
+   one tool-free diagnosis over bounded, sanitized events already persisted by
+   `storage.py`. `recovery.py` validates that the report cites only supplied log
+   IDs, or builds a deterministic report when offline or the model call fails.
 3. `runtime.py` resolves the
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
@@ -92,7 +100,9 @@ of this repository merely because an agent selects them.
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
+| Prompt interpretation before planning | `task_analyst.py`, `orchestrator.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
+| Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py`, `worker.py`, `__main__.py`, `frontend/views.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |

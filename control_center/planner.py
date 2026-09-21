@@ -184,6 +184,57 @@ def _append_code_audit_task(plan: dict[str, Any]) -> dict[str, Any]:
     return validate_plan(audited)
 
 
+def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
+    """Apply concrete artifact constraints from the advisory Task Analyst.
+
+    The original prompt remains authoritative, but an otherwise valid model
+    plan must not silently replace an explicitly detected artifact (for
+    example, a CMD/BAT file) with an unrelated execution capability.
+    """
+    if not isinstance(analysis, dict):
+        return plan
+    characteristics = analysis.get("task_characteristics")
+    if not isinstance(characteristics, dict):
+        return plan
+    requires_write = characteristics.get("requires_filesystem_write") is True
+    task_type = str(analysis.get("task_type") or "").strip().casefold()
+    windows_script = task_type == "windows_command_script"
+    if not requires_write and not windows_script:
+        return plan
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return plan
+    reconciled = dict(plan)
+    updated_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        current = dict(task)
+        capabilities = list(current.get("required_capabilities", []))
+        if requires_write and not any(capability in {
+                "filesystem.create", "filesystem.modify", "filesystem.overwrite"
+        } for capability in capabilities):
+            capabilities.append("filesystem.create")
+        if windows_script:
+            # The runtime intentionally does not allow arbitrary cmd.exe
+            # execution. Static creation/read-back is the safe validation path.
+            capabilities = [capability for capability in capabilities
+                             if capability != "execution.python_script"]
+            description = str(current.get("description") or "").strip()
+            if not re.search(r"\b(?:cmd|bat|batch|command prompt)\b|\.(?:cmd|bat)\b", description, re.I):
+                description += " The artifact must be a Windows CMD/BAT script (.cmd or .bat), not Python."
+            current["description"] = description[:MAX_DESCRIPTION_CHARS]
+            criteria = list(current.get("success_criteria", []))
+            artifact_criterion = "A .cmd or .bat file exists and contains the requested Windows command behavior."
+            if not any(re.search(r"\.(?:cmd|bat)\b|CMD|BAT", str(item), re.I) for item in criteria):
+                criteria.append(artifact_criterion)
+            current["success_criteria"] = criteria[:MAX_CRITERIA]
+            current["preferred_skills"] = [skill for skill in current.get("preferred_skills", [])
+                                            if str(skill).casefold() not in {"python-development", "python"}]
+        current["required_capabilities"] = capabilities[:MAX_CAPABILITIES]
+        updated_tasks.append(current)
+    reconciled["tasks"] = updated_tasks
+    return validate_plan(reconciled)
+
+
 class PlanValidationError(ValueError):
     """The proposed plan does not satisfy the versioned plan contract."""
 
@@ -454,7 +505,7 @@ class Planner:
             )
 
     @staticmethod
-    def _parse_output(value: Any) -> dict[str, Any]:
+    def _parse_output(value: Any, analysis: Any = None) -> dict[str, Any]:
         if isinstance(value, dict) and set(value) == {"message"} and isinstance(value["message"], dict):
             value = value["message"].get("content")
         if isinstance(value, str):
@@ -464,7 +515,9 @@ class Planner:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
-        return _append_code_audit_task(_collapse_simple_artifact_plan(validate_plan(value)))
+        plan = _collapse_simple_artifact_plan(validate_plan(value))
+        plan = _reconcile_task_analysis(plan, analysis)
+        return _append_code_audit_task(plan)
 
     @staticmethod
     def _prompt(goal: str, context: dict[str, Any]) -> str:
@@ -492,6 +545,9 @@ class Planner:
             + json.dumps(capability_ids, ensure_ascii=False)
             + ". Capabilities describe likely needs and never grant permission. Preferred Skills are hints only. "
             "User goal: " + json.dumps(goal, ensure_ascii=False)
+            + ("\nTask Analyst interpretation (advisory constraints; preserve the original goal): " +
+               json.dumps(context.get("task_analysis"), ensure_ascii=False, separators=(",", ":"))
+               if isinstance(context.get("task_analysis"), dict) else "")
         )
 
     def create_plan(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -499,7 +555,7 @@ class Planner:
         self._reset_metrics()
         if self.decide is None:
             if self.offline:
-                return fallback_plan(goal)
+                return _reconcile_task_analysis(fallback_plan(goal), (context or {}).get("task_analysis"))
             raise PlanGenerationError("No planner model is configured. Use explicit offline mode for fallback planning.")
         limited_context = context if isinstance(context, dict) else {}
         request = self._prompt(goal, limited_context)
@@ -508,7 +564,7 @@ class Planner:
         except Exception as exc:
             raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
         try:
-            return self._parse_output(output)
+            return self._parse_output(output, limited_context.get("task_analysis"))
         except (PlanValidationError, TypeError, ValueError) as first_error:
             rendered = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
             repair_prompt = (
@@ -517,7 +573,7 @@ class Planner:
             )
             try:
                 repaired = self._call(repair_prompt, limited_context)
-                return self._parse_output(repaired)
+                return self._parse_output(repaired, limited_context.get("task_analysis"))
             except Exception as second_error:
                 raise PlanGenerationError(
                     f"Planner output remained invalid after one repair attempt: {second_error}"

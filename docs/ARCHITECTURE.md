@@ -1,7 +1,10 @@
 # Architecture
 
 Freya includes a first-class orchestration layer. User prompts enter
-`control_center/orchestrator.py`, which asks `control_center/planner.py` for a
+`control_center/orchestrator.py`. When an enabled agent is marked with
+`config.orchestration_role=task_analyst`, it first asks `control_center/task_analyst.py`
+for a strict, tool-free interpretation of the original prompt. That result is
+advisory context only. Freya then asks `control_center/planner.py` for a
 strict structured plan and persists that snapshot before asking
 `control_center/agent_selector.py` to rank compatible existing agents,
 then uses `control_center/execution_graph.py` to release dependency-ready tasks,
@@ -29,7 +32,7 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-       Planner → immutable plan → Execution Graph → Agent Selector → Orchestrator
+       Task Analyst → Planner → immutable plan → Execution Graph → Agent Selector → Orchestrator
                                               ↓              ↓              ↓
                                       dependency state   Capability Policy  scheduler → spawned worker → local Ollama
                                               ↑                                  ↓
@@ -38,7 +41,8 @@ browser → HTTP API → SQLite
                                               capability resolver → policy engine → tools → workspace
 ```
 
-The Planner determines **what** work exists. The Agent Selector determines
+The Task Analyst clarifies **what the user meant** without executing anything;
+the original prompt remains authoritative. The Planner determines **what** work exists. The Agent Selector determines
 **who** is the safest and most suitable existing candidate for one planned
 task. The deterministic Execution Graph determines **when** dependency-ready
 tasks run. The Worker determines **how** one selected task executes. Capability
@@ -110,7 +114,7 @@ therefore wins over late model output.
 
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
-events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. SSE accepts `Last-Event-ID`/`after`, replays later events and then
+events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
@@ -158,6 +162,22 @@ changes abandoned active runs to `Failed`, preserves their plan and writes one
 `freya.interrupted` event; repeating recovery produces no duplicate event.
 
 ## Structured planning
+
+### Prompt interpretation
+
+`task_analyst.py` validates a bounded JSON interpretation containing explicit
+and inferred requirements, assumptions, risks, task characteristics, a
+recommended role, acceptance criteria and validation strategy. The orchestrator
+selects one enabled agent with `config.orchestration_role=task_analyst`; older
+agents named or described as “Task Analyst” / “Analyst Planner” remain
+discoverable through a compatibility fallback. It emits
+`freya.task_analysis.started` and `freya.task_analysis.completed` (or
+`freya.task_analysis.skipped` when none is configured) before planning.
+The analyst adapter calls loopback Ollama with `tools=[]`, and a deterministic
+interpretation is used if the model is unavailable. The role does not grant
+capabilities, and a Skill is optional guidance only—not the routing or security
+mechanism. Cancellation is rechecked after this phase so a late analyst result
+cannot start a planner call or resurrect a terminal orchestration.
 
 Plan schema version 1 requires a goal, summary, `simple` or `multi_step`
 complexity, global success criteria and one to twenty tasks. Every task has a
@@ -328,6 +348,37 @@ snapshot used to start the attempt. The original plan remains available
 separately from the effective plan. Task recovery does not create agents,
 auto-approve capabilities, weaken policy, or add a free-form shell.
 
+## Post-failure log diagnosis
+
+When an execution graph reaches a terminal failure, `Orchestrator` makes one
+diagnostic pass before committing the orchestration's `Failed` state. The input
+comes only from already-persisted orchestration and delegated-task events. Each
+entry is sanitized and reduced to a stable `log_id`, source, timestamp,
+event/status identifiers, IDs, policy fields, and bounded
+message/reason/error text. File contents, model transcripts, private reasoning,
+tool inputs, and workspace snapshots are excluded; at most 250 entries are sent.
+
+`FailureAnalyzer` uses the recovery model configuration but a separate,
+tool-free, non-streaming call. Its strict result contains `cause`, one or more
+`evidence_log_ids`, `retryable`, and `recommended_action`. Validation rejects
+unknown evidence IDs. `--recovery-offline` skips the call, and provider,
+transport, schema, or citation failures fall back to a deterministic diagnosis
+from the same log set. The fallback metrics retain that a model call was
+attempted.
+
+The lifecycle emits `freya.failure_analysis.started` and
+`freya.failure_analysis.completed`. The completed event and final orchestration
+response retain the grounded cause, cited IDs, retryability, recommended action,
+mode, and metrics. This pass is explanatory only: it does not invoke tools,
+retry a Runtime task, create a delegation, alter capabilities, resolve
+approvals, mutate the plan, or reopen a terminal state. Cancellation is
+rechecked before the final failure commit.
+
+The deterministic diagnosis classifies `NoProgressDetected` and maximum-step
+failures separately and recommends changing the action strategy instead of
+blindly increasing the step limit. Runtime terminal events also retain the
+failure class, stop reason, workspace-change count and no-progress flag.
+
 
 ## Global integration and result composition
 
@@ -477,8 +528,18 @@ runtime resource use. Ollama receives `num_predict=-1` in that mode.
 The worker tracks successful post-write validation actions. Ten consecutive
 successful validations, or ten identical successful actions, produce an
 `task.auto_completed` event and close the task without another model call.
-Read-only tool calls may retry within the configured bound. Writes and process
-execution are never automatically retried.
+Read-only tool calls may retry within the configured bound. If the worker has
+not changed the workspace and repeats the same read-only action three times,
+or alternates the same two read-only actions for three cycles, it emits
+`task.no_progress` and fails early with `NoProgressDetected`; increasing the
+step budget is not treated as a fix. Writes and process execution are never
+automatically retried.
+
+Git inspection is applicability-aware. A task workspace outside a Git checkout
+does not advertise `git_diff`, and the assigned Git Inspection Skill is removed
+from the prompt-visible skill context while the immutable assignment remains in
+the task snapshot. A direct non-applicable request returns a failed result with
+`error_class=not_applicable` rather than a misleading success.
 
 Text-mode models may emit JSON actions instead of native tool calls. When a
 model concatenates several action objects, the worker executes only the first,

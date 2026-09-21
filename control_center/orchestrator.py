@@ -13,12 +13,17 @@ from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
 from .integration import GlobalVerifier, IntegrationReplanner, ResultIntegrator
 from .integration_orchestrator import IntegrationOrchestrationMixin
-from .recovery import (RECOVERY_VERSION, RecoveryController, Replanner,
+from .recovery import (FAILURE_ANALYSIS_VERSION, RECOVERY_VERSION,
+                       FailureAnalyzer, RecoveryController, Replanner,
                        allowed_replan_scope, build_retry_prompt,
+                       deterministic_failure_diagnosis,
                        semantic_failure_fingerprint)
+from .security import sanitize
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
+from .task_analyst import (TaskAnalyst, deterministic_task_analysis,
+                            select_task_analyst)
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 
 
@@ -33,6 +38,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                  evaluator: Evaluator | None = None,
                  recovery: RecoveryController | None = None,
                  replanner: Replanner | None = None,
+                 failure_analyzer: FailureAnalyzer | None = None,
+                 task_analyst: TaskAnalyst | None = None,
                  global_verifier: GlobalVerifier | None = None,
                  integration_replanner: IntegrationReplanner | None = None,
                  result_integrator: ResultIntegrator | None = None):
@@ -47,6 +54,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self.wait = wait or time.sleep
         self.recovery = recovery or RecoveryController(offline=True)
         self.replanner = replanner or Replanner()
+        self.failure_analyzer = failure_analyzer or FailureAnalyzer(offline=True)
+        self.task_analyst = task_analyst
         self.global_verifier = global_verifier or GlobalVerifier(offline=True)
         self.integration_replanner = integration_replanner or IntegrationReplanner()
         self.result_integrator = result_integrator or ResultIntegrator()
@@ -63,6 +72,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                        "max_recovery_model_calls": 16, "max_integration_rounds": 2,
                        "max_integration_model_calls": 12}
         self.recovery_lock = threading.Lock()
+        self.failure_analysis_lock = threading.Lock()
         self.config.update(config or {})
         for field in ("max_delegated_tasks", "max_parallel_tasks", "max_semantic_attempts_per_task",
                       "max_plan_revisions", "max_recovery_actions",
@@ -141,6 +151,74 @@ class Orchestrator(IntegrationOrchestrationMixin):
             delegation_id, status=task["status"], result=result,
             finished_at=task.get("finished_at"),
         )
+
+    @staticmethod
+    def _selection_failure_message(selection: dict, agents: list[dict]) -> str:
+        """Turn the persisted selector snapshot into a concise log-visible cause."""
+        names = {str(agent.get("id")): str(agent.get("name") or agent.get("id"))
+                 for agent in agents if isinstance(agent, dict) and agent.get("id")}
+        details: list[str] = []
+        for candidate in selection.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            label = names.get(str(candidate.get("agent_id")), str(candidate.get("agent_id") or "Agent"))
+            warnings = [str(item).strip() for item in candidate.get("warnings", [])
+                        if str(item).strip()]
+            if warnings:
+                details.append(label + ": " + "; ".join(warnings[:4]))
+        if not details:
+            details = [str(item).strip() for item in selection.get("warnings", [])
+                       if str(item).strip()]
+        base = "No eligible or conditional agent is available for the planned task."
+        return sanitize(base + ((" Cause: " + " | ".join(details[:5])) if details else ""))[:4000]
+
+    @staticmethod
+    def _compact_failure_log(source: str, event: dict, *, task_id: str = "") -> dict:
+        event_id = event.get("id")
+        log_id = (f"orchestration:{event_id}" if source == "orchestration" else
+                  f"task:{task_id}:{event_id}")
+        compact = {"log_id": log_id, "source": source}
+        for key in ("timestamp", "event_type", "level", "status", "task_id", "agent_id",
+                    "runtime_task_id", "tool", "capability", "policy_decision",
+                    "message", "reason", "error"):
+            value = event.get(key)
+            if value not in (None, "", [], {}):
+                compact[key] = str(value)[:2000]
+        return sanitize(compact)
+
+    def _failure_logs(self, oid: str, graph: ExecutionGraph) -> list[dict]:
+        """Return a bounded log-only diagnostic context for a failed graph."""
+        run = self.store.get_orchestration(oid)
+        logs = [self._compact_failure_log("orchestration", event)
+                for event in run.get("events", [])]
+        for node in graph.serialize():
+            runtime_task_id = str(node.get("runtime_task_id") or "")
+            if not runtime_task_id:
+                continue
+            for event in self.store.list_events(task_id=runtime_task_id, limit=200):
+                logs.append(self._compact_failure_log(
+                    "task", event, task_id=runtime_task_id,
+                ))
+        logs.sort(key=lambda item: (str(item.get("timestamp") or ""), str(item["log_id"])))
+        return logs[-250:]
+
+    def _analyze_graph_failure(self, oid: str, graph: ExecutionGraph) -> tuple[dict, dict, str]:
+        """Run one model review from persisted logs, then fail over deterministically."""
+        logs = self._failure_logs(oid, graph)
+        mode = "model"
+        try:
+            with self.failure_analysis_lock:
+                diagnosis = self.failure_analyzer.analyze(logs)
+            metrics = dict(self.failure_analyzer.metrics)
+            if self.failure_analyzer.deterministic:
+                mode = "deterministic"
+        except Exception as exc:
+            diagnosis = deterministic_failure_diagnosis(logs)
+            metrics = dict(getattr(self.failure_analyzer, "metrics", {}) or {})
+            metrics.setdefault("model_calls", 1)
+            metrics["fallback_error"] = sanitize(str(exc))[:1000]
+            mode = "deterministic_fallback"
+        return diagnosis, metrics, mode
 
     def cancel(self, oid: str) -> dict:
         """Idempotently cancel a run and every active child under one process lock."""
@@ -270,6 +348,50 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "workspace_path": run.get("config", {}).get("workspace_path") or "",
             "workloads": workloads,
         }
+
+    def _analyze_prompt(self, oid: str, prompt: str) -> tuple[dict | None, dict]:
+        """Interpret the prompt once before planning when a Task Analyst exists."""
+        analyst = select_task_analyst(self.store.list_agents())
+        if analyst is None:
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] == "Planning":
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.task_analysis.skipped", "status": "Planning",
+                        "message": "No enabled Task Analyst is configured; Freya sent the original prompt to the planner.",
+                    })
+            return None, {"mode": "skipped", "model_calls": 0}
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Planning":
+                return None, {"mode": "cancelled", "model_calls": 0}
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.task_analysis.started", "status": "Planning",
+                "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
+                "message": "Task Analyst is interpreting the original prompt before planning.",
+            })
+        try:
+            analyzer = self.task_analyst or TaskAnalyst(offline=True)
+            analysis = analyzer.analyze(prompt, analyst)
+            metrics = dict(getattr(analyzer, "metrics", {}) or {})
+            mode = str(metrics.get("mode") or "model")
+        except Exception as exc:
+            analysis = deterministic_task_analysis(prompt)
+            metrics = dict(getattr(self.task_analyst, "metrics", {}) or {})
+            metrics["fallback_error"] = sanitize(str(exc))[:1000]
+            metrics["mode"] = "deterministic_fallback"
+            mode = "deterministic_fallback"
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] == "Planning":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task_analysis.completed", "status": "Planning",
+                    "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
+                    "analysis_version": analysis.get("analysis_version", 1),
+                    # This is a bounded operational interpretation, not
+                    # hidden chain-of-thought. Keep the key explicit so the
+                    # persistence sanitizer does not remove it.
+                    "analysis_mode": mode, "metrics": metrics, "task_analysis": analysis,
+                    "message": "Task Analyst produced a bounded interpretation for the planner.",
+                })
+        return analysis, metrics
 
     def _select_planned_task(self, oid: str, task: dict, run: dict) -> dict | None:
         planned_task_id = task["id"]
@@ -474,16 +596,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     })
             return {"error": "Agent selection failed: " + str(exc)}
         with self.lock:
+            if selection["selected_agent_id"] is None:
+                selection["failure_reason"] = self._selection_failure_message(selection, agents)
             selection_id = self.store.save_agent_selection(oid, selection)
             if selection_id is None:
                 return None
             selected_agent_id = selection["selected_agent_id"]
             if selected_agent_id is None:
+                failure_reason = selection["failure_reason"]
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.agent_selection.failed", "status": "Failed",
                     "task_id": planned_task_id, "selector_version": selection["selector_version"],
                     "selection_id": selection_id,
-                    "message": "No eligible or conditional agent is available for the planned task.",
+                    "message": failure_reason,
                 })
             else:
                 self.store.add_orchestration_event(oid, {
@@ -836,9 +961,37 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 f"{summary['failed']} failed, {summary['blocked']} blocked, "
                 f"{summary['cancelled']} cancelled and {summary['skipped']} skipped nodes."
             )
-            completed = self.store.transition_orchestration(
-                oid, ("Running",), "Failed", error=message,
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.failure_analysis.started", "status": "Running",
+                "analysis_version": FAILURE_ANALYSIS_VERSION,
+                "message": "Freya started one bounded review using persisted sanitized logs only.",
+            })
+            diagnosis, analysis_metrics, analysis_mode = self._analyze_graph_failure(oid, graph)
+            report = (
+                "Failure diagnosis\n"
+                f"Cause: {diagnosis['cause']}\n"
+                f"Evidence logs: {', '.join(diagnosis['evidence_log_ids'])}\n"
+                f"Retryable: {'yes' if diagnosis['retryable'] else 'no'}\n"
+                f"Recommended action: {diagnosis['recommended_action']}"
             )
+            message += " Cause: " + diagnosis["cause"]
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] != "Running":
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.failure_analysis.completed", "status": "Success",
+                    "analysis_version": FAILURE_ANALYSIS_VERSION,
+                    "analysis_mode": analysis_mode,
+                    "cause": diagnosis["cause"],
+                    "evidence_log_ids": diagnosis["evidence_log_ids"],
+                    "retryable": diagnosis["retryable"],
+                    "recommended_action": diagnosis["recommended_action"],
+                    "metrics": analysis_metrics,
+                    "message": report,
+                })
+                completed = self.store.transition_orchestration(
+                    oid, ("Running",), "Failed", error=message, response=report,
+                )
             status = "Failed"
         else:
             raise ValueError("Successful graphs must pass through global integration.")
@@ -896,13 +1049,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             "cancelled": "freya.task.failed",
                         }.get(current)
                         if event_type:
+                            event_message = f"Planned task entered {current}."
+                            event_error = ""
+                            if current == "failed" and runtime_task.get("error"):
+                                event_error = str(runtime_task["error"])
+                                event_message += " Cause: " + event_error
                             self.store.add_orchestration_event(oid, {
                                 "event_type": event_type,
                                 "status": runtime_task["status"],
                                 "task_id": node["plan_task_id"],
                                 "agent_id": node.get("selected_agent_id"),
                                 "runtime_task_id": node.get("runtime_task_id"),
-                                "message": f"Planned task entered {current}.",
+                                "message": event_message,
+                                "error": event_error,
                             })
 
                 transitions = graph.refresh_dependencies(utcnow())
@@ -968,14 +1127,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         selection = selected["selection"]
                         if selection["selected_agent_id"] is None:
                             node["selection_id"] = selected["selection_id"]
+                            failure_reason = selection.get("failure_reason") or (
+                                "No eligible agent is available for this planned task."
+                            )
                             graph.mark_failed(
-                                selection_target["id"],
-                                "No eligible agent is available for this planned task.", utcnow(),
+                                selection_target["id"], failure_reason, utcnow(),
                             )
                             self.store.add_orchestration_event(oid, {
                                 "event_type": "freya.task.failed", "status": "Failed",
                                 "task_id": selection_target["id"],
-                                "message": "No eligible agent is available for this planned task.",
+                                "message": failure_reason,
+                                "error": failure_reason,
                             })
                         else:
                             graph.mark_selected(
@@ -1134,12 +1296,27 @@ class Orchestrator(IntegrationOrchestrationMixin):
             })
         planning_metrics: dict = {}
         try:
+            analysis, analysis_metrics = self._analyze_prompt(oid, planning["prompt"])
+            # A Task Analyst call may be in flight when cancellation arrives;
+            # never start a planner call after the run has left Planning.
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] != "Planning":
+                    return
             context = self._planning_context(self.store.list_agents())
+            if analysis is not None:
+                # The original prompt remains authoritative; analysis is an
+                # advisory, untrusted interpretation for the planner only.
+                context["task_analysis"] = analysis
             with self.planner_lock:
                 try:
                     plan = self.planner.create_plan(planning["prompt"], context)
                 finally:
                     planning_metrics = dict(self.planner.metrics)
+            planning_metrics["task_analysis"] = {
+                key: value for key, value in analysis_metrics.items()
+                if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
+                           "total_tokens", "duration_seconds"}
+            }
             if len(plan["tasks"]) > int(self.config["max_delegated_tasks"]):
                 raise ValueError(
                     f"Plan contains {len(plan['tasks'])} tasks but max_delegated_tasks is "

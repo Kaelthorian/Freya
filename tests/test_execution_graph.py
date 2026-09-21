@@ -370,6 +370,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(states, {"bad": "failed", "child": "blocked", "independent": "success"})
         self.assertEqual([item[0] for item in runtime.submissions], ["bad", "independent"])
 
+    def test_failed_selection_runs_log_only_failure_analysis(self):
+        runtime = ControlledRuntime(self.store)
+        final = self.run_graph(
+            execution_plan([planned_task("unavailable")]),
+            {"unavailable": None}, runtime, lambda seconds: None,
+        )
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(runtime.submissions, [])
+        self.assertIn("No mapped agent", final["error"])
+        self.assertIn("Failure diagnosis", final["response"])
+        events = {event["event_type"]: event for event in final["events"]}
+        self.assertIn("freya.failure_analysis.started", events)
+        self.assertIn("freya.failure_analysis.completed", events)
+        diagnosis = json.loads(events["freya.failure_analysis.completed"]["payload_json"])
+        self.assertEqual(diagnosis["analysis_mode"], "deterministic")
+        self.assertTrue(diagnosis["evidence_log_ids"])
+
+    def test_runtime_failure_cause_is_added_to_persisted_diagnostic_logs(self):
+        agent = self.agent("Fails")
+        runtime = ControlledRuntime(self.store)
+        final = self.run_graph(
+            execution_plan([planned_task("broken")]), {"broken": agent["id"]}, runtime,
+            lambda seconds: runtime.finish_active({"broken": "Failed"}),
+        )
+        self.assertEqual(final["status"], "Failed")
+        self.assertIn("Planned task entered failed", final["error"])
+        analysis_event = next(event for event in final["events"]
+                              if event["event_type"] == "freya.failure_analysis.completed")
+        analysis = json.loads(analysis_event["payload_json"])
+        self.assertIn("Planned task entered failed", analysis["cause"])
+        self.assertTrue(all(str(item).startswith(("orchestration:", "task:"))
+                            for item in analysis["evidence_log_ids"]))
+
     def test_waiting_for_approval_is_nonterminal(self):
         agent = self.agent("Approval")
         runtime = ControlledRuntime(self.store, {"approval": "WaitingForApproval"})

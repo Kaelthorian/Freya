@@ -10,6 +10,11 @@ Ollama and allowlisted tools → selected agent workspace.
   use an existing absolute folder or a generated per-task folder.
 - Create and persist a validated orchestration plan before delegation. Planner
   capability declarations are requirements only and never grant access.
+- If an enabled agent is marked `config.orchestration_role=task_analyst`, run
+  its bounded, tool-free interpretation before planning. Treat the result as
+  advisory context only; the original prompt and capability policy remain the
+  authorities. A Skill can provide guidance but never selects this role or
+  grants it access.
 - Keep orchestration state transitions conditional and terminal states final.
   Cancellation must serialize with delegation creation and include children
   waiting for approval.
@@ -22,10 +27,18 @@ Ollama and allowlisted tools → selected agent workspace.
   capability.
 - Keep reusable Skills declarative. `skills.py` validates and resolves them;
   required/recommended capabilities are diagnostics and never grants.
+- Treat Git inspection as workspace-applicable only: non-Git task workspaces
+  must not advertise `git_diff` or inject Git Inspection guidance.
+- Stop workers that repeat successful read-only actions without workspace
+  progress and persist a grounded no-progress cause instead of extending the
+  step loop indefinitely.
 - Keep Ollama inference loopback-only and preserve token and timing metrics.
 - Keep the web server loopback-only and the worker/database ownership boundary.
 - Preserve serialization per agent and per selected workspace.
 - Preserve durable approvals and WaitingForApproval; never auto-grant a requested or new capability.
+- Diagnose terminal task-graph failures from bounded, sanitized persisted logs only.
+  The post-failure pass is tool-free, runs once, cites supplied log IDs, and must
+  never re-execute work, grant capabilities, or reopen a terminal state.
 - Keep Python support at 3.10+ and avoid runtime dependencies unless setup and
   documentation are updated.
 

@@ -287,11 +287,22 @@ class Runtime:
         else:
             self.store.cancel_pending_approvals(task_id, "cancelled: task finished before resolution")
         fields.update({"finished_at": now(), "progress": 100})
-        self.store.update_task(task_id, **fields)
+        allowed_fields = {
+            "status", "started_at", "finished_at", "duration_seconds", "steps", "progress",
+            "result", "verification", "error", "model_calls", "tool_calls", "prompt_tokens",
+            "generated_tokens", "total_tokens",
+        }
+        persisted = {key: value for key, value in fields.items() if key in allowed_fields}
+        self.store.update_task(task_id, **persisted)
         self.store.append_event(task_id, {"event_type": "task." + fields["status"].lower(),
                                           "status": fields["status"], "level": "error" if fields["status"] == "Failed" else "info",
                                           "error": fields.get("error", ""), "output": fields.get("result", ""),
-                                          "duration_seconds": fields.get("duration_seconds", 0)})
+                                          "duration_seconds": fields.get("duration_seconds", 0),
+                                          "failure_class": fields.get("failure_class", ""),
+                                          "stop_reason": fields.get("stop_reason", ""),
+                                          "no_progress_detected": fields.get("no_progress_detected", False),
+                                          "no_progress_actions": fields.get("no_progress_actions", 0),
+                                          "workspace_changes": fields.get("workspace_changes", 0)})
         self._refresh_agent(task["agent_id"], failed=fields["status"] == "Failed")
 
     def _spawn(self, task: dict[str, Any]) -> None:
@@ -366,9 +377,9 @@ class Runtime:
                                     str(request.get("tool") or "unknown"), request.get("arguments") or {},
                                     str(request.get("action_summary") or ""), str(request.get("resource") or "."),
                                     str(request.get("reason") or "Approval required."), approval_id=approval_id,
+                                    mark_waiting=True,
                                 )
                                 worker["approval_id"] = approval["id"]
-                                self.store.update_task(task_id, status="WaitingForApproval")
                                 self.store.append_event(task_id, {
                                     "event_type": "approval.requested", "level": "warning",
                                     "status": "WaitingForApproval", "tool": approval["tool"],

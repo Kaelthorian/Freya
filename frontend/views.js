@@ -70,11 +70,12 @@ function freyaTaskRow(item) {
 function freyaRunRow(item) {
   const run = item.run || {}, active = FREYA_ORCHESTRATION_ACTIVE.has(run.status);
   const startedAt = run.created_at, elapsed = active && startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : Number(run.duration_seconds) || 0;
-  const action = active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<span class="muted">—</span>';
+  const failed = run.status === 'Failed', failure = failed ? taskTitle(uiText(run.error || run.response || 'Failure cause unavailable.'), 120) : '';
+  const action = active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<a class="text-link" href="#/logs?orchestration_id=' + encodeURIComponent(run.id || '') + '">' + (failed ? 'Diagnosis' : 'Logs') + ' ' + icon('arrow') + '</a>';
   return [
     '<tr>',
     '<td>' + badge(run.status || 'Pending') + '</td>',
-    '<td><strong class="table-title">' + esc(taskTitle(run.prompt)) + '</strong><span class="table-sub">' + (active ? 'Waiting for a delegated task to start' : 'Orchestration completed') + '</span></td>',
+    '<td><strong class="table-title">' + esc(taskTitle(run.prompt)) + '</strong><span class="table-sub" title="' + esc(failure) + '">' + (failed ? esc(failure) : active ? 'Waiting for a delegated task to start' : 'Orchestration completed') + '</span></td>',
     '<td><strong>Freya</strong><span class="table-sub">Orchestrator</span></td>',
     '<td class="nowrap muted">' + date(startedAt) + '</td>',
     '<td class="mono nowrap">' + duration(elapsed) + '</td>',

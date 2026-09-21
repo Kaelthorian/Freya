@@ -59,7 +59,8 @@ class ToolboxTests(unittest.TestCase):
 
     def test_git_diff_reports_when_project_has_no_repository(self) -> None:
         result = self.toolbox.invoke("git_diff")
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_class, "not_applicable")
         self.assertIn("not inside a Git repository", result.output)
 
     def test_workspace_python_script_runs_without_a_shell(self) -> None:

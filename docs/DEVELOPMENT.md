@@ -40,6 +40,15 @@ when explicitly choosing the deterministic one-task fallback, such as an
 offline test environment. Provider errors fail planning and do not trigger the
 fallback.
 
+Before the planner, Freya uses the first enabled agent whose
+`config.orchestration_role` is `task_analyst` to interpret the original prompt.
+The agent is tool-free and its JSON result is advisory; the original prompt and
+capability policy remain authoritative. If no such agent exists, planning still
+receives the original prompt and emits `freya.task_analysis.skipped`. If the
+analyst model fails, Freya records the error and uses a deterministic bounded
+interpretation. The role can be selected in the agent editor; a Skill is not
+required for routing or authorization.
+
 Semantic evaluation has separate local-model configuration:
 
 ```powershell
@@ -78,6 +87,28 @@ resolves approvals. Replanning stores an effective-plan revision without
 overwriting the original plan or rerunning accepted tasks. Its deterministic
 scope contains only the recovery source and never-started descendants; active,
 historical and independent work is protected and revalidated again by Storage.
+
+The same recovery model, endpoint, and timeout also power exactly one
+post-failure diagnosis after a task graph can no longer progress. That call
+receives only bounded, sanitized persisted log entries, has no tools, and must
+cite supplied `log_id` values. `--recovery-offline` uses the deterministic
+logs-only diagnosis; any provider or validation error falls back to that same
+deterministic path. The report is stored in the orchestration response and
+`freya.failure_analysis.completed`. It explains the failure but never retries
+work or changes policy. Use the failed run's **Diagnosis** link to inspect its
+generated logs.
+
+For troubleshooting, use `GET /api/logs?orchestration_id=<id>&limit=10000` (or
+the run's Diagnosis link). The response combines worker events with the
+orchestration timeline, so Task Analyst interpretation, plan/selection events,
+`task.no_progress`, terminal `failure_class` and the final failure diagnosis
+are visible together. A `NoProgressDetected` report means the worker repeated
+successful read-only actions without changing the workspace; raising
+`max_steps` alone is not a corrective action.
+
+Git Inspection is only prompt-visible when the task workspace is inside a Git
+checkout. Non-Git workspaces omit `git_diff` from the worker schemas and report
+direct requests as `not_applicable`, avoiding misleading successful Git checks.
 
 Global integration uses its own tool-free local-model configuration and
 independent budget:

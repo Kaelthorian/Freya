@@ -17,8 +17,10 @@ from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
 from .evaluator import (DEFAULT_EVALUATOR_ENDPOINT, DEFAULT_EVALUATOR_MODEL,
                         DEFAULT_EVALUATOR_TIMEOUT_SECONDS, Evaluator, OllamaEvaluator)
 from .recovery import (DEFAULT_RECOVERY_ENDPOINT, DEFAULT_RECOVERY_MODEL,
-                       DEFAULT_RECOVERY_TIMEOUT_SECONDS, OllamaRecoveryAdvisor,
+                       DEFAULT_RECOVERY_TIMEOUT_SECONDS, FailureAnalyzer,
+                       OllamaFailureAnalyzer, OllamaRecoveryAdvisor,
                        RecoveryController, Replanner)
+from .task_analyst import OllamaTaskAnalyst, TaskAnalyst
 from .integration import (DEFAULT_INTEGRATION_ENDPOINT, DEFAULT_INTEGRATION_MODEL,
                           DEFAULT_INTEGRATION_TIMEOUT_SECONDS, GlobalVerifier,
                           IntegrationReplanner, OllamaGlobalVerifier,
@@ -135,6 +137,11 @@ def main():
         planner = (Planner(offline=True) if args.planner_offline else
                    Planner(OllamaPlanner(args.planner_model, args.planner_endpoint,
                                          args.planner_timeout)))
+        # Task Analyst is selected from the enabled agents at run time.  Its
+        # adapter is deliberately separate from the planner so prompt
+        # interpretation is a distinct, tool-free preplanning phase.
+        task_analyst = (TaskAnalyst(offline=True) if args.planner_offline else
+                        TaskAnalyst(OllamaTaskAnalyst()))
         evaluator = (Evaluator(offline=True) if args.evaluator_offline else
                      Evaluator(OllamaEvaluator(args.evaluator_model, args.evaluator_endpoint,
                                                args.evaluator_timeout)))
@@ -144,6 +151,11 @@ def main():
         recovery = (RecoveryController(offline=True) if recovery_adapter is None else
                     RecoveryController(recovery_adapter))
         replanner = Replanner(recovery_adapter)
+        failure_analyzer = (FailureAnalyzer(offline=True) if args.recovery_offline else
+                            FailureAnalyzer(OllamaFailureAnalyzer(
+                                args.recovery_model, args.recovery_endpoint,
+                                args.recovery_timeout,
+                            )))
         if args.integration_offline:
             global_verifier = GlobalVerifier(offline=True)
             integration_replanner = IntegrationReplanner()
@@ -160,6 +172,8 @@ def main():
             ))
         orchestrator = Orchestrator(store, runtime, planner=planner, evaluator=evaluator,
                                     recovery=recovery, replanner=replanner,
+                                    failure_analyzer=failure_analyzer,
+                                    task_analyst=task_analyst,
                                     global_verifier=global_verifier,
                                     integration_replanner=integration_replanner,
                                     result_integrator=result_integrator, config={

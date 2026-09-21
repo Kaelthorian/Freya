@@ -9,6 +9,7 @@ from control_center.agent_context import (
     build_agent_context,
     build_effective_agent,
     normalize_result_output,
+    skills_for_workspace,
     validate_structured_output,
 )
 from control_center.config import normalize_agent
@@ -77,6 +78,14 @@ class AgentContextTests(unittest.TestCase):
         self.assertEqual(valid["summary"], "Done")
         with self.assertRaises(ValueError):
             validate_structured_output({"summary": "Done", "unexpected": True})
+
+    def test_git_inspection_skill_is_filtered_outside_repository(self):
+        visible, excluded = skills_for_workspace([
+            {"id": "git-inspection", "name": "Git Inspection", "active": True},
+            {"id": "python-development", "name": "Python Development", "active": True},
+        ], "C:/workspace-that-is-not-a-checkout")
+        self.assertEqual(excluded, ["git-inspection"])
+        self.assertEqual([skill["id"] for skill in visible], ["python-development"])
 
 class RepeatedFailureTests(unittest.TestCase):
     def test_repeated_nonrecoverable_action_is_blocked(self):

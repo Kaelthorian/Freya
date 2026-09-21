@@ -15,6 +15,8 @@ from control_center.execution_graph import ExecutionGraph
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
 from control_center.recovery import (
+    FailureAnalyzer,
+    OllamaFailureAnalyzer,
     RECOVERY_VERSION,
     RecoveryController,
     RecoveryGenerationError,
@@ -22,7 +24,9 @@ from control_center.recovery import (
     Replanner,
     allowed_replan_scope,
     build_retry_prompt,
+    deterministic_failure_diagnosis,
     semantic_failure_fingerprint,
+    validate_failure_diagnosis,
     validate_recovery_decision,
 )
 from control_center.storage import Store
@@ -220,6 +224,113 @@ class RecoveryContractTests(unittest.TestCase):
         self.assertIn("Gather proof", prompt)
         self.assertIn("Missing evidence", prompt)
         self.assertIn("attempt 2", prompt)
+
+
+class FailureAnalysisContractTests(unittest.TestCase):
+    def logs(self):
+        return [{
+            "log_id": "orchestration:7",
+            "source": "orchestration",
+            "event_type": "freya.agent_selection.failed",
+            "status": "Failed",
+            "message": "No eligible agent. Required capability execution.python_script is denied.",
+        }, {
+            "log_id": "orchestration:8",
+            "source": "orchestration",
+            "event_type": "freya.task.blocked",
+            "status": "Failed",
+            "message": "A dependent task was blocked.",
+        }]
+
+    def test_offline_analysis_reports_root_log_cause(self):
+        result = FailureAnalyzer(offline=True).analyze(self.logs())
+        self.assertIn("execution.python_script", result["cause"])
+        self.assertEqual(result["evidence_log_ids"][0], "orchestration:7")
+        self.assertFalse(result["retryable"])
+
+    def test_analysis_model_receives_only_logs_and_cites_supplied_id(self):
+        captured = []
+
+        def model(logs):
+            captured.append(logs)
+            return {
+                "cause": "The required capability is denied.",
+                "evidence_log_ids": ["orchestration:7"],
+                "retryable": False,
+                "recommended_action": "Use an allowed plan.",
+            }
+
+        analyzer = FailureAnalyzer(model)
+        result = analyzer.analyze(self.logs())
+        self.assertEqual(result["cause"], "The required capability is denied.")
+        self.assertEqual(captured, [self.logs()])
+        self.assertEqual(analyzer.metrics["model_calls"], 1)
+
+    def test_ollama_analysis_is_one_tool_free_logs_only_call(self):
+        requests = []
+
+        def transport(method, url, body, **kwargs):
+            requests.append((method, url, body, kwargs))
+            return {
+                "message": {"content": json.dumps({
+                    "cause": "The required capability is denied.",
+                    "evidence_log_ids": ["orchestration:7"],
+                    "retryable": False,
+                    "recommended_action": "Use an allowed plan.",
+                })},
+                "prompt_eval_count": 30,
+                "eval_count": 12,
+            }
+
+        analyzer = FailureAnalyzer(OllamaFailureAnalyzer(
+            model="failure-test", endpoint="http://127.0.0.1:11434",
+            timeout_seconds=9, request=transport,
+        ))
+        result = analyzer.analyze(self.logs())
+
+        self.assertFalse(result["retryable"])
+        self.assertEqual(len(requests), 1)
+        method, url, body, kwargs = requests[0]
+        self.assertEqual((method, url), ("POST", "http://127.0.0.1:11434/api/chat"))
+        self.assertEqual(body["tools"], [])
+        self.assertEqual(set(body["format"]["required"]), {
+            "cause", "evidence_log_ids", "retryable", "recommended_action",
+        })
+        self.assertFalse(body["stream"])
+        self.assertFalse(body["think"])
+        self.assertEqual(kwargs["timeout"], 9)
+        user_content = body["messages"][1]["content"]
+        self.assertIn(json.dumps(self.logs(), ensure_ascii=False, separators=(",", ":")),
+                      user_content)
+        self.assertNotIn("workspace", user_content.casefold())
+        self.assertEqual(analyzer.metrics["model_calls"], 1)
+        self.assertEqual(analyzer.metrics["total_tokens"], 42)
+
+    def test_analysis_rejects_evidence_not_present_in_logs(self):
+        with self.assertRaisesRegex(RecoveryValidationError, "not supplied"):
+            validate_failure_diagnosis({
+                "cause": "Unsupported claim.",
+                "evidence_log_ids": ["orchestration:999"],
+                "retryable": False,
+                "recommended_action": "Inspect the logs.",
+            }, known_log_ids={"orchestration:7"})
+
+    def test_deterministic_analysis_requires_persisted_logs(self):
+        with self.assertRaisesRegex(Exception, "No persisted failure logs"):
+            deterministic_failure_diagnosis([])
+
+    def test_no_progress_analysis_recommends_strategy_change_not_more_steps(self):
+        logs = [{
+            "log_id": "task:t1:5", "source": "task", "event_type": "task.no_progress",
+            "status": "Failed", "error": "NoProgressDetected: the same read-only action was repeated.",
+        }, {
+            "log_id": "task:t1:6", "source": "task", "event_type": "task.failed",
+            "status": "Failed", "error": "NoProgressDetected: repeated read-only actions.",
+        }]
+        result = FailureAnalyzer(offline=True).analyze(logs)
+        self.assertTrue(result["retryable"])
+        self.assertIn("Change the worker strategy", result["recommended_action"])
+        self.assertNotIn("Increase the step", result["recommended_action"])
 
 
 class AllowedReplanScopeTests(unittest.TestCase):

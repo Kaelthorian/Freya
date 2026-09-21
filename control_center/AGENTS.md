@@ -4,8 +4,11 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
+`task_analyst.py` owns the optional, tool-free prompt interpretation contract.
 `planner.py` owns the versioned orchestration-plan contract, normalization and
-DAG validation. `orchestrator.py` persists that snapshot before it selects and
+DAG validation. `orchestrator.py` runs the Task Analyst first when an enabled
+agent has `config.orchestration_role=task_analyst` (with a legacy name/role
+fallback), then persists that snapshot before it selects and
 delegates to existing agents through `Runtime`; workers cannot create agents or
 bypass tool policy.
 
@@ -28,9 +31,19 @@ bypass tool policy.
   and keep cancellation serialized with task submission.
 - The production Planner calls loopback Ollama without tools. Deterministic
   fallback requires the explicit `--planner-offline` mode.
+- Task Analyst output is advisory, strictly validated JSON. It receives the
+  original prompt, has no tools or workspace authority, and may use a
+  deterministic fallback if its model call fails; the original prompt remains
+  authoritative.
 - Keep context assembly in `agent_context.py`; do not add role-specific global
   prompts to the worker. Repeated non-recoverable tool failures must be
   bounded before consuming the task step budget.
+- `worker.py` must stop repeated successful read-only actions when no workspace
+  progress is observed. `tools.py` and `agent_context.py` must filter Git
+  inspection when the task workspace is not inside a checkout.
+- `storage.py`'s orchestration log query merges runtime and orchestration event
+  timelines without exposing private model reasoning; preserve source labels
+  and stable evidence IDs when extending it.
 - Keep Skill validation, resolution, compatibility diagnostics and compact
   rendering in `skills.py`; Skills never execute tools or modify policy. Task
   records must retain immutable Skill snapshots and versions.

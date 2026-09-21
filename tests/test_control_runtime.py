@@ -194,6 +194,18 @@ class WorkerTests(unittest.TestCase):
                             for event in self.events))
         self.assertTrue(result["verification"]["passed"])
 
+    def test_repeated_successful_reads_stop_as_no_progress_before_step_limit(self):
+        responses = [answer(calls=[("list_files", {"path": "."})]) for _ in range(4)]
+        result = self.run_worker(responses, tools=["list_files"], config={"max_steps": 20})
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertTrue(result["no_progress_detected"])
+        self.assertLess(result["steps"], 20)
+        no_progress = [event["event"] for event in self.events
+                       if event.get("event", {}).get("event_type") == "task.no_progress"]
+        self.assertEqual(len(no_progress), 1)
+        self.assertIn("read-only", no_progress[0]["reason"])
+
     def test_zero_tool_budget_and_step_budget(self):
         call = answer(calls=[("write_file", {"path": "x", "content": "one"}), ("write_file", {"path": "y", "content": "two"})])
         result = self.run_worker([call], config={"max_tool_calls": 0})
@@ -226,6 +238,15 @@ class WorkerTests(unittest.TestCase):
                            ("run_command", {"argv": ["python", "x.py"]}), ("git_diff", {})):
             self.assertFalse(box.invoke(name, args).success, name)
         self.assertTrue(box.invoke("list_files", {"path": "allowed"}).success)
+
+    def test_non_git_workspace_hides_git_diff_and_marks_direct_request_inapplicable(self):
+        box = PolicyToolbox(self.root, self.workspace, DEFAULT_CONFIG,
+                            ["list_files", "read_file", "git_diff"])
+        self.assertNotIn("git_diff", box.enabled)
+        self.assertFalse(any(schema["function"]["name"] == "git_diff" for schema in box.schemas))
+        result = box.invoke("git_diff", {})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_class, "not_applicable")
 
     def test_symlink_escape_is_neither_read_nor_listed_nor_searched(self):
         outside = self.root / "secret.txt"
