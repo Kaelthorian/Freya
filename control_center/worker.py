@@ -54,6 +54,8 @@ Tool usage rules:
 - The workspace root is ".".
 - To inspect the workspace root, use list_files with path ".".
 - If an action repeatedly fails with identical arguments, change strategy instead of repeating it.
+- Never invent tool names or capability-request tools. If the available tools cannot complete the step, report the exact limitation to Freya.
+- Interactive Python programs must be tested with the run_command stdin field; never wait for a human terminal.
 
 Use native tool calls or a JSON action in this form:
 {"action":"read_file","path":"file.py"}. To finish in JSON mode, use
@@ -66,6 +68,10 @@ class TaskStopped(RuntimeError):
 
 class NoProgressDetected(TaskStopped):
     """The worker repeated read-only actions without changing the workspace."""
+
+
+class BlockedActionCycle(TaskStopped):
+    """The worker kept requesting denied or deterministically blocked actions."""
 
 
 def _parse_tool_arguments(value: Any) -> dict[str, Any]:
@@ -406,6 +412,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "workspace_changes": 0,
         "no_progress_actions": 0,
         "no_progress_detected": False,
+        "blocked_actions": 0,
         "stop_reason": "",
         "failure_class": "",
     }
@@ -459,6 +466,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "skipped_with_reason": "", "evidence": [],
     }
     failure_history: dict[str, int] = {}
+    blocked_action_count = 0
     successful_validation_streak = 0
     last_success_signature = ""
     repeated_success_count = 0
@@ -641,7 +649,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         last_success_signature = ""
                     if not result.success and result.policy_decision not in {"deny", "approval_required", "denied"} and not argument_error:
                         recoverable = any(marker in result.output.lower() for marker in ("does not exist", "not found", "no matches"))
-                        result.error_class = "recoverable" if recoverable else "environment_error"
+                        if not result.error_class:
+                            result.error_class = "recoverable" if recoverable else "environment_error"
                         relevant_args = {key: value for key, value in safe_args.items() if key != "timeout_seconds"}
                         signature = hashlib.sha256(json.dumps({
                             "tool": name,
@@ -703,6 +712,19 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                                      "reason": "The workspace change was followed by ten successful validation actions."})
                     legacy_tool_block = result.policy_decision == "deny" and "disabled" in result.policy_reason.lower()
                     policy_blocked = result.policy_decision in {"deny", "approval_required"} and not legacy_tool_block
+                    blocked_reason = ""
+                    if result.success:
+                        blocked_action_count = 0
+                    elif (result.error_class == "repeated_action_blocked"
+                          or result.policy_decision == "deny"):
+                        blocked_action_count += 1
+                        telemetry["blocked_actions"] = blocked_action_count
+                        if blocked_action_count >= 3:
+                            blocked_reason = (
+                                "BlockedActionCycle: the worker requested three consecutive denied or "
+                                "repeatedly blocked actions. Freya must diagnose or replan the task."
+                            )
+                            telemetry["stop_reason"] = blocked_reason
                     publish("event", event={**common, "event_type": "step.finished",
                                              "level": "info" if result.success else ("warning" if policy_blocked else "error"),
                                              "status": "Success" if result.success else ("ApprovalRequired" if result.policy_decision == "approval_required" else ("Denied" if policy_blocked or result.policy_decision in {"denied"} else "Failed")),
@@ -712,10 +734,22 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                              "policy_decision": result.policy_decision or "deny",
                                              "policy_reason": result.policy_reason,
                                              "error_class": result.error_class})
+                    if blocked_reason:
+                        publish("event", event={
+                            "event_type": "task.blocked", "level": "error", "status": "Failed",
+                            "step_id": step_id, "tool": name,
+                            "reason": blocked_reason,
+                            "output": {"blocked_actions": blocked_action_count,
+                                       "last_error_class": result.error_class,
+                                       "last_policy_decision": result.policy_decision},
+                            "error_class": "blocked_action_cycle",
+                        })
                     update()
                     guard()
                     if no_progress_reason:
                         raise NoProgressDetected(no_progress_reason)
+                    if blocked_reason:
+                        raise BlockedActionCycle(blocked_reason)
                     if result.success or argument_error or result.error_class == "repeated_action_blocked":
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
@@ -867,7 +901,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             verification_state["skipped_with_reason"] = "Verification disabled by configuration."
     except Exception as exc:
         error = "{}: {}".format(type(exc).__name__, exc)
-        telemetry["failure_class"] = "no_progress" if isinstance(exc, NoProgressDetected) else type(exc).__name__
+        telemetry["failure_class"] = (
+            "no_progress" if isinstance(exc, NoProgressDetected)
+            else "blocked_action_cycle" if isinstance(exc, BlockedActionCycle)
+            else type(exc).__name__
+        )
         if not telemetry.get("stop_reason"):
             telemetry["stop_reason"] = error
     result_output: Any = final

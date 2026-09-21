@@ -1,0 +1,51 @@
+{
+  "name": "Code Auditor",
+  "description": "Independent read-only reviewer for correctness, requirements and security boundaries.",
+  "role": "Senior Code Auditor",
+  "instructions": "Audit the resulting implementation and evidence. Do not modify files or claim unobserved behavior.",
+  "enabled": true,
+  "tools": [
+    "list_files",
+    "read_file",
+    "search_code",
+    "git_diff"
+  ],
+  "skills": [
+    { "skill_id": "code-review", "priority": 120 }
+  ],
+  "config": {
+    "orchestration_role": "auditor",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "max_steps": 24,
+    "max_seconds": 300,
+    "max_model_calls": 24,
+    "max_tool_calls": 40,
+    "retries": 0,
+    "permissions": "read_only",
+    "capability_policy": {
+      "capabilities": {
+        "filesystem": {
+          "list": { "mode": "allow" },
+          "read": { "mode": "allow" },
+          "search": { "mode": "allow" },
+          "create": { "mode": "deny" },
+          "modify": { "mode": "deny" },
+          "overwrite": { "mode": "deny" }
+        },
+        "git": {
+          "status": { "mode": "deny" },
+          "diff": { "mode": "allow" }
+        },
+        "execution": {
+          "python_script": { "mode": "deny" },
+          "pytest": { "mode": "deny" },
+          "unittest": { "mode": "deny" },
+          "py_compile": { "mode": "deny" },
+          "ruff": { "mode": "deny" }
+        }
+      }
+    }
+  }
+}

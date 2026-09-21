@@ -69,6 +69,26 @@ class ToolboxTests(unittest.TestCase):
         self.assertTrue(result.success, result.output)
         self.assertEqual(result.output.strip(), "hello")
 
+    def test_interactive_python_uses_controlled_stdin(self) -> None:
+        self.toolbox.invoke("write_file", {
+            "path": "sum.py",
+            "content": "a = int(input('A: '))\nb = int(input('B: '))\nprint(a + b)\n",
+        })
+        result = self.toolbox.invoke("run_command", {
+            "argv": ["python", "sum.py"], "stdin": "2\n3\n", "timeout_seconds": 2,
+        })
+        self.assertTrue(result.success, result.output)
+        self.assertTrue(result.output.rstrip().endswith("5"), result.output)
+
+    def test_interactive_python_without_stdin_fails_fast_with_guidance(self) -> None:
+        self.toolbox.invoke("write_file", {"path": "wait.py", "content": "input('Value: ')\n"})
+        result = self.toolbox.invoke("run_command", {
+            "argv": ["python", "wait.py"], "timeout_seconds": 2,
+        })
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_class, "interactive_input_required")
+        self.assertIn("INTERACTIVE_INPUT_REQUIRED", result.output)
+
 
 if __name__ == "__main__":
     unittest.main()

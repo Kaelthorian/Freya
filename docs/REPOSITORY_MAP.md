@@ -11,8 +11,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── task_analyst.py       tool-free prompt interpretation contract and deterministic fallback
-│   ├── planner.py            plan schema, Ollama adapter, validation and explicit offline fallback
+│   ├── task_analyst.py       tool-free operational-prompt rewrite, reconciliation and fallback
+│   ├── planner.py            plan schema, conditional QA/audit nodes, validation and offline fallback
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
@@ -32,7 +32,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── policy.py             policy schema, legacy migration and engine
 │   ├── skills.py             reusable Skill registry, validation and resolution
 │   ├── agent_context.py      structured agent defaults, effective config and worker context
-│   ├── presets.py            safe generic Programmer preset definitions
+│   ├── presets.py            separated Programmer, Task Analyst, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
 │   ├── index.html / styles.css
@@ -41,24 +41,33 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
 ├── tests/                    API, storage, runtime, policy, Skill and tool tests
-├── data/                     generated database and automatic workspaces
+├── data/
+│   ├── agents/              versioned, importable pipeline-agent definitions
+│   └── (runtime files)      ignored databases, logs, locks and workspaces
 └── docs/                     architecture, API and operating instructions
 ```
 
-`data/` is generated and ignored by Git. User-selected workspaces can live
-anywhere accessible to the local server and are never treated as source files
-of this repository merely because an agent selects them.
+Only `data/agents/*.json` is versioned. These files contain shareable agent
+configuration without runtime IDs, task history, prompts, metrics or secrets
+and can be imported from the Agents page. All other `data/` content is generated
+and ignored by Git. User-selected workspaces can live anywhere accessible to the
+local server and are never treated as source files merely because an agent
+selects them.
 
 ## Main flow
 
 1. `frontend/` calls `control_center/http.py`, which applies same-origin and
    loopback Host checks before dispatching to `api.py`.
-2. `api.py` validates agents and browses local folders. If an enabled Task Analyst
-   exists, `orchestrator.py` first interprets the original prompt through
-   `task_analyst.py` without tools; the bounded result is advisory context. Freya
-   then sends the original prompt and that context through the loopback Ollama
+2. `api.py` validates agents and browses local folders. `orchestrator.py` first
+   sends the human prompt to the enabled Task Analyst through `task_analyst.py`
+   without tools. The validated version-2 `operational_prompt` is reconciled
+   against deterministic facts and replaces the human wording downstream; the
+   human prompt remains stored only as audit evidence. Freya sends that brief
+   and its structured constraints through the loopback Ollama
    adapter in `planner.py`; `orchestrator.py` stores the validated plan snapshot
-   atomically. `execution_graph.py` releases ready
+   atomically. Interactive work receives an independent QA node using bounded
+   Python stdin, and mutation work ends with a read-only Code Auditor node.
+   `execution_graph.py` releases ready
    tasks in plan order and `agent_selector.py` classifies and ranks an existing
    agent once for each ready task before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
@@ -95,14 +104,15 @@ of this repository merely because an agent selects them.
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
-| Tool implementation | `tools.py`, runtime/tool tests |
+| Tool implementation or controlled stdin | `tools.py`, `worker.py`, `tests/test_tools.py`, `tests/test_control_runtime.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
-| Prompt interpretation before planning | `task_analyst.py`, `orchestrator.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py` |
+| Prompt rewrite before planning | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py` |
+| Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
-| Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py`, `worker.py`, `__main__.py`, `frontend/views.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
+| Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py` (normalized actor/workspace traces), `worker.py`, `__main__.py`, `frontend/views.js`, `frontend/components.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |

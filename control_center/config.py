@@ -188,8 +188,8 @@ def normalize_agent(data: dict, existing: dict | None = None) -> dict:
     else:
         config["capability_policy"] = validate_policy(policy_input)
     config["model"] = _text(config["model"], "model", 200, True)
-    if config.get("orchestration_role") not in {"worker", "task_analyst", "planner", "auditor"}:
-        raise ValueError("orchestration_role must be worker, task_analyst, planner, or auditor.")
+    if config.get("orchestration_role") not in {"worker", "task_analyst", "planner", "qa", "auditor"}:
+        raise ValueError("orchestration_role must be worker, task_analyst, planner, qa, or auditor.")
     if re.search(r"[\s\x00-\x1f]", config["model"]):
         raise ValueError("model must not contain whitespace or control characters.")
     config["system_prompt"] = _text(config["system_prompt"], "system_prompt", 16000)

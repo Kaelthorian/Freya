@@ -7,6 +7,7 @@ from pathlib import Path
 
 from control_center.api import Application
 from control_center.config import normalize_agent
+from control_center.execution_graph import ExecutionGraph
 from control_center.orchestrator import Orchestrator
 from control_center.planner import (
     MAX_PLAN_TASKS,
@@ -272,8 +273,8 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertIn("freya.plan.created", event_types)
         created = next(event for event in stored["events"] if event["event_type"] == "freya.plan.created")
         payload = json.loads(created["payload_json"])
-        self.assertEqual(payload["task_count"], 1)
-        self.assertEqual(payload["task_ids"], ["task-1"])
+        self.assertEqual(payload["task_count"], 2)
+        self.assertEqual(payload["task_ids"], ["task-1", "code-audit"])
 
     def test_failed_planning_emits_failure_without_plan(self):
         run = self.store.create_orchestration("Create hello.txt")
@@ -284,6 +285,24 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertIsNone(stored["plan"])
         self.assertEqual(stored["planning_metrics"]["model_calls"], 2)
         self.assertIn("freya.planning.failed", [event["event_type"] for event in stored["events"]])
+
+    def test_graph_timeout_runs_failure_analysis_before_failing(self):
+        run = self.store.create_orchestration("Human source prompt")
+        enter_planning(self.store, run["id"])
+        operational_plan = fallback_plan("Task Analyst operational brief")
+        self.store.save_orchestration_plan(run["id"], operational_plan, PLAN_SCHEMA_VERSION)
+        self.store.initialize_execution_graph(
+            run["id"], ExecutionGraph(operational_plan).serialize(),
+        )
+        self.store.transition_orchestration(run["id"], ("Planned",), "Running")
+        Orchestrator(self.store, None, planner=Planner(offline=True))._timeout(run["id"])
+        final = self.store.get_orchestration(run["id"])
+        event_types = [event["event_type"] for event in final["events"]]
+        self.assertEqual(final["status"], "Failed")
+        self.assertIn("freya.timeout", event_types)
+        self.assertIn("freya.failure_analysis.started", event_types)
+        self.assertIn("freya.failure_analysis.completed", event_types)
+        self.assertIn("time limit", (final["error"] or "").lower())
 
     def test_ollama_metrics_are_persisted_with_the_plan(self):
         def transport(method, url, body, **kwargs):
@@ -558,8 +577,55 @@ class TaskAnalysisPlannerTests(unittest.TestCase):
         planner = Planner(decide)
         analysis = {"task_type": "windows_command_script", "task_characteristics": {"requires_filesystem_write": True}}
         planner.create_plan("Create a .bat file", {"task_analysis": analysis})
-        self.assertIn("Task Analyst interpretation", seen["prompt"])
+        self.assertIn("Task Analyst structured analysis", seen["prompt"])
         self.assertIn("windows_command_script", seen["prompt"])
+
+    def test_interactive_analysis_inserts_qa_before_code_audit(self):
+        generated = plan(tasks=[task(
+            "implement", "Implement calculator",
+            required_capabilities=["filesystem.create", "execution.python_script"],
+            preferred_skills=["python-development"],
+        )])
+        analysis = {
+            "task_type": "python_cli",
+            "task_characteristics": {
+                "requires_filesystem_write": True,
+                "interactive": True,
+                "requires_user_input": True,
+            },
+            "validation": {"interactive_validation_required": True},
+        }
+        result = Planner(lambda prompt, context: generated).create_plan(
+            "Create an interactive calculator", {"task_analysis": analysis},
+        )
+        self.assertEqual([item["id"] for item in result["tasks"]],
+                         ["implement", "qa-interactive-test", "code-audit"])
+        self.assertEqual(result["tasks"][1]["depends_on"], ["implement"])
+        self.assertIn("interactive-testing", result["tasks"][1]["preferred_skills"])
+        self.assertEqual(result["tasks"][2]["depends_on"],
+                         ["implement", "qa-interactive-test"])
+
+    def test_existing_model_audit_is_normalized_after_qa(self):
+        generated = plan(complexity="multi_step", tasks=[
+            task("implement", "Implement calculator", required_capabilities=["filesystem.create"]),
+            task("review", "Perform code review", depends_on=["implement"],
+                 required_capabilities=["filesystem.read"], preferred_skills=["code-review"]),
+        ])
+        analysis = {
+            "task_type": "python_cli",
+            "task_characteristics": {
+                "requires_filesystem_write": True, "interactive": True,
+                "requires_user_input": True,
+            },
+            "validation": {"interactive_validation_required": True},
+        }
+        result = Planner(lambda prompt, context: generated).create_plan(
+            "Interactive calculator", {"task_analysis": analysis},
+        )
+        self.assertEqual([item["id"] for item in result["tasks"]],
+                         ["implement", "qa-interactive-test", "review"])
+        self.assertEqual(result["tasks"][-1]["depends_on"],
+                         ["implement", "qa-interactive-test"])
 
 
 class OllamaPlannerTests(unittest.TestCase):

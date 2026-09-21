@@ -1,8 +1,9 @@
-"""Prompt interpretation before structured orchestration planning.
+"""Prompt rewriting before structured orchestration planning.
 
-The Task Analyst is advisory only. It receives the original user prompt, has no
-tools or workspace authority, and returns a bounded JSON specification for the
-planner. Capability policy remains the only authority for execution.
+The Task Analyst receives the original user prompt, has no tools or workspace
+authority, and returns a bounded operational brief.  That brief replaces the
+human prompt for planning and delegation while the original remains persisted
+as audit evidence. Capability policy remains the only authority for execution.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from .security import sanitize
 from .transport import request_json
 
 
-TASK_ANALYSIS_VERSION = 1
+TASK_ANALYSIS_VERSION = 2
 MAX_ANALYSIS_TEXT_CHARS = 4000
 MAX_ANALYSIS_INPUT_CHARS = 12000
 MAX_ANALYSIS_ITEMS = 30
@@ -24,7 +25,7 @@ DEFAULT_ANALYST_TIMEOUT_SECONDS = 60.0
 TASK_ANALYST_ROLE = "task_analyst"
 
 ANALYSIS_FIELDS = {
-    "objective", "task_type", "requirements", "assumptions", "task_characteristics",
+    "operational_prompt", "objective", "task_type", "requirements", "assumptions", "task_characteristics",
     "risks", "plan", "acceptance_criteria", "validation", "recommended_agent_role",
     "ready_for_execution", "blocking_reason",
 }
@@ -38,6 +39,7 @@ CHARACTERISTIC_FIELDS = {
 ANALYSIS_RESPONSE_FORMAT = {
     "type": "object",
     "properties": {
+        "operational_prompt": {"type": "string"},
         "objective": {"type": "string"},
         "task_type": {"type": "string"},
         "requirements": {"type": "array", "items": {"type": "object"}},
@@ -105,7 +107,7 @@ def _bounded_prompt(prompt: str, limit: int) -> str:
 
 
 def validate_task_analysis(value: Any) -> dict[str, Any]:
-    """Validate and bound the advisory interpretation returned by the analyst."""
+    """Validate and bound the operational rewrite returned by the analyst."""
     if not isinstance(value, dict):
         raise TaskAnalysisError("Task analysis must be an object.")
     value = dict(value)
@@ -226,6 +228,7 @@ def validate_task_analysis(value: Any) -> dict[str, Any]:
 
     return sanitize({
         "analysis_version": TASK_ANALYSIS_VERSION,
+        "operational_prompt": _text(value["operational_prompt"], "operational_prompt"),
         "objective": _text(value["objective"], "objective"),
         "task_type": _text(value["task_type"], "task_type"),
         "requirements": normalized_requirements,
@@ -285,6 +288,14 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
     interactive = bool(re.search(r"\b(?:interactiv|input|ingres|introdu|no cierre|pause|pausa)\w*\b", lowered))
     calculator = "calculadora" in lowered or "calculator" in lowered
     requires_input = interactive or calculator
+    requires_write = windows_script or calculator or bool(re.search(
+        r"\b(?:crea|crear|create|escrib|write|implement|program|codig|code|archivo|file|script|modific|edit)\w*\b",
+        lowered,
+    ))
+    requires_read = bool(re.search(
+        r"\b(?:lee|leer|read|inspect|review|revis|analiz|analy|debug|diagnos)\w*\b",
+        lowered,
+    ))
     task_type = "windows_command_script" if windows_script else "general_task"
     requirements = [{"id": "REQ-1", "description": objective, "source": "explicit"}]
     assumptions = []
@@ -296,8 +307,8 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
     characteristics = {
         "interactive": interactive,
         "requires_user_input": requires_input,
-        "requires_filesystem_read": False,
-        "requires_filesystem_write": True,
+        "requires_filesystem_read": requires_read,
+        "requires_filesystem_write": requires_write,
         "requires_code_execution": calculator or windows_script or "script" in lowered,
         "requires_network": False,
         "requires_gui": False,
@@ -323,7 +334,16 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
         "expected_result": "El artefacto requerido existe y cumple los criterios observables.",
     }]
     criteria = [{"id": "AC-1", "description": "El resultado cumple el objetivo original del usuario.", "verifies": ["REQ-1"]}]
+    operational_prompt = _bounded_prompt((
+        "Implement the following request exactly:\n" + objective
+        + ("\n\nArtifact constraint: create a Windows CMD/BAT script, not a Python substitute."
+           if windows_script else "")
+        + ("\n\nValidation constraint: the program requires user input. Do not launch it without "
+           "controlled stdin; a QA Tester must exercise representative input and verify the output."
+           if requires_input else "")
+    ), MAX_ANALYSIS_TEXT_CHARS)
     return validate_task_analysis({
+        "operational_prompt": operational_prompt,
         "objective": objective,
         "task_type": task_type,
         "requirements": requirements,
@@ -362,10 +382,11 @@ class OllamaTaskAnalyst:
         timeout = max(0.1, min(float(timeout), 120.0))
         instructions = str(agent.get("instructions") or "").strip()
         system = (
-            "You are Freya's Task Analyst. Interpret the original user prompt before execution. "
-            "Return only the strict JSON schema requested. Preserve explicit requirements, label "
-            "assumptions, detect interactive input and risks, and never execute tools or claim work "
-            "was completed. The interpretation is advisory; the original prompt remains authoritative.\n\n"
+            "You are Freya's Task Analyst and prompt engineer. Rewrite the human request into a precise, "
+            "self-contained operational_prompt for the planner and delegated agents. Return only the strict "
+            "JSON schema requested. Preserve every explicit requirement, label assumptions, detect interactive "
+            "input and risks, and include concrete acceptance and validation instructions. Never execute tools "
+            "or claim work was completed. Your operational_prompt replaces the human wording downstream.\n\n"
             + instructions[:16000]
         )
         started = time.monotonic()
@@ -400,6 +421,67 @@ class OllamaTaskAnalyst:
         return validate_task_analysis(value)
 
 
+def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Enforce prompt-observable safety facts on a schema-valid model result.
+
+    A model can satisfy the JSON schema while contradicting obvious facts in the
+    source prompt.  The deterministic interpretation is therefore used as a
+    one-way floor: it may turn requirements on, but never remove model-detected
+    requirements.  The corrected operational prompt is the only prompt sent
+    downstream.
+    """
+    normalized = validate_task_analysis(analysis)
+    detected = deterministic_task_analysis(prompt)
+    corrected = dict(normalized)
+    changes: list[str] = []
+
+    model_characteristics = dict(normalized["task_characteristics"])
+    detected_characteristics = detected["task_characteristics"]
+    for field, required in detected_characteristics.items():
+        if required and not model_characteristics.get(field):
+            model_characteristics[field] = True
+            changes.append("task_characteristics." + field)
+    corrected["task_characteristics"] = model_characteristics
+
+    if detected["task_type"] != "general_task" and normalized["task_type"] != detected["task_type"]:
+        corrected["task_type"] = detected["task_type"]
+        changes.append("task_type")
+
+    validation = dict(normalized["validation"])
+    if detected["validation"]["interactive_validation_required"] and not validation["interactive_validation_required"]:
+        validation["interactive_validation_required"] = True
+        changes.append("validation.interactive_validation_required")
+    validation["avoid"] = list(dict.fromkeys([
+        *validation["avoid"], *detected["validation"]["avoid"],
+    ]))[:MAX_ANALYSIS_ITEMS]
+    corrected["validation"] = validation
+    corrected["risks"] = list(dict.fromkeys(
+        (item["risk"], item["prevention"])
+        for item in [*normalized["risks"], *detected["risks"]]
+    ))
+    corrected["risks"] = [
+        {"risk": risk, "prevention": prevention}
+        for risk, prevention in corrected["risks"][:MAX_ANALYSIS_ITEMS]
+    ]
+
+    additions: list[str] = []
+    if corrected["task_type"] == "windows_command_script":
+        additions.append("Create a Windows CMD/BAT artifact; do not substitute Python.")
+    if validation["interactive_validation_required"]:
+        additions.append(
+            "The result is interactive. The implementation agent must not wait for terminal input; "
+            "a QA Tester must run it with bounded controlled stdin and verify logical output."
+        )
+    operational = normalized["operational_prompt"].strip()
+    for addition in additions:
+        if addition.casefold() not in operational.casefold():
+            suffix = "\n\nMandatory constraint: " + addition
+            operational = operational[:max(1, MAX_ANALYSIS_TEXT_CHARS - len(suffix))] + suffix
+            changes.append("operational_prompt")
+    corrected["operational_prompt"] = operational
+    return validate_task_analysis(corrected), list(dict.fromkeys(changes))
+
+
 class TaskAnalyst:
     """Wrapper that supports explicit offline mode and deterministic fallback."""
 
@@ -410,12 +492,13 @@ class TaskAnalyst:
 
     def analyze(self, prompt: str, agent: dict[str, Any]) -> dict[str, Any]:
         if self.offline or self.adapter is None:
-            self.metrics = {"model_calls": 0, "mode": "deterministic"}
+            self.metrics = {"model_calls": 0, "mode": "deterministic", "corrected_fields": []}
             return deterministic_task_analysis(prompt)
         try:
-            result = self.adapter.analyze(prompt, agent)
+            result, corrections = reconcile_task_analysis(prompt, self.adapter.analyze(prompt, agent))
             self.metrics = dict(self.adapter.metrics)
             self.metrics["mode"] = "model"
+            self.metrics["corrected_fields"] = corrections
             return result
         except Exception:
             self.metrics = dict(self.adapter.metrics)

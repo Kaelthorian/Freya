@@ -20,6 +20,7 @@ from .security import sanitize
 MAX_FILE_BYTES = 512_000
 MAX_WRITE_BYTES = 1_000_000
 MAX_OUTPUT_CHARS = 20_000
+MAX_STDIN_CHARS = 16_000
 MAX_SEARCH_HITS = 200
 IGNORED_DIRECTORIES = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache"}
 
@@ -115,10 +116,11 @@ class Toolbox:
             ),
             self._schema(
                 "run_command",
-                "Run a restricted Python test/script, Ruff check, or read-only Git status/diff command. No shell is used.",
+                "Run a restricted Python test/script, Ruff check, or read-only Git status/diff command. No shell is used. Interactive Python scripts require bounded stdin.",
                 {
                     "argv": {"type": "array", "items": {"type": "string"}, "description": "Command and arguments as a list."},
                     "timeout_seconds": {"type": "integer", "description": "Timeout from 1 to 120 seconds (default 30)."},
+                    "stdin": {"type": "string", "description": "Optional newline-delimited input for a Python program (maximum 16000 characters)."},
                 },
                 ["argv"],
             ),
@@ -163,6 +165,8 @@ class Toolbox:
         error_class = ""
         if name == "git_diff" and not success and "not inside a Git repository" in str(output):
             error_class = "not_applicable"
+        if name == "run_command" and not success and "INTERACTIVE_INPUT_REQUIRED" in str(output):
+            error_class = "interactive_input_required"
         return ToolResult(
             name=name,
             output=_clip(str(output)),
@@ -270,6 +274,7 @@ class Toolbox:
         self,
         argv: list[str],
         timeout_seconds: int = 30,
+        stdin: str | None = None,
     ) -> tuple[str, bool, int | None]:
         if not isinstance(argv, list) or not argv or len(argv) > 40:
             raise ValueError("argv must be a non-empty list with at most 40 entries.")
@@ -279,6 +284,11 @@ class Toolbox:
             raise ValueError("An argv item exceeds the 4000 character limit.")
         if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 120:
             raise ValueError("timeout_seconds must be between 1 and 120.")
+        if stdin is not None:
+            if not isinstance(stdin, str) or "\x00" in stdin:
+                raise ValueError("stdin must be text without NUL characters.")
+            if len(stdin) > MAX_STDIN_CHARS:
+                raise ValueError("stdin exceeds the 16000 character limit.")
 
         executable = Path(argv[0]).name.lower()
         command = argv[1:]
@@ -314,6 +324,8 @@ class Toolbox:
                     raise ValueError("Python scripts must be .py files inside the workspace.")
                 normalized = [str(script)] + command[1:]
         elif executable in {"git", "git.exe"}:
+            if stdin is not None:
+                raise ValueError("stdin is only supported for Python commands.")
             git_root, pathspec = self._git_scope()
             if command == ["status", "--short"]:
                 normalized = ["-C", str(git_root), "status", "--short", "--", pathspec]
@@ -326,22 +338,36 @@ class Toolbox:
             executable = "git"
             cwd = git_root
         elif executable in {"ruff", "ruff.exe"} and command == ["check", "."]:
+            if stdin is not None:
+                raise ValueError("stdin is only supported for Python commands.")
             normalized = ["check", "."]
             executable = "ruff"
         else:
             raise ValueError("Command blocked. Allowed commands are workspace Python, Ruff check, and scoped Git status/diff.")
 
+        run_options: dict[str, Any] = {
+            "cwd": str(cwd), "capture_output": True, "text": True,
+            "encoding": "utf-8", "errors": "replace", "timeout": timeout_seconds,
+            "shell": False,
+        }
+        if stdin is None:
+            # A background worker has no human terminal. Closing stdin makes an
+            # accidental input() fail immediately instead of consuming the
+            # orchestration deadline.
+            run_options["stdin"] = subprocess.DEVNULL
+        else:
+            run_options["input"] = stdin
         result = subprocess.run(
             [sys.executable, *normalized] if executable.startswith("python") or executable == "py" else [executable, *normalized],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            shell=False,
+            **run_options,
         )
         output = (result.stdout or "") + (result.stderr or "")
+        if stdin is None and result.returncode != 0 and "EOFError" in output:
+            output = (
+                "INTERACTIVE_INPUT_REQUIRED: the program requested terminal input, but workers have no live "
+                "terminal. Retry with run_command stdin containing bounded newline-delimited test input.\n\n"
+                + output
+            )
         return _clip(output or "Command completed with no output."), result.returncode == 0, result.returncode
 
     def _validate_unittest_discovery(self, args: list[str]) -> list[str]:
@@ -438,7 +464,7 @@ def argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
     """Keep result logs useful without persisting full source contents."""
     summary: dict[str, Any] = {}
     for key, value in arguments.items():
-        if key in {"content", "old", "new"}:
+        if key in {"content", "old", "new", "stdin"}:
             summary[key] = {"redacted": True, "characters": len(value) if isinstance(value, str) else None}
         else:
             summary[key] = sanitize({key: value}).get(str(key))

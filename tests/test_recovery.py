@@ -30,6 +30,7 @@ from control_center.recovery import (
     validate_recovery_decision,
 )
 from control_center.storage import Store
+from control_center.task_analyst import deterministic_task_analysis
 from tests.test_execution_graph import ControlledRuntime, MappingSelector, execution_plan, planned_task
 
 
@@ -753,6 +754,16 @@ class ReplannerTests(unittest.TestCase):
         self.assertIn("replacement", {task["id"] for task in result["plan"]["tasks"]})
         self.assertEqual(result["superseded_task_ids"], ["a"])
 
+    def test_revision_cannot_replace_analyst_operational_goal(self):
+        revision = self.valid_revision()
+        revision["plan"] = {**revision["plan"], "goal": "A different human or model goal"}
+        with self.assertRaisesRegex(RecoveryValidationError, "operational goal"):
+            Replanner(lambda prompt, context, revision=False, value=revision: value).create_revision(
+                current_plan=self.current(), source_task_id="a", affected_task_ids=["a", "child"],
+                allowed_task_ids={"a", "child"}, protected_task_ids=set(),
+                accepted_task_ids=set(), historical_task_ids={"a", "child"},
+            )
+
     def test_revision_cannot_supersede_accepted_task(self):
         with self.assertRaisesRegex(RecoveryValidationError, "Accepted"):
             Replanner(lambda prompt, context, revision=False: self.valid_revision()).create_revision(
@@ -972,6 +983,9 @@ class RecoverySchedulerTests(unittest.TestCase):
         runtime = ControlledRuntime(self.store)
         original = execution_plan([planned_task("a")])
         revised = execution_plan([planned_task("a"), planned_task("replacement")])
+        operational_goal = deterministic_task_analysis("Replan")["operational_prompt"]
+        original["goal"] = operational_goal
+        revised["goal"] = operational_goal
 
         def evaluator_model(prompt, context):
             result = evaluation(
@@ -1071,7 +1085,12 @@ class RecoverySchedulerTests(unittest.TestCase):
                 lambda prompt, context: recovery_decision("replan_subgraph")
             ),
             replanner=Replanner(lambda prompt, context, revision=False: {
-                "summary": "replace a only", "plan": revised, "superseded_task_ids": ["a"],
+                "summary": "replace a only",
+                "plan": {**revised,
+                         "goal": context["current_plan"]["goal"],
+                         "summary": context["current_plan"]["summary"],
+                         "success_criteria": context["current_plan"]["success_criteria"]},
+                "superseded_task_ids": ["a"],
             }),
             wait=lambda seconds: runtime.finish_active(),
             config={"max_wallclock_seconds": 10},
@@ -1257,8 +1276,11 @@ class RecoverySchedulerTests(unittest.TestCase):
             source = context["source_task_id"]
             new_id = "replacement-" + str(len(revision_calls))
             tasks = list(context["current_plan"]["tasks"]) + [planned_task(new_id)]
+            revised_plan = execution_plan(tasks)
+            for field in ("goal", "summary", "success_criteria"):
+                revised_plan[field] = context["current_plan"][field]
             return {
-                "summary": "bounded revision", "plan": execution_plan(tasks),
+                "summary": "bounded revision", "plan": revised_plan,
                 "superseded_task_ids": [source],
             }
 

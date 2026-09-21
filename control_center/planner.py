@@ -82,6 +82,16 @@ _SIMPLE_ARTIFACT_HINT = re.compile(
 )
 
 
+def _is_code_audit_task(task: dict[str, Any]) -> bool:
+    return (
+        "code-review" in task.get("preferred_skills", [])
+        or bool(re.search(
+            r"\b(?:code audit|code auditor|code review|audit code|review code|revis(?:e|ar) c[oó]digo)\b",
+            str(task.get("objective", "")), re.I,
+        ))
+    )
+
+
 def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """Merge an over-decomposed linear file workflow into one worker task."""
     tasks = plan.get("tasks", [])
@@ -154,8 +164,7 @@ def _append_code_audit_task(plan: dict[str, Any]) -> dict[str, Any]:
     }
     if not capabilities.intersection({"filesystem.create", "filesystem.modify", "filesystem.overwrite"}):
         return plan
-    if any(re.search(r"\b(?:audit|auditor|review|revis(?:e|ar))\b", str(task.get("objective", "")), re.I)
-           for task in tasks):
+    if any(_is_code_audit_task(task) for task in tasks):
         return plan
     ids = {task["id"] for task in tasks}
     audit_id = "code-audit"
@@ -184,19 +193,82 @@ def _append_code_audit_task(plan: dict[str, Any]) -> dict[str, Any]:
     return validate_plan(audited)
 
 
-def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
-    """Apply concrete artifact constraints from the advisory Task Analyst.
+def _append_qa_task(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
+    """Insert one independent QA node when observable input must be tested."""
+    if not isinstance(analysis, dict):
+        return plan
+    characteristics = analysis.get("task_characteristics")
+    validation = analysis.get("validation")
+    interactive = (
+        isinstance(characteristics, dict)
+        and (characteristics.get("interactive") is True
+             or characteristics.get("requires_user_input") is True)
+    ) or (
+        isinstance(validation, dict)
+        and validation.get("interactive_validation_required") is True
+    )
+    tasks = plan.get("tasks", [])
+    if not interactive or not isinstance(tasks, list) or len(tasks) >= MAX_PLAN_TASKS:
+        return plan
+    if any(
+        "interactive-testing" in task.get("preferred_skills", [])
+        or re.search(r"\b(?:qa|quality assurance|interactive test)\b", str(task.get("objective", "")), re.I)
+        for task in tasks
+    ):
+        return plan
 
-    The original prompt remains authoritative, but an otherwise valid model
-    plan must not silently replace an explicitly detected artifact (for
-    example, a CMD/BAT file) with an unrelated execution capability.
-    """
+    audit_tasks = [task for task in tasks if _is_code_audit_task(task)]
+    implementation_tasks = [task for task in tasks if not _is_code_audit_task(task)]
+    if not implementation_tasks:
+        return plan
+    ids = {task["id"] for task in tasks}
+    qa_id = "qa-interactive-test"
+    suffix = 2
+    while qa_id in ids:
+        qa_id = f"qa-interactive-test-{suffix}"
+        suffix += 1
+    qa = {
+        "id": qa_id,
+        "objective": "QA-test the interactive behavior with controlled input",
+        "description": (
+            "Act as the independent QA Tester after implementation. Inspect the produced program, "
+            "choose representative and edge-case inputs, and run supported Python programs with the "
+            "run_command stdin field so execution cannot wait for a terminal. Verify exit status and "
+            "logical output. Do not modify files. If the artifact cannot be executed by the restricted "
+            "runtime, report the exact unsupported boundary instead of waiting or inventing success."
+        ),
+        "depends_on": [task["id"] for task in implementation_tasks],
+        "required_capabilities": ["filesystem.read", "execution.python_script"],
+        "preferred_skills": ["interactive-testing", "software-testing"],
+        "success_criteria": [
+            "Representative controlled input completes without timeout or crash.",
+            "Observed output is logically correct for the supplied input.",
+            "The QA report cites the command, bounded stdin case, exit status and observed output.",
+        ],
+    }
+    updated = dict(plan)
+    updated["complexity"] = "multi_step"
+    # If the Planner model already emitted an audit node, normalize it behind
+    # QA instead of allowing audit-before-behavior-test ordering.
+    normalized_audits = []
+    for task in audit_tasks:
+        current = dict(task)
+        current["depends_on"] = list(dict.fromkeys([*current.get("depends_on", []), qa_id]))
+        normalized_audits.append(current)
+    updated["tasks"] = [*implementation_tasks, qa, *normalized_audits]
+    return validate_plan(updated)
+
+
+def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
+    """Apply concrete constraints from the Task Analyst operational brief."""
     if not isinstance(analysis, dict):
         return plan
     characteristics = analysis.get("task_characteristics")
     if not isinstance(characteristics, dict):
         return plan
     requires_write = characteristics.get("requires_filesystem_write") is True
+    interactive = (characteristics.get("interactive") is True
+                   or characteristics.get("requires_user_input") is True)
     task_type = str(analysis.get("task_type") or "").strip().casefold()
     windows_script = task_type == "windows_command_script"
     if not requires_write and not windows_script:
@@ -229,6 +301,14 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
             current["success_criteria"] = criteria[:MAX_CRITERIA]
             current["preferred_skills"] = [skill for skill in current.get("preferred_skills", [])
                                             if str(skill).casefold() not in {"python-development", "python"}]
+        if interactive:
+            description = str(current.get("description") or "").strip()
+            instruction = (
+                "Do not wait for interactive terminal input during implementation; "
+                "the dependent QA Tester owns controlled-stdin behavioral verification."
+            )
+            if instruction.casefold() not in description.casefold():
+                current["description"] = (description + " " + instruction).strip()[:MAX_DESCRIPTION_CHARS]
         current["required_capabilities"] = capabilities[:MAX_CAPABILITIES]
         updated_tasks.append(current)
     reconciled["tasks"] = updated_tasks
@@ -517,6 +597,7 @@ class Planner:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
         plan = _collapse_simple_artifact_plan(validate_plan(value))
         plan = _reconcile_task_analysis(plan, analysis)
+        plan = _append_qa_task(plan, analysis)
         return _append_code_audit_task(plan)
 
     @staticmethod
@@ -541,11 +622,12 @@ class Planner:
             "A task may require multiple capabilities when one agent needs them to complete the objective. "
             "Use multi_step only when there are genuinely distinct pieces of work, dependencies, or specialized agents. "
             "Multi-step plans should normally use 2-6 tasks. "
+            "Do not add QA or code-audit tasks yourself; Freya appends and orders those deterministic stages. "
             "required_capabilities may only use these IDs: "
             + json.dumps(capability_ids, ensure_ascii=False)
             + ". Capabilities describe likely needs and never grant permission. Preferred Skills are hints only. "
-            "User goal: " + json.dumps(goal, ensure_ascii=False)
-            + ("\nTask Analyst interpretation (advisory constraints; preserve the original goal): " +
+            "Task Analyst operational prompt (authoritative task input): " + json.dumps(goal, ensure_ascii=False)
+            + ("\nTask Analyst structured analysis (authoritative constraints): " +
                json.dumps(context.get("task_analysis"), ensure_ascii=False, separators=(",", ":"))
                if isinstance(context.get("task_analysis"), dict) else "")
         )
@@ -555,7 +637,10 @@ class Planner:
         self._reset_metrics()
         if self.decide is None:
             if self.offline:
-                return _reconcile_task_analysis(fallback_plan(goal), (context or {}).get("task_analysis"))
+                analysis = (context or {}).get("task_analysis")
+                plan = _reconcile_task_analysis(fallback_plan(goal), analysis)
+                plan = _append_qa_task(plan, analysis)
+                return _append_code_audit_task(plan)
             raise PlanGenerationError("No planner model is configured. Use explicit offline mode for fallback planning.")
         limited_context = context if isinstance(context, dict) else {}
         request = self._prompt(goal, limited_context)
@@ -564,7 +649,9 @@ class Planner:
         except Exception as exc:
             raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
         try:
-            return self._parse_output(output, limited_context.get("task_analysis"))
+            parsed = self._parse_output(output, limited_context.get("task_analysis"))
+            parsed["goal"] = goal
+            return validate_plan(parsed)
         except (PlanValidationError, TypeError, ValueError) as first_error:
             rendered = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
             repair_prompt = (
@@ -573,7 +660,9 @@ class Planner:
             )
             try:
                 repaired = self._call(repair_prompt, limited_context)
-                return self._parse_output(repaired, limited_context.get("task_analysis"))
+                parsed = self._parse_output(repaired, limited_context.get("task_analysis"))
+                parsed["goal"] = goal
+                return validate_plan(parsed)
             except Exception as second_error:
                 raise PlanGenerationError(
                     f"Planner output remained invalid after one repair attempt: {second_error}"

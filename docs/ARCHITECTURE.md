@@ -4,7 +4,9 @@ Freya includes a first-class orchestration layer. User prompts enter
 `control_center/orchestrator.py`. When an enabled agent is marked with
 `config.orchestration_role=task_analyst`, it first asks `control_center/task_analyst.py`
 for a strict, tool-free interpretation of the original prompt. That result is
-advisory context only. Freya then asks `control_center/planner.py` for a
+schema-validated and semantically reconciled into an `operational_prompt`; it
+replaces the human wording for every downstream stage while the source remains
+immutable audit evidence. Freya then asks `control_center/planner.py` for a
 strict structured plan and persists that snapshot before asking
 `control_center/agent_selector.py` to rank compatible existing agents,
 then uses `control_center/execution_graph.py` to release dependency-ready tasks,
@@ -14,7 +16,7 @@ Workers remain the only components allowed to invoke tools;
 Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
 before a node can fail or a validated effective-plan revision can replace its subgraph.
 After every active task is accepted, `control_center/integration.py` verifies
-the original goal and every original global criterion against a fingerprinted
+the Analyst-derived operational goal and every planned global criterion against a fingerprinted
 effective-plan snapshot. Only global `accepted` permits final response
 composition and `Success`; `needs_work` or resolvable `blocked` may append
 bounded new tasks through the normal selector/policy/runtime/evaluator/recovery
@@ -32,7 +34,9 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-       Task Analyst → Planner → immutable plan → Execution Graph → Agent Selector → Orchestrator
+       Task Analyst → Planner → implementation → conditional QA → read-only Auditor
+                              ↓                    ↓                 ↓
+                       immutable plan ─────→ Execution Graph → Agent Selector → Orchestrator
                                               ↓              ↓              ↓
                                       dependency state   Capability Policy  scheduler → spawned worker → local Ollama
                                               ↑                                  ↓
@@ -41,8 +45,10 @@ browser → HTTP API → SQLite
                                               capability resolver → policy engine → tools → workspace
 ```
 
-The Task Analyst clarifies **what the user meant** without executing anything;
-the original prompt remains authoritative. The Planner determines **what** work exists. The Agent Selector determines
+The Task Analyst rewrites **what the user meant** without executing anything;
+its validated operational prompt is authoritative for execution and the human
+prompt remains available only for audit. Deterministic reconciliation prevents
+schema-valid contradictions such as ignoring interactive input. The Planner determines **what** work exists. The Agent Selector determines
 **who** is the safest and most suitable existing candidate for one planned
 task. The deterministic Execution Graph determines **when** dependency-ready
 tasks run. The Worker determines **how** one selected task executes. Capability
@@ -50,7 +56,7 @@ Policy remains the sole authority for **whether** each requested action is
 permitted. The Evaluator determines **whether the produced result actually
 satisfied** the planned objective and criteria.
 The Global Verifier determines **whether the complete accepted effective plan
-satisfies the original objective and global criteria**. The Integration
+satisfies the operational objective and global criteria**. The Integration
 Replanner may only append new work for a global gap; it cannot edit, delete,
 supersede, or rerun accepted tasks. The Result Integrator determines **what
 grounded response to present**, but it cannot change correctness. These
@@ -106,7 +112,7 @@ integration never fabricates a recovery action. `orchestration_integrations`
 stores one immutable row per `(orchestration_id, round)`: integration version,
 effective-plan revision, strict result, metrics, bounded snapshot, truncation
 flag, deterministic flag, graph fingerprint and global-problem fingerprint.
-The snapshot retains the original goal and criteria, active task IDs, accepted
+The snapshot retains the immutable Analyst-derived goal and criteria, active task IDs, accepted
 evaluation IDs and attempts. Before inserting a result or applying its final
 response/replan, Storage atomically rechecks `Integrating`, the plan revision
 and the current graph fingerprint. Cancellation, timeout or any snapshot change
@@ -114,13 +120,13 @@ therefore wins over late model output.
 
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
-events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
+events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. The persistence layer normalizes every runtime and orchestration event with `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how` and a stable `trace_id`. This is derived centrally from the assigned agent, task snapshot and orchestration, so Task Analyst, Planner, Programmer, Code Auditor and other selected agents cannot disappear from the audit trail when an emitter omits a display field. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
 Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
-The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single task, preventing redundant delegations. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill so the Code Auditor is explicitly selected after implementation. The created event contains only the goal, complexity, task count, task IDs and
+The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single implementation task. If the Analyst marks user input or interactive validation, it appends one dependent `qa-interactive-test` node with `interactive-testing`; QA may execute supported Python with bounded stdin but cannot modify files. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill, so ordering is implementation → QA when required → Code Auditor. The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
 Selection emits `freya.agent_selection.started`, followed by either
 `freya.agent_selected` or `freya.agent_selection.failed`. The selected event
@@ -165,16 +171,20 @@ changes abandoned active runs to `Failed`, preserves their plan and writes one
 
 ### Prompt interpretation
 
-`task_analyst.py` validates a bounded JSON interpretation containing explicit
-and inferred requirements, assumptions, risks, task characteristics, a
+`task_analyst.py` validates a version-2 bounded JSON result containing the
+self-contained `operational_prompt`, explicit and inferred requirements,
+assumptions, risks, task characteristics, a
 recommended role, acceptance criteria and validation strategy. The orchestrator
 selects one enabled agent with `config.orchestration_role=task_analyst`; older
 agents named or described as “Task Analyst” / “Analyst Planner” remain
 discoverable through a compatibility fallback. It emits
-`freya.task_analysis.started` and `freya.task_analysis.completed` (or
-`freya.task_analysis.skipped` when none is configured) before planning.
+`freya.task_analysis.started` and `freya.task_analysis.completed` before
+planning. If no enabled Analyst exists, Freya emits a deterministic operational
+brief rather than bypassing the phase.
 The analyst adapter calls loopback Ollama with `tools=[]`, and a deterministic
-interpretation is used if the model is unavailable. The role does not grant
+interpretation is used if the model is unavailable. Before use, deterministic
+facts can only strengthen model characteristics and required interactive
+validation; corrections are logged in `corrected_fields`. The role does not grant
 capabilities, and a Skill is optional guidance only—not the routing or security
 mechanism. Cancellation is rechecked after this phase so a late analyst result
 cannot start a planner call or resurrect a terminal orchestration.
@@ -206,6 +216,14 @@ errors never fall back silently. Deterministic one-task planning exists only for
 tests and the explicit `--planner-offline` mode. Planner calls are serialized per
 orchestrator so concurrent runs cannot mix provider metrics; cancellation uses a
 separate lifecycle lock and remains responsive while a planner call is pending.
+
+`tools.py` supports optional `stdin` only on the restricted Python branch of
+`run_command`, capped at 16,000 characters and never through a shell. Without
+stdin, child stdin is closed, so an accidental `input()` raises immediately with
+`interactive_input_required` instead of waiting until orchestration timeout.
+Three consecutive denied or repeatedly blocked actions trigger
+`task.blocked`; Freya then evaluates/replans or reports the cause. Graph timeouts
+also pass through the persisted logs-only failure-analysis path.
 
 Preferred Skills remain unvalidated semantic hints so planning is not coupled
 to the mutable Skill registry. Required capabilities must exist in the platform

@@ -4,7 +4,8 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
-`task_analyst.py` owns the optional, tool-free prompt interpretation contract.
+`task_analyst.py` owns the tool-free prompt-rewrite contract and semantic
+reconciliation against observable source-prompt facts.
 `planner.py` owns the versioned orchestration-plan contract, normalization and
 DAG validation. `orchestrator.py` runs the Task Analyst first when an enabled
 agent has `config.orchestration_role=task_analyst` (with a legacy name/role
@@ -31,19 +32,25 @@ bypass tool policy.
   and keep cancellation serialized with task submission.
 - The production Planner calls loopback Ollama without tools. Deterministic
   fallback requires the explicit `--planner-offline` mode.
-- Task Analyst output is advisory, strictly validated JSON. It receives the
-  original prompt, has no tools or workspace authority, and may use a
-  deterministic fallback if its model call fails; the original prompt remains
-  authoritative.
+- Task Analyst output is strictly validated JSON. It receives the original
+  prompt, has no tools or workspace authority, and may use a deterministic
+  fallback if its model call fails. Its `operational_prompt` replaces the human
+  wording for Planner and workers; the original remains immutable audit evidence.
+- Interactive plans append a dependent QA node with `interactive-testing`, then
+  the normal read-only Code Auditor. `run_command` accepts bounded stdin for
+  Python only and closes stdin otherwise so `input()` cannot consume the wall-clock deadline.
 - Keep context assembly in `agent_context.py`; do not add role-specific global
   prompts to the worker. Repeated non-recoverable tool failures must be
   bounded before consuming the task step budget.
 - `worker.py` must stop repeated successful read-only actions when no workspace
-  progress is observed. `tools.py` and `agent_context.py` must filter Git
+  progress is observed and bound consecutive denied/repeatedly blocked actions.
+  `tools.py` and `agent_context.py` must filter Git
   inspection when the task workspace is not inside a checkout.
 - `storage.py`'s orchestration log query merges runtime and orchestration event
   timelines without exposing private model reasoning; preserve source labels
-  and stable evidence IDs when extending it.
+  and stable evidence IDs when extending it. Every persisted row must retain
+  the normalized actor/workspace trace (`who`, `where`, `when`, `what`, `how`,
+  `phase`, `trace_id`) so Task Analyst and every delegated agent are auditable.
 - Keep Skill validation, resolution, compatibility diagnostics and compact
   rendering in `skills.py`; Skills never execute tools or modify policy. Task
   records must retain immutable Skill snapshots and versions.

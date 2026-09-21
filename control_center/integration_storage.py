@@ -141,8 +141,9 @@ class IntegrationStoreMixin:
             ).fetchone()
             if row is not None:
                 evaluations[row["id"]] = self._evaluation(row, include_snapshot=True)
+        original_plan = _load(run["plan_json"])
         prepared = build_integration_input(
-            original_user_prompt=run["prompt"], original_plan=_load(run["plan_json"]),
+            original_user_prompt=original_plan["goal"], original_plan=original_plan,
             effective_plan=_load(run["effective_plan_json"]) or _load(run["plan_json"]),
             plan_revision=int(run["current_plan_revision"] or 0),
             graph_nodes=nodes, evaluations=evaluations, revision_history=[],

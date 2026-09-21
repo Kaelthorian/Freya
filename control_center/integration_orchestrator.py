@@ -51,7 +51,9 @@ class IntegrationOrchestrationMixin:
                     evaluation_id, include_snapshot=True,
                 )
         return build_integration_input(
-            original_user_prompt=run["prompt"], original_plan=run["plan"],
+            # The immutable plan goal is the Task Analyst operational prompt.
+            # The human source prompt remains on the orchestration row for audit only.
+            original_user_prompt=run["plan"]["goal"], original_plan=run["plan"],
             effective_plan=run.get("effective_plan") or run["plan"],
             plan_revision=int(run.get("current_plan_revision") or 0),
             graph_nodes=graph["nodes"], evaluations=evaluations,

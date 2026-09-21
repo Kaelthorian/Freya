@@ -10,7 +10,7 @@ from . import __version__
 from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
 from .capabilities import capability_catalog
 from .planner import Planner
-from .presets import programmer_agent_payload
+from .presets import AGENT_PRESETS, agent_preset_payload
 from .security import sanitize
 
 LIVE = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -112,8 +112,10 @@ class Application:
             except Exception as exc:
                 return {"models": [], "error": str(exc)}
         if parts in (["agent-presets"], ["presets"]):
-            return [{"id": "programmer", "name": "Programmer",
-                     "description": "Generic software engineering agent with Skills, capabilities and verification."}]
+            return [
+                {"id": preset_id, "name": preset["name"], "description": preset["description"]}
+                for preset_id, preset in AGENT_PRESETS.items()
+            ]
         if parts == ["approvals"]:
             return self.store.list_approvals(status=query.get("status") or None,
                                              task_id=query.get("task_id") or None, limit=self._limit(query))
@@ -206,10 +208,12 @@ class Application:
 
     def _mutate(self, method, path, body):
         parts = path.strip("/").split("/")[1:]
-        if method == "POST" and parts in (["agent-presets", "programmer"], ["presets", "programmer"]):
+        if (method == "POST" and len(parts) == 2
+                and parts[0] in {"agent-presets", "presets"}
+                and parts[1] in AGENT_PRESETS):
             if not isinstance(body, dict):
                 raise ValueError("Preset body must be an object.")
-            payload = programmer_agent_payload(body)
+            payload = agent_preset_payload(parts[1], body)
             self._ensure_agent_name_available(payload["name"])
             agent = self.store.create_agent(payload)
             self._agent_event(agent, "agent.created")

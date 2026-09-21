@@ -68,6 +68,7 @@ class TaskAnalystTests(unittest.TestCase):
     def test_long_prompt_is_bounded_without_failing_preplanning(self):
         result = deterministic_task_analysis("A" * 6000 + " calculator input")
         self.assertLessEqual(len(result["objective"]), 4000)
+        self.assertLessEqual(len(result["operational_prompt"]), 4000)
         self.assertTrue(result["task_characteristics"]["requires_user_input"])
 
     def test_task_analyst_is_not_selected_as_worker(self):
@@ -82,6 +83,15 @@ class TaskAnalystTests(unittest.TestCase):
         )
         self.assertEqual(selection["status"], "no_eligible_agent")
 
+    def test_worker_prompt_contains_analyst_brief_not_human_source(self):
+        rendered = Orchestrator._execution_prompt(
+            "Precise operational brief",
+            {"objective": "Implement the requested artifact", "success_criteria": ["It works"]},
+        )
+        self.assertIn("TASK ANALYST OPERATIONAL BRIEF", rendered)
+        self.assertIn("Precise operational brief", rendered)
+        self.assertNotIn("ORIGINAL USER REQUEST", rendered)
+
     def test_ollama_adapter_is_tool_free_and_validates_json(self):
         captured = {}
 
@@ -95,7 +105,7 @@ class TaskAnalystTests(unittest.TestCase):
         result = adapter.analyze("Create a file", agent)
         self.assertEqual(captured["payload"]["tools"], [])
         self.assertIn("format", captured["payload"])
-        self.assertEqual(result["analysis_version"], 1)
+        self.assertEqual(result["analysis_version"], 2)
         self.assertEqual(adapter.metrics["total_tokens"], 9)
 
     def test_orchestrator_runs_analysis_before_planning(self):
@@ -108,12 +118,35 @@ class TaskAnalystTests(unittest.TestCase):
         orchestrator = Orchestrator(store, None, task_analyst=TaskAnalyst(adapter))
         analysis, metrics = orchestrator._analyze_prompt("run-1", "Create a file")
         self.assertEqual(adapter.prompts, [("Create a file", analyst["id"])])
-        self.assertEqual(analysis["analysis_version"], 1)
+        self.assertEqual(analysis["analysis_version"], 2)
         self.assertEqual(metrics["mode"], "model")
         self.assertEqual([event["event_type"] for event in store.events], [
             "freya.task_analysis.started", "freya.task_analysis.completed",
         ])
         self.assertEqual(store.events[-1]["agent_id"], analyst["id"])
+
+    def test_model_analysis_is_semantically_corrected_before_becoming_operational(self):
+        flawed = deterministic_task_analysis("Create a file")
+        flawed["operational_prompt"] = "Create a Python file and run it normally."
+        flawed["task_type"] = "general_task"
+        flawed["task_characteristics"]["interactive"] = False
+        flawed["task_characteristics"]["requires_user_input"] = False
+        flawed["validation"]["interactive_validation_required"] = False
+
+        class FlawedAdapter:
+            metrics = {"model_calls": 1}
+            def analyze(self, _prompt, _agent):
+                return flawed
+
+        wrapper = TaskAnalyst(FlawedAdapter())
+        result = wrapper.analyze(
+            "Crea una calculadora CMD que solicite input y no cierre la ventana.",
+            {"id": "analyst"},
+        )
+        self.assertEqual(result["task_type"], "windows_command_script")
+        self.assertTrue(result["validation"]["interactive_validation_required"])
+        self.assertIn("controlled stdin", result["operational_prompt"])
+        self.assertIn("operational_prompt", wrapper.metrics["corrected_fields"])
 
 
 if __name__ == "__main__":

@@ -124,6 +124,11 @@ def validate_replan_revision(*, current_plan: dict[str, Any], revised_plan: dict
     """Validate a cumulative revision against deterministic mutable/protected scope."""
     current_plan = validate_plan(deepcopy(current_plan))
     revised_plan = validate_plan(deepcopy(revised_plan))
+    for field in ("goal", "summary", "success_criteria"):
+        if revised_plan[field] != current_plan[field]:
+            raise RecoveryValidationError(
+                "Recovery revision cannot modify the Task Analyst operational goal or global plan fields."
+            )
     if len(revised_plan["tasks"]) > int(max_tasks):
         raise RecoveryValidationError("Revised plan exceeds the configured task limit.")
     current = {item["id"]: item for item in current_plan["tasks"]}
@@ -769,8 +774,10 @@ class Replanner:
         self.metrics = {"model_calls": 0}
         parsed = None
         for prompt in (
-            "Return a complete effective plan revision and explicitly list superseded task ids.",
-            "Repair the prior response. Return only strict plan-revision JSON with no extra fields.",
+            "Return a complete effective plan revision and explicitly list superseded task ids. "
+            "Preserve the current plan goal, summary and global success criteria exactly.",
+            "Repair the prior response. Return only strict plan-revision JSON with no extra fields. "
+            "Do not change the current plan goal, summary or global success criteria.",
         )[:max_model_calls]:
             self.metrics["model_calls"] += 1
             try:

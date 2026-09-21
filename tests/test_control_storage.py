@@ -140,14 +140,49 @@ class StoreTests(unittest.TestCase):
             "agent_id": first["id"], "task_analysis": {"task_type": "general_task"},
             "message": "Task Analyst interpretation",
         })
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "freya.plan.created", "status": "Planned",
+            "message": "Plan saved",
+        })
 
         grouped = self.store.list_events(orchestration_id=run["id"])
         self.assertEqual(len([item for item in grouped if item.get("source") != "orchestration"]), 2)
         analyst_events = [item for item in grouped if item.get("event_type") == "freya.task_analysis.completed"]
         self.assertEqual(len(analyst_events), 1)
         self.assertEqual(analyst_events[0]["task_analysis"]["task_type"], "general_task")
+        self.assertEqual(analyst_events[0]["source"], "orchestration")
+        self.assertEqual(analyst_events[0]["actor_type"], "task_analyst")
+        self.assertEqual(analyst_events[0]["actor_name"], "Coder")
+        self.assertEqual(analyst_events[0]["phase"], "task_analysis")
+        self.assertEqual(analyst_events[0]["what"], "Task Analyst interpretation")
+        self.assertEqual(analyst_events[0]["trace_id"], run["id"])
+        planner_events = [item for item in grouped if item.get("event_type") == "freya.plan.created"]
+        self.assertEqual(planner_events[0]["actor_type"], "orchestrator")
+        self.assertEqual(planner_events[0]["who"], "orchestrator")
         self.assertEqual({item["orchestration_id"] for item in grouped}, {run["id"]})
         self.assertEqual({item["agent_name"] for item in grouped if item.get("source") != "orchestration"}, {"Coder", "Auditor"})
+
+    def test_runtime_events_include_complete_actor_trace(self):
+        agent = self.agent("Programmer", role="Programmer")
+        task = self.task(agent, "Create the output file")
+        run = self.store.create_orchestration("Create the output file", {"workspace_path": "workspaces/task"})
+        self.store.transition_orchestration(run["id"], "Queued", "Running")
+        self.store.add_delegation(run["id"], agent["id"], "Create the file", task["id"])
+        event = self.store.append_event(task["id"], {
+            "event_type": "step.finished", "status": "Success", "tool": "write_file",
+            "capability": "filesystem.write", "output": {"path": "result.txt"},
+        })
+        stored = self.store.list_events(task["id"])[0]
+        self.assertEqual(stored["id"], event["id"])
+        self.assertEqual(stored["source"], "runtime")
+        self.assertEqual(stored["agent_name"], "Programmer")
+        self.assertEqual(stored["actor_role"], "Programmer")
+        self.assertEqual(stored["actor_type"], "agent")
+        self.assertEqual(stored["phase"], "execution")
+        self.assertEqual(stored["workspace"], "workspaces/task")
+        self.assertEqual(stored["orchestration_id"], run["id"])
+        self.assertEqual(stored["runtime_task_id"], task["id"])
+        self.assertEqual(stored["how"]["tool"], "write_file")
     def test_metrics_agent_aggregation_and_history_use_stored_execution_data(self):
         first, second = self.agent("One"), self.agent("Two", enabled=False)
         passed, failed, running = self.task(first), self.task(first), self.task(second)

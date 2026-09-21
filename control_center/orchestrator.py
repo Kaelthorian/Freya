@@ -123,11 +123,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self._orchestration_workspaces[oid] = selected
         return selected
     @staticmethod
-    def _execution_prompt(original_prompt: str, planned_task: dict,
+    def _execution_prompt(operational_prompt: str, planned_task: dict,
                           attempt_prompt: str = "") -> str:
-        """Keep the complete user request visible to every delegated worker."""
+        """Send the Task Analyst's operational brief to every delegated worker."""
         sections = [
-            "ORIGINAL USER REQUEST (preserve every requirement):\n" + str(original_prompt or "").strip(),
+            "TASK ANALYST OPERATIONAL BRIEF (authoritative for execution):\n"
+            + str(operational_prompt or "").strip(),
             "DELEGATED PLAN STEP:\n" + str(planned_task.get("objective") or "").strip(),
         ]
         description = str(planned_task.get("description") or "").strip()
@@ -138,7 +139,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             sections.append("Step success criteria:\n" + "\n".join("- " + str(item) for item in criteria))
         if attempt_prompt.strip():
             sections.append("RECOVERY INSTRUCTIONS:\n" + attempt_prompt.strip())
-        sections.append("Complete this step without inventing missing requirements; use the original request as the source of truth.")
+        sections.append("Complete this step without inventing requirements outside the Task Analyst operational brief.")
         return "\n\n".join(section for section in sections if section.strip())
 
     def _snapshot_delegation(self, delegation_id: str, task: dict) -> None:
@@ -350,23 +351,29 @@ class Orchestrator(IntegrationOrchestrationMixin):
         }
 
     def _analyze_prompt(self, oid: str, prompt: str) -> tuple[dict | None, dict]:
-        """Interpret the prompt once before planning when a Task Analyst exists."""
+        """Rewrite the human prompt once before any downstream planning."""
         analyst = select_task_analyst(self.store.list_agents())
         if analyst is None:
+            analysis = deterministic_task_analysis(prompt)
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] == "Planning":
                     self.store.add_orchestration_event(oid, {
-                        "event_type": "freya.task_analysis.skipped", "status": "Planning",
-                        "message": "No enabled Task Analyst is configured; Freya sent the original prompt to the planner.",
+                        "event_type": "freya.task_analysis.completed", "status": "Planning",
+                        "agent_name": "Freya deterministic Task Analyst",
+                        "analysis_version": analysis.get("analysis_version", 2),
+                        "analysis_mode": "deterministic_no_agent",
+                        "metrics": {"mode": "deterministic_no_agent", "model_calls": 0},
+                        "task_analysis": analysis,
+                        "message": "No enabled Task Analyst was configured; Freya produced a deterministic operational brief.",
                     })
-            return None, {"mode": "skipped", "model_calls": 0}
+            return analysis, {"mode": "deterministic_no_agent", "model_calls": 0}
         with self.lock:
             if self.store.get_orchestration(oid)["status"] != "Planning":
                 return None, {"mode": "cancelled", "model_calls": 0}
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.task_analysis.started", "status": "Planning",
                 "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
-                "message": "Task Analyst is interpreting the original prompt before planning.",
+                "message": "Task Analyst is rewriting the human prompt into the operational task brief.",
             })
         try:
             analyzer = self.task_analyst or TaskAnalyst(offline=True)
@@ -389,7 +396,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     # hidden chain-of-thought. Keep the key explicit so the
                     # persistence sanitizer does not remove it.
                     "analysis_mode": mode, "metrics": metrics, "task_analysis": analysis,
-                    "message": "Task Analyst produced a bounded interpretation for the planner.",
+                    "corrected_fields": metrics.get("corrected_fields", []),
+                    "message": "Task Analyst produced the operational prompt used by the planner and workers.",
                 })
         return analysis, metrics
 
@@ -499,6 +507,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 )
 
     def _timeout(self, oid: str) -> None:
+        graph = None
         with self.lock:
             run = self.store.get_orchestration(oid)
             if run["status"] != "Running":
@@ -513,10 +522,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 self.store.save_execution_graph(oid, graph.serialize())
                 self._close_terminal_attempts(oid, graph)
                 self.store.add_orchestration_event(oid, {
-                    "event_type": "freya.graph.completed", "status": "Failed",
-                    "message": "The execution graph reached its time limit.",
+                    "event_type": "freya.timeout", "status": "Failed",
+                    "message": "Orchestration time limit reached; active delegated tasks were cancelled.",
                     "summary": graph.summary(),
                 })
+        if graph is not None:
+            # Use the ordinary graph failure path so a timeout receives the
+            # same bounded root-cause report as every other terminal failure.
+            self._finish_graph(oid, graph)
+        else:
             self._fail_running(oid, "Orchestration time limit reached; active delegated tasks were cancelled.")
 
     def _abort_graph(self, oid: str, message: str) -> None:
@@ -1006,7 +1020,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "status": status, "message": message,
         })
 
-    def _run_graph(self, oid: str, running: dict, deadline: float) -> None:
+    def _run_graph(self, oid: str, running: dict, deadline: float,
+                   operational_prompt: str = "") -> None:
+        operational_prompt = (
+            str(operational_prompt).strip()
+            or str((running.get("plan") or {}).get("goal") or "").strip()
+        )
+        if not operational_prompt:
+            raise ValueError("Execution graph has no Task Analyst operational prompt.")
         while True:
             if self.clock() >= deadline:
                 self._timeout(oid)
@@ -1194,7 +1215,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             task["id"], "Selected agent is executing another task.", utcnow(),
                         )
                         continue
-                    execution_prompt = self._execution_prompt(run.get("prompt", ""), task, node.get("attempt_prompt") or "")
+                    execution_prompt = self._execution_prompt(
+                        operational_prompt, task, node.get("attempt_prompt") or "",
+                    )
                     try:
                         runtime_task = self.runtime.submit(
                             agent_id, execution_prompt,
@@ -1303,13 +1326,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if self.store.get_orchestration(oid)["status"] != "Planning":
                     return
             context = self._planning_context(self.store.list_agents())
-            if analysis is not None:
-                # The original prompt remains authoritative; analysis is an
-                # advisory, untrusted interpretation for the planner only.
-                context["task_analysis"] = analysis
+            if analysis is None:
+                raise ValueError("Task Analyst did not produce an operational prompt.")
+            context["task_analysis"] = analysis
+            operational_prompt = str(analysis.get("operational_prompt") or "").strip()
+            if not operational_prompt:
+                raise ValueError("Task Analyst operational prompt is empty.")
             with self.planner_lock:
                 try:
-                    plan = self.planner.create_plan(planning["prompt"], context)
+                    plan = self.planner.create_plan(operational_prompt, context)
                 finally:
                     planning_metrics = dict(self.planner.metrics)
             planning_metrics["task_analysis"] = {
@@ -1361,7 +1386,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "event_type": "freya.analyzing", "status": "Running",
                     "message": "Freya is scheduling ready tasks from the execution graph.",
                 })
-            self._run_graph(oid, running, deadline)
+            self._run_graph(oid, running, deadline, operational_prompt)
         except Exception as exc:
             self._abort_graph(oid, str(exc))
 
@@ -1381,13 +1406,23 @@ class Orchestrator(IntegrationOrchestrationMixin):
             })
         planning_metrics: dict = {}
         try:
+            analysis, analysis_metrics = self._analyze_prompt(oid, planning["prompt"])
+            if analysis is None:
+                raise ValueError("Task Analyst did not produce an operational prompt.")
+            operational_prompt = str(analysis.get("operational_prompt") or "").strip()
             agents = self.store.list_agents()
             context = self._planning_context(agents)
+            context["task_analysis"] = analysis
             with self.planner_lock:
                 try:
-                    plan = self.planner.create_plan(planning["prompt"], context)
+                    plan = self.planner.create_plan(operational_prompt, context)
                 finally:
                     planning_metrics = dict(self.planner.metrics)
+            planning_metrics["task_analysis"] = {
+                key: value for key, value in analysis_metrics.items()
+                if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
+                           "total_tokens", "duration_seconds"}
+            }
         except Exception as exc:
             self._fail_planning(oid, exc, planning_metrics)
             return
@@ -1421,7 +1456,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     self._timeout(oid)
                     return
                 if self.decide:
-                    decision = self._decision(running["prompt"], self.store.list_agents(), results)
+                    decision = self._decision(operational_prompt, self.store.list_agents(), results)
                 else:
                     # Compatibility path for explicitly injected legacy decision hooks.
                     selected_task = self._select_planned_task(
@@ -1460,7 +1495,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         agent = self.store.get_agent(agent_id)
                         if agent.get("enabled") is not True:
                             raise ValueError("Selected agent is disabled or unavailable.")
-                        execution_prompt = self._execution_prompt(running.get("prompt", ""), item, objective)
+                        execution_prompt = self._execution_prompt(operational_prompt, item, objective)
                         task = self.runtime.submit(
                             agent_id, execution_prompt, self._workspace_for_run(running),
                         )

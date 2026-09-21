@@ -426,8 +426,13 @@ class GroundedLifecycleTests(unittest.TestCase):
         run, runtime, orchestrator = self.make(
             initial=initial, evaluator=Evaluator(evaluate),
             recovery=RecoveryController(lambda p, c: recovery_decision("replan_subgraph")),
-            replanner=Replanner(lambda *args, **kwargs: {
-                "summary": "Replace incomplete component", "plan": revised, "superseded_task_ids": ["a"],
+            replanner=Replanner(lambda _prompt, context, **kwargs: {
+                "summary": "Replace incomplete component",
+                "plan": {**revised,
+                         "goal": context["current_plan"]["goal"],
+                         "summary": context["current_plan"]["summary"],
+                         "success_criteria": context["current_plan"]["success_criteria"]},
+                "superseded_task_ids": ["a"],
             }),
             replan_model=lambda p, c: integration_calls.append(True),
             config={"max_plan_revisions": 1},

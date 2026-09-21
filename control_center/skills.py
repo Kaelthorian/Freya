@@ -54,6 +54,29 @@ BUILTIN_SKILLS: tuple[dict[str, Any], ...] = (
         "required_capabilities": ["filesystem.read"], "tags": ["testing", "pytest", "unittest", "verification"], "source": "builtin", "enabled": True,
     },
     {
+        "id": "interactive-testing", "name": "Interactive Program Testing", "category": "Software Quality", "version": 1,
+        "description": "Exercise command-line programs with bounded controlled input and verify observable output.",
+        "instructions": [
+            "Use run_command stdin for programs that call input; never wait for a human terminal.",
+            "Test representative and edge-case inputs, then cite exit status and observed output.",
+            "Do not modify the implementation while acting as QA; report failures to Freya.",
+        ],
+        "procedures": [{
+            "name": "Test Interactive CLI", "description": "Validate an interactive Python program without a live terminal.",
+            "steps": [
+                "Inspect the implementation to determine its input sequence.",
+                "Prepare bounded newline-delimited stdin for a representative case.",
+                "Run the workspace Python script with controlled stdin and a short timeout.",
+                "Compare the exit status and output with the expected logical result.",
+                "Repeat only with a distinct edge case when it adds useful evidence.",
+                "Report the exact command, input case, exit status and observed output.",
+            ],
+        }],
+        "recommended_capabilities": ["filesystem.read", "filesystem.search", "execution.python_script"],
+        "required_capabilities": ["filesystem.read", "execution.python_script"],
+        "tags": ["qa", "interactive", "stdin", "cli", "testing"], "source": "builtin", "enabled": True,
+    },
+    {
         "id": "debugging", "name": "Debugging", "category": "Engineering", "version": 1,
         "description": "Find root causes and apply evidence-based fixes.",
         "instructions": ["Start from observable symptoms and reproduce when possible.", "Separate confirmed causes from hypotheses."],

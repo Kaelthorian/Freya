@@ -41,10 +41,12 @@ offline test environment. Provider errors fail planning and do not trigger the
 fallback.
 
 Before the planner, Freya uses the first enabled agent whose
-`config.orchestration_role` is `task_analyst` to interpret the original prompt.
-The agent is tool-free and its JSON result is advisory; the original prompt and
-capability policy remain authoritative. If no such agent exists, planning still
-receives the original prompt and emits `freya.task_analysis.skipped`. If the
+`config.orchestration_role` is `task_analyst` to rewrite the original prompt.
+The agent is tool-free. Its schema-validated, semantically reconciled
+`operational_prompt` replaces the human text for Planner and workers; the
+original is retained only as immutable audit evidence and capability policy
+remains authoritative. If no such agent exists, Freya produces a deterministic
+operational brief. If the
 analyst model fails, Freya records the error and uses a deterministic bounded
 interpretation. The role can be selected in the agent editor; a Skill is not
 required for routing or authorization.
@@ -101,10 +103,19 @@ generated logs.
 For troubleshooting, use `GET /api/logs?orchestration_id=<id>&limit=10000` (or
 the run's Diagnosis link). The response combines worker events with the
 orchestration timeline, so Task Analyst interpretation, plan/selection events,
+and every selected agent's normalized `who`/`where`/`when`/`what`/`how` trace,
 `task.no_progress`, terminal `failure_class` and the final failure diagnosis
 are visible together. A `NoProgressDetected` report means the worker repeated
 successful read-only actions without changing the workspace; raising
 `max_steps` alone is not a corrective action.
+`BlockedActionCycle` means three consecutive actions were denied or repeatedly
+blocked; Freya stops that worker and diagnoses/replans instead of consuming the
+remaining step budget. Orchestration timeouts also emit failure analysis.
+
+Interactive Python QA uses `run_command` with a bounded `stdin` string. Without
+stdin the worker closes the child stream, so `input()` fails immediately rather
+than waiting for a human terminal. This does not add shell access and QA Tester
+cannot modify files.
 
 Git Inspection is only prompt-visible when the task workspace is inside a Git
 checkout. Non-Git workspaces omit `git_diff` from the worker schemas and report
@@ -149,6 +160,12 @@ SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
 `-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including the final read-only Code Auditor); direct task submissions still get one directory per task. These
 generated paths are ignored by Git.
 
+Shareable pipeline-agent definitions live in `data/agents/*.json`. Import them
+one at a time from **Agents → Import agent** on a fresh installation. They contain
+configuration and Skill assignments only; the SQLite database, runtime status,
+prompts, logs, approvals, metrics and generated workspaces remain ignored. The
+referenced Ollama model and assigned built-in Skills must exist before import.
+
 In agent settings, **Choose folder** chooses that agent's default folder. In the Freya form, selecting an existing folder uses it directly for the orchestration, so agents can act on files already there; leaving it empty creates an isolated workspace.
 The **Assign a task** form also has its own folder selector. It starts with
 the agent default, can override it for one execution, and uses a fresh generated
@@ -156,11 +173,15 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
-Plans that create or modify code append one dependent, read-only Code Auditor task automatically; it is selected through the `code-review` Skill and appears as a separate audit row in Logs.
+Interactive plans append a dependent QA Tester task selected through the
+`interactive-testing` Skill. Plans that create or modify code then append one
+dependent, read-only Code Auditor task selected through `code-review`, producing
+the ordered path Programmer → QA when needed → Code Auditor in Logs.
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
 verification, autonomy, output, and limits are compact expandable sections. The
-Agents page also exposes the generic Programmer preset.
+API presets cover Programmer, Task Analyst, QA Tester and Code Auditor; the
+Agents page keeps the existing Programmer quick-create action.
 
 The **Skills** page manages reusable declarative knowledge. Create or edit a
 Skill with a stable lowercase ID, version, instructions, adaptable procedures,

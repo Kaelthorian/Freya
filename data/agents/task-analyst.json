@@ -1,0 +1,44 @@
+{
+  "name": "Task Analyst",
+  "description": "Prompt-engineering specialist that rewrites human requests into operational briefs.",
+  "role": "Task Analyst Planner",
+  "instructions": "Preserve every explicit requirement. Produce a precise self-contained operational prompt, identify assumptions, interactive behavior, risks, acceptance criteria and a validation strategy.",
+  "enabled": true,
+  "tools": [],
+  "skills": [],
+  "config": {
+    "orchestration_role": "task_analyst",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "max_steps": 1,
+    "max_seconds": 120,
+    "max_model_calls": 1,
+    "max_tool_calls": 0,
+    "retries": 0,
+    "permissions": "read_only",
+    "capability_policy": {
+      "capabilities": {
+        "filesystem": {
+          "list": { "mode": "deny" },
+          "read": { "mode": "deny" },
+          "search": { "mode": "deny" },
+          "create": { "mode": "deny" },
+          "modify": { "mode": "deny" },
+          "overwrite": { "mode": "deny" }
+        },
+        "git": {
+          "status": { "mode": "deny" },
+          "diff": { "mode": "deny" }
+        },
+        "execution": {
+          "python_script": { "mode": "deny" },
+          "pytest": { "mode": "deny" },
+          "unittest": { "mode": "deny" },
+          "py_compile": { "mode": "deny" },
+          "ruff": { "mode": "deny" }
+        }
+      }
+    }
+  }
+}

@@ -105,8 +105,10 @@ The orchestration moves through `Queued`, `Planning`, `Planned`, `Running`, and
 `Integrating` before success. A globally requested append-only revision returns
 it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning emits
 `freya.planning.started`. Before the planner, configured Task Analyst runs emit
-`freya.task_analysis.started` and `freya.task_analysis.completed`; when none is
-configured, `freya.task_analysis.skipped` is emitted. Planning then emits either
+`freya.task_analysis.started` and `freya.task_analysis.completed`; without a
+configured agent the completed event contains a deterministic operational brief.
+The version-2 result includes `operational_prompt`, and `corrected_fields` lists
+deterministic semantic corrections. Planning then emits either
 `freya.plan.created` with a safe goal/complexity/task summary or
 `freya.planning.failed`. A plan uses schema version 1:
 
@@ -187,8 +189,8 @@ unchanged. Recovery does not create agents, auto-approve capabilities, bypass
 policy, or provide direct agent-to-agent messaging.
 A graph with every active effective task in accepted `success` enters
 `Integrating`; node success alone never produces orchestration `Success`.
-`GlobalVerifier` evaluates the original prompt, immutable original goal/global
-criteria, current effective plan, accepted results/evaluations and bounded
+`GlobalVerifier` evaluates the Analyst operational prompt, immutable operational
+goal/global criteria, current effective plan, accepted results/evaluations and bounded
 verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
 or `error`, and each original global criterion appears exactly once.
 
@@ -241,6 +243,9 @@ integration adapters are loopback-only and tool-free.
 | POST | `/api/agents/{id}/tasks` | assign a task with optional workspace override |
 | GET | `/api/agent-presets` | list safe built-in presets |
 | POST | `/api/agent-presets/programmer` | create a generic Programmer agent |
+| POST | `/api/agent-presets/task-analyst` | create a tool-free prompt-rewrite agent |
+| POST | `/api/agent-presets/qa-tester` | create a non-writing QA agent with controlled Python execution |
+| POST | `/api/agent-presets/code-auditor` | create a read-only Code Auditor |
 | GET | `/api/tools` | actual and explicitly unavailable tools (advanced mapping) |
 | GET | `/api/capabilities` | structured Filesystem, Execution, and Git actions |
 | GET | `/api/models?endpoint=...` | installed models from local Ollama |
@@ -265,7 +270,7 @@ and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
 optional `secret_env` name. `config.orchestration_role` may be `worker`,
-`task_analyst`, `planner`, or `auditor`; `task_analyst` runs before planning and
+`task_analyst`, `planner`, `qa`, or `auditor`; `task_analyst` runs before planning and
 does not grant any capability. The `capability_policy` belongs inside `config`
 and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
@@ -290,6 +295,13 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 `q` (name, ID, description, category, or tags), `category`, `enabled`, and
 `source`. Compatibility summaries include operational state, priority, missing required or recommended capability IDs, and missing concrete tools/runtime support.
 
+`run_command` accepts optional `{ "stdin": "..." }` only for restricted Python
+commands. Input is capped at 16,000 characters and is redacted to a character
+count in logs. Omitting it closes child stdin; a Python `input()` therefore
+fails immediately with `interactive_input_required` instead of hanging. The
+Planner adds `qa-interactive-test` when the Analyst marks a request interactive,
+followed by `code-audit` for mutation plans.
+
 ## Tasks, observations and metrics
 
 | Method | Route | Purpose |
@@ -307,7 +319,7 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.
 
-Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. `GET /api/logs?orchestration_id=...` also merges the persisted orchestration timeline (for example `freya.task_analysis.completed` and failure-analysis events); those rows use a string `id` such as `orchestration:12` and `source=orchestration`. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
+Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. `GET /api/logs?orchestration_id=...` also merges the persisted orchestration timeline (for example `freya.task_analysis.completed` and failure-analysis events); those rows use a string `id` such as `orchestration:12` and `source=orchestration`. Every log row includes a normalized trace: `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how`, `trace_id`, plus the relevant status/tool/input/output/error/duration fields. This makes Task Analyst, Planner, Programmer, Code Auditor and any other participating actor visible in the same audit trail. `how` is bounded to operational metadata (tool, capability, policy, attempt and related IDs), never private model reasoning. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
 and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.

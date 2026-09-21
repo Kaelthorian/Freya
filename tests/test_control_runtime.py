@@ -206,6 +206,20 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(no_progress), 1)
         self.assertIn("read-only", no_progress[0]["reason"])
 
+    def test_three_denied_invented_tools_stop_as_blocked_cycle(self):
+        responses = [
+            answer(calls=[("request_new_capabilities", {"capability": "shell"})])
+            for _ in range(3)
+        ]
+        result = self.run_worker(responses, tools=["read_file"], config={"max_steps": 20})
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "blocked_action_cycle")
+        self.assertEqual(result["blocked_actions"], 3)
+        self.assertLess(result["steps"], 20)
+        blocked = [event["event"] for event in self.events
+                   if event.get("event", {}).get("event_type") == "task.blocked"]
+        self.assertEqual(len(blocked), 1)
+
     def test_zero_tool_budget_and_step_budget(self):
         call = answer(calls=[("write_file", {"path": "x", "content": "one"}), ("write_file", {"path": "y", "content": "two"})])
         result = self.run_worker([call], config={"max_tool_calls": 0})

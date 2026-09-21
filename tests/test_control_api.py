@@ -99,6 +99,19 @@ class ApiTests(unittest.TestCase):
         status, body = self.request("POST", "/api/agents", {"name": "original"})
         self.assertEqual(status, 409)
         self.assertIn("already exists", body["error"])
+
+    def test_pipeline_agent_presets_are_listed_and_qa_can_be_created(self):
+        status, presets = self.request("GET", "/api/agent-presets")
+        self.assertEqual(status, 200)
+        self.assertEqual({item["id"] for item in presets}, {
+            "programmer", "task-analyst", "qa-tester", "code-auditor",
+        })
+        status, qa = self.request("POST", "/api/agent-presets/qa-tester", {})
+        self.assertEqual(status, 201, qa)
+        self.assertEqual(qa["config"]["orchestration_role"], "qa")
+        self.assertIn("run_command", qa["tools"])
+        self.assertNotIn("write_file", qa["tools"])
+
     def test_agent_creation_accepts_editor_capability_policy_inside_config(self):
         status, agent = self.request("POST", "/api/agents", {
             "name": "Policy editor",

@@ -1,0 +1,57 @@
+{
+  "name": "Programmer",
+  "description": "Generic software engineering agent for implementation, debugging and verification.",
+  "role": "Software Engineer",
+  "instructions": "Inspect the repository before modifying it. Keep changes minimal, preserve security boundaries, and report evidence.",
+  "enabled": true,
+  "tools": [
+    "list_files",
+    "read_file",
+    "search_code",
+    "write_file",
+    "edit_file",
+    "run_command",
+    "git_diff"
+  ],
+  "skills": [
+    { "skill_id": "python-development", "priority": 100 },
+    { "skill_id": "software-testing", "priority": 90 },
+    { "skill_id": "debugging", "priority": 80 },
+    { "skill_id": "git-inspection", "priority": 70 }
+  ],
+  "config": {
+    "orchestration_role": "worker",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "max_steps": 40,
+    "max_seconds": 900,
+    "max_model_calls": 40,
+    "max_tool_calls": 100,
+    "retries": 1,
+    "permissions": "execute",
+    "capability_policy": {
+      "capabilities": {
+        "filesystem": {
+          "list": { "mode": "allow" },
+          "read": { "mode": "allow" },
+          "search": { "mode": "allow" },
+          "create": { "mode": "allow" },
+          "modify": { "mode": "allow" },
+          "overwrite": { "mode": "ask" }
+        },
+        "git": {
+          "status": { "mode": "allow" },
+          "diff": { "mode": "allow" }
+        },
+        "execution": {
+          "python_script": { "mode": "ask" },
+          "pytest": { "mode": "ask" },
+          "unittest": { "mode": "ask" },
+          "py_compile": { "mode": "ask" },
+          "ruff": { "mode": "ask" }
+        }
+      }
+    }
+  }
+}

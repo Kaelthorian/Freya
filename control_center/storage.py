@@ -1273,9 +1273,137 @@ class Store(IntegrationStoreMixin):
         return next(item for item in self.list_plan_revisions(oid) if item["id"] == revision_id)
 
 
+    @staticmethod
+    def _trace_phase(event_type: Any) -> str:
+        """Map an event to an operational phase for human-readable tracing."""
+        value = str(event_type or "").casefold()
+        phases = (
+            ("task_analysis", "task_analysis"),
+            ("failure_analysis", "failure_analysis"),
+            ("planning", "planning"),
+            ("plan.", "planning"),
+            ("selection", "selection"),
+            ("delegat", "delegation"),
+            ("recovery", "recovery"),
+            ("integrat", "integration"),
+            ("verification", "verification"),
+            ("model.", "execution"),
+            ("step.", "execution"),
+            ("tool.", "execution"),
+            ("capability.", "execution"),
+            ("workspace.", "execution"),
+            ("task.", "lifecycle"),
+            ("execution.", "lifecycle"),
+        )
+        return next((phase for marker, phase in phases if marker in value), "orchestration")
+
+    @staticmethod
+    def _trace_actor_type(event_type: Any, actor_role: Any = None,
+                          source: str = "runtime", has_agent: bool = False) -> str:
+        value = str(event_type or "").casefold()
+        role = str(actor_role or "").casefold()
+        if "task_analysis" in value or "task analyst" in role:
+            return "task_analyst"
+        if "failure_analysis" in value or "failure analyst" in role:
+            return "failure_analyst"
+        if "planning" in value or "planner" in role:
+            return "planner"
+        if "auditor" in role or "review" in role:
+            return "auditor"
+        if has_agent:
+            return "agent"
+        return "orchestrator" if source == "orchestration" else "runtime"
+
+    @classmethod
+    def _trace_fields(cls, event: dict[str, Any], *, source: str,
+                      trace_id: str | None = None, agent_name: str | None = None,
+                      actor_role: str | None = None, workspace: str | None = None,
+                      timestamp: str | None = None) -> dict[str, Any]:
+        """Return a bounded, consistent who/where/when/what/how trace."""
+        event_type = event.get("event_type") or "update"
+        when = event.get("timestamp") or timestamp or utcnow()
+        resolved_name = agent_name or event.get("agent_name") or event.get("actor_name")
+        if str(resolved_name or "").strip() in {"", "—", "-", "None"}:
+            resolved_name = None
+        resolved_role = actor_role or event.get("actor_role") or event.get("agent_role")
+        if str(resolved_role or "").strip() in {"", "—", "-", "None"}:
+            resolved_role = None
+        resolved_workspace = workspace or event.get("workspace") or event.get("workspace_path")
+        phase = event.get("phase") or cls._trace_phase(event_type)
+        has_agent = bool(event.get("agent_id") or resolved_name or resolved_role)
+        actor_type = event.get("actor_type") or cls._trace_actor_type(
+            event_type, resolved_role, source, has_agent,
+        )
+        action = event.get("action") or str(event_type).replace("_", " ").replace(".", " / ")
+        what = event.get("what") or event.get("message") or event.get("reason") or action
+        how_keys = (
+            "agent_id", "orchestration_id", "tool", "capability", "policy_decision", "policy_reason", "selection_id",
+            "analysis_mode", "model", "attempt", "step_id", "step_number",
+            "runtime_task_id", "planned_task_id", "plan_task_id", "recovery_id",
+        )
+        how = dict(event.get("how") or {}) if isinstance(event.get("how"), dict) else {}
+        for key in how_keys:
+            if event.get(key) is not None:
+                how.setdefault(key, event[key])
+        return {
+            "source": source,
+            "trace_id": trace_id or event.get("trace_id"),
+            "phase": phase,
+            "actor_type": actor_type,
+            "actor_name": resolved_name,
+            "actor_role": resolved_role,
+            "who": resolved_name or resolved_role or event.get("agent_id") or actor_type,
+            "where": resolved_workspace or event.get("location") or source,
+            "workspace": resolved_workspace,
+            "when": when,
+            "action": action,
+            "what": what,
+            "how": how,
+        }
+
     def add_orchestration_event(self, oid, event):
         with self._connection(write=True) as c:
-            c.execute("INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)", (oid,utcnow(),event.get("event_type","update"),event.get("status"),event.get("agent_id"),event.get("task_id"),event.get("message",event.get("reason","")),_dump(event)))
+            payload = dict(event or {})
+            run = c.execute(
+                "SELECT config_json FROM orchestration_runs WHERE id=?", (oid,),
+            ).fetchone()
+            # Plan events often carry both a human-facing plan task id (`t1`)
+            # and the concrete runtime task id. Resolve the latter first so
+            # actor role and workspace are attached to the orchestration row.
+            task_id = payload.get("runtime_task_id") or payload.get("task_id")
+            task = c.execute(
+                "SELECT agent_id,agent_name,agent_role,workspace FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone() if task_id else None
+            agent_id = payload.get("agent_id") or (task["agent_id"] if task else None)
+            agent = c.execute(
+                "SELECT name,role FROM agents WHERE id=?", (agent_id,),
+            ).fetchone() if agent_id else None
+            config = _load(run["config_json"]) if run else {}
+            workspace = (payload.get("workspace") or payload.get("workspace_path")
+                         or (task["workspace"] if task else None)
+                         or (config or {}).get("workspace_path"))
+            payload.update(agent_id=agent_id, task_id=payload.get("task_id"))
+            payload.setdefault("orchestration_id", oid)
+            if payload.get("runtime_task_id") is None and task_id and task_id != payload.get("task_id"):
+                payload["runtime_task_id"] = task_id
+            trace = self._trace_fields(
+                payload, source="orchestration", trace_id=oid,
+                agent_name=(payload.get("agent_name") or (task["agent_name"] if task else None)
+                            or (agent["name"] if agent else None)),
+                actor_role=(payload.get("actor_role") or (task["agent_role"] if task else None)
+                            or (agent["role"] if agent else None)),
+                workspace=workspace, timestamp=utcnow(),
+            )
+            payload.update(trace)
+            timestamp = payload["when"]
+            c.execute(
+                "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (oid, timestamp, payload.get("event_type", "update"), payload.get("status"),
+                 agent_id, payload.get("task_id"), sanitize(payload.get("message", payload.get("reason", ""))),
+                 _dump(payload)),
+            )
 
     def save_agent_selection(self, oid: str, selection: dict[str, Any]) -> str | None:
         """Persist an immutable selector snapshot while the orchestration is running."""
@@ -1416,7 +1544,9 @@ class Store(IntegrationStoreMixin):
 
     def _append_event(self, connection: sqlite3.Connection, task_id: str | None, event: dict) -> dict:
         if task_id is not None:
-            task = connection.execute("SELECT agent_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = connection.execute(
+                "SELECT agent_id,agent_name,agent_role,workspace FROM tasks WHERE id=?", (task_id,),
+            ).fetchone()
             if task is None:
                 raise KeyError(task_id)
             agent_id = task["agent_id"]
@@ -1424,11 +1554,36 @@ class Store(IntegrationStoreMixin):
             agent_id = event.get("agent_id")
             if connection.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone() is None:
                 raise KeyError(agent_id)
+            task = None
+        agent = connection.execute(
+            "SELECT name,role FROM agents WHERE id=?", (agent_id,),
+        ).fetchone()
+        delegation = connection.execute(
+            "SELECT orchestration_id FROM orchestration_delegations WHERE task_id=? "
+            "ORDER BY created_at DESC LIMIT 1", (task_id,),
+        ).fetchone() if task_id else None
+        orchestration_id = event.get("orchestration_id") or (
+            delegation["orchestration_id"] if delegation else None
+        )
         payload = sanitize(dict(event))
         payload.update(task_id=task_id, agent_id=agent_id,
                        timestamp=payload.get("timestamp") or utcnow(),
                        event_type=payload.get("event_type") or "log",
                        level=str(payload.get("level") or "INFO").upper())
+        payload.update(
+            orchestration_id=orchestration_id,
+            runtime_task_id=task_id,
+            agent_name=(payload.get("agent_name") or (task["agent_name"] if task else None)
+                        or (agent["name"] if agent else None)),
+            actor_role=(payload.get("actor_role") or (task["agent_role"] if task else None)
+                        or (agent["role"] if agent else None)),
+            workspace=(payload.get("workspace") or (task["workspace"] if task else None)),
+        )
+        payload.update(self._trace_fields(
+            payload, source="runtime", trace_id=orchestration_id or task_id,
+            agent_name=payload.get("agent_name"), actor_role=payload.get("actor_role"),
+            workspace=payload.get("workspace"), timestamp=payload["timestamp"],
+        ))
         payload.pop("id", None)
         cursor = connection.execute(
             "INSERT INTO log_events(task_id,agent_id,timestamp,event_type,level,step_id,tool,status,error,"
@@ -1500,7 +1655,7 @@ class Store(IntegrationStoreMixin):
             params.append(end)
         with self._connection() as connection:
             order = "DESC" if filters.get("newest") else "ASC"
-            rows = connection.execute("SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,a.name AS current_agent_name, " +
+            rows = connection.execute("SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,t.agent_role AS task_agent_role,t.workspace AS task_workspace,a.name AS current_agent_name,a.role AS current_agent_role, " +
                                       "d.orchestration_id,o.prompt AS orchestration_prompt,o.status AS orchestration_status, " +
                                       "o.created_at AS orchestration_created_at " +
                                       "FROM log_events e LEFT JOIN tasks t ON t.id=e.task_id " +
@@ -1512,6 +1667,21 @@ class Store(IntegrationStoreMixin):
             for row in rows:
                 payload = dict(_load(row["payload_json"]), id=row["id"])
                 payload["agent_name"] = row["task_agent_name"] or row["current_agent_name"] or payload.get("agent_id", "—")
+                payload.setdefault("source", "runtime")
+                payload.setdefault("runtime_task_id", payload.get("task_id"))
+                if not payload.get("agent_role"):
+                    payload["agent_role"] = row["task_agent_role"] or row["current_agent_role"]
+                if not payload.get("workspace"):
+                    payload["workspace"] = row["task_workspace"]
+                if not payload.get("orchestration_id"):
+                    payload["orchestration_id"] = row["orchestration_id"]
+                payload.update({
+                    key: value for key, value in self._trace_fields(
+                        payload, source="runtime", trace_id=payload.get("orchestration_id") or payload.get("task_id"),
+                        agent_name=payload.get("agent_name"), actor_role=payload.get("agent_role"),
+                        workspace=payload.get("workspace"), timestamp=payload.get("timestamp"),
+                    ).items() if value is not None and payload.get(key) is None
+                })
                 if row["orchestration_id"]:
                     payload["orchestration_id"] = row["orchestration_id"]
                     payload["orchestration_prompt"] = row["orchestration_prompt"] or ""
@@ -1542,8 +1712,10 @@ class Store(IntegrationStoreMixin):
                         "OR lower(oe.event_type) LIKE '%blocked%' OR lower(oe.event_type) LIKE '%denied%')"
                     )
                 orchestration_rows = connection.execute(
-                    "SELECT oe.*,a.name AS orchestration_agent_name "
+                    "SELECT oe.*,a.name AS orchestration_agent_name,a.role AS orchestration_agent_role,"
+                    "o.config_json AS orchestration_config_json "
                     "FROM orchestration_events oe LEFT JOIN agents a ON a.id=oe.agent_id "
+                    "LEFT JOIN orchestration_runs o ON o.id=oe.orchestration_id "
                     "WHERE " + " AND ".join(orchestration_where) + " ORDER BY oe.id ASC",
                     orchestration_params,
                 )
@@ -1551,6 +1723,13 @@ class Store(IntegrationStoreMixin):
                     payload = _load(row["payload_json"])
                     if not isinstance(payload, dict):
                         payload = {}
+                    runtime_task = None
+                    runtime_task_id = payload.get("runtime_task_id")
+                    if runtime_task_id:
+                        runtime_task = connection.execute(
+                            "SELECT agent_id,agent_name,agent_role,workspace FROM tasks WHERE id=?",
+                            (runtime_task_id,),
+                        ).fetchone()
                     payload.update({
                         "id": "orchestration:" + str(row["id"]),
                         "log_id": "orchestration:" + str(row["id"]),
@@ -1561,10 +1740,24 @@ class Store(IntegrationStoreMixin):
                         "status": row["status"] or payload.get("status") or "INFO",
                         "level": str(payload.get("level") or
                                      ("ERROR" if str(row["status"] or "").casefold() in {"failed", "denied"} else "INFO")).upper(),
-                        "agent_id": row["agent_id"] or payload.get("agent_id"),
-                        "agent_name": row["orchestration_agent_name"] or payload.get("agent_name") or row["agent_id"] or "—",
+                        "agent_id": row["agent_id"] or payload.get("agent_id") or (runtime_task["agent_id"] if runtime_task else None),
+                        "agent_name": row["orchestration_agent_name"] or payload.get("agent_name") or (runtime_task["agent_name"] if runtime_task else None) or row["agent_id"] or "—",
+                        "agent_role": row["orchestration_agent_role"] or payload.get("agent_role") or (runtime_task["agent_role"] if runtime_task else None),
                         "task_id": row["task_id"] or payload.get("task_id"),
                         "message": row["message"] or payload.get("message") or payload.get("reason") or "",
+                    })
+                    if not payload.get("workspace") and runtime_task:
+                        payload["workspace"] = runtime_task["workspace"]
+                    if not payload.get("workspace"):
+                        config = _load(row["orchestration_config_json"]) or {}
+                        payload["workspace"] = config.get("workspace_path")
+                    payload.setdefault("runtime_task_id", payload.get("task_id"))
+                    payload.update({
+                        key: value for key, value in self._trace_fields(
+                            payload, source="orchestration", trace_id=row["orchestration_id"],
+                            agent_name=payload.get("agent_name"), actor_role=payload.get("actor_role"),
+                            workspace=payload.get("workspace"), timestamp=row["timestamp"],
+                        ).items() if value is not None and payload.get(key) is None
                     })
                     result.append(payload)
             result.sort(key=lambda item: (str(item.get("timestamp") or ""), str(item.get("id") or "")),

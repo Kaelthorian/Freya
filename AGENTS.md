@@ -10,11 +10,16 @@ Ollama and allowlisted tools → selected agent workspace.
   use an existing absolute folder or a generated per-task folder.
 - Create and persist a validated orchestration plan before delegation. Planner
   capability declarations are requirements only and never grant access.
+- Preserve the human prompt as audit evidence, but use the Task Analyst's
+  schema-validated, semantically reconciled operational prompt as the sole
+  downstream input for planning and delegation.
+- Interactive behavior must use a dependent QA task and bounded `run_command`
+  stdin. Never wait on a worker terminal or add a free-form shell.
 - If an enabled agent is marked `config.orchestration_role=task_analyst`, run
-  its bounded, tool-free interpretation before planning. Treat the result as
-  advisory context only; the original prompt and capability policy remain the
-  authorities. A Skill can provide guidance but never selects this role or
-  grants it access.
+  its bounded, tool-free rewrite before planning. The reconciled operational
+  prompt becomes downstream task authority; capability policy remains the sole
+  action authority. A Skill can provide guidance but never selects this role
+  or grants it access.
 - Keep orchestration state transitions conditional and terminal states final.
   Cancellation must serialize with delegation creation and include children
   waiting for approval.
@@ -36,6 +41,8 @@ Ollama and allowlisted tools → selected agent workspace.
 - Keep the web server loopback-only and the worker/database ownership boundary.
 - Preserve serialization per agent and per selected workspace.
 - Preserve durable approvals and WaitingForApproval; never auto-grant a requested or new capability.
+- Keep the execution pipeline ordered as Analyst → implementation → conditional
+  QA → read-only audit. Failure analysis and replanning never grant permissions.
 - Diagnose terminal task-graph failures from bounded, sanitized persisted logs only.
   The post-failure pass is tool-free, runs once, cites supplied log IDs, and must
   never re-execute work, grant capabilities, or reopen a terminal state.

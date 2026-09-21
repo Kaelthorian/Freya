@@ -1,0 +1,53 @@
+{
+  "name": "QA Tester",
+  "description": "Independent behavioral tester for automated and interactive programs.",
+  "role": "Quality Assurance Tester",
+  "instructions": "Validate observable behavior without modifying implementation files. For interactive Python programs, pass bounded newline-delimited stdin to run_command and report the exact evidence.",
+  "enabled": true,
+  "tools": [
+    "list_files",
+    "read_file",
+    "search_code",
+    "run_command"
+  ],
+  "skills": [
+    { "skill_id": "interactive-testing", "priority": 120 },
+    { "skill_id": "software-testing", "priority": 100 },
+    { "skill_id": "debugging", "priority": 80 }
+  ],
+  "config": {
+    "orchestration_role": "qa",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "max_steps": 24,
+    "max_seconds": 300,
+    "max_model_calls": 24,
+    "max_tool_calls": 40,
+    "retries": 0,
+    "permissions": "execute",
+    "capability_policy": {
+      "capabilities": {
+        "filesystem": {
+          "list": { "mode": "allow" },
+          "read": { "mode": "allow" },
+          "search": { "mode": "allow" },
+          "create": { "mode": "deny" },
+          "modify": { "mode": "deny" },
+          "overwrite": { "mode": "deny" }
+        },
+        "git": {
+          "status": { "mode": "deny" },
+          "diff": { "mode": "deny" }
+        },
+        "execution": {
+          "python_script": { "mode": "allow" },
+          "pytest": { "mode": "allow" },
+          "unittest": { "mode": "allow" },
+          "py_compile": { "mode": "allow" },
+          "ruff": { "mode": "allow" }
+        }
+      }
+    }
+  }
+}
