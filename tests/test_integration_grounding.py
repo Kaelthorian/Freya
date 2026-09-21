@@ -295,7 +295,11 @@ class GroundedLifecycleTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in records], ["blocked", "accepted"])
         self.assertEqual(records[0]["snapshot"]["proof_refs_by_criterion"][GOAL.casefold()], [])
         self.assertTrue(records[1]["criteria"][0]["evidence"])
-        self.assertEqual([item[0] for item in runtime.submissions], ["Complete a", "Complete b", "Complete c"])
+        prompts = [self.store.get_task(item[2])["prompt"] for item in runtime.submissions]
+        self.assertEqual(len(prompts), 3)
+        for objective in ("Complete a", "Complete b", "Complete c"):
+            self.assertTrue(any(objective in prompt for prompt in prompts))
+        self.assertTrue(all(GOAL in prompt for prompt in prompts))
 
     def test_integration_added_task_uses_45_retry_without_rerunning_a_b(self):
         def evaluator_model(prompt, context):

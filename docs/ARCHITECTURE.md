@@ -110,14 +110,13 @@ therefore wins over late model output.
 
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
-events build the reconstructable timeline while every attempt remains in
-`log_events`. SSE accepts `Last-Event-ID`/`after`, replays later events and then
+events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
 Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
-The created event contains only the goal, complexity, task count, task IDs and
+The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single task, preventing redundant delegations. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill so the Code Auditor is explicitly selected after implementation. The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
 Selection emits `freya.agent_selection.started`, followed by either
 `freya.agent_selected` or `freya.agent_selection.failed`. The selected event
@@ -459,7 +458,7 @@ The scheduler supports bounded concurrency and serializes tasks per agent and
 per resolved workspace. An agent can set an existing absolute default directory;
 task submission can override that path for one run, and an explicit empty
 override creates a fresh directory under `data/workspaces/`. Every task records
-the resolved workspace in its immutable snapshot and runs in a spawned process.
+the resolved workspace in its immutable snapshot and runs in a spawned process. A Freya orchestration allocates an empty-selection workspace once, persists it in the orchestration config, and passes that same path to every dependent node so implementation, verification, and the read-only Code Auditor observe the same files.
 On Windows the worker is assigned to a kill-on-close Job Object before tool
 execution; POSIX uses a process session. Cancel, restart and shutdown terminate
 the worker tree and persist a terminal event.
@@ -469,14 +468,17 @@ worker pauses between actions. When a capability or autonomy rule is ask, the
 worker emits approval.requested, the parent persists the request, changes the
 task to WaitingForApproval, and blocks the worker until once/task/deny is
 resolved. Cancellation denies pending requests and terminates the worker. The total wall-clock deadline continues while
-paused. Progress is the greatest fraction of the configured step, model-call,
-tool-call and token budgets and reaches 100 only at termination.
+paused. Progress is the greatest fraction of the configured step, model-call and
+tool-call budgets and reaches 100 only at termination. Token usage remains
+visible in metrics, but the task token budget is unlimited when `max_tokens=0`
+(the default); wall-clock, step, model-call and tool-call limits still bound
+runtime resource use. Ollama receives `num_predict=-1` in that mode.
 
-Token usage comes from the provider response. `num_predict` bounds generated
-tokens, but provider-reported prompt usage can make a response cross the total
-budget; in that case no tool from that response executes. Read-only tool calls
-may retry within the configured bound. Writes and process execution are never
-automatically retried.
+The worker tracks successful post-write validation actions. Ten consecutive
+successful validations, or ten identical successful actions, produce an
+`task.auto_completed` event and close the task without another model call.
+Read-only tool calls may retry within the configured bound. Writes and process
+execution are never automatically retried.
 
 Text-mode models may emit JSON actions instead of native tool calls. When a
 model concatenates several action objects, the worker executes only the first,

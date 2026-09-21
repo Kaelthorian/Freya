@@ -130,6 +130,27 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in outcome["criteria"]],
                          ["satisfied", "satisfied"])
         self.assertIn("pytest: passed", outcome["criteria"][0]["evidence"])
+    def test_offline_accepts_direct_file_readback_for_existence(self):
+        criteria = ["The file script.bat exists."]
+        calls = []
+        outcome = Evaluator(
+            lambda prompt, context: calls.append(context)
+        ).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": True,
+                "failed": False, "unavailable": False,
+                "evidence": [{
+                    "check": "filesystem:read_file:script.bat",
+                    "status": "passed",
+                    "output": "echo hello",
+                }],
+            }),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(calls, [])
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
 
     def test_offline_does_not_accept_inconsistent_unrequested_pass_flag(self):
         outcome = Evaluator(offline=True).evaluate(

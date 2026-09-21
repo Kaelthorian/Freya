@@ -7,6 +7,7 @@ trust grant: Python scripts are not an operating-system sandbox.
 from __future__ import annotations
 
 import json
+import difflib
 import os
 import queue
 import re
@@ -337,11 +338,15 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             raise TaskStopped("Maximum execution time reached (including paused time).")
         return remaining
 
+    token_limit = config.get("max_tokens", 0)
+    token_limited = isinstance(token_limit, int) and token_limit > 0
+
     def update() -> None:
+        token_progress = metrics["total_tokens"] / token_limit if token_limited else 0
         progress = max(metrics["steps"] / config.get("max_steps", 20),
                        metrics["model_calls"] / config.get("max_model_calls", 20),
                        metrics["tool_calls"] / max(1, config.get("max_tool_calls", 40)),
-                       metrics["total_tokens"] / config.get("max_tokens", 32000))
+                       token_progress)
         publish("update", fields={**metrics, "duration_seconds": round(time.monotonic() - started, 3),
                                    "progress": round(min(99, progress * 100), 1)})
 
@@ -368,6 +373,49 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     success = False
     modified = False
     modified_paths: dict[str, str | None] = {}
+    workspace_diffs: list[dict[str, Any]] = []
+
+    def publish_workspace_diff(name: str, arguments: dict[str, Any], existing_before: bool = False) -> None:
+        """Persist a bounded unified diff for every successful file mutation."""
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return
+        if name == "edit_file":
+            old = arguments.get("old")
+            new = arguments.get("new")
+            if not isinstance(old, str) or not isinstance(new, str):
+                return
+            before, after = old, new
+            from_name = "a/" + path
+            change_type = "modified"
+        elif name == "write_file":
+            content = arguments.get("content")
+            if not isinstance(content, str):
+                return
+            # Metadata is enough to distinguish a new file from an overwrite;
+            # the previous contents are not read solely to build this evidence.
+            existing = existing_before
+            before, after = "", content
+            from_name = "a/" + path if existing else "/dev/null"
+            change_type = "overwritten" if existing else "created"
+        else:
+            return
+        diff = "".join(difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile=from_name, tofile="b/" + path, lineterm="\n",
+        ))
+        if not diff:
+            diff = "(no textual difference)"
+        if len(diff) > 64_000:
+            diff = diff[:64_000] + "\n[… diff clipped at 64,000 characters …]"
+        payload = {"path": path, "change_type": change_type, "diff": diff}
+        workspace_diffs.append(payload)
+        publish("event", event={
+            "event_type": "workspace.diff", "level": "info", "status": "Success",
+            "tool": name, "path": path,
+            "reason": "Generated a unified diff preview from the successful file change.",
+            "output": payload,
+        })
     observed_files: dict[str, tuple[bool, str]] = {}
     verification = effective["verification"]
     verification_state: dict[str, Any] = {
@@ -376,6 +424,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "skipped_with_reason": "", "evidence": [],
     }
     failure_history: dict[str, int] = {}
+    successful_validation_streak = 0
+    last_success_signature = ""
+    repeated_success_count = 0
+    auto_completed = False
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     try:
         while True:
@@ -384,8 +436,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 raise TaskStopped("Maximum steps reached.")
             if metrics["model_calls"] >= config.get("max_model_calls", 20):
                 raise TaskStopped("Maximum model calls reached.")
-            token_budget = config.get("max_tokens", 32000) - metrics["total_tokens"]
-            if token_budget <= 0:
+            token_budget = (token_limit - metrics["total_tokens"]) if token_limited else -1
+            if token_limited and token_budget <= 0:
                 raise TaskStopped("Maximum cumulative tokens reached.")
             metrics["model_calls"] += 1
             call_id = uuid.uuid4().hex
@@ -400,7 +452,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                       "stream": False, "think": False,
                                       "options": {"temperature": config.get("temperature", 0),
                                                   "num_ctx": config.get("context_window", 8192),
-                                                  "num_predict": min(token_budget, config.get("context_window", 8192))}},
+                                                  # Ollama uses -1 for unlimited generation.
+                                                  "num_predict": min(token_budget, config.get("context_window", 8192)) if token_limited else -1}},
                                      timeout=remaining, token=token)
             except Exception as exc:
                 publish("event", event={"event_type": "model.failed", "level": "error", "status": "Failed",
@@ -420,7 +473,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                                 "generated_tokens": response.get("eval_count", 0),
                                                 "eval_duration": response.get("eval_duration", 0)}})
             update()
-            if metrics["total_tokens"] > config.get("max_tokens", 32000):
+            if token_limited and metrics["total_tokens"] > token_limit:
                 raise TaskStopped("Maximum cumulative tokens exceeded by provider-reported usage; no further actions executed.")
             raw = response.get("message")
             if not isinstance(raw, dict):
@@ -484,6 +537,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         requested = safe_args.get("timeout_seconds", 30)
                         if isinstance(requested, int) and not isinstance(requested, bool) and 1 <= requested <= 120:
                             safe_args["timeout_seconds"] = max(1, min(requested, int(remaining)))
+                    existing_before = False
+                    if name == "write_file":
+                        try:
+                            existing_before = box.safe_path(str(safe_args.get("path", ""))).exists()
+                        except (OSError, ValueError):
+                            existing_before = False
                     result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                               else box.invoke(name, safe_args))
                     if result.policy_decision == "deny" and not argument_error:
@@ -522,6 +581,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 error_class="approval_denied",
                             )
                     if result.success and name in WRITE_TOOLS:
+                        publish_workspace_diff(name, safe_args, existing_before)
+                        successful_validation_streak = 0
+                        repeated_success_count = 0
+                        last_success_signature = ""
                         path = safe_args.get("path")
                         if isinstance(path, str) and path.strip():
                             modified_paths[path] = (safe_args.get("content")
@@ -534,6 +597,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         if isinstance(path, str) and path in modified_paths:
                             expected = modified_paths[path]
                             observed_files[path] = (expected is None or result.output == expected, result.output)
+                    if not result.success:
+                        successful_validation_streak = 0
+                        repeated_success_count = 0
+                        last_success_signature = ""
                     if not result.success and result.policy_decision not in {"deny", "approval_required", "denied"} and not argument_error:
                         recoverable = any(marker in result.output.lower() for marker in ("does not exist", "not found", "no matches"))
                         result.error_class = "recoverable" if recoverable else "environment_error"
@@ -553,6 +620,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "Choose a different tool, different arguments, or report the limitation."
                             ).format(failure_history[signature])
                             result.error_class = "repeated_action_blocked"
+                    if result.success and name not in WRITE_TOOLS:
+                        successful_validation_streak += 1
+                        signature = hashlib.sha256(json.dumps({"tool": name, "arguments": {key: value for key, value in safe_args.items() if key != "timeout_seconds"}}, sort_keys=True, default=str).encode()).hexdigest()
+                        repeated_success_count = repeated_success_count + 1 if signature == last_success_signature else 1
+                        last_success_signature = signature
+                        if modified and (successful_validation_streak >= 10 or repeated_success_count >= 10):
+                            final = "Completed after repeated successful validation actions."
+                            success = True
+                            auto_completed = True
+                            publish("event", event={"event_type": "task.auto_completed", "level": "info",
+                                                     "status": "Success",
+                                                     "reason": "The workspace change was followed by ten successful validation actions."})
                     legacy_tool_block = result.policy_decision == "deny" and "disabled" in result.policy_reason.lower()
                     policy_blocked = result.policy_decision in {"deny", "approval_required"} and not legacy_tool_block
                     publish("event", event={**common, "event_type": "step.finished",
@@ -570,6 +649,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
                                 if legacy else {"role": "tool", "tool_name": name, "content": result.output})
+                if auto_completed:
+                    break
+            if auto_completed:
+                break
         if success and verification_state["requested"]:
             publish("event", event={"event_type": "verification.started", "level": "info", "status": "Running",
                                      "reason": "Run configured verification checks with tool evidence."})
@@ -736,8 +819,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                       {"role": "user", "content": "Repair this final answer into the required JSON contract:\n" + str(final)}],
                          "tools": [], "stream": False, "think": False,
                          "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
-                                     "num_predict": min(config.get("max_tokens", 32000) - metrics["total_tokens"],
-                                                       config.get("context_window", 8192))}},
+                                     "num_predict": (min(token_limit - metrics["total_tokens"], config.get("context_window", 8192)) if token_limited else -1)}},
                         timeout=guard(), token=token,
                     )
                     for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
@@ -763,6 +845,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         else:
             result_output = repaired
         if isinstance(result_output, dict):
+            if workspace_diffs:
+                result_output["workspace_diffs"] = workspace_diffs
             result_output["verification"] = verification_state
             if verification_state.get("skipped_with_reason"):
                 result_output["limitations"].append(verification_state["skipped_with_reason"].strip())

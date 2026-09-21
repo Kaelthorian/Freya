@@ -126,6 +126,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_events(after=failed["id"])), 2)
         self.assertEqual(len(self.store.list_events(limit=1)), 1)
 
+    def test_log_events_expose_orchestration_group_and_agent(self):
+        first, second = self.agent("Coder"), self.agent("Auditor")
+        first_task, second_task = self.task(first), self.task(second)
+        run = self.store.create_orchestration("Build and review the change")
+        self.store.transition_orchestration(run["id"], "Queued", "Running")
+        self.store.add_delegation(run["id"], first["id"], "Implement", first_task["id"])
+        self.store.add_delegation(run["id"], second["id"], "Review", second_task["id"])
+        self.store.append_event(first_task["id"], {"event_type": "step.finished", "status": "Success"})
+        self.store.append_event(second_task["id"], {"event_type": "step.finished", "status": "Success"})
+
+        grouped = self.store.list_events(orchestration_id=run["id"])
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual({item["orchestration_id"] for item in grouped}, {run["id"]})
+        self.assertEqual({item["agent_name"] for item in grouped}, {"Coder", "Auditor"})
     def test_metrics_agent_aggregation_and_history_use_stored_execution_data(self):
         first, second = self.agent("One"), self.agent("Two", enabled=False)
         passed, failed, running = self.task(first), self.task(first), self.task(second)

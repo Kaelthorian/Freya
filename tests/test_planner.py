@@ -143,8 +143,29 @@ class PlannerGenerationTests(unittest.TestCase):
             {"capabilities": [{"id": "filesystem.read"}]},
         )
         self.assertEqual(result["complexity"], "multi_step")
-        self.assertEqual(len(result["tasks"]), 4)
+        self.assertEqual(len(result["tasks"]), 5)
+        self.assertEqual(result["tasks"][-1]["preferred_skills"], ["code-review"])
 
+    def test_linear_single_artifact_plan_adds_one_audit_task(self):
+        raw = plan(
+            complexity="multi_step",
+            goal="Create a calculator suma.bat that asks for two numbers and returns their sum.",
+            tasks=[
+                task("create-file", "Create suma.bat", required_capabilities=["filesystem.create"]),
+                task("write-content", "Write the calculator code into suma.bat", depends_on=["create-file"],
+                     required_capabilities=["filesystem.modify"]),
+                task("verify-file", "Verify suma.bat", depends_on=["write-content"],
+                     required_capabilities=["filesystem.read"]),
+            ],
+        )
+        result = Planner(lambda prompt, context: json.dumps(raw)).create_plan(raw["goal"])
+        self.assertEqual(result["complexity"], "multi_step")
+        self.assertEqual(len(result["tasks"]), 2)
+        self.assertIn("suma.bat", result["tasks"][0]["objective"])
+        self.assertEqual(result["tasks"][0]["required_capabilities"],
+                         ["filesystem.create", "filesystem.modify", "filesystem.read"])
+        self.assertEqual(result["tasks"][1]["preferred_skills"], ["code-review"])
+        self.assertEqual(result["tasks"][1]["depends_on"], ["create-file"])
     def test_invalid_json_receives_one_successful_repair(self):
         calls = []
 
@@ -185,6 +206,18 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_orchestration_allocates_one_persisted_workspace_for_all_nodes(self):
+        class RuntimeStub:
+            def __init__(self, data_dir):
+                self.data_dir = data_dir
+
+        run = self.store.create_orchestration("Create and audit a file", {"workspace_path": ""})
+        orchestrator = Orchestrator(self.store, RuntimeStub(self.temporary.name), planner=Planner(offline=True))
+        first = orchestrator._workspace_for_run(run)
+        second = orchestrator._workspace_for_run(self.store.get_orchestration(run["id"]))
+        self.assertEqual(first, second)
+        self.assertTrue(Path(first).is_dir())
+        self.assertEqual(self.store.get_orchestration(run["id"])["config"]["workspace_path"], first)
     def test_plan_is_persisted_and_recovered_after_store_restart(self):
         run = self.store.create_orchestration("Create hello.txt")
         expected = fallback_plan("Create hello.txt")
@@ -307,7 +340,9 @@ class DeterministicRuntime:
         if run["plan"] is None or run["status"] != "Running":
             raise AssertionError("Plan must be persisted before delegation.")
         created = self.store.create_task(agent_id, objective, workspace_path or "workspace")
-        status, result = self.outcomes.get(objective, ("Success", objective + " result"))
+        marker = "DELEGATED PLAN STEP:\n"
+        label = objective.split(marker, 1)[1].split("\n\n", 1)[0] if marker in objective else objective
+        status, result = self.outcomes.get(label, self.outcomes.get(objective, ("Success", objective + " result")))
         fields = {"status": status, "result": result}
         if status in {"Success", "Failed", "Cancelled"}:
             fields["finished_at"] = "2026-09-17T00:00:00+00:00"

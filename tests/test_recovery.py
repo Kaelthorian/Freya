@@ -789,7 +789,7 @@ class RecoverySchedulerTests(unittest.TestCase):
         self.assertEqual(len(final["evaluations"]), 2)
         self.assertEqual(len(final["recoveries"]), 1)
         self.assertEqual(len(final["selections"]), 2)
-        self.assertNotEqual(runtime.submissions[0][0], runtime.submissions[1][0])
+        self.assertNotEqual(self.store.get_task(runtime.submissions[0][2])["prompt"], self.store.get_task(runtime.submissions[1][2])["prompt"])
         self.assertTrue(all(item["selected_agent_id"] == agent["id"]
                             for item in final["attempts"]))
         self.assertEqual(

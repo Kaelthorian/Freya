@@ -235,9 +235,11 @@ class ControlledRuntime:
 
     def submit(self, agent_id, objective, workspace_path=None):
         task = self.store.create_task(agent_id, objective, workspace_path or "workspace")
-        status = self.initial.get(objective, "Running")
+        marker = "DELEGATED PLAN STEP:\n"
+        label = objective.split(marker, 1)[1].split("\n\n", 1)[0] if marker in objective else objective
+        status = self.initial.get(label, self.initial.get(objective, "Running"))
         task = self.store.update_task(task["id"], status=status)
-        self.submissions.append((objective, agent_id, task["id"]))
+        self.submissions.append((label, agent_id, task["id"]))
         return task
 
     def cancel(self, task_id):
@@ -253,7 +255,9 @@ class ControlledRuntime:
         for task in self.store.list_tasks(limit=10000):
             if task["status"] in {"Queued", "Running", "WaitingForApproval", "Paused"}:
                 active.append(task)
-                status = outcomes.get(task["prompt"], "Success")
+                marker = "DELEGATED PLAN STEP:\n"
+                label = task["prompt"].split(marker, 1)[1].split("\n\n", 1)[0] if marker in task["prompt"] else task["prompt"]
+                status = outcomes.get(label, outcomes.get(task["prompt"], "Success"))
                 fields = {"status": status, "result": task["prompt"] + " result"}
                 if status == "Success":
                     fields["verification"] = {

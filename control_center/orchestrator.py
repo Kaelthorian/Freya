@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from .recovery import (RECOVERY_VERSION, RecoveryController, Replanner,
                        allowed_replan_scope, build_retry_prompt,
                        semantic_failure_fingerprint)
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
-from .planner import MAX_GOAL_CHARS, MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
+from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 
@@ -50,6 +51,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self.integration_replanner = integration_replanner or IntegrationReplanner()
         self.result_integrator = result_integrator or ResultIntegrator()
         self.lock = threading.RLock()
+        self._orchestration_workspaces: dict[str, str] = {}
         self.planner_lock = threading.Lock()
         self.evaluator_lock = threading.Lock()
         self.integration_lock = threading.Lock()
@@ -74,13 +76,60 @@ class Orchestrator(IntegrationOrchestrationMixin):
         )
 
     def submit(self, prompt: str, workspace_path: str | None = None) -> dict:
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > MAX_GOAL_CHARS:
-            raise ValueError(f"Orchestration prompt must contain 1-{MAX_GOAL_CHARS} characters.")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Orchestration prompt must contain at least one character.")
         config = {**self.config, "workspace_path": workspace_path or ""}
         run = self.store.create_orchestration(prompt.strip(), config)
         threading.Thread(target=self._run, args=(run["id"],), daemon=True,
                          name="freya-orchestrator").start()
         return run
+
+    def _workspace_for_run(self, run: dict) -> str | None:
+        """Return the one workspace shared by every node in an orchestration."""
+        config = run.get("config") or {}
+        configured = str(config.get("workspace_path") or "").strip()
+        if configured:
+            return configured
+        oid = str(run.get("id") or "")
+        cached = self._orchestration_workspaces.get(oid)
+        if cached:
+            return cached
+        data_dir = getattr(self.runtime, "data_dir", None)
+        if data_dir is None:
+            # Lightweight test runtimes and extension hooks may allocate their
+            # own workspace when no production data directory is available.
+            return None
+        root = Path(data_dir) / "workspaces"
+        root.mkdir(parents=True, exist_ok=True)
+        workspace = root / uuid4().hex
+        workspace.mkdir(parents=True, exist_ok=False)
+        selected = str(workspace)
+        setter = getattr(self.store, "set_orchestration_workspace", None)
+        if callable(setter):
+            persisted = setter(oid, selected)
+            persisted_path = str(((persisted or {}).get("config") or {}).get("workspace_path") or "").strip()
+            if persisted_path:
+                selected = persisted_path
+        self._orchestration_workspaces[oid] = selected
+        return selected
+    @staticmethod
+    def _execution_prompt(original_prompt: str, planned_task: dict,
+                          attempt_prompt: str = "") -> str:
+        """Keep the complete user request visible to every delegated worker."""
+        sections = [
+            "ORIGINAL USER REQUEST (preserve every requirement):\n" + str(original_prompt or "").strip(),
+            "DELEGATED PLAN STEP:\n" + str(planned_task.get("objective") or "").strip(),
+        ]
+        description = str(planned_task.get("description") or "").strip()
+        criteria = planned_task.get("success_criteria") or []
+        if description:
+            sections.append("Step context:\n" + description)
+        if criteria:
+            sections.append("Step success criteria:\n" + "\n".join("- " + str(item) for item in criteria))
+        if attempt_prompt.strip():
+            sections.append("RECOVERY INSTRUCTIONS:\n" + attempt_prompt.strip())
+        sections.append("Complete this step without inventing missing requirements; use the original request as the source of truth.")
+        return "\n\n".join(section for section in sections if section.strip())
 
     def _snapshot_delegation(self, delegation_id: str, task: dict) -> None:
         result = {
@@ -983,10 +1032,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             task["id"], "Selected agent is executing another task.", utcnow(),
                         )
                         continue
+                    execution_prompt = self._execution_prompt(run.get("prompt", ""), task, node.get("attempt_prompt") or "")
                     try:
                         runtime_task = self.runtime.submit(
-                            agent_id, node.get("attempt_prompt") or task["objective"],
-                            run.get("config", {}).get("workspace_path") or None,
+                            agent_id, execution_prompt,
+                            self._workspace_for_run(run),
                         )
                     except ValueError as exc:
                         refreshed = self.store.get_agent(agent_id)
@@ -1012,7 +1062,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         continue
                     try:
                         delegation_id = self.store.add_delegation(
-                            oid, agent_id, node.get("attempt_prompt") or task["objective"], runtime_task["id"],
+                            oid, agent_id, execution_prompt, runtime_task["id"],
                         )
                         if delegation_id is None:
                             self.runtime.cancel(runtime_task["id"])
@@ -1029,7 +1079,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             selection_id=node["selection_id"],
                             runtime_task_id=runtime_task["id"], delegation_id=delegation_id,
                             attempt=int(graph.node(task["id"])["attempt"]),
-                            prompt=graph.node(task["id"]).get("attempt_prompt") or task["objective"],
+                            prompt=execution_prompt,
                             recovery_action_id=graph.node(task["id"]).get("recovery_action_id"),
                         )
                         if attempt_record is None:
@@ -1115,6 +1165,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "plan_schema_version": PLAN_SCHEMA_VERSION,
                     "planning_metrics": planning_metrics,
                 })
+                self._workspace_for_run(planned)
                 graph = ExecutionGraph(plan)
                 self.store.initialize_execution_graph(oid, graph.serialize())
                 self.store.add_orchestration_event(oid, {
@@ -1232,11 +1283,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         agent = self.store.get_agent(agent_id)
                         if agent.get("enabled") is not True:
                             raise ValueError("Selected agent is disabled or unavailable.")
+                        execution_prompt = self._execution_prompt(running.get("prompt", ""), item, objective)
                         task = self.runtime.submit(
-                            agent_id, objective, running.get("config", {}).get("workspace_path") or None,
+                            agent_id, execution_prompt, self._workspace_for_run(running),
                         )
                         delegation_id = self.store.add_delegation(
-                            oid, agent_id, objective, task["id"],
+                            oid, agent_id, execution_prompt, task["id"],
                         )
                         if delegation_id is None:
                             self.runtime.cancel(task["id"])

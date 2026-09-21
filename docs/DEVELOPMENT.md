@@ -115,16 +115,17 @@ data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
 
 SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
-`-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. These
+`-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including the final read-only Code Auditor); direct task submissions still get one directory per task. These
 generated paths are ignored by Git.
 
-In agent settings, **Choose folder** chooses that agent's default folder.
+In agent settings, **Choose folder** chooses that agent's default folder. In the Freya form, selecting an existing folder uses it directly for the orchestration, so agents can act on files already there; leaving it empty creates an isolated workspace.
 The **Assign a task** form also has its own folder selector. It starts with
 the agent default, can override it for one execution, and uses a fresh generated
 workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
+Plans that create or modify code append one dependent, read-only Code Auditor task automatically; it is selected through the `code-review` Skill and appears as a separate audit row in Logs.
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
 verification, autonomy, output, and limits are compact expandable sections. The

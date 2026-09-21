@@ -194,6 +194,9 @@ class Store(IntegrationStoreMixin):
         agent.pop("deleted_at")
         agent["enabled"] = bool(agent["enabled"])
         agent["config"] = _load(agent.pop("config_json"))
+        # Migrate the previous implicit default to unlimited token accounting.
+        if agent["config"].get("max_tokens") == 32000:
+            agent["config"]["max_tokens"] = 0
         stored_tools = [item[0] for item in connection.execute(
             "SELECT tool_name FROM agent_tools WHERE agent_id=? ORDER BY tool_name", (agent_id,),
         )]
@@ -675,6 +678,37 @@ class Store(IntegrationStoreMixin):
         status = fields.pop("status", current["status"])
         updated = self.transition_orchestration(oid, (current["status"],), status, **fields)
         return updated or self.get_orchestration(oid)
+
+    def set_orchestration_workspace(self, oid: str, workspace_path: str) -> dict | None:
+        """Persist one shared workspace for every task in an orchestration.
+
+        An empty workspace selection means "create an isolated workspace".  The
+        workspace must be allocated once per orchestration, rather than once per
+        delegated node, so implementation and read-only audit tasks see the same
+        files.  This update is intentionally write-once: an explicit user-selected
+        folder or an already allocated isolated workspace is never replaced.
+        """
+        workspace = sanitize(workspace_path)
+        if not isinstance(workspace, str) or not workspace.strip():
+            raise ValueError("An orchestration workspace must be a non-empty path.")
+        now = utcnow()
+        with self._connection(write=True) as c:
+            row = c.execute(
+                "SELECT status,config_json FROM orchestration_runs WHERE id=?", (oid,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(oid)
+            config = _load(row["config_json"]) or {}
+            current = config.get("workspace_path") or ""
+            if not current:
+                config["workspace_path"] = workspace
+                c.execute(
+                    "UPDATE orchestration_runs SET config_json=?,updated_at=? "
+                    "WHERE id=? AND status IN (?,?,?,?,?) AND config_json=?",
+                    (_dump(config), now, oid, "Queued", "Planning", "Planned", "Running",
+                     "Integrating", row["config_json"]),
+                )
+        return self.get_orchestration(oid)
 
     def save_orchestration_plan(self, oid: str, plan: dict[str, Any], schema_version: int,
                                 planning_metrics: dict[str, Any] | None = None) -> dict | None:
@@ -1444,30 +1478,47 @@ class Store(IntegrationStoreMixin):
             return result
 
     def list_events(self, task_id: str | None = None, after: int = 0, limit: int = 200, **filters: Any) -> list[dict]:
-        where, params = ["id > ?"], [max(0, int(after))]
-        for column, value in (("task_id", task_id), ("agent_id", filters.get("agent_id")),
-                              ("level", filters.get("level")), ("tool", filters.get("tool"))):
+        where, params = ["e.id > ?"], [max(0, int(after))]
+        for column, value in (("e.task_id", task_id), ("e.agent_id", filters.get("agent_id")),
+                              ("e.level", filters.get("level")), ("e.tool", filters.get("tool")),
+                              ("d.orchestration_id", filters.get("orchestration_id"))):
             if value:
                 where.append(column + "=?")
-                params.append(str(value).upper() if column == "level" else value)
+                params.append(str(value).upper() if column.endswith(".level") else value)
         if filters.get("error_only"):
-            where.append("(level IN ('ERROR','CRITICAL') OR (error IS NOT NULL AND error != ''))")
+            where.append("(e.level IN ('ERROR','CRITICAL') OR (e.error IS NOT NULL AND e.error != ''))")
         if filters.get("date_from"):
-            where.append("timestamp >= ?")
+            where.append("e.timestamp >= ?")
             params.append(filters["date_from"])
         if filters.get("date_to"):
             end = str(filters["date_to"])
             if len(end) == 10:
                 end = (datetime.fromisoformat(end) + timedelta(days=1)).date().isoformat()
-                where.append("timestamp < ?")
+                where.append("e.timestamp < ?")
             else:
-                where.append("timestamp <= ?")
+                where.append("e.timestamp <= ?")
             params.append(end)
         with self._connection() as connection:
             order = "DESC" if filters.get("newest") else "ASC"
-            rows = connection.execute("SELECT id,payload_json FROM log_events WHERE " + " AND ".join(where)
-                                      + " ORDER BY id " + order + " LIMIT ?", [*params, max(1, min(int(limit), 10000))])
-            return [dict(_load(row["payload_json"]), id=row["id"]) for row in rows]
+            rows = connection.execute("SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,a.name AS current_agent_name, " +
+                                      "d.orchestration_id,o.prompt AS orchestration_prompt,o.status AS orchestration_status, " +
+                                      "o.created_at AS orchestration_created_at " +
+                                      "FROM log_events e LEFT JOIN tasks t ON t.id=e.task_id " +
+                                      "LEFT JOIN agents a ON a.id=e.agent_id " +
+                                      "LEFT JOIN orchestration_delegations d ON d.task_id=e.task_id " +
+                                      "LEFT JOIN orchestration_runs o ON o.id=d.orchestration_id WHERE " + " AND ".join(where)
+                                      + " ORDER BY e.id " + order + " LIMIT ?", [*params, max(1, min(int(limit), 10000))])
+            result = []
+            for row in rows:
+                payload = dict(_load(row["payload_json"]), id=row["id"])
+                payload["agent_name"] = row["task_agent_name"] or row["current_agent_name"] or payload.get("agent_id", "—")
+                if row["orchestration_id"]:
+                    payload["orchestration_id"] = row["orchestration_id"]
+                    payload["orchestration_prompt"] = row["orchestration_prompt"] or ""
+                    payload["orchestration_status"] = row["orchestration_status"] or ""
+                    payload["orchestration_created_at"] = row["orchestration_created_at"] or ""
+                result.append(payload)
+            return result
 
     def metrics(self, agent_id: str | None = None) -> dict:
         where, params = (" WHERE t.agent_id=?", [agent_id]) if agent_id else ("", [])

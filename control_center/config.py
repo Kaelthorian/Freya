@@ -38,7 +38,8 @@ DEFAULT_CONFIG = {
     "endpoint": "http://127.0.0.1:11434",
     "temperature": 0.0,
     "context_window": 8192,
-    "max_tokens": 32000,
+    # Zero means unlimited cumulative provider tokens. Runtime safety remains bounded by max_steps, max_model_calls, max_tool_calls and max_seconds.
+    "max_tokens": 0,
     "max_steps": 20,
     "max_seconds": 600,
     "max_model_calls": 20,
@@ -61,7 +62,7 @@ DEFAULT_CONFIG = {
     "output": {"format": "text", "include": DEFAULT_OUTPUT["include"]},
 }
 LIMITS = {
-    "context_window": (512, 131072), "max_tokens": (128, 1000000),
+    "context_window": (512, 131072), "max_tokens": (0, 1000000),
     "max_steps": (1, 100), "max_seconds": (1, 86400),
     "max_model_calls": (1, 100), "max_tool_calls": (0, 1000), "retries": (0, 3),
 }

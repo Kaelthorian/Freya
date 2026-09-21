@@ -356,6 +356,26 @@ class Evaluator:
                 Evaluator._records(criteria, "unknown", "Verification did not conclusively pass."),
                 confidence=1.0, missing=criteria or ["Conclusive verification result."],
             )
+        readback_evidence = [
+            item for item in evidence
+            if item.get("status", "").casefold() == "passed"
+            and str(item.get("check", "")).casefold().startswith("filesystem:read_file:")
+        ]
+        presence_criteria = [
+            item for item in criteria
+            if re.search(r"\b(file|archivo|exist|exists|created|create|saved|guardado)\b", item, re.I)
+        ]
+        if criteria and len(presence_criteria) == len(criteria) and readback_evidence:
+            return Evaluator._decision(
+                "accepted",
+                "Direct filesystem read-back evidence satisfies the planned existence criterion.",
+                Evaluator._records(
+                    criteria, "satisfied",
+                    "The file was read back successfully after the write.",
+                    evidence_labels,
+                ),
+                confidence=1.0,
+            )
         test_criteria = [item for item in criteria
                          if re.search(r"\b(test|tests|pytest|unittest|lint|build)\b", item, re.I)]
         passed_evidence = any(item.get("status", "").casefold() == "passed" for item in evidence)

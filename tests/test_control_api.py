@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 from control_center.api import Application
 from control_center.http import ControlServer
 from control_center.orchestrator import Orchestrator
-from control_center.planner import MAX_GOAL_CHARS, Planner
+from control_center.planner import Planner
 from control_center.storage import Store
 
 
@@ -121,15 +121,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/agents", {"name": "bad", "tools": ["browser"]})[0], 400)
         self.assertEqual(self.request("GET", "/api/tasks?limit=99999")[0], 400)
 
-    def test_orchestration_prompt_limit_is_rejected_before_submission(self):
+    def test_orchestration_prompt_accepts_long_input(self):
         orchestrator = StubOrchestrator()
         self.server.application.orchestrator = orchestrator
+        prompt = "x" * 5_000
         status, body = self.request("POST", "/api/orchestrations", {
-            "prompt": "x" * (MAX_GOAL_CHARS + 1),
+            "prompt": prompt,
         })
-        self.assertEqual(status, 400)
-        self.assertIn(str(MAX_GOAL_CHARS), body["error"])
-        self.assertEqual(orchestrator.submissions, [])
+        self.assertEqual(status, 201)
+        self.assertEqual(body["prompt"], prompt)
+        self.assertEqual(orchestrator.submissions, [(prompt, "")])
 
     def test_cancelling_terminal_orchestration_is_http_idempotent(self):
         orchestrator = Orchestrator(self.store, self.runtime, planner=Planner(offline=True))

@@ -120,8 +120,8 @@ class Runtime:
                 raise ValueError("Agent is disabled.")
             if agent_id in self.paused or agent.get("status") == "Paused":
                 raise ValueError("Resume the agent before submitting a task.")
-            if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
-                raise ValueError("Task prompt must contain 1–32000 characters.")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("Task prompt must contain at least one character.")
             configured = (agent.get("config", {}).get("workspace_path", "")
                           if workspace_path is None else workspace_path)
             selected = normalize_workspace_path(configured)

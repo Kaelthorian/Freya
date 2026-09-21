@@ -764,8 +764,11 @@ class IntegrationSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(final["status"], "Success")
         self.assertEqual(calls, [["a", "b", "integration-c"]])
-        self.assertEqual([item[0] for item in runtime.submissions],
-                         ["Complete a", "Complete b", "Complete integration-c"])
+        prompts = [self.store.get_task(item[2])["prompt"] for item in runtime.submissions]
+        self.assertEqual(len(prompts), 3)
+        for objective in ("Complete a", "Complete b", "Complete integration-c"):
+            self.assertTrue(any(objective in prompt for prompt in prompts))
+        self.assertTrue(all("Complete product" in prompt for prompt in prompts))
         self.assertEqual(selector.calls.count("a"), 1)
         self.assertEqual(selector.calls.count("b"), 1)
         self.assertEqual(selector.calls.count("integration-c"), 1)

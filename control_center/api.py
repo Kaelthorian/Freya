@@ -9,7 +9,7 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, DEFAULT_TOOLS, TOOL_CATALOG, normalize_agent, normalize_workspace_path, validate_endpoint
 from .capabilities import capability_catalog
-from .planner import MAX_GOAL_CHARS
+from .planner import Planner
 from .presets import programmer_agent_payload
 from .security import sanitize
 
@@ -132,7 +132,7 @@ class Application:
             task["events"] = self.store.list_events(task_id=parts[1], limit=10000)
             return task
         if parts == ["logs"]:
-            filters = {k: v for k, v in query.items() if k in {"agent_id", "level", "tool", "date_from", "date_to"} and v}
+            filters = {k: v for k, v in query.items() if k in {"agent_id", "level", "tool", "date_from", "date_to", "orchestration_id"} and v}
             filters["error_only"] = query.get("error_only", "").lower() in {"true", "1"}
             filters["newest"] = "after" not in query
             return self.store.list_events(task_id=query.get("task_id") or None, after=int(query.get("after", 0)),
@@ -236,9 +236,8 @@ class Application:
         if method == "POST" and parts == ["orchestrations"]:
             if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
             prompt = body.get("prompt") if isinstance(body, dict) else None
-            if (not isinstance(prompt, str) or not prompt.strip()
-                    or len(prompt.strip()) > MAX_GOAL_CHARS):
-                raise ValueError(f"Orchestration prompt must contain 1-{MAX_GOAL_CHARS} characters.")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("Orchestration prompt must contain at least one character.")
             workspace = body.get("workspace_path", "")
             if workspace:
                 workspace = normalize_workspace_path(workspace)
@@ -282,8 +281,8 @@ class Application:
                 if action == "tasks":
                     if (set(body) - {"prompt", "workspace_path"} or "prompt" not in body
                             or not isinstance(body["prompt"], str) or not body["prompt"].strip()
-                            or len(body["prompt"]) > 32000):
-                        raise ValueError("Enter a non-empty prompt of up to 32,000 characters.")
+                            ):
+                        raise ValueError("Enter a non-empty prompt.")
                     workspace_path = (normalize_workspace_path(body["workspace_path"])
                                       if "workspace_path" in body else None)
                     if not agent["enabled"] or agent["status"] in {"Paused", "Offline"}:

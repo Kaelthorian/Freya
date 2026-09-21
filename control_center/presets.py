@@ -38,7 +38,7 @@ PROGRAMMER_PRESET: dict[str, Any] = {
         "identity": copy.deepcopy(DEFAULT_IDENTITY),
         "verification": copy.deepcopy(DEFAULT_VERIFICATION),
         "output": copy.deepcopy(DEFAULT_OUTPUT),
-        "max_steps": 40, "max_seconds": 900, "max_tokens": 48000,
+        "max_steps": 40, "max_seconds": 900, "max_tokens": 0,
         "max_model_calls": 40, "max_tool_calls": 100, "retries": 1,
     },
 }

@@ -114,6 +114,18 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_INTERNAL", json.dumps(self.events) + json.dumps(result))
         self.assertNotIn("thinking", self.payloads[-1]["messages"][2])
 
+    def test_successful_file_write_emits_workspace_code_diff(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.bat", "content": "@echo off\necho %1"})]),
+            answer("Created calculator.bat."),
+        ])
+        self.assertEqual(result["status"], "Success")
+        diffs = [event["event"] for event in self.events
+                 if event.get("event", {}).get("event_type") == "workspace.diff"]
+        self.assertEqual(len(diffs), 1)
+        self.assertEqual(diffs[0]["output"]["path"], "calculator.bat")
+        self.assertEqual(diffs[0]["output"]["change_type"], "created")
+        self.assertIn("+@echo off", diffs[0]["output"]["diff"])
     def test_fallback_disabled_tool_is_a_visible_error_without_mutation(self):
         result = self.run_worker([answer('{"action":"write_file","path":"blocked.txt","content":"bad"}'),
                                   answer('{"action":"finish","message":"Could not write"}')], tools=["read_file"])
@@ -166,6 +178,21 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["tool_calls"], 0)
         self.assertFalse((self.workspace / "x").exists())
         self.assertEqual(self.payloads[0]["options"]["num_predict"], 128)
+
+    def test_unlimited_token_budget_uses_ollama_unlimited_predict(self):
+        result = self.run_worker([answer("Finished.")], config={"max_tokens": 0})
+        self.assertEqual(result["status"], "Success")
+        self.assertEqual(self.payloads[0]["options"]["num_predict"], -1)
+
+    def test_ten_successful_validations_auto_complete_after_a_write(self):
+        responses = [answer(calls=[("write_file", {"path": "verified.txt", "content": "OK"})])]
+        responses.extend(answer(calls=[("read_file", {"path": "verified.txt"})]) for _ in range(10))
+        result = self.run_worker(responses)
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(len(self.payloads), 11)
+        self.assertTrue(any(event.get("event", {}).get("event_type") == "task.auto_completed"
+                            for event in self.events))
+        self.assertTrue(result["verification"]["passed"])
 
     def test_zero_tool_budget_and_step_budget(self):
         call = answer(calls=[("write_file", {"path": "x", "content": "one"}), ("write_file", {"path": "y", "content": "two"})])

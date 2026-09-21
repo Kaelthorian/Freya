@@ -17,7 +17,10 @@ from .transport import request_json
 
 PLAN_SCHEMA_VERSION = 1
 MAX_PLAN_TASKS = 20
-MAX_GOAL_CHARS = 2_000
+# User prompts are accepted without an application-level character limit.
+# The model/provider context window and HTTP transport remain the practical
+# boundaries for safely processing extremely large requests.
+MAX_GOAL_CHARS: int | None = None
 MAX_SUMMARY_CHARS = 4_000
 MAX_OBJECTIVE_CHARS = 2_000
 MAX_DESCRIPTION_CHARS = 4_000
@@ -72,6 +75,113 @@ PLAN_RESPONSE_FORMAT = {
     "required": sorted(PLAN_FIELDS),
     "additionalProperties": False,
 }
+
+_SIMPLE_ARTIFACT_HINT = re.compile(
+    r"(?:\.[a-z0-9]{1,8}\b|\b(?:file|archivo|script|document|documento)\b)",
+    re.IGNORECASE,
+)
+
+
+def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Merge an over-decomposed linear file workflow into one worker task."""
+    tasks = plan.get("tasks", [])
+    if not isinstance(tasks, list) or not 2 <= len(tasks) <= 6:
+        return plan
+    combined_text = " ".join(
+        [str(plan.get("goal", "")), str(plan.get("summary", ""))]
+        + [str(task.get("objective", "")) + " " + str(task.get("description", ""))
+           for task in tasks]
+    )
+    if not _SIMPLE_ARTIFACT_HINT.search(combined_text):
+        return plan
+    for index, task in enumerate(tasks):
+        dependencies = set(task.get("depends_on", []))
+        expected = set() if index == 0 else {tasks[index - 1]["id"]}
+        if dependencies != expected:
+            return plan
+        if any(not str(capability).startswith(("filesystem.", "execution.", "git."))
+               for capability in task.get("required_capabilities", [])):
+            return plan
+
+    def unique(values: list[str], maximum: int) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+            if len(result) >= maximum:
+                break
+        return result
+
+    objective = str(plan.get("goal") or tasks[0]["objective"]).strip()
+    if len(objective) > MAX_OBJECTIVE_CHARS:
+        objective = str(tasks[0]["objective"]).strip()[:MAX_OBJECTIVE_CHARS]
+    description = "Complete the requested artifact workflow in one pass: " + "; ".join(
+        str(task["description"]).strip() for task in tasks
+    )
+    merged = {
+        "id": tasks[0]["id"],
+        "objective": objective,
+        "description": description[:MAX_DESCRIPTION_CHARS],
+        "depends_on": list(tasks[0].get("depends_on", [])),
+        "required_capabilities": unique(
+            [capability for task in tasks for capability in task.get("required_capabilities", [])],
+            MAX_CAPABILITIES,
+        ),
+        "preferred_skills": unique(
+            [skill for task in tasks for skill in task.get("preferred_skills", [])],
+            MAX_PREFERRED_SKILLS,
+        ),
+        "success_criteria": unique(
+            [criterion for task in tasks for criterion in task.get("success_criteria", [])],
+            MAX_CRITERIA,
+        ),
+    }
+    collapsed = dict(plan)
+    collapsed["complexity"] = "simple"
+    collapsed["tasks"] = [merged]
+    return validate_plan(collapsed)
+
+def _append_code_audit_task(plan: dict[str, Any]) -> dict[str, Any]:
+    """Add exactly one read-only Code Review task after code/file changes."""
+    tasks = plan.get("tasks", [])
+    if not isinstance(tasks, list) or len(tasks) >= MAX_PLAN_TASKS:
+        return plan
+    capabilities = {
+        str(capability) for task in tasks
+        for capability in task.get("required_capabilities", [])
+    }
+    if not capabilities.intersection({"filesystem.create", "filesystem.modify", "filesystem.overwrite"}):
+        return plan
+    if any(re.search(r"\b(?:audit|auditor|review|revis(?:e|ar))\b", str(task.get("objective", "")), re.I)
+           for task in tasks):
+        return plan
+    ids = {task["id"] for task in tasks}
+    audit_id = "code-audit"
+    suffix = 2
+    while audit_id in ids:
+        audit_id = f"code-audit-{suffix}"
+        suffix += 1
+    audited = dict(plan)
+    audited["complexity"] = "multi_step"
+    audited["tasks"] = [*tasks, {
+        "id": audit_id,
+        "objective": "Audit the code produced for the user's request",
+        "description": (
+            "Perform a read-only code audit after implementation. Inspect the current workspace, "
+            "the resulting diff when available, callers and relevant edge cases. Do not modify files "
+            "or execute commands. Report confirmed findings and hypotheses separately."
+        ),
+        "depends_on": [task["id"] for task in tasks],
+        "required_capabilities": ["filesystem.read"],
+        "preferred_skills": ["code-review"],
+        "success_criteria": [
+            "The changed code is inspected with the Code Review skill.",
+            "Findings include severity, evidence and file references, or clearly state that no findings were detected.",
+        ],
+    }]
+    return validate_plan(audited)
 
 
 class PlanValidationError(ValueError):
@@ -157,13 +267,13 @@ def _object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def _text(value: Any, label: str, maximum: int) -> str:
+def _text(value: Any, label: str, maximum: int | None) -> str:
     if not isinstance(value, str):
         raise PlanValidationError(f"{label} must be a string.")
     normalized = re.sub(r"\s+", " ", value).strip()
     if not normalized:
         raise PlanValidationError(f"{label} must not be empty.")
-    if len(normalized) > maximum:
+    if maximum is not None and len(normalized) > maximum:
         raise PlanValidationError(f"{label} exceeds {maximum} characters.")
     return normalized
 
@@ -354,7 +464,7 @@ class Planner:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
-        return validate_plan(value)
+        return _append_code_audit_task(_collapse_simple_artifact_plan(validate_plan(value)))
 
     @staticmethod
     def _prompt(goal: str, context: dict[str, Any]) -> str:

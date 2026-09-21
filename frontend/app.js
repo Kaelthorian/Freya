@@ -175,14 +175,14 @@ window.addEventListener('hashchange', () => {
   const current = route(), key = `${current.page}/${current.id || ''}`;
   if (key !== currentKey) state.tab = 'timeline';
   currentKey = key;
-  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; }
+  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; state.filters.logs.orchestration_id = current.query.get('orchestration_id') || ''; }
   render(true);
 });
 
 document.addEventListener('click', async event => {
   const target = event.target.closest('[data-action]');
   if (!target || target.disabled) return;
-  const { action, id, value } = target.dataset;
+  const { action, id, value, orchestrationId } = target.dataset;
   try {
     if (action === 'import-agent') { importAgentFromFile(); return; }
     if (action === 'import-skills') { importSkillsFromFile(); return; }
@@ -213,8 +213,8 @@ document.addEventListener('click', async event => {
     if (action === 'chart') { state.chart = value; return render(); }
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
-    if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
-    if (action === 'copy-task-logs') { event.preventDefault(); const events = await api(`/logs?task_id=${encodeURIComponent(id)}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
+    if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} Agent ${e.agent_name || e.agent_id || '—'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
+    if (action === 'copy-task-logs') { event.preventDefault(); const filter = orchestrationId ? `orchestration_id=${encodeURIComponent(orchestrationId)}` : `task_id=${encodeURIComponent(id)}`; const events = await api(`/logs?${filter}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
     if (action === 'copy-task-details') { const task = await api(`/tasks/${encodeURIComponent(id)}`); await navigator.clipboard.writeText(serialize(task)); toast('Task details copied to the clipboard.'); return; }
     if (action === 'delete-agent') return confirmAction({ title: 'Delete agent', description: 'This agent will be removed from the workspace. Agents with active tasks cannot be deleted.', label: 'Delete agent', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agent deleted.'); } });
     if (action === 'cancel-task') return confirmAction({ title: 'Cancel this run', description: 'The runtime will be asked to cancel this run, and the request will be recorded in its history. An action already in progress may finish before cancellation takes effect.', label: 'Cancel run', danger: true, action: async () => { await api(`/tasks/${id}/cancel`, 'POST', {}); toast('Cancellation requested.'); } });
@@ -240,8 +240,13 @@ document.addEventListener('submit', event => { if (event.target.id === 'log-filt
 document.addEventListener('submit', async event => {
   if (event.target.id !== 'freya-form') return;
   event.preventDefault();
-  const prompt = event.target.prompt.value.trim(), workspace_path = event.target.workspace_path.value.trim();
+  const form = event.target;
+  if (form.dataset.submitting === 'true') return;
+  const prompt = form.prompt.value.trim(), workspace_path = form.workspace_path.value.trim();
   if (!prompt) return;
+  form.dataset.submitting = 'true';
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
   try {
     const run = await api('/orchestrations', 'POST', { prompt, workspace_path });
     state.freyaHistory = [];
@@ -250,6 +255,10 @@ document.addEventListener('submit', async event => {
     toast('Freya started the orchestration.');
     await refresh();
   } catch (error) { toast(error.message, true); }
+  finally {
+    form.dataset.submitting = 'false';
+    if (submitButton) submitButton.disabled = false;
+  }
 });
 document.addEventListener('input', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
 document.addEventListener('change', event => { if (event.target.form?.id === 'freya-form' && event.target.name in state.freyaDraft) state.freyaDraft[event.target.name] = event.target.value; });
@@ -271,7 +280,7 @@ async function boot() {
   try { const [tools, config, skills] = await Promise.all([api('/tools'), api('/config'), api('/skills')]); Object.assign(state, { tools, config, skills }); }
   catch (error) { toast(error.message, true); }
   const current = route();
-  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; }
+  if (current.page === 'logs') { state.filters.logs.agent_id = current.query.get('agent_id') || ''; state.filters.logs.task_id = current.query.get('task_id') || ''; state.filters.logs.orchestration_id = current.query.get('orchestration_id') || ''; }
   await refresh(true); currentKey = `${current.page}/${current.id || ''}`;
   connectEvents(); setInterval(() => refresh(), 10000);
 }

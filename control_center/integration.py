@@ -357,7 +357,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         "superseded_task_ids": item.get("superseded_task_ids") or [],
     } for item in revision_history[-10:]]
     context = sanitize({
-        "original_user_prompt": clip(original_user_prompt, 2_000),
+        "original_user_prompt": original_user_prompt,
         "original_goal": original["goal"],
         "global_success_criteria": list(original["success_criteria"]),
         "effective_plan_revision": int(plan_revision),
@@ -409,7 +409,8 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
     if rendered_size() > MAX_CONTEXT_CHARS:
         # Deterministic minimal form: global criteria remain exact, optional task prose is removed.
         context_truncated = True
-        context["original_user_prompt"] = compact_text(context["original_user_prompt"], 500)
+        # The user's request is authoritative; preserve it exactly. The remaining
+        # optional fields are reduced below to keep the integration payload bounded.
         context["plan_revision_history"] = []
         for task in context["active_tasks"]:
             task["objective"] = compact_text(task["objective"], 200)

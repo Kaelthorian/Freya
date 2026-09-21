@@ -25,9 +25,9 @@ immutable Skill snapshots, including version and procedures.
 
 ## Freya orchestration
 
-`POST /api/orchestrations` with `{ "prompt": "..." }` queues a bounded run.
-The trimmed prompt must contain 1–2000 characters; oversized input returns HTTP
-400 before a run is created.
+`POST /api/orchestrations` with `{ "prompt": "...", "workspace_path": "..." }` queues a bounded run. An existing absolute workspace is used directly; when omitted or empty, Freya creates one isolated workspace for the orchestration and shares it across all planned nodes.
+The trimmed prompt must be non-empty. The application does not impose an
+artificial character limit before creating a run.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
 `planning_metrics`, selection snapshots, delegations, execution attempts,
@@ -121,7 +121,7 @@ it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning
 
 `required_capabilities` are validated registry IDs that describe likely task
 needs; they do not grant permission. `preferred_skills` are non-binding semantic
-hints and may name a Skill that is not currently installed.
+hints and may name a Skill that is not currently installed. For plans that mutate file/code artifacts, Freya appends one read-only `code-audit` task with `preferred_skills: ["code-review"]` after the implementation tasks.
 
 After planning, `freya.agent_selection.started` marks deterministic local
 ranking. `freya.agent_selected` records the planned task ID, selected agent ID,
@@ -286,7 +286,7 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 | GET | `/api/tasks/{id}` | task snapshot, events and merged timeline |
 | POST | `/api/tasks/{id}/cancel` | terminate a live task |
 | POST | `/api/tasks/{id}/retry` | create a new task from a terminal prompt |
-| GET | `/api/logs` | filter by agent, task, level, tool, error and date |
+| GET | `/api/logs` | filter by agent, task, orchestration, level, tool, error and date |
 | GET | `/api/metrics?agent_id=` | global or per-agent aggregates |
 | GET | `/api/health` | API, runtime and optional host telemetry |
 | GET | `/api/events?after=N` | replay/global SSE stream |
@@ -295,8 +295,8 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.
 
-Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
-and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
+Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
+and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
 
