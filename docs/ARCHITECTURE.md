@@ -182,8 +182,10 @@ Graph execution emits `freya.graph.initialized`, `freya.task.ready`,
 and `freya.graph.completed`. Together with selection and delegation snapshots,
 these events reconstruct Plan Task → Selection → Agent → Runtime Task → Result.
 Semantic review emits `freya.evaluation.started` once and then exactly one
-`freya.evaluation.completed` or `freya.evaluation.failed`; events carry IDs and
-status metadata, never the full evaluation or internal prompts.
+`freya.evaluation.completed` or `freya.evaluation.failed`. Completion events
+carry the validated criterion-by-criterion decision and metrics; non-accepted
+decisions also carry a bounded summary of the exact input evidence. Evaluator
+prompts and private reasoning are never logged.
 
 Orchestration transitions are conditional on the stored current state:
 Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
@@ -219,7 +221,7 @@ changes abandoned active runs to `Failed`, preserves their plan and writes one
 
 ### Prompt interpretation
 
-`task_analyst.py` validates a version-2 bounded JSON result containing the
+`task_analyst.py` validates a version-3 bounded JSON result containing the
 self-contained `operational_prompt`, explicit and inferred requirements,
 assumptions, risks, task characteristics, a
 recommended role, acceptance criteria and validation strategy. The orchestrator
@@ -230,9 +232,12 @@ discoverable through a compatibility fallback. It emits
 planning. If no enabled Analyst exists, Freya emits a deterministic operational
 brief rather than bypassing the phase.
 The analyst adapter calls loopback Ollama with `tools=[]`, and a deterministic
-interpretation is used if the model is unavailable. Before use, deterministic
-facts can only strengthen model characteristics and required interactive
-validation; corrections are logged in `corrected_fields`. The role does not grant
+interpretation is used if the model is unavailable. A standalone
+`program_creation` request without a named language receives an explicit
+Python 3.10+ assumption; a language named by the user is preserved. Other
+missing-input blockers remain fail-closed. Deterministic facts can only
+strengthen model characteristics and required interactive validation;
+corrections are logged in `corrected_fields`. The role does not grant
 capabilities, and a Skill is optional guidance only—not the routing or security
 mechanism. Cancellation is rechecked after this phase so a late analyst result
 cannot start a planner call or resurrect a terminal orchestration.
@@ -702,7 +707,12 @@ immutable system policy. Identity includes purpose, responsibilities, and
 constraints; behavior controls planning, ambiguity, evidence, and repeated
 failure handling; autonomy records decision preferences without granting
 capabilities; verification and output define evidence and result shape. The
-default output remains text for legacy compatibility, while structured output is strictly validated as summary/actions/artifacts/verification/limitations. A JSON-looking invalid result receives one repair attempt; otherwise an explicit fallback and limitation are returned. Verification state is persisted separately.
+default output remains text for legacy compatibility, while structured
+output is strictly validated as summary/actions/artifacts/verification/limitations.
+Any invalid structured response, including prose, receives one repair attempt.
+If fallback normalization is needed, `task.result_contract` logs a bounded,
+sanitized preview and repair details; format failure stays separate from task
+limitations and objective success. Verification state is persisted separately.
 
 The worker classifies recoverable, environment, policy, approval, invalid,
 unavailable and unknown-tool requests. A repeated policy denial with the same

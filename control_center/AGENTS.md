@@ -36,6 +36,9 @@ bypass tool policy.
   prompt, has no tools or workspace authority, and may use a deterministic
   fallback if its model call fails. Its `operational_prompt` replaces the human
   wording for Planner and workers; the original remains immutable audit evidence.
+- A program_creation request without a named language uses an explicit Python
+  3.10+ assumption. A code_change follows the existing project stack. Preserve
+  explicit languages and keep unrelated missing-input blockers fail-closed.
 - Interactive plans append a dependent QA node with `interactive-testing`, then
   the normal read-only Code Auditor. `run_command` accepts bounded stdin for
   Python only and closes stdin otherwise so `input()` cannot consume the wall-clock deadline.
@@ -44,6 +47,10 @@ bypass tool policy.
   bounded before consuming the task step budget.
 - `worker.py` must stop repeated successful read-only actions when no workspace
   progress is observed and bound consecutive denied/repeatedly blocked actions.
+  For structured output, attempt one bounded format repair for prose and
+  malformed JSON; emit a sanitized task.result_contract diagnostic when the
+  original response needs repair or fallback. Keep that format diagnostic
+  separate from task limitations and semantic success.
   `tools.py` and `agent_context.py` must filter Git
   inspection when the task workspace is not inside a checkout.
 - `storage.py`'s orchestration log query merges runtime and orchestration event

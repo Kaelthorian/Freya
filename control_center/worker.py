@@ -1150,14 +1150,20 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     result_output: Any = final
     if effective["output"]["format"] == "structured":
         repaired = None
-        repair_failed = False
+        model_response_valid = False
+        repair_attempted = False
+        validation_error = ""
+        repair_error = ""
         try:
             repaired = validate_structured_output(final)
-        except (TypeError, ValueError):
-            # Plain prose remains a compatibility fallback for legacy model
-            # responses. JSON-looking output gets exactly one repair attempt.
-            repair_eligible = str(final or "").lstrip().startswith(("{", chr(96) * 3))
-            if repair_eligible and metrics["model_calls"] < config.get("max_model_calls", 20):
+            model_response_valid = True
+        except (TypeError, ValueError) as exc:
+            validation_error = sanitize(str(exc))[:1000]
+            # A response-format repair is useful for prose as well as malformed
+            # JSON. Keep it bounded to one call and record its outcome separately
+            # from whether the requested work itself succeeded.
+            if metrics["model_calls"] < config.get("max_model_calls", 20):
+                repair_attempted = True
                 metrics["model_calls"] += 1
                 repair_id = uuid.uuid4().hex
                 publish("event", event={"event_type": "model.repair.started", "level": "warning", "status": "Running",
@@ -1166,8 +1172,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     repair_response = transport(
                         "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
                         {"model": config["model"],
-                         "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object or array or string), limitations (array)."},
-                                      {"role": "user", "content": "Repair this final answer into the required JSON contract:\n" + str(final)}],
+                         "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object, array, or string), limitations (array). Preserve only claims supported by the completed work and verification."},
+                                      {"role": "user", "content": "Convert this final answer into the required JSON contract. It may be prose, malformed JSON, or JSON with invalid fields. Preserve its useful result without inventing work:\n" + str(final)}],
                          "tools": [], "stream": False, "think": False,
                          "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
                                      "num_predict": (min(token_limit - metrics["total_tokens"], config.get("context_window", 8192)) if token_limited else -1)}},
@@ -1175,7 +1181,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     )
                     for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
                         value = repair_response.get(source, 0) or 0
-                        if not isinstance(value, (int, float)) or value < 0:
+                        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                             raise ValueError("Ollama returned invalid repair usage metrics.")
                         metrics[key] += int(value)
                     metrics["total_tokens"] = metrics["prompt_tokens"] + metrics["generated_tokens"]
@@ -1184,18 +1190,30 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         raise ValueError("Ollama returned no repair message.")
                     repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
                     publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
-                                             "step_id": repair_id, "output": {"valid": True}})
+                                             "step_id": repair_id,
+                                             "output": {"valid": True, "fields": sorted(repaired)}})
                 except Exception as exc:
-                    repair_failed = True
+                    repaired = None
+                    repair_error = sanitize("{}: {}".format(type(exc).__name__, exc))[:1000]
                     publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",
-                                             "step_id": repair_id, "error": "{}: {}".format(type(exc).__name__, exc)})
+                                             "step_id": repair_id, "error": repair_error})
+            else:
+                repair_error = "The model-call budget was exhausted before the format repair."
         if repaired is None:
             result_output = normalize_result_output(final, effective["output"])
-            if isinstance(result_output, dict):
-                result_output["limitations"].append("The model output did not satisfy the structured contract; fallback normalization was used.")
         else:
             result_output = repaired
         if isinstance(result_output, dict):
+            try:
+                validate_structured_output(result_output)
+                normalized_contract_valid = True
+            except (TypeError, ValueError):
+                normalized_contract_valid = False
+                result_output = {
+                    "summary": str(final or "").strip() or "No final response was provided.",
+                    "actions": [], "artifacts": [], "verification": [], "limitations": [],
+                }
+                normalized_contract_valid = True
             result_output["actions"] = list(result_output.get("actions") or []) + runtime_actions
             result_output["artifacts"] = list(result_output.get("artifacts") or []) + runtime_artifacts
             if workspace_diffs:
@@ -1203,6 +1221,34 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             result_output["verification"] = verification_state
             if verification_state.get("skipped_with_reason"):
                 result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
+        else:
+            normalized_contract_valid = False
+        contract_diagnostics = {
+            "format": "structured",
+            "required_fields": ["summary", "actions", "artifacts", "verification", "limitations"],
+            "model_response_valid": model_response_valid,
+            "repair_attempted": repair_attempted,
+            "repair_succeeded": repaired is not None and repair_attempted,
+            "fallback_normalization_used": repaired is None,
+            "normalized_result_valid": normalized_contract_valid,
+            "validation_error": validation_error,
+            "repair_error": repair_error,
+        }
+        if not model_response_valid:
+            contract_diagnostics["original_response_preview"] = sanitize(
+                str(final or "")
+            )[:4000]
+        publish("event", event={
+            "event_type": "task.result_contract",
+            "level": "warning" if not model_response_valid else "info",
+            "status": "Warning" if not model_response_valid else "Success",
+            "message": (
+                "The final response required structured-format repair or normalization."
+                if not model_response_valid else
+                "The final response satisfied the structured output contract."
+            ),
+            "output": contract_diagnostics,
+        })
     update()
     return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,

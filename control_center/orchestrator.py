@@ -24,7 +24,7 @@ from .security import sanitize
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .skills import skill_summary
-from .task_analyst import (TaskAnalyst, deterministic_task_analysis,
+from .task_analyst import (TaskAnalyst, reconciled_deterministic_task_analysis,
                             select_task_analyst)
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 
@@ -449,19 +449,24 @@ class Orchestrator(IntegrationOrchestrationMixin):
         """Rewrite the human prompt once before any downstream planning."""
         analyst = select_task_analyst(self.store.list_agents())
         if analyst is None:
-            analysis = deterministic_task_analysis(prompt)
+            analysis, corrections = reconciled_deterministic_task_analysis(prompt)
+            metrics = {
+                "mode": "deterministic_no_agent", "model_calls": 0,
+                "corrected_fields": corrections,
+            }
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] == "Planning":
                     self.store.add_orchestration_event(oid, {
                         "event_type": "freya.task_analysis.completed", "status": "Planning",
                         "agent_name": "Freya deterministic Task Analyst",
-                        "analysis_version": analysis.get("analysis_version", 2),
+                        "analysis_version": analysis.get("analysis_version", 3),
                         "analysis_mode": "deterministic_no_agent",
-                        "metrics": {"mode": "deterministic_no_agent", "model_calls": 0},
+                        "metrics": metrics,
                         "task_analysis": analysis,
+                        "corrected_fields": corrections,
                         "message": "No enabled Task Analyst was configured; Freya produced a deterministic operational brief.",
                     })
-            return analysis, {"mode": "deterministic_no_agent", "model_calls": 0}
+            return analysis, metrics
         with self.lock:
             if self.store.get_orchestration(oid)["status"] != "Planning":
                 return None, {"mode": "cancelled", "model_calls": 0}
@@ -476,17 +481,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
             metrics = dict(getattr(analyzer, "metrics", {}) or {})
             mode = str(metrics.get("mode") or "model")
         except Exception as exc:
-            analysis = deterministic_task_analysis(prompt)
+            analysis, corrections = reconciled_deterministic_task_analysis(prompt)
             metrics = dict(getattr(self.task_analyst, "metrics", {}) or {})
             metrics["fallback_error"] = sanitize(str(exc))[:1000]
             metrics["mode"] = "deterministic_fallback"
+            metrics["corrected_fields"] = corrections
             mode = "deterministic_fallback"
         with self.lock:
             if self.store.get_orchestration(oid)["status"] == "Planning":
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.task_analysis.completed", "status": "Planning",
                     "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
-                    "analysis_version": analysis.get("analysis_version", 1),
+                    "analysis_version": analysis.get("analysis_version", 3),
                     # This is a bounded operational interpretation, not
                     # hidden chain-of-thought. Keep the key explicit so the
                     # persistence sanitizer does not remove it.
@@ -819,6 +825,57 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "message": "The planned task was blocked by a failed dependency.",
                 })
 
+    @staticmethod
+    def _evaluation_log_input(snapshot: dict) -> dict:
+        """Build a bounded, sanitized record of the evidence shown to evaluation."""
+        if not isinstance(snapshot, dict):
+            return {}
+        planned = snapshot.get("planned_task")
+        planned = planned if isinstance(planned, dict) else {}
+        runtime = snapshot.get("runtime_task")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        verification = runtime.get("verification")
+        verification = verification if isinstance(verification, dict) else {}
+        evidence = []
+        raw_evidence = verification.get("evidence", [])
+        if not isinstance(raw_evidence, list):
+            raw_evidence = []
+        for item in raw_evidence[:8]:
+            if not isinstance(item, dict):
+                continue
+            bounded = {
+                key: item[key] for key in ("check", "status", "type", "tool", "exit_code")
+                if key in item
+            }
+            for key in ("command", "supports_acceptance_criteria"):
+                value = item.get(key)
+                if isinstance(value, list):
+                    bounded[key] = [str(part)[:300] for part in value[:10]]
+            bounded["output"] = str(item.get("output") or "")[:1_200]
+            evidence.append(bounded)
+        result = str(runtime.get("result") or "")
+        return sanitize({
+            "planned_task": {
+                key: planned.get(key)
+                for key in ("id", "objective", "description", "success_criteria")
+                if key in planned
+            },
+            "runtime_task": {
+                "status": runtime.get("status"),
+                "error": str(runtime.get("error") or "")[:1_000],
+                "result_preview": result[:3_000],
+                "verification": {
+                    key: verification.get(key)
+                    for key in ("requested", "attempted", "passed", "failed", "unavailable")
+                    if key in verification
+                } | {
+                    "skipped_with_reason": str(verification.get("skipped_with_reason") or "")[:1_000],
+                    "evidence": evidence,
+                },
+            },
+            "context_truncated": bool(snapshot.get("context_truncated")),
+        })
+
     def _evaluate_graph_node(self, oid: str, plan: dict, target: dict,
                              deadline: float) -> None:
         """Evaluate one technical success without holding the orchestration lock."""
@@ -908,6 +965,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 return
             event_type = ("freya.evaluation.failed" if technical_error
                           else "freya.evaluation.completed")
+            evaluation_output = {
+                "decision": evaluation,
+                "deterministic": bool(outcome.get("deterministic")),
+                "context_truncated": bool(outcome.get("context_truncated")),
+                "metrics": metrics,
+            }
+            if evaluation["status"] != "accepted":
+                evaluation_output["input"] = self._evaluation_log_input(
+                    outcome.get("context_snapshot") or {},
+                )
             self.store.add_orchestration_event(oid, {
                 "event_type": event_type,
                 "status": "Failed" if evaluation["status"] != "accepted" else "Success",
@@ -918,6 +985,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "evaluation_status": evaluation["status"],
                 "evaluator_version": EVALUATOR_VERSION,
                 "message": evaluation["summary"],
+                "output": evaluation_output,
             })
             if evaluation["status"] == "accepted":
                 self.store.add_orchestration_event(oid, {

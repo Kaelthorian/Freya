@@ -799,6 +799,15 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(node_state["evaluation_status"], "needs_revision")
         self.assertIn("requires revision", node_state["error"])
         self.assertEqual(len(runtime.submissions), 1)
+        event = next(item for item in final["events"]
+                     if item["event_type"] == "freya.evaluation.completed")
+        event_payload = json.loads(event["payload_json"])
+        self.assertEqual(event_payload["output"]["decision"]["summary"], "A small part is missing.")
+        self.assertEqual(
+            event_payload["output"]["decision"]["criteria"][0]["status"], "partial",
+        )
+        self.assertIn("planned_task", event_payload["output"]["input"])
+        self.assertIn("verification", event_payload["output"]["input"]["runtime_task"])
 
     def test_evaluator_technical_failure_is_persisted_and_emits_failed_event(self):
         agent = self.agent("Broken evaluator")

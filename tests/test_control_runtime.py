@@ -281,6 +281,12 @@ class WorkerTests(unittest.TestCase):
         result = self.run_worker([
             answer(calls=[("write_file", {"path": "observed.py", "content": "print(1)"})]),
             answer("The model returned prose instead of the structured contract."),
+            answer(json.dumps({
+                "summary": "Created observed.py.",
+                "actions": [], "artifacts": [],
+                "verification": "The file was created.",
+                "limitations": [],
+            })),
         ], tools=["write_file"], config={
             "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
             "verification": {"enabled": False, "inspect_changes": False, "run_available_tests": False,
@@ -289,7 +295,40 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["status"], "Success", result["error"])
         self.assertEqual(result["result"]["actions"][0]["tool"], "write_file")
         self.assertEqual(result["result"]["artifacts"][0]["path"], "observed.py")
-        self.assertTrue(result["result"]["limitations"])
+        self.assertFalse(any("structured output" in item.casefold()
+                             for item in result["result"]["limitations"]))
+        contract_event = next(
+            item["event"] for item in self.events
+            if item.get("event", {}).get("event_type") == "task.result_contract"
+        )
+        self.assertFalse(contract_event["output"]["model_response_valid"])
+        self.assertTrue(contract_event["output"]["repair_attempted"])
+        self.assertTrue(contract_event["output"]["repair_succeeded"])
+        self.assertFalse(contract_event["output"]["fallback_normalization_used"])
+        self.assertIn("prose", contract_event["output"]["original_response_preview"])
+
+    def test_failed_structured_repair_is_logged_without_becoming_task_failure(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "fallback.py", "content": "print(1)"})]),
+            answer("The model returned prose instead of the structured contract."),
+            answer("The repair response was also prose."),
+        ], tools=["write_file"], config={
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {"enabled": False, "inspect_changes": False, "run_available_tests": False,
+                            "require_tool_evidence": False, "completion_criteria": []},
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["result"]["summary"],
+                         "The model returned prose instead of the structured contract.")
+        self.assertFalse(any("structured output" in item.casefold()
+                             for item in result["result"]["limitations"]))
+        contract_event = next(
+            item["event"] for item in self.events
+            if item.get("event", {}).get("event_type") == "task.result_contract"
+        )
+        self.assertTrue(contract_event["output"]["fallback_normalization_used"])
+        self.assertTrue(contract_event["output"]["normalized_result_valid"])
+        self.assertFalse(contract_event["output"]["repair_succeeded"])
     def test_fallback_disabled_tool_is_a_visible_error_without_mutation(self):
         result = self.run_worker([answer('{"action":"write_file","path":"blocked.txt","content":"bad"}'),
                                   answer('{"action":"finish","message":"Could not write"}')], tools=["read_file"])
@@ -473,8 +512,8 @@ class RuntimeTests(unittest.TestCase):
         final = self.completed(task)
         self.assertEqual(final["status"], "Success", final["error"])
         self.assertEqual((Path(final["workspace"]) / "created.txt").read_text(), "written by tool")
-        self.assertEqual(final["model_calls"], 2)
-        self.assertEqual(final["total_tokens"], 10)
+        self.assertEqual(final["model_calls"], 3)
+        self.assertEqual(final["total_tokens"], 15)
         self.assertEqual(self.store.list_steps(task["id"])[0]["status"], "Success")
         self.assertFalse(self.runtime.active)
 

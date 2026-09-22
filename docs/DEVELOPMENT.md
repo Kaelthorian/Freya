@@ -51,6 +51,12 @@ analyst model fails, Freya records the error and uses a deterministic bounded
 interpretation. The role can be selected in the agent editor; a Skill is not
 required for routing or authorization.
 
+For a standalone program request with no language specified, the Analyst
+records Python 3.10+ as an assumption and adds it to the operational brief.
+An explicit language is preserved. This default does not clear unrelated
+missing-input blockers or select a language for code changes in an existing
+project.
+
 `ready_for_execution=false` is a hard pre-planning gate. Freya records
 `freya.task_analysis.blocked`, fails planning with the analyst's
 `blocking_reason`, and does not create a plan, workspace, or delegation. A
@@ -114,6 +120,21 @@ quoted-output, exit-code, or JSON completion criterion. Missing evidence returns
 For filesystem-only tasks without Git or tests, the Worker may instead verify
 each modified file with an allowed `read_file` read-back; missing or mismatched
 read-back evidence remains blocked or failed.
+
+Task Analyst language policy applies in model, offline, no-analyst and deterministic
+fallback paths: standalone program creation defaults to Python 3.10+ when no
+language is named; code changes preserve the detected project stack. A language
+assumption clears only a language-only blocker, never unrelated missing inputs.
+
+For each non-accepted evaluation, `freya.evaluation.completed` includes the
+validated decision by criterion and a bounded summary of the exact task and
+verification evidence shown to the evaluator. `GET /api/logs` exposes the same
+event output. Structured final responses receive one repair attempt even when
+the original answer is prose; if normalization is needed, `task.result_contract`
+stores a sanitized response preview, validation error, repair outcome and
+fallback status. A failed format repair is diagnostic and does not itself
+invalidate objective evidence. Exact criterion links from successful controlled
+commands are accepted deterministically.
 
 Semantic recovery has its own local, tool-free model and hard budgets:
 

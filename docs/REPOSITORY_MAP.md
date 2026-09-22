@@ -11,19 +11,19 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── task_analyst.py       tool-free rewrite, canonical task kinds, repair and deterministic fallback
+│   ├── task_analyst.py       versioned tool-free rewrite, language assumptions and deterministic reconciliation
 │   ├── planner.py            plan schema, safe verification derivation, conditional QA/audit and fallback
 │   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
-│   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
+│   ├── evaluator.py          criterion evidence checks, decision schema and tool-free Ollama adapter
 │   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and deterministic criterion-to-proof association
 │   ├── integration_orchestrator.py orchestration-level integration lifecycle
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
-│   ├── worker.py             bounded Ollama/tool loop, dynamic tool prompt, feedback and per-agent policy
+│   ├── worker.py             bounded Ollama/tool loop, response repair diagnostics and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── transport.py          non-redirecting local Ollama HTTP client
 │   ├── storage.py            transactional SQLite repository and metrics
@@ -61,7 +61,7 @@ selects them.
    loopback Host checks before dispatching to `api.py`.
 2. `api.py` validates agents and browses local folders. `orchestrator.py` first
    sends the human prompt to the enabled Task Analyst through `task_analyst.py`
-   without tools. The validated version-2 `operational_prompt` is reconciled
+   without tools. The validated version-3 `operational_prompt` is reconciled
    against deterministic facts and replaces the human wording downstream; the
    human prompt remains stored only as audit evidence. Freya sends that brief
    and its structured constraints through the loopback Ollama
@@ -83,8 +83,11 @@ selects them.
    reject mutation of active, historical or independent work before committing
    the effective plan, without changing the original plan snapshot.
    Runtime command output that directly satisfies an observable completion
-   criterion is promoted to bounded verification evidence, and malformed
-   structured output is merged with the runtime action/artifact record.
+   criterion is promoted to bounded verification evidence and can satisfy that
+   exact criterion deterministically. Invalid structured final text receives
+   one repair attempt; `task.result_contract` logs sanitized format diagnostics,
+   while `freya.evaluation.completed` logs criterion decisions and bounded
+   input evidence for non-accepted outcomes.
    The worker also stops duplicate writes after successful read-back and reports
    missing-file reads without repeating them unchanged; semantic recovery then
    fails deterministic absent-artifact inputs instead of rotating agents.
@@ -121,7 +124,7 @@ selects them.
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Tool implementation, dynamic tool prompt or controlled stdin | `tools.py`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_control_runtime.py`, `tests/test_agent_context.py` |
-| Runtime evidence, structured fallback or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_recovery.py` |
+| Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills, minimal assignment or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_factory.py`, `agent_context.py`, `tests/test_skills.py`, `tests/test_agent_factory.py`, `tests/test_agent_context.py` |

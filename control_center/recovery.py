@@ -335,6 +335,7 @@ def deterministic_failure_diagnosis(logs: list[dict[str, Any]]) -> dict[str, Any
     root_types = (
         "freya.agent_selection.failed", "model.failed", "step.finished",
         "task.failed", "execution.interrupted", "freya.evaluation.failed",
+        "freya.evaluation.completed",
         "freya.integration.failed", "freya.planning.failed", "freya.task.failed",
     )
     root = next(
@@ -538,6 +539,9 @@ def build_retry_prompt(planned_task: dict[str, Any], evaluation: dict[str, Any],
         str(planned_task.get("objective") or "").strip(),
         "", f"Semantic recovery attempt {attempt}.",
         "Address the prior evaluation; do not merely repeat the previous claim.",
+        "Treat persisted verification evidence as authoritative. Do not claim that command output "
+        "was unconfirmed when a passed command_execution record has exit_code 0 and includes its output. "
+        "A response-format repair or normalization is a diagnostic, separate from whether the objective passed.",
         "Recovery instructions: " + str(instructions).strip(),
     ]
     if issues:

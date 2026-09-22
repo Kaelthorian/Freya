@@ -340,10 +340,12 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
             def analyze(self, prompt, agent):
                 analysis = deterministic_task_analysis(prompt)
                 analysis["ready_for_execution"] = False
-                analysis["blocking_reason"] = "The user needs to specify the programming language."
+                analysis["blocking_reason"] = (
+                    "The user needs to specify the target database and authentication method."
+                )
                 return analysis
 
-        run = self.store.create_orchestration("Crea un hola mundo")
+        run = self.store.create_orchestration("Connect the service to a database.")
         orchestrator = Orchestrator(
             self.store, None,
             task_analyst=TaskAnalyst(BlockedAdapter()),
@@ -354,7 +356,7 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertEqual(stored["status"], "Failed")
         self.assertIsNone(stored["plan"])
         self.assertEqual(calls, [])
-        self.assertIn("programming language", stored["error"])
+        self.assertIn("target database", stored["error"])
         self.assertIn("freya.task_analysis.blocked", [event["event_type"] for event in stored["events"]])
 
     def test_graph_timeout_runs_failure_analysis_before_failing(self):

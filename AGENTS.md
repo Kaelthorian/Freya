@@ -13,6 +13,10 @@ Ollama and allowlisted tools → selected agent workspace.
 - Preserve the human prompt as audit evidence, but use the Task Analyst's
   schema-validated, semantically reconciled operational prompt as the sole
   downstream input for planning and delegation.
+- For program_creation without a named language, record Python 3.10+ as an
+  explicit assumption. For code_change, inspect and preserve the existing
+  project language; use Python only if no stack exists for standalone work.
+  Preserve explicit user choices and do not clear unrelated blockers.
 - Treat `ready_for_execution=false` plus `blocking_reason` as a hard planning
   gate: emit the blocker, create no plan, and delegate no worker until the
   missing user input is resolved.

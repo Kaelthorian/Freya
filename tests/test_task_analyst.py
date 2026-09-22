@@ -8,6 +8,7 @@ from control_center.task_analyst import (
     OllamaTaskAnalyst,
     TaskAnalyst,
     deterministic_task_analysis,
+    reconcile_task_analysis,
     select_task_analyst,
     validate_task_analysis,
 )
@@ -105,8 +106,81 @@ class TaskAnalystTests(unittest.TestCase):
         result = adapter.analyze("Create a file", agent)
         self.assertEqual(captured["payload"]["tools"], [])
         self.assertIn("format", captured["payload"])
-        self.assertEqual(result["analysis_version"], 2)
+        self.assertIn("assume Python 3.10+", captured["payload"]["messages"][0]["content"])
+        self.assertEqual(result["analysis_version"], 3)
         self.assertEqual(adapter.metrics["total_tokens"], 9)
+
+    def test_missing_language_for_program_uses_explicit_python_assumption(self):
+        prompt = "Create a program that prints Hello World."
+        blocked = deterministic_task_analysis(prompt)
+        blocked["ready_for_execution"] = False
+        blocked["blocking_reason"] = "The user needs to specify the programming language."
+
+        result, corrected_fields = reconcile_task_analysis(prompt, blocked)
+
+        self.assertTrue(result["ready_for_execution"])
+        self.assertIsNone(result["blocking_reason"])
+        self.assertIn("Programming language: Python 3.10+", result["operational_prompt"])
+        self.assertTrue(any("Python 3.10+" in item["description"]
+                            for item in result["assumptions"]))
+        self.assertIn("ready_for_execution", corrected_fields)
+        self.assertIn("assumptions", corrected_fields)
+
+    def test_explicit_language_is_preserved_when_analyst_misses_it(self):
+        prompt = "Create a JavaScript program that prints Hello World."
+        blocked = deterministic_task_analysis(prompt)
+        blocked["ready_for_execution"] = False
+        blocked["blocking_reason"] = "The user needs to specify the programming language."
+
+        result, _ = reconcile_task_analysis(prompt, blocked)
+
+        self.assertTrue(result["ready_for_execution"])
+        self.assertIn("Programming language: JavaScript", result["operational_prompt"])
+        self.assertFalse(any("Python 3.10+" in item["description"]
+                             for item in result["assumptions"]))
+
+    def test_go_is_detected_as_a_language_only_in_language_context(self):
+        explicit, _ = reconcile_task_analysis(
+            "Create a Go program that prints Hello World.",
+            deterministic_task_analysis("Create a Go program that prints Hello World."),
+        )
+        ordinary_verb, _ = reconcile_task_analysis(
+            "Create a program, go home, and print Hello World.",
+            deterministic_task_analysis("Create a program, go home, and print Hello World."),
+        )
+        self.assertIn("Programming language: Go", explicit["operational_prompt"])
+        self.assertIn("Programming language: Python 3.10+",
+                      ordinary_verb["operational_prompt"])
+
+    def test_code_change_without_language_uses_existing_project_stack(self):
+        prompt = "Modify the existing project to add a route."
+        blocked = deterministic_task_analysis(prompt)
+        blocked["task_kind"] = "code_change"
+        blocked["ready_for_execution"] = False
+        blocked["blocking_reason"] = "The user needs to specify the programming language."
+
+        result, _ = reconcile_task_analysis(prompt, blocked)
+
+        self.assertTrue(result["ready_for_execution"])
+        self.assertIn("preserve the existing project's language",
+                      result["operational_prompt"])
+        self.assertFalse(any("Use Python 3.10+" in item["description"]
+                             for item in result["assumptions"]))
+        self.assertTrue(any("existing project's language" in item["description"]
+                            for item in result["assumptions"]))
+
+    def test_language_default_does_not_clear_a_compound_blocker(self):
+        prompt = "Create a program that prints Hello World."
+        blocked = deterministic_task_analysis(prompt)
+        blocked["ready_for_execution"] = False
+        blocked["blocking_reason"] = (
+            "The user needs to specify the programming language and the target database."
+        )
+
+        result, _ = reconcile_task_analysis(prompt, blocked)
+
+        self.assertFalse(result["ready_for_execution"])
+        self.assertIn("target database", result["blocking_reason"])
 
     def test_ollama_adapter_repairs_blocked_contract_once_before_failure(self):
         first = deterministic_task_analysis("Create a file")
@@ -139,12 +213,28 @@ class TaskAnalystTests(unittest.TestCase):
         orchestrator = Orchestrator(store, None, task_analyst=TaskAnalyst(adapter))
         analysis, metrics = orchestrator._analyze_prompt("run-1", "Create a file")
         self.assertEqual(adapter.prompts, [("Create a file", analyst["id"])])
-        self.assertEqual(analysis["analysis_version"], 2)
+        self.assertEqual(analysis["analysis_version"], 3)
         self.assertEqual(metrics["mode"], "model")
         self.assertEqual([event["event_type"] for event in store.events], [
             "freya.task_analysis.started", "freya.task_analysis.completed",
         ])
         self.assertEqual(store.events[-1]["agent_id"], analyst["id"])
+
+    def test_deterministic_modes_apply_the_language_default(self):
+        prompt = "Create a program that prints Hello World."
+        offline_analyst = TaskAnalyst(offline=True)
+        analysis = offline_analyst.analyze(prompt, {})
+        self.assertTrue(analysis["ready_for_execution"])
+        self.assertIn("Programming language: Python 3.10+", analysis["operational_prompt"])
+        self.assertIn("assumptions", offline_analyst.metrics["corrected_fields"])
+
+        store = AnalysisStore([])
+        orchestrator = Orchestrator(store, None)
+        no_agent_analysis, metrics = orchestrator._analyze_prompt("run-1", prompt)
+        self.assertIn("Programming language: Python 3.10+",
+                      no_agent_analysis["operational_prompt"])
+        self.assertIn("assumptions", metrics["corrected_fields"])
+        self.assertEqual(store.events[-1]["corrected_fields"], metrics["corrected_fields"])
 
     def test_orchestrator_blocks_planning_when_analysis_requires_input(self):
         analyst = normalize_agent({
@@ -214,6 +304,11 @@ class TaskAnalystTests(unittest.TestCase):
 
         result = TaskAnalyst(ProgramAdapter()).analyze("hace un hola mundo", {"id": "analyst"})
         self.assertEqual(result["task_kind"], "program_creation")
+
+    def test_python_mentioned_in_bug_report_does_not_make_it_program_creation(self):
+        prompt = "Fix the Python authentication bug."
+        result, _ = reconcile_task_analysis(prompt, deterministic_task_analysis(prompt))
+        self.assertEqual(result["task_kind"], "analysis")
 
 
 if __name__ == "__main__":

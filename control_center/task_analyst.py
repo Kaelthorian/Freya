@@ -17,7 +17,7 @@ from .security import sanitize
 from .transport import request_json
 
 
-TASK_ANALYSIS_VERSION = 2
+TASK_ANALYSIS_VERSION = 3
 MAX_ANALYSIS_TEXT_CHARS = 4000
 MAX_ANALYSIS_INPUT_CHARS = 12000
 MAX_ANALYSIS_ITEMS = 30
@@ -424,7 +424,10 @@ class OllamaTaskAnalyst:
             "You are Freya's Task Analyst and prompt engineer. Rewrite the human request into a precise, "
             "self-contained operational_prompt for the planner and delegated agents. Return only the strict "
             "JSON schema requested. Preserve every explicit requirement, label assumptions, detect interactive "
-            "input and risks, and include concrete acceptance and validation instructions. Never execute tools "
+            "input and risks, and include concrete acceptance and validation instructions. For a standalone "
+            "program with no language named, assume Python 3.10+ and state that assumption. For a code change, "
+            "preserve the target project's existing language. Do not block only to ask for a language when "
+            "these safe choices apply. Preserve an explicitly named language. Never execute tools "
             "or claim work was completed. Your operational_prompt replaces the human wording downstream.\n\n"
             + instructions[:16000]
         )
@@ -481,6 +484,49 @@ class OllamaTaskAnalyst:
         return result
 
 
+_PROGRAMMING_LANGUAGES = (
+    (r"\bpython(?:\s*3(?:\.\d+)?)?\b", "Python"),
+    (r"\bjavascript\b|\bjs\b", "JavaScript"),
+    (r"\btypescript\b|\bts\b", "TypeScript"),
+    (r"\bjava\b", "Java"),
+    (r"(?<!\w)c\+\+(?!\w)", "C++"),
+    (r"(?<!\w)c#(?!\w)|\bcsharp\b", "C#"),
+    (r"\brust\b", "Rust"),
+    (r"\bgolang\b|\bgo\s+(?:language|program|script|code)\b|"
+     r"\b(?:in|using|with|use|usar|en)\s+go\b", "Go"),
+    (r"\bruby\b", "Ruby"),
+    (r"\bphp\b", "PHP"),
+    (r"\bkotlin\b", "Kotlin"),
+    (r"\bswift\b", "Swift"),
+    (r"\bpowershell\b|\bpwsh\b", "PowerShell"),
+    (r"\bbash\b", "Bash"),
+    (r"\bsql\b", "SQL"),
+    (r"\bc\b", "C"),
+)
+
+
+def _requested_programming_language(prompt: str) -> str | None:
+    lowered = str(prompt or "").casefold()
+    return next((name for pattern, name in _PROGRAMMING_LANGUAGES
+                 if re.search(pattern, lowered)), None)
+
+
+def _only_language_is_blocking(reason: str) -> bool:
+    """Recognize a single missing-language question, not compound blockers."""
+    clauses = [item.strip() for item in re.split(
+        r"[.;\n]+|\b(?:and|also|plus|as well|y|adem[aá]s|tambi[eé]n)\b",
+        str(reason or ""), flags=re.I,
+    ) if item.strip()]
+    if len(clauses) != 1:
+        return False
+    clause = clauses[0].casefold()
+    return (bool(re.search(r"\b(?:language|idioma)\b", clause))
+            and bool(re.search(
+                r"\b(?:specif\w*|clarif\w*|missing|unspecified|need\w*|require\w*|"
+                r"especific\w*|indic\w*|defin\w*|falt\w*)\b", clause,
+            )))
+
+
 def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Enforce prompt-observable safety facts on a schema-valid model result.
 
@@ -520,9 +566,10 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
     model_describes_program = (
         normalized.get("task_kind") == "program_creation"
         or (
-            model_characteristics.get("requires_code_execution") is True
+            normalized.get("task_kind") in {"general", "file_creation"}
+            and model_characteristics.get("requires_code_execution") is True
             and bool(re.search(
-                r"\b(?:program|programa|script|execute|execut|run|stdout|output|salida|print|imprima|python)\b",
+                r"\b(?:program|programa|script|execute|execut|run|stdout|output|salida|print|imprima)\b",
                 model_text,
             ))
         )
@@ -538,6 +585,50 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
           and detected.get("task_kind") != "general"):
         corrected["task_kind"] = detected["task_kind"]
         changes.append("task_kind")
+
+    if corrected.get("task_kind") in {"program_creation", "code_change"}:
+        requested_language = _requested_programming_language(prompt)
+        if requested_language is not None:
+            language_instruction = (
+                "Programming language: " + requested_language + " (explicitly requested)."
+            )
+        elif corrected.get("task_kind") == "code_change":
+            language_instruction = (
+                "Programming language: inspect and preserve the existing project's language; "
+                "use Python 3.10+ only for standalone work without an established project stack."
+            )
+        else:
+            language_instruction = (
+                "Programming language: Python 3.10+ "
+                "(assumption because the standalone program request did not specify one)."
+            )
+        if requested_language is None:
+            assumptions = list(corrected.get("assumptions", []))
+            if corrected.get("task_kind") == "code_change":
+                assumption = {
+                    "description": "Preserve the existing project's language; use Python 3.10+ only if no project stack exists.",
+                    "reason": "The request did not name a language; code changes should follow the target project's existing technology.",
+                }
+            else:
+                assumption = {
+                    "description": "Use Python 3.10+ for this standalone program.",
+                    "reason": "The request did not name a programming language; Python is Freya's default for standalone program creation.",
+                }
+            if assumption not in assumptions:
+                assumptions.append(assumption)
+                corrected["assumptions"] = assumptions[:MAX_ANALYSIS_ITEMS]
+                changes.append("assumptions")
+        if (corrected.get("ready_for_execution") is False
+                and _only_language_is_blocking(corrected.get("blocking_reason", ""))):
+            corrected["ready_for_execution"] = True
+            corrected["blocking_reason"] = None
+            changes.extend(["ready_for_execution", "blocking_reason"])
+        operational = str(corrected.get("operational_prompt") or "").strip()
+        if language_instruction.casefold() not in operational.casefold():
+            suffix = "\n\n" + language_instruction
+            operational = operational[:max(1, MAX_ANALYSIS_TEXT_CHARS - len(suffix))] + suffix
+            corrected["operational_prompt"] = operational
+            changes.append("operational_prompt")
 
     validation = dict(normalized["validation"])
     if detected["validation"]["interactive_validation_required"] and not validation["interactive_validation_required"]:
@@ -564,7 +655,7 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
             "The result is interactive. The implementation agent must not wait for terminal input; "
             "a QA Tester must run it with bounded controlled stdin and verify logical output."
         )
-    operational = normalized["operational_prompt"].strip()
+    operational = str(corrected["operational_prompt"] or "").strip()
     if operational.casefold() in {"{}", "[]", "null"}:
         # Some local models satisfy the string schema with a JSON placeholder.
         # Keep the deterministic operational brief authoritative instead of
@@ -580,6 +671,11 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
     return validate_task_analysis(corrected), list(dict.fromkeys(changes))
 
 
+def reconciled_deterministic_task_analysis(prompt: str) -> tuple[dict[str, Any], list[str]]:
+    """Apply the same prompt-grounded corrections to deterministic analysis."""
+    return reconcile_task_analysis(prompt, deterministic_task_analysis(prompt))
+
+
 class TaskAnalyst:
     """Wrapper that supports explicit offline mode and deterministic fallback."""
 
@@ -590,8 +686,12 @@ class TaskAnalyst:
 
     def analyze(self, prompt: str, agent: dict[str, Any]) -> dict[str, Any]:
         if self.offline or self.adapter is None:
-            self.metrics = {"model_calls": 0, "mode": "deterministic", "corrected_fields": []}
-            return deterministic_task_analysis(prompt)
+            result, corrections = reconciled_deterministic_task_analysis(prompt)
+            self.metrics = {
+                "model_calls": 0, "mode": "deterministic",
+                "corrected_fields": corrections,
+            }
+            return result
         try:
             result, corrections = reconcile_task_analysis(prompt, self.adapter.analyze(prompt, agent))
             self.metrics = dict(self.adapter.metrics)

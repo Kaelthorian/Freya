@@ -60,6 +60,37 @@ def decision(criteria, status="accepted"):
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_linked_successful_command_accepts_each_exact_criterion(self):
+        criteria = ["The script outputs 'Hello, World!' to the console"]
+        model_calls = []
+        outcome = Evaluator(
+            lambda prompt, context: model_calls.append(context),
+        ).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": True,
+                "failed": False, "unavailable": False,
+                "evidence": [{
+                    "type": "command_execution",
+                    "check": "command_output:python hello_world.py",
+                    "status": "passed", "tool": "run_command",
+                    "command": ["python", "hello_world.py"],
+                    "exit_code": 0, "output": "Hello, World!",
+                    "supports_acceptance_criteria": list(criteria),
+                }],
+            }),
+            execution_node=node(),
+        )
+
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertTrue(outcome["deterministic"])
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+        self.assertIn("exit_code=0", outcome["criteria"][0]["evidence"])
+        self.assertEqual(model_calls, [])
+        bounded = outcome["context_snapshot"]["runtime_task"]["verification"]["evidence"][0]
+        self.assertEqual(bounded["supports_acceptance_criteria"], criteria)
+        self.assertEqual(bounded["command"], ["python", "hello_world.py"])
+
     def test_model_accepts_verified_auth_fix(self):
         criteria = ["Authentication succeeds.", "All tests pass."]
         evaluator = Evaluator(lambda prompt, context: decision(criteria, "accepted"))
