@@ -1,0 +1,260 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Review",
+      "description": "Review changes for correctness, risks and maintainability.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Ground findings in the current code and diff.",
+        "Prioritize concrete correctness and security issues."
+      ],
+      "procedures": [
+        {
+          "name": "Review Change",
+          "description": "",
+          "steps": [
+            "Inspect the relevant diff.",
+            "Trace affected callers and data flow.",
+            "Check edge cases and error handling.",
+            "Report findings with evidence."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "review",
+        "quality",
+        "security"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "debugging",
+      "name": "Debugging",
+      "description": "Find root causes and apply evidence-based fixes.",
+      "category": "Engineering",
+      "version": 1,
+      "instructions": [
+        "Start from observable symptoms and reproduce when possible.",
+        "Separate confirmed causes from hypotheses."
+      ],
+      "procedures": [
+        {
+          "name": "Debug Failure",
+          "description": "",
+          "steps": [
+            "Inspect the error and surrounding implementation.",
+            "Reproduce the failure when possible.",
+            "Locate the root cause.",
+            "Apply a focused fix.",
+            "Run relevant verification."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "filesystem.modify",
+        "execution.python_script",
+        "execution.pytest"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "debugging",
+        "diagnostics",
+        "errors"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "git-inspection",
+      "name": "Git Inspection",
+      "description": "Inspect repository state and review the resulting changes.",
+      "category": "Engineering",
+      "version": 1,
+      "instructions": [
+        "Use Git as evidence about the current workspace state.",
+        "Keep repository inspection read-only."
+      ],
+      "procedures": [
+        {
+          "name": "Inspect Repository",
+          "description": "",
+          "steps": [
+            "Inspect repository status.",
+            "Review the relevant diff.",
+            "Summarize tracked changes and limitations."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "git.status",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "git.diff"
+      ],
+      "tags": [
+        "git",
+        "diff",
+        "repository"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "interactive-testing",
+      "name": "Interactive Program Testing",
+      "description": "Exercise command-line programs with bounded controlled input and verify observable output.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Use run_command stdin for programs that call input; never wait for a human terminal.",
+        "Test representative and edge-case inputs, then cite exit status and observed output.",
+        "Do not modify the implementation while acting as QA; report failures to Freya."
+      ],
+      "procedures": [
+        {
+          "name": "Test Interactive CLI",
+          "description": "Validate an interactive Python program without a live terminal.",
+          "steps": [
+            "Inspect the implementation to determine its input sequence.",
+            "Prepare bounded newline-delimited stdin for a representative case.",
+            "Run the workspace Python script with controlled stdin and a short timeout.",
+            "Compare the exit status and output with the expected logical result.",
+            "Repeat only with a distinct edge case when it adds useful evidence.",
+            "Report the exact command, input case, exit status and observed output."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "execution.python_script"
+      ],
+      "required_capabilities": [
+        "filesystem.read",
+        "execution.python_script"
+      ],
+      "tags": [
+        "qa",
+        "interactive",
+        "stdin",
+        "cli",
+        "testing"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "python-development",
+      "name": "Python Development",
+      "description": "Develop, debug and validate Python software.",
+      "category": "Software Development",
+      "version": 1,
+      "instructions": [
+        "Follow existing project conventions.",
+        "Prefer small reviewable changes.",
+        "Validate syntax and relevant tests when available."
+      ],
+      "procedures": [
+        {
+          "name": "Implement Change",
+          "description": "A practical sequence for a Python change.",
+          "steps": [
+            "Inspect relevant existing files.",
+            "Identify affected code.",
+            "Implement the minimal change.",
+            "Validate syntax.",
+            "Run relevant tests when available.",
+            "Inspect the resulting diff."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "filesystem.create",
+        "filesystem.modify",
+        "filesystem.overwrite",
+        "execution.python_script",
+        "execution.pytest",
+        "execution.py_compile",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "python",
+        "development",
+        "backend",
+        "debugging"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "software-testing",
+      "name": "Software Testing",
+      "description": "Design, run and interpret focused software tests.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Prefer focused tests that verify observable behavior.",
+        "Explain unavailable test infrastructure instead of fabricating results."
+      ],
+      "procedures": [
+        {
+          "name": "Validate Change",
+          "description": "",
+          "steps": [
+            "Locate relevant tests.",
+            "Add or adapt focused coverage when appropriate.",
+            "Run the available test command.",
+            "Inspect failures and report evidence."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.create",
+        "filesystem.modify",
+        "execution.pytest",
+        "execution.unittest",
+        "execution.py_compile"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "testing",
+        "pytest",
+        "unittest",
+        "verification"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    }
+  ]
+}

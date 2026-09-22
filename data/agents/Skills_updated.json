@@ -1,0 +1,479 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Review",
+      "description": "Review changes for correctness, risks and maintainability.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Ground findings in the current code and diff.",
+        "Prioritize concrete correctness and security issues."
+      ],
+      "procedures": [
+        {
+          "name": "Review Change",
+          "description": "",
+          "steps": [
+            "Inspect the relevant diff.",
+            "Trace affected callers and data flow.",
+            "Check edge cases and error handling.",
+            "Report findings with evidence."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "review",
+        "quality",
+        "security"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "debugging",
+      "name": "Debugging",
+      "description": "Find root causes and apply evidence-based fixes.",
+      "category": "Engineering",
+      "version": 1,
+      "instructions": [
+        "Start from observable symptoms and reproduce when possible.",
+        "Separate confirmed causes from hypotheses."
+      ],
+      "procedures": [
+        {
+          "name": "Debug Failure",
+          "description": "",
+          "steps": [
+            "Inspect the error and surrounding implementation.",
+            "Reproduce the failure when possible.",
+            "Locate the root cause.",
+            "Apply a focused fix.",
+            "Run relevant verification."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "filesystem.modify",
+        "execution.python_script",
+        "execution.pytest"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "debugging",
+        "diagnostics",
+        "errors"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "git-inspection",
+      "name": "Git Inspection",
+      "description": "Inspect repository state and review the resulting changes.",
+      "category": "Engineering",
+      "version": 1,
+      "instructions": [
+        "Use Git as evidence about the current workspace state.",
+        "Keep repository inspection read-only."
+      ],
+      "procedures": [
+        {
+          "name": "Inspect Repository",
+          "description": "",
+          "steps": [
+            "Inspect repository status.",
+            "Review the relevant diff.",
+            "Summarize tracked changes and limitations."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "git.status",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "git.diff"
+      ],
+      "tags": [
+        "git",
+        "diff",
+        "repository"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "interactive-testing",
+      "name": "Interactive Program Testing",
+      "description": "Exercise command-line programs with bounded controlled input and verify observable output.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Use run_command stdin for programs that call input; never wait for a human terminal.",
+        "Test representative and edge-case inputs, then cite exit status and observed output.",
+        "Do not modify the implementation while acting as QA; report failures to Freya."
+      ],
+      "procedures": [
+        {
+          "name": "Test Interactive CLI",
+          "description": "Validate an interactive Python program without a live terminal.",
+          "steps": [
+            "Inspect the implementation to determine its input sequence.",
+            "Prepare bounded newline-delimited stdin for a representative case.",
+            "Run the workspace Python script with controlled stdin and a short timeout.",
+            "Compare the exit status and output with the expected logical result.",
+            "Repeat only with a distinct edge case when it adds useful evidence.",
+            "Report the exact command, input case, exit status and observed output."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "execution.python_script"
+      ],
+      "required_capabilities": [
+        "filesystem.read",
+        "execution.python_script"
+      ],
+      "tags": [
+        "qa",
+        "interactive",
+        "stdin",
+        "cli",
+        "testing"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "python-development",
+      "name": "Python Development",
+      "description": "Develop, debug and validate Python software.",
+      "category": "Software Development",
+      "version": 1,
+      "instructions": [
+        "Follow existing project conventions.",
+        "Prefer small reviewable changes.",
+        "Validate syntax and relevant tests when available."
+      ],
+      "procedures": [
+        {
+          "name": "Implement Change",
+          "description": "A practical sequence for a Python change.",
+          "steps": [
+            "Inspect relevant existing files.",
+            "Identify affected code.",
+            "Implement the minimal change.",
+            "Validate syntax.",
+            "Run relevant tests when available.",
+            "Inspect the resulting diff."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "filesystem.create",
+        "filesystem.modify",
+        "filesystem.overwrite",
+        "execution.python_script",
+        "execution.pytest",
+        "execution.py_compile",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "python",
+        "development",
+        "backend",
+        "debugging"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "software-testing",
+      "name": "Software Testing",
+      "description": "Design, run and interpret focused software tests.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Prefer focused tests that verify observable behavior.",
+        "Explain unavailable test infrastructure instead of fabricating results."
+      ],
+      "procedures": [
+        {
+          "name": "Validate Change",
+          "description": "",
+          "steps": [
+            "Locate relevant tests.",
+            "Add or adapt focused coverage when appropriate.",
+            "Run the available test command.",
+            "Inspect failures and report evidence."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.create",
+        "filesystem.modify",
+        "execution.pytest",
+        "execution.unittest",
+        "execution.py_compile"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "testing",
+        "pytest",
+        "unittest",
+        "verification"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "requirements-validation",
+      "name": "Requirements Validation",
+      "description": "Turn task requirements into explicit, testable acceptance criteria before validating an implementation.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Read the original task and success criteria before evaluating the implementation.",
+        "Convert each requirement into an observable condition that can be verified.",
+        "Separate explicit requirements from reasonable assumptions.",
+        "Do not declare success when a mandatory requirement was not verified."
+      ],
+      "procedures": [
+        {
+          "name": "Build Acceptance Matrix",
+          "description": "Create a traceable set of acceptance checks from the task.",
+          "steps": [
+            "Inspect the original task, objective and available success criteria.",
+            "Identify each required behavior and constraint.",
+            "Define how each requirement can be verified.",
+            "Define the evidence needed to prove each result.",
+            "Mark ambiguous or technically unverifiable requirements."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "requirements",
+        "acceptance",
+        "qa",
+        "validation"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "qa-functional-validation",
+      "name": "QA Functional Validation",
+      "description": "Validate real behavior with controlled inputs, expected results, observed outputs and reproducible evidence.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Do not approve behavior only by reading the implementation; execute it when technically possible.",
+        "For each important behavior record the input, expected result, observed result and evidence.",
+        "Test representative cases, edge cases and invalid inputs when relevant.",
+        "Check exit status and observable output; include stdout or stderr when the execution capability exposes them.",
+        "For interactive Python programs use controlled stdin through execution.python_script instead of waiting for human input.",
+        "If a required behavior cannot be exercised with available capabilities, mark it BLOCKED instead of PASS.",
+        "Do not modify product code while acting as QA.",
+        "Classify verified cases as PASS, FAIL, BLOCKED or NOT_TESTED."
+      ],
+      "procedures": [
+        {
+          "name": "Prepare Functional QA",
+          "description": "Determine what must be tested and build concrete test cases.",
+          "steps": [
+            "Read the original task and acceptance criteria.",
+            "Inspect the relevant implementation and diff.",
+            "Identify entry points, accepted inputs and observable outputs.",
+            "Create at least one representative case per required behavior.",
+            "Add edge or invalid cases where they can reveal meaningful failures.",
+            "Define the expected result before running each case."
+          ]
+        },
+        {
+          "name": "Execute Input Output Cases",
+          "description": "Run controlled cases and compare expected behavior with actual behavior.",
+          "steps": [
+            "Run the real implementation with the prepared input.",
+            "Use bounded newline-delimited stdin for interactive Python programs.",
+            "Capture the exit status and observable output.",
+            "Compare the observed result with the expected result.",
+            "Record PASS or FAIL with enough evidence to reproduce the result.",
+            "Repeat for each required case without unnecessary duplicate executions."
+          ]
+        },
+        {
+          "name": "Validate Negative Cases",
+          "description": "Verify behavior for invalid or boundary input when relevant.",
+          "steps": [
+            "Select invalid, empty, boundary or unexpected inputs relevant to the task.",
+            "Execute them using the same real entry point.",
+            "Check that failures are controlled and do not produce misleading success.",
+            "Record exceptions, error output or incorrect behavior as evidence."
+          ]
+        },
+        {
+          "name": "Produce QA Verdict",
+          "description": "Produce a requirement-by-requirement QA result based only on observed evidence.",
+          "steps": [
+            "List each requirement evaluated.",
+            "List the inputs used and expected result.",
+            "List the observed result and supporting evidence.",
+            "Classify each case as PASS, FAIL, BLOCKED or NOT_TESTED.",
+            "Do not approve the task if a mandatory requirement failed or remains unverified."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff",
+        "execution.python_script",
+        "execution.pytest",
+        "execution.unittest",
+        "execution.py_compile"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "qa",
+        "functional",
+        "stdin",
+        "input-output",
+        "acceptance",
+        "regression",
+        "evidence"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "architecture-analysis",
+      "name": "Architecture Analysis",
+      "description": "Review a change in the context of the existing architecture, responsibilities and dependencies.",
+      "category": "Engineering",
+      "version": 1,
+      "instructions": [
+        "Analyze changes in the context of the surrounding system instead of as isolated files.",
+        "Identify affected dependencies, callers and responsibilities.",
+        "Look for duplicated responsibility, unnecessary coupling and violations of existing design patterns.",
+        "Distinguish concrete architectural risks from stylistic preferences."
+      ],
+      "procedures": [
+        {
+          "name": "Review Architecture Impact",
+          "description": "Assess structural impact of a change.",
+          "steps": [
+            "Identify the components affected by the change.",
+            "Trace important callers, dependencies and data flow.",
+            "Compare the new structure with existing project conventions.",
+            "Check for duplicated responsibility or unnecessary coupling.",
+            "Report concrete risks with supporting evidence."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "architecture",
+        "design",
+        "dependencies",
+        "review"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
+      "id": "security-review",
+      "name": "Security Review",
+      "description": "Review code changes for concrete security risks related to inputs, execution, secrets and filesystem access.",
+      "category": "Software Quality",
+      "version": 1,
+      "instructions": [
+        "Focus on security risks directly supported by the changed code and data flow.",
+        "Check handling of untrusted input and validation boundaries.",
+        "Look for hardcoded secrets, unsafe command construction and unsafe filesystem access.",
+        "Do not report hypothetical vulnerabilities without a plausible path and evidence.",
+        "Report the affected code, triggering condition and consequence for each finding."
+      ],
+      "procedures": [
+        {
+          "name": "Review Security Impact",
+          "description": "Inspect changed code for concrete security regressions.",
+          "steps": [
+            "Inspect the relevant diff and surrounding code.",
+            "Identify new or modified input surfaces.",
+            "Trace external input into sensitive operations.",
+            "Check validation before command execution, filesystem access or other sensitive actions.",
+            "Check for secrets or credentials introduced in code.",
+            "Report supported findings and clearly state when no concrete issue was found."
+          ]
+        }
+      ],
+      "recommended_capabilities": [
+        "filesystem.read",
+        "filesystem.search",
+        "git.diff"
+      ],
+      "required_capabilities": [
+        "filesystem.read"
+      ],
+      "tags": [
+        "security",
+        "review",
+        "input-validation",
+        "quality"
+      ],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    }
+  ]
+}
