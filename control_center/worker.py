@@ -74,6 +74,48 @@ class BlockedActionCycle(TaskStopped):
     """The worker kept requesting denied or deterministically blocked actions."""
 
 
+def _policy_denial_signature(tool: str, capability: str, arguments: dict[str, Any]) -> str:
+    """Identify a materially identical denied action without retaining output text."""
+    relevant = {key: value for key, value in arguments.items() if key != "timeout_seconds"}
+    payload = {"tool": tool, "capability": capability or "unknown", "arguments": relevant}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _command_evidence_criteria(criteria: list[str], argv: list[str], result: ToolResult) -> list[str]:
+    """Return criteria directly supported by one successful controlled command.
+
+    The runtime only promotes a command to evidence when the criterion contains
+    an observable contract: a quoted output, a successful exit-code assertion,
+    or a JSON-output assertion.  A successful but unrelated command therefore
+    cannot make an arbitrary task pass.
+    """
+    if not result.success or result.exit_code != 0 or not isinstance(argv, list):
+        return []
+    output = str(result.output or "").strip()
+    normalized_output = output.casefold()
+    supported: list[str] = []
+    for raw in criteria:
+        criterion = str(raw or "").strip()
+        lowered = criterion.casefold()
+        quoted = re.findall(r"[\"'“”]([^\"'“”]+)[\"'“”]", criterion)
+        output_assertion = bool(re.search(r"\b(output|outputs|stdout|print|prints|imprime|salida|produce|produces)\b", lowered))
+        exit_assertion = bool(re.search(r"\b(exit|return|status|c[oó]digo)\b.*\b(?:0|zero|cero|success|successful|successful(?:ly)?)\b", lowered))
+        json_assertion = "json" in lowered and bool(output)
+        matches_output = bool(quoted) and all(item.casefold() in normalized_output for item in quoted)
+        valid_json = False
+        if json_assertion:
+            try:
+                json.loads(output)
+                valid_json = True
+            except (TypeError, ValueError):
+                valid_json = False
+        if (output_assertion and matches_output) or (exit_assertion and result.exit_code == 0) or valid_json:
+            supported.append(criterion)
+    return supported
+
+
 def _parse_tool_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -465,6 +507,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "passed": False, "failed": False, "unavailable": False,
         "skipped_with_reason": "", "evidence": [],
     }
+    runtime_actions: list[dict[str, Any]] = []
+    runtime_artifacts: list[dict[str, Any]] = []
+    command_evidence: list[dict[str, Any]] = []
+    policy_denials: dict[str, int] = {}
     failure_history: dict[str, int] = {}
     blocked_action_count = 0
     successful_validation_streak = 0
@@ -587,8 +633,22 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             existing_before = box.safe_path(str(safe_args.get("path", ""))).exists()
                         except (OSError, ValueError):
                             existing_before = False
-                    result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
-                              else box.invoke(name, safe_args))
+                    resolved_capability = common.get("capability", "unknown")
+                    denial_signature = _policy_denial_signature(name, resolved_capability, safe_args)
+                    if not argument_error and policy_denials.get(denial_signature, 0) > 0:
+                        result = ToolResult(
+                            name,
+                            "POLICY_DENIED_REPEAT\n\nThis action was denied by policy. Repeating the same action "
+                            "without changing permissions, strategy or target will not succeed. Choose another "
+                            "permitted strategy, request the capability through the allowed mechanism, or report "
+                            "the limitation to Freya.",
+                            False, 0, capability=resolved_capability,
+                            policy_decision="deny", policy_reason="Repeated materially identical policy denial.",
+                            executed=False, error_class="repeated_policy_denied",
+                        )
+                    else:
+                        result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
+                                  else box.invoke(name, safe_args))
                     no_progress_reason = ""
                     if result.policy_decision == "deny" and not argument_error:
                         request_kind = "request_new_capabilities" if result.capability in {"", "unknown"} else "request_missing_capabilities"
@@ -625,6 +685,35 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 policy_reason="Approval denied by operator.", executed=False,
                                 error_class="approval_denied",
                             )
+                    if result.policy_decision == "deny" and result.capability:
+                        policy_denials[denial_signature] = policy_denials.get(denial_signature, 0) + 1
+                    runtime_actions.append({
+                        "tool": name,
+                        "arguments": argument_summary(safe_args),
+                        "capability": result.capability or resolved_capability,
+                        "policy_decision": result.policy_decision or "allow",
+                        "policy_reason": result.policy_reason or "",
+                        "success": bool(result.success),
+                        "exit_code": result.exit_code,
+                        "output": str(result.output or "")[:4000],
+                        "error_class": result.error_class or "",
+                    })
+                    if result.success and name == "run_command":
+                        supported = _command_evidence_criteria(
+                            verification.get("completion_criteria", []),
+                            safe_args.get("argv", []), result,
+                        )
+                        if supported:
+                            command_evidence.append({
+                                "type": "command_execution",
+                                "check": "command_output:" + " ".join(str(item) for item in safe_args.get("argv", [])),
+                                "status": "passed",
+                                "tool": "run_command",
+                                "command": list(safe_args.get("argv", [])),
+                                "exit_code": result.exit_code,
+                                "output": str(result.output or "")[:4000],
+                                "supports_acceptance_criteria": supported,
+                            })
                     if result.success and name in WRITE_TOOLS:
                         publish_workspace_diff(name, safe_args, existing_before)
                         telemetry["workspace_changes"] += 1
@@ -637,6 +726,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                                      if name == "write_file" and isinstance(safe_args.get("content"), str)
                                                      else None)
                             observed_files.pop(path, None)
+                            runtime_artifacts.append({
+                                "path": path,
+                                "change_type": "overwritten" if existing_before else "created",
+                                "tool": name,
+                            })
                         modified = True
                     if result.success and name == "read_file":
                         path = safe_args.get("path")
@@ -888,6 +982,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 if readback_passed:
                     verification_state["unavailable"] = False
                     verification_state["skipped_with_reason"] += "Used read-back filesystem evidence."
+            if command_evidence:
+                verification_state["attempted"] = True
+                verification_state["evidence"].extend(command_evidence)
+                criteria = [str(item).strip() for item in verification.get("completion_criteria", []) if str(item).strip()]
+                supported = {
+                    criterion
+                    for item in command_evidence
+                    for criterion in item.get("supports_acceptance_criteria", [])
+                }
+                if not criteria or all(item in supported for item in criteria):
+                    verification_state["passed"] = True
+                    verification_state["unavailable"] = False
             if not verification_state["attempted"] and not verification_state["unavailable"]:
                 verification_state["skipped_with_reason"] = "No verification check was selected."
             if verification_state["failed"]:
@@ -957,6 +1063,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         else:
             result_output = repaired
         if isinstance(result_output, dict):
+            result_output["actions"] = list(result_output.get("actions") or []) + runtime_actions
+            result_output["artifacts"] = list(result_output.get("artifacts") or []) + runtime_artifacts
             if workspace_diffs:
                 result_output["workspace_diffs"] = workspace_diffs
             result_output["verification"] = verification_state

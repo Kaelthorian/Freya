@@ -80,6 +80,11 @@ selects them.
    the recovery source and never-started descendants. Replanner and Storage both
    reject mutation of active, historical or independent work before committing
    the effective plan, without changing the original plan snapshot.
+   Runtime command output that directly satisfies an observable completion
+   criterion is promoted to bounded verification evidence, and malformed
+   structured output is merged with the runtime action/artifact record.
+   Recovery carries bounded workspace state into the next attempt and derives
+   only read inspection for a new agent; it never grants overwrite.
    When every active effective task is accepted, the run enters `Integrating`.
    `integration.py` checks the original global criteria against a bounded,
    fingerprinted snapshot. Only global `accepted` creates the grounded final
@@ -109,6 +114,7 @@ selects them.
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Tool implementation or controlled stdin | `tools.py`, `worker.py`, `tests/test_tools.py`, `tests/test_control_runtime.py` |
+| Runtime evidence, structured fallback or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
@@ -116,6 +122,7 @@ selects them.
 | Prompt rewrite before planning | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py` |
 | Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
+| Recovery workspace context or safe retry capabilities | `orchestrator.py`, `recovery.py`, `agent_factory.py`, `agent_selector.py`, `tests/test_agent_factory.py`, `tests/test_recovery.py` |
 | Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py` (normalized actor/workspace traces), `worker.py`, `__main__.py`, `frontend/views.js`, `frontend/components.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
 | Dynamic agent construction, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |

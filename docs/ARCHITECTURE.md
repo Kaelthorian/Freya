@@ -131,7 +131,7 @@ therefore wins over late model output.
 
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
-events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. The persistence layer normalizes every runtime and orchestration event with `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how` and a stable `trace_id`. This is derived centrally from the assigned agent, task snapshot and orchestration, so Task Analyst, Planner, Programmer, Code Auditor and other selected agents cannot disappear from the audit trail when an emitter omits a display field. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
+events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. The worker also persists every successful or denied runtime action in the structured result. A successful `run_command` whose output directly satisfies a quoted-output, exit-code, or JSON completion criterion becomes `command_execution` verification evidence; the final verification flags are derived from that evidence rather than from the model's prose. The persistence layer normalizes every runtime and orchestration event with `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how` and a stable `trace_id`. This is derived centrally from the assigned agent, task snapshot and orchestration, so Task Analyst, Planner, Programmer, Code Auditor and other selected agents cannot disappear from the audit trail when an emitter omits a display field. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
@@ -139,6 +139,10 @@ Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
 The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single implementation task. If the Analyst marks user input or interactive validation, it appends one dependent `qa-interactive-test` node with `interactive-testing`; QA may execute supported Python with bounded stdin but cannot modify files. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill, so ordering is implementation → QA when required → Code Auditor. The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
+For an Analyst-confirmed simple, non-interactive program/script/file creation
+with one implementation task and no audit/review criterion, the planner keeps
+the implementation task as the complete plan; this bounded fast path avoids
+inventing a second verification actor without changing capability policy.
 Agent construction emits `freya.agent_factory.started`, `freya.agent_created`
 and `freya.agent_policy.validated`; construction errors emit
 `freya.agent_factory.failed`. Lifecycle cleanup emits
@@ -359,8 +363,12 @@ fingerprints stop repeated equivalent
 failures. Same-agent retry revalidates and reuses the exact dynamic agent ID.
 Different-agent retry creates a new dynamic identity/Skill variant, excludes
 every prior agent ID, and derives the same capability ceiling from the unchanged
-plan task; there is no silent same-agent fallback or policy expansion. Retry prompts include bounded evaluator issues
-and missing evidence, not raw prior model transcripts or private reasoning.
+plan task; recovery inspection may derive only the safe `filesystem.read`
+prerequisite and never `filesystem.overwrite`. There is no silent same-agent
+fallback or policy expansion. Retry prompts include bounded evaluator issues,
+missing evidence, and the previous workspace state so the new attempt can
+inspect existing artifacts before creating or modifying files; raw prior model
+transcripts and private reasoning are not reused.
 
 Replanning produces a complete cumulative effective plan. Accepted and
 superseded historical snapshots remain unchanged and new work uses new task IDs.
@@ -663,9 +671,13 @@ capabilities; verification and output define evidence and result shape. The
 default output remains text for legacy compatibility, while structured output is strictly validated as summary/actions/artifacts/verification/limitations. A JSON-looking invalid result receives one repair attempt; otherwise an explicit fallback and limitation are returned. Verification state is persisted separately.
 
 The worker classifies recoverable, environment, policy, approval, and invalid
-requests. A repeated non-recoverable action with the same capability,
-arguments, and error reaches the configured limit and returns
-`REPEATED_ACTION_BLOCKED` so model-call and step budgets are not wasted.
+requests. A repeated policy denial with the same tool, capability and
+arguments is intercepted before the underlying tool is invoked again and is
+recorded as `repeated_policy_denied`; repeated blocked behavior still reaches
+`BlockedActionCycle` so model-call and step budgets are bounded. If structured
+model output is malformed, the worker merges the runtime actions, artifacts,
+workspace diffs and verification evidence into the explicit fallback result
+instead of discarding technical work.
 
 ## Feature scope
 

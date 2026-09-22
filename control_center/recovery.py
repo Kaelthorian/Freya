@@ -312,7 +312,24 @@ def deterministic_failure_diagnosis(logs: list[dict[str, Any]]) -> dict[str, Any
          and _failure_text(event)),
         next((event for event in failure_events if _failure_text(event)), failure_events[0]),
     )
-    cause = _failure_text(root) or "The persisted logs record a failure without a specific error message."
+    denied = next((event for event in failure_events if (
+        str(event.get("error_class", "")).casefold() == "policy_denied"
+        or str(event.get("policy_decision", "")).casefold() == "deny"
+    )), None)
+    blocked = next((event for event in failure_events if (
+        str(event.get("error_class", "")).casefold() == "blocked_action_cycle"
+        or "blockedactioncycle" in _failure_text(event).casefold()
+    )), None)
+    if denied is not None:
+        capability = str(denied.get("capability") or denied.get("requested_capability") or "unknown")
+        tool = str(denied.get("tool") or "tool")
+        reason = str(denied.get("policy_reason") or "Policy denied the requested capability.")
+        cause = f"Policy denied {capability} for {tool}. {reason}"
+        if blocked is not None:
+            cause += " The worker repeated the denied action and triggered BlockedActionCycle."
+        root = denied
+    else:
+        cause = _failure_text(root) or "The persisted logs record a failure without a specific error message."
     normalized = cause.casefold()
     if "no_progress" in normalized or "noprogress" in normalized or "no progress" in normalized:
         retryable = True
@@ -481,7 +498,8 @@ def semantic_failure_fingerprint(plan_task_id: str, agent_id: str,
 
 
 def build_retry_prompt(planned_task: dict[str, Any], evaluation: dict[str, Any],
-                       instructions: str, *, attempt: int) -> str:
+                       instructions: str, *, attempt: int,
+                       workspace_state: dict[str, Any] | None = None) -> str:
     """Build a bounded retry objective from durable, sanitized evidence."""
     issues = [str(item)[:500] for item in evaluation.get("issues", [])[:10]]
     missing = [str(item)[:500] for item in evaluation.get("missing_evidence", [])[:10]]
@@ -495,6 +513,13 @@ def build_retry_prompt(planned_task: dict[str, Any], evaluation: dict[str, Any],
         lines.append("Issues: " + "; ".join(issues))
     if missing:
         lines.append("Missing evidence: " + "; ".join(missing))
+    if isinstance(workspace_state, dict):
+        bounded = sanitize(workspace_state)
+        lines.extend([
+            "Previous attempt workspace state is authoritative evidence. Inspect it before creating or modifying files.",
+            "Previous workspace state: " + json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))[:6_000],
+            "Prefer reading, executing or validating an existing artifact over recreating it.",
+        ])
     lines.append("Produce objective verification evidence for every success criterion.")
     return sanitize("\n".join(lines))[:12_000]
 
@@ -631,7 +656,8 @@ class RecoveryController:
                evaluation: dict[str, Any], history: list[dict[str, Any]],
                available_agents: list[dict[str, Any]], plan: dict[str, Any],
                limits: dict[str, Any],
-               can_create_agent: bool = False) -> dict[str, Any]:
+               can_create_agent: bool = False,
+               workspace_state: dict[str, Any] | None = None) -> dict[str, Any]:
         self.metrics = {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
                         "total_tokens": 0, "duration_seconds": 0.0}
         task_id = str(planned_task.get("id") or "")
@@ -651,6 +677,7 @@ class RecoveryController:
             "planned_task": planned_task,
             "execution": {"attempt": attempt, "selected_agent_id": current_agent},
             "evaluation": evaluation,
+            "workspace_state": sanitize(workspace_state or {}),
             "prior_recoveries": [{key: item.get(key) for key in
                                   ("action", "reason", "fingerprint", "source_attempt")}
                                  for item in history[-8:]],

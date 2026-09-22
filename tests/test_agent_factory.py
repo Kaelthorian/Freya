@@ -121,6 +121,21 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertNotIn("run_command", agent["tools"])
         self.assertEqual(self.active_modes(agent), {"filesystem.read": "allow"})
 
+    def test_recovery_workspace_state_derives_safe_read_without_overwrite(self):
+        created = self.create(planned_task(
+            required_capabilities=["filesystem.create", "execution.python_script"],
+            _recovery_workspace_state={
+                "workspace_diffs": [{"path": "hello.py", "change_type": "created"}],
+                "verification": {"attempted": False},
+            },
+        ))
+        agent = created["agent"]
+        self.assertIn("read_file", agent["tools"])
+        self.assertIn("filesystem.read", created["required_capabilities"])
+        self.assertNotIn("filesystem.overwrite", created["required_capabilities"])
+        self.assertEqual(self.active_modes(agent)["filesystem.read"], "allow")
+        self.assertEqual(self.active_modes(agent).get("filesystem.overwrite"), None)
+
     def test_exact_preferred_skill_is_assigned_when_compatible(self):
         agent = self.create(planned_task())["agent"]
         skill = next(item for item in agent["skills"]

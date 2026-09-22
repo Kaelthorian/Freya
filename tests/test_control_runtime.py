@@ -126,6 +126,75 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(diffs[0]["output"]["path"], "calculator.bat")
         self.assertEqual(diffs[0]["output"]["change_type"], "created")
         self.assertIn("+@echo off", diffs[0]["output"]["diff"])
+
+    def test_successful_command_output_becomes_acceptance_evidence(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')"})]),
+            answer(calls=[("run_command", {"argv": ["python", "hello.py"]})]),
+            answer("Created and verified hello.py."),
+        ], tools=["write_file", "run_command"], config={
+            "permissions": "execute",
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {
+                "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": True,
+                "completion_criteria": ["The program outputs 'Hello World' when executed"],
+            },
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertFalse(result["verification"]["unavailable"])
+        evidence = result["verification"]["evidence"]
+        command = next(item for item in evidence if item.get("type") == "command_execution")
+        self.assertEqual(command["exit_code"], 0)
+        self.assertIn("Hello World", command["output"])
+        self.assertIn("The program outputs 'Hello World' when executed",
+                      command["supports_acceptance_criteria"])
+        self.assertTrue(any(item["tool"] == "run_command" for item in result["result"]["actions"]))
+
+    def test_identical_policy_denial_is_intercepted_before_second_tool_execution(self):
+        existing = self.workspace / "existing.py"
+        existing.write_text("print('old')", encoding="utf-8")
+        policy = {
+            "capabilities": {
+                "filesystem": {
+                    "create": {"mode": "allow"}, "read": {"mode": "allow"},
+                    "modify": {"mode": "deny"}, "overwrite": {"mode": "deny"},
+                    "list": {"mode": "deny"}, "search": {"mode": "deny"},
+                },
+                "execution": {"python_script": {"mode": "deny"}, "pytest": {"mode": "deny"},
+                               "unittest": {"mode": "deny"}, "py_compile": {"mode": "deny"},
+                               "ruff": {"mode": "deny"}},
+                "git": {"status": {"mode": "deny"}, "diff": {"mode": "deny"}},
+            }
+        }
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
+            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
+            answer('{"action":"finish","message":"Policy denied; no safe overwrite."}'),
+        ], tools=["write_file"], config={"capability_policy": policy})
+        self.assertEqual(result["status"], "Success", result["error"])
+        writes = [event["event"] for event in self.events
+                  if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0]["error_class"], "policy_denied")
+        self.assertEqual(writes[1]["error_class"], "repeated_policy_denied")
+        self.assertIn("POLICY_DENIED_REPEAT", writes[1]["output"])
+
+    def test_runtime_actions_and_artifacts_survive_malformed_structured_output(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "observed.py", "content": "print(1)"})]),
+            answer("The model returned prose instead of the structured contract."),
+        ], tools=["write_file"], config={
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {"enabled": False, "inspect_changes": False, "run_available_tests": False,
+                            "require_tool_evidence": False, "completion_criteria": []},
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["result"]["actions"][0]["tool"], "write_file")
+        self.assertEqual(result["result"]["artifacts"][0]["path"], "observed.py")
+        self.assertTrue(result["result"]["limitations"])
     def test_fallback_disabled_tool_is_a_visible_error_without_mutation(self):
         result = self.run_worker([answer('{"action":"write_file","path":"blocked.txt","content":"bad"}'),
                                   answer('{"action":"finish","message":"Could not write"}')], tools=["read_file"])

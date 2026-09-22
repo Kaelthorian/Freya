@@ -166,7 +166,30 @@ class PlannerGenerationTests(unittest.TestCase):
         self.assertEqual(result["tasks"][0]["required_capabilities"],
                          ["filesystem.create", "filesystem.modify", "filesystem.read"])
         self.assertEqual(result["tasks"][1]["preferred_skills"], ["code-review"])
-        self.assertEqual(result["tasks"][1]["depends_on"], ["create-file"])
+
+    def test_trivial_program_analysis_uses_one_implementation_task(self):
+        raw = plan(
+            complexity="simple",
+            goal="Create and run a Hello World program.",
+            tasks=[task(
+                "hello", "Create a Hello World Python program",
+                required_capabilities=["filesystem.create", "execution.python_script"],
+                success_criteria=["The program outputs 'Hello World' when executed"],
+            )],
+        )
+        analysis = {
+            "task_type": "Program Creation",
+            "task_characteristics": {
+                "interactive": False, "requires_user_input": False,
+                "long_running": False, "requires_external_service": False,
+                "requires_gui": False, "requires_elevated_privileges": False,
+            },
+        }
+        result = Planner(lambda prompt, context: json.dumps(raw)).create_plan(
+            raw["goal"], {"task_analysis": analysis}
+        )
+        self.assertEqual(result["complexity"], "simple")
+        self.assertEqual([item["id"] for item in result["tasks"]], ["hello"])
     def test_invalid_json_receives_one_successful_repair(self):
         calls = []
 

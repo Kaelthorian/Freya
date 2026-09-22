@@ -67,9 +67,11 @@ python -m control_center --evaluator-model qwen2.5-coder:7b `
 The evaluator endpoint is also loopback-only and the adapter exposes no tools.
 Use `--evaluator-offline` explicitly for deterministic evidence-only evaluation.
 Offline evaluation is conservative: acceptance requires configured verification
-to be requested, attempted and passed. Runtime result text and agent claims are
-not objective evidence. Missing evidence returns `blocked`, including through
-the Orchestrator's default compatibility fallback.
+to be requested, attempted and passed. Runtime result prose and agent claims are
+not objective evidence, but a successful controlled `run_command` can emit
+bounded `command_execution` evidence when its output directly satisfies a
+quoted-output, exit-code, or JSON completion criterion. Missing evidence returns
+`blocked`, including through the Orchestrator's default compatibility fallback.
 For filesystem-only tasks without Git or tests, the Worker may instead verify
 each modified file with an allowed `read_file` read-back; missing or mismatched
 read-back evidence remains blocked or failed.
@@ -116,8 +118,11 @@ are visible together. A `NoProgressDetected` report means the worker repeated
 successful read-only actions without changing the workspace; raising
 `max_steps` alone is not a corrective action.
 `BlockedActionCycle` means three consecutive actions were denied or repeatedly
-blocked; Freya stops that worker and diagnoses/replans instead of consuming the
-remaining step budget. Orchestration timeouts also emit failure analysis.
+blocked; identical policy denials are intercepted before a second underlying
+tool invocation, then Freya stops that worker and diagnoses/replans instead of
+consuming the remaining step budget. A recovery retry receives bounded prior
+workspace state and may derive read-only inspection, but never overwrite
+authority. Orchestration timeouts also emit failure analysis.
 
 Interactive Python QA uses `run_command` with a bounded `stdin` string. Without
 stdin the worker closes the child stream, so `input()` fails immediately rather
@@ -302,6 +307,10 @@ local end-to-end run.
   mode records a conservative `fail`; online mode may schedule a bounded retry
   or validated revision. Repeated equivalent failures and exhausted budgets
   produce `freya.recovery.exhausted`.
+- If a worker completed a command but evaluation is blocked, inspect the
+  `command_execution` item in `verification.evidence`; do not infer success from
+  the final answer alone. If a retry targets an existing artifact, inspect the
+  persisted workspace state and prefer read/execute/validate over recreating it.
 
 See [API.md](API.md) for routes and [ARCHITECTURE.md](ARCHITECTURE.md) for trust
 and process boundaries.

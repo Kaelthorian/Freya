@@ -92,6 +92,34 @@ def _is_code_audit_task(task: dict[str, Any]) -> bool:
     )
 
 
+def _is_trivial_task(plan: dict[str, Any], analysis: Any) -> bool:
+    """Recognize a bounded artifact-plus-execution flow without weakening planning."""
+    if not isinstance(analysis, dict) or plan.get("complexity") != "simple":
+        return False
+    tasks = plan.get("tasks")
+    characteristics = analysis.get("task_characteristics")
+    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(characteristics, dict):
+        return False
+    if any(characteristics.get(key) is True for key in (
+        "interactive", "requires_user_input", "long_running", "requires_external_service",
+        "requires_gui", "requires_elevated_privileges",
+    )):
+        return False
+    if str(analysis.get("task_type") or "").casefold() not in {
+        "program creation", "script creation", "file creation",
+    }:
+        return False
+    task = tasks[0]
+    if _is_code_audit_task(task) or any(
+        re.search(r"\b(?:audit|review|revis(?:e|ar)|inspect code)\b", str(item), re.I)
+        for item in task.get("success_criteria", [])
+    ):
+        return False
+    allowed = {"filesystem.create", "filesystem.modify", "filesystem.read",
+               "execution.python_script", "execution.py_compile"}
+    return set(task.get("required_capabilities", [])) <= allowed
+
+
 def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """Merge an over-decomposed linear file workflow into one worker task."""
     tasks = plan.get("tasks", [])
@@ -153,8 +181,10 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
     collapsed["tasks"] = [merged]
     return validate_plan(collapsed)
 
-def _append_code_audit_task(plan: dict[str, Any]) -> dict[str, Any]:
+def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[str, Any]:
     """Add exactly one read-only Code Review task after code/file changes."""
+    if _is_trivial_task(plan, analysis):
+        return plan
     tasks = plan.get("tasks", [])
     if not isinstance(tasks, list) or len(tasks) >= MAX_PLAN_TASKS:
         return plan
@@ -598,7 +628,7 @@ class Planner:
         plan = _collapse_simple_artifact_plan(validate_plan(value))
         plan = _reconcile_task_analysis(plan, analysis)
         plan = _append_qa_task(plan, analysis)
-        return _append_code_audit_task(plan)
+        return _append_code_audit_task(plan, analysis)
 
     @staticmethod
     def _prompt(goal: str, context: dict[str, Any]) -> str:
@@ -645,7 +675,7 @@ class Planner:
                 analysis = (context or {}).get("task_analysis")
                 plan = _reconcile_task_analysis(fallback_plan(goal), analysis)
                 plan = _append_qa_task(plan, analysis)
-                return _append_code_audit_task(plan)
+                return _append_code_audit_task(plan, analysis)
             raise PlanGenerationError("No planner model is configured. Use explicit offline mode for fallback planning.")
         limited_context = context if isinstance(context, dict) else {}
         request = self._prompt(goal, limited_context)

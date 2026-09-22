@@ -226,6 +226,18 @@ class RecoveryContractTests(unittest.TestCase):
         self.assertIn("Missing evidence", prompt)
         self.assertIn("attempt 2", prompt)
 
+    def test_retry_prompt_includes_previous_workspace_state(self):
+        prompt = build_retry_prompt(
+            self.task(), evaluation("blocked"), "Inspect before changing.", attempt=2,
+            workspace_state={
+                "workspace_diffs": [{"path": "hello.py", "change_type": "created"}],
+                "verification": {"attempted": True, "passed": False},
+            },
+        )
+        self.assertIn("Previous attempt workspace state", prompt)
+        self.assertIn("hello.py", prompt)
+        self.assertIn("Prefer reading, executing or validating", prompt)
+
 
 class FailureAnalysisContractTests(unittest.TestCase):
     def logs(self):
@@ -332,6 +344,22 @@ class FailureAnalysisContractTests(unittest.TestCase):
         self.assertTrue(result["retryable"])
         self.assertIn("Change the worker strategy", result["recommended_action"])
         self.assertNotIn("Increase the step", result["recommended_action"])
+
+    def test_deterministic_analysis_preserves_policy_denial_chain(self):
+        logs = [{
+            "log_id": "task:t1:10", "source": "task", "event_type": "step.finished",
+            "status": "Denied", "tool": "write_file", "capability": "filesystem.overwrite",
+            "policy_decision": "deny", "policy_reason": "overwrite is denied for existing.py",
+            "error_class": "policy_denied",
+        }, {
+            "log_id": "task:t1:11", "source": "task", "event_type": "task.blocked",
+            "status": "Failed", "error_class": "blocked_action_cycle",
+            "reason": "BlockedActionCycle: repeated denied actions.",
+        }]
+        result = FailureAnalyzer(offline=True).analyze(logs)
+        self.assertIn("filesystem.overwrite", result["cause"])
+        self.assertIn("write_file", result["cause"])
+        self.assertIn("BlockedActionCycle", result["cause"])
 
 
 class AllowedReplanScopeTests(unittest.TestCase):

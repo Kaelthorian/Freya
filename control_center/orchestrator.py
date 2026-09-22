@@ -157,6 +157,23 @@ class Orchestrator(IntegrationOrchestrationMixin):
         )
 
     @staticmethod
+    def _recovery_workspace_state(task: dict | None) -> dict[str, Any]:
+        """Build bounded, auditable state for a subsequent recovery attempt."""
+        if not isinstance(task, dict):
+            return {}
+        result = task.get("result")
+        result_dict = result if isinstance(result, dict) else {}
+        return sanitize({
+            "workspace": task.get("workspace") or "",
+            "status": task.get("status") or "",
+            "verification": task.get("verification") or {},
+            "workspace_diffs": result_dict.get("workspace_diffs") or [],
+            "artifacts": result_dict.get("artifacts") or [],
+            "actions": result_dict.get("actions") or [],
+            "error": task.get("error") or "",
+        })
+
+    @staticmethod
     def _selection_failure_message(selection: dict, agents: list[dict]) -> str:
         """Turn the persisted selector snapshot into a concise log-visible cause."""
         names = {str(agent.get("id")): str(agent.get("name") or agent.get("id"))
@@ -183,11 +200,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
                   f"task:{task_id}:{event_id}")
         compact = {"log_id": log_id, "source": source}
         for key in ("timestamp", "event_type", "level", "status", "task_id", "agent_id",
-                    "runtime_task_id", "tool", "capability", "policy_decision",
-                    "message", "reason", "error"):
+                    "runtime_task_id", "tool", "capability", "requested_capability",
+                    "policy_decision", "policy_reason", "error_class", "step_id",
+                    "step_number", "attempt", "message", "reason", "error", "resource"):
             value = event.get(key)
             if value not in (None, "", [], {}):
                 compact[key] = str(value)[:2000]
+        for key in ("output", "input"):
+            value = event.get(key)
+            if value not in (None, "", [], {}):
+                bounded = sanitize(value)
+                if isinstance(bounded, (dict, list)):
+                    bounded = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"), default=str)
+                compact[key] = str(bounded)[:4000]
         return sanitize(compact)
 
     def _failure_logs(self, oid: str, graph: ExecutionGraph) -> list[dict]:
@@ -629,8 +654,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
             context = self._selection_context(current_run)
             required_agent_id = None
             excluded_agent_ids: list[str] = []
+            recovery_workspace_state: dict[str, Any] = {}
             if node.get("recovery_action_id"):
                 recovery_action = self.store.get_recovery(node["recovery_action_id"])
+                recovery_workspace_state = dict(
+                    (recovery_action.get("snapshot") or {}).get("workspace_state") or {}
+                )
                 prior = next((
                     item for item in self.store.list_execution_attempts(oid)
                     if item["plan_task_id"] == planned_task_id
@@ -656,8 +685,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if required_agent_id:
                     agents = [self.store.get_agent(required_agent_id)]
                 else:
+                    factory_task = dict(task)
+                    if recovery_workspace_state:
+                        factory_task["_recovery_workspace_state"] = recovery_workspace_state
                     created = self._create_dynamic_agent(
-                        oid, task, selection_attempt,
+                        oid, factory_task, selection_attempt,
                         variant=max(0, selection_attempt - 1),
                     )
                     agents = [created["agent"]]
@@ -852,6 +884,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         task_id = target["plan_task_id"]
         planned_task = next(task for task in plan["tasks"] if task["id"] == task_id)
         evaluation = self.store.get_evaluation(target["evaluation_id"])
+        previous_runtime_task = self.store.get_task(target.get("runtime_task_id")) if target.get("runtime_task_id") else None
+        workspace_state = self._recovery_workspace_state(previous_runtime_task)
         recoveries = self.store.list_recoveries(oid)
         revisions = self.store.list_plan_revisions(oid)
         history = [item for item in recoveries
@@ -911,6 +945,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     evaluation=evaluation, history=history,
                     available_agents=current_agents, plan=plan, limits=limits,
                     can_create_agent=True,
+                    workspace_state=workspace_state,
                 )
         except Exception as exc:
             decision = {
@@ -948,6 +983,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             retry_prompt = build_retry_prompt(
                 planned_task, evaluation, decision["instructions"],
                 attempt=int(target["attempt"]) + 1,
+                workspace_state=workspace_state,
             )
         with self.lock:
             run = self.store.get_orchestration(oid)
@@ -965,7 +1001,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 source_evaluation_id=target["evaluation_id"], decision=decision,
                 recovery_version=RECOVERY_VERSION, prompt=retry_prompt,
                 snapshot={"evaluation_status": evaluation.get("status"), "limits": limits,
-                          "allowed_replan_scope": sorted(allowed_scope)},
+                          "allowed_replan_scope": sorted(allowed_scope),
+                          "workspace_state": workspace_state},
             )
             if record is None:
                 return
@@ -973,6 +1010,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "event_type": "freya.recovery.decided", "status": "Running",
                 "task_id": task_id, "recovery_id": recovery_id,
                 "action": decision["action"], "reason": decision["reason"],
+                "workspace_state": workspace_state,
+                "selected_strategy": decision["action"],
                 "message": "Freya committed a bounded recovery decision.",
             })
             if decision["action"] == "fail":

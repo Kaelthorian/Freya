@@ -320,9 +320,13 @@ guidance and are adapted when a step is unavailable. List filtering accepts
 `run_command` accepts optional `{ "stdin": "..." }` only for restricted Python
 commands. Input is capped at 16,000 characters and is redacted to a character
 count in logs. Omitting it closes child stdin; a Python `input()` therefore
-fails immediately with `interactive_input_required` instead of hanging. The
-Planner adds `qa-interactive-test` when the Analyst marks a request interactive,
-followed by `code-audit` for mutation plans.
+fails immediately with `interactive_input_required` instead of hanging. A
+successful command can add a `command_execution` item to
+`verification.evidence` when its bounded output directly supports a quoted
+output, exit-code, or JSON completion criterion. The Planner adds
+`qa-interactive-test` when the Analyst marks a request interactive, followed by
+`code-audit` for mutation plans except for the bounded simple non-interactive
+single-task creation fast path.
 
 ## Tasks, observations and metrics
 
@@ -345,6 +349,15 @@ Logs group delegated runtime events by `orchestration_id` when present, so one F
 and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
+
+Structured task results preserve runtime truth even when the model's final
+structured response is invalid: `actions` contains bounded tool outcomes,
+`artifacts` contains successful file changes, and `verification.evidence` may
+contain `command_execution` records with `command`, `exit_code`, `output` and
+`supports_acceptance_criteria`. Recovery snapshots and retry prompts carry a
+bounded `workspace_state` with prior verification, actions, artifacts, diffs
+and error; a newly generated recovery agent may gain only `filesystem.read`
+for that inspection, never `filesystem.overwrite`.
 
 Skills support `GET /api/skills/{id}/versions` and `GET /api/skills/{id}/versions/{version}` for immutable history. `DELETE /api/skills/{id}` archives a skill and records an audit event; archived skills are excluded from `/api/skills` unless `include_deleted=true` is requested.
 

@@ -238,6 +238,12 @@ class AgentFactory:
         if (not isinstance(required, list)
                 or any(not isinstance(item, str) for item in required)):
             raise ValueError("required_capabilities must be a list of strings.")
+        recovery_state = task.get("_recovery_workspace_state")
+        if recovery_state is not None and "filesystem.read" not in required:
+            # Recovery inspection is a safe, task-derived prerequisite.  It is
+            # deliberately narrower than write authority and still passes
+            # through the generated policy and selector checks below.
+            required.append("filesystem.read")
         role = self.orchestration_role(task)
         write_capabilities = {
             "filesystem.create", "filesystem.modify", "filesystem.overwrite",
