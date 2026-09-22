@@ -51,6 +51,12 @@ analyst model fails, Freya records the error and uses a deterministic bounded
 interpretation. The role can be selected in the agent editor; a Skill is not
 required for routing or authorization.
 
+After planning, Freya creates one ephemeral least-privilege agent for each ready
+plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
+The factory uses only enabled registry Skills, caps assignments at eight, derives
+Tools from the complete task policy, and persists provenance for audit and
+terminal cleanup.
+
 Semantic evaluation has separate local-model configuration:
 
 ```powershell
@@ -81,10 +87,11 @@ The recovery endpoint remains loopback-only. Invalid JSON gets at most one repai
 without exceeding the total model-call budget. The orchestration wall-clock deadline
 is rechecked after each recovery or replanning call before more work starts.
 Use `--recovery-offline` for model-free deterministic behavior: same-agent
-retry for `needs_revision`/`blocked`, different-agent retry for `rejected` when
-an enabled alternative exists, and fail for evaluator errors or unavailable
-alternatives. Retries always create a new persisted attempt and rerun Agent
-Selector and capability-policy checks. Recovery never grants capabilities or
+retry for `needs_revision`/`blocked`, a new dynamic agent variant for `rejected`,
+and fail for evaluator errors. Same-agent retry reuses the exact generated ID;
+different-agent retry creates a new identity/Skill combination while preserving
+the same task-derived capability ceiling. Every retry creates a persisted attempt
+and reruns Agent Selector and capability-policy checks. Recovery never grants capabilities or
 resolves approvals. Replanning stores an effective-plan revision without
 overwriting the original plan or rerunning accepted tasks. Its deterministic
 scope contains only the recovery source and never-started descendants; active,
@@ -160,11 +167,12 @@ SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
 `-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including the final read-only Code Auditor); direct task submissions still get one directory per task. These
 generated paths are ignored by Git.
 
-Shareable pipeline-agent definitions live in `data/agents/*.json`. Import them
-one at a time from **Agents → Import agent** on a fresh installation. They contain
-configuration and Skill assignments only; the SQLite database, runtime status,
-prompts, logs, approvals, metrics and generated workspaces remain ignored. The
-referenced Ollama model and assigned built-in Skills must exist before import.
+Shareable manual-agent definitions remain available in the versioned data/agents
+directory. They are useful for direct task submission and compatibility
+workflows, but normal Freya orchestration no longer requires Programmer, QA
+Tester or Code Auditor imports. Definitions contain configuration and Skill
+assignments only; runtime state, prompts, logs, approvals, metrics and generated
+workspaces remain ignored.
 
 In agent settings, **Choose folder** chooses that agent's default folder. In the Freya form, selecting an existing folder uses it directly for the orchestration, so agents can act on files already there; leaving it empty creates an isolated workspace.
 The **Assign a task** form also has its own folder selector. It starts with
@@ -173,10 +181,11 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
-Interactive plans append a dependent QA Tester task selected through the
-`interactive-testing` Skill. Plans that create or modify code then append one
-dependent, read-only Code Auditor task selected through `code-review`, producing
-the ordered path Programmer → QA when needed → Code Auditor in Logs.
+Interactive plans append a dependent QA task with `interactive-testing`; mutation
+plans append one dependent read-only audit task with `code-review`. The factory
+creates independent QA and Auditor agents at dispatch time, so the ordered path
+Implementation → QA when needed → Code Auditor appears in Logs without
+preconfigured pipeline agents.
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
 verification, autonomy, output, and limits are compact expandable sections. The
@@ -226,8 +235,8 @@ python -m pytest -q
 ```
 
 Capability, structured-agent and Skill behavior is covered by
-`tests/test_capabilities.py`, `tests/test_agent_context.py` and
-`tests/test_skills.py`. The worker
+`tests/test_capabilities.py`, `tests/test_agent_context.py`,
+`tests/test_skills.py` and `tests/test_agent_factory.py`. The worker
 resolves and evaluates a capability before every tool invocation. A policy or autonomy ask creates a durable approval request, moves the task to WaitingForApproval, and the Approvals page resolves it once, for the task, or denies it.
 
 Runtime tests use a local fake Ollama server and spawned worker processes. The
@@ -276,6 +285,8 @@ local end-to-end run.
   orchestrations Failed once and records `freya.interrupted` without changing persisted
   plans. Durable
   graph nodes are closed as cancelled/skipped so none remain apparently active.
+  Dynamic agents for the interrupted orchestration are soft-archived and an
+  idempotent `freya.dynamic_agent.archived` event records cleanup.
 - A planner timeout or invalid repaired response leaves the orchestration Failed;
   inspect `planning_metrics` and `freya.planning.failed` on the run.
 - A Runtime task `Success` means execution finished technically. Its graph node

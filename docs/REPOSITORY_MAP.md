@@ -13,6 +13,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── task_analyst.py       tool-free operational-prompt rewrite, reconciliation and fallback
 │   ├── planner.py            plan schema, conditional QA/audit nodes, validation and offline fallback
+│   ├── agent_factory.py      per-task least-privilege agent creation, provenance and Skill assignment
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
@@ -67,9 +68,12 @@ selects them.
    adapter in `planner.py`; `orchestrator.py` stores the validated plan snapshot
    atomically. Interactive work receives an independent QA node using bounded
    Python stdin, and mutation work ends with a read-only Code Auditor node.
-   `execution_graph.py` releases ready
-   tasks in plan order and `agent_selector.py` classifies and ranks an existing
-   agent once for each ready task before delegation. A technical Runtime success
+   `execution_graph.py` releases ready tasks in plan order. For each ready task,
+   `agent_factory.py` creates one validated ephemeral agent whose complete policy
+   comes only from `required_capabilities`, whose Tools are derived from that
+   policy, and whose Skills come from the enabled registry without granting
+   authority. `agent_selector.py` then validates and classifies that generated
+   candidate before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
    A non-accepted evaluation enters bounded recovery; retries are reselected and
    recorded as new attempts, while deterministic DAG scope limits replanning to
@@ -113,6 +117,7 @@ selects them.
 | Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
 | Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py` (normalized actor/workspace traces), `worker.py`, `__main__.py`, `frontend/views.js`, `frontend/components.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
+| Dynamic agent construction, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |

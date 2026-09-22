@@ -346,10 +346,14 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(final["status"], "Success")
         self.assertIn(2, active_counts)
-        self.assertEqual(len({item[1] for item in runtime.submissions}), 2)
-        self.assertEqual({item[1] for item in runtime.submissions},
-                         {agent["id"] for agent in agents})
+        selected_ids = {item[1] for item in runtime.submissions}
+        manual_ids = {agent["id"] for agent in agents}
+        self.assertEqual(len(selected_ids), 2)
+        self.assertTrue(selected_ids.isdisjoint(manual_ids))
+        self.assertEqual({agent["id"] for agent in self.store.list_agents()}, manual_ids)
         self.assertEqual(len(final["selections"]), 2)
+        self.assertEqual(sum(event["event_type"] == "freya.agent_created"
+                             for event in final["events"]), 2)
 
     def test_failure_blocks_descendant_but_independent_branch_completes(self):
         agents = [self.agent(name) for name in ("Bad", "Independent")]

@@ -319,6 +319,46 @@ class Store(IntegrationStoreMixin):
         return any(row["id"] != exclude_id and str(row["name"]).strip().casefold() == normalized
                    for row in rows)
 
+    @staticmethod
+    def _archive_dynamic_agents(connection: sqlite3.Connection, orchestration_id: str,
+                                timestamp: str) -> list[dict[str, Any]]:
+        archived: list[dict[str, Any]] = []
+        rows = connection.execute(
+            "SELECT a.id,a.name,a.role,c.config_json FROM agents a "
+            "JOIN agent_configs c ON c.agent_id=a.id WHERE a.deleted_at IS NULL"
+        ).fetchall()
+        for row in rows:
+            config = _load(row["config_json"]) or {}
+            provenance = config.get("provenance") if isinstance(config, dict) else {}
+            if not isinstance(provenance, dict):
+                continue
+            if (provenance.get("generated_by_freya") is not True
+                    or provenance.get("ephemeral") is not True
+                    or provenance.get("orchestration_id") != orchestration_id):
+                continue
+            cursor = connection.execute(
+                "UPDATE agents SET deleted_at=?,updated_at=?,enabled=0,status='Offline' "
+                "WHERE id=? AND deleted_at IS NULL",
+                (timestamp, timestamp, row["id"]),
+            )
+            if cursor.rowcount == 1:
+                archived.append({
+                    "agent_id": row["id"], "name": row["name"], "role": row["role"],
+                    "plan_task_id": provenance.get("plan_task_id"),
+                    "attempt": provenance.get("attempt"),
+                    "factory_version": provenance.get("factory_version"),
+                })
+        return archived
+
+    def archive_dynamic_agents(self, orchestration_id: str) -> list[dict[str, Any]]:
+        """Soft-archive every ephemeral agent owned by one terminal run."""
+        if not isinstance(orchestration_id, str) or not orchestration_id.strip():
+            raise ValueError("orchestration_id must be non-empty text.")
+        with self._connection(write=True) as connection:
+            return self._archive_dynamic_agents(
+                connection, orchestration_id.strip(), utcnow(),
+            )
+
     def delete_agent(self, agent_id: str) -> None:
         with self._connection(write=True) as connection:
             self._agent(connection, agent_id)
@@ -1505,6 +1545,24 @@ class Store(IntegrationStoreMixin):
                     "VALUES(?,?,?,?,?,?)",
                     (row["id"], now, event["event_type"], event["status"], message, _dump(event)),
                 )
+                for agent in self._archive_dynamic_agents(c, row["id"], now):
+                    archived_event = {
+                        "event_type": "freya.dynamic_agent.archived",
+                        "status": "Failed",
+                        "orchestration_id": row["id"],
+                        "agent_id": agent["agent_id"],
+                        "plan_task_id": agent.get("plan_task_id"),
+                        "attempt": agent.get("attempt"),
+                        "factory_version": agent.get("factory_version"),
+                        "message": "Freya archived an ephemeral agent after interrupted recovery.",
+                    }
+                    c.execute(
+                        "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,"
+                        "status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)",
+                        (row["id"], now, archived_event["event_type"], "Failed",
+                         agent["agent_id"], agent.get("plan_task_id"),
+                         archived_event["message"], _dump(archived_event)),
+                    )
             return len(rows)
 
     def get_task(self, task_id: str) -> dict:

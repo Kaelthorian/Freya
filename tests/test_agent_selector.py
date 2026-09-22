@@ -369,9 +369,9 @@ class AgentSelectionIntegrationTests(unittest.TestCase):
         self.assertEqual(run["status"], "Success")
         self.assertEqual(len(run["selections"]), 1)
         selection = run["selections"][0]
-        self.assertEqual(selection["selected_agent_id"], agent["id"])
+        self.assertNotEqual(selection["selected_agent_id"], agent["id"])
         self.assertEqual(selection["selector_version"], AGENT_SELECTOR_VERSION)
-        self.assertEqual(selection["snapshot"]["selected_agent_id"], agent["id"])
+        self.assertEqual(selection["snapshot"]["selected_agent_id"], selection["selected_agent_id"])
         reopened = Store(self.path).get_orchestration(run["id"])
         self.assertEqual(reopened["selections"][0]["snapshot"], selection["snapshot"])
         before_edit = copy.deepcopy(selection["snapshot"])
@@ -379,29 +379,30 @@ class AgentSelectionIntegrationTests(unittest.TestCase):
         self.store.update_agent(agent["id"], updated)
         self.assertEqual(self.store.get_orchestration(run["id"])["selections"][0]["snapshot"],
                          before_edit)
+        self.assertEqual(self.store.list_agents()[0]["id"], agent["id"])
 
     def test_selection_events_are_emitted(self):
-        agent, run = self.run_orchestration()
+        _, run = self.run_orchestration()
         event_types = [event["event_type"] for event in run["events"]]
         self.assertIn("freya.agent_selection.started", event_types)
         self.assertIn("freya.agent_selected", event_types)
         selected = next(event for event in run["events"]
                         if event["event_type"] == "freya.agent_selected")
         payload = json.loads(selected["payload_json"])
-        self.assertEqual(payload["agent_id"], agent["id"])
+        self.assertEqual(payload["agent_id"], run["selections"][0]["selected_agent_id"])
         self.assertEqual(payload["selector_version"], AGENT_SELECTOR_VERSION)
 
-    def test_failed_selection_is_persisted_and_emits_failed_event(self):
-        _, run = self.run_orchestration("deny")
-        self.assertEqual(run["status"], "Failed")
-        self.assertIn("Required capability filesystem.read is denied", run["error"])
-        self.assertIn("Failure diagnosis", run["response"])
-        self.assertEqual(run["selections"][0]["status"], "no_eligible_agent")
-        self.assertIsNone(run["selections"][0]["selected_agent_id"])
+    def test_manual_denied_policy_does_not_block_dynamic_factory(self):
+        manual, run = self.run_orchestration("deny")
+        self.assertEqual(run["status"], "Success")
+        self.assertEqual(run["selections"][0]["status"], "selected")
+        self.assertNotEqual(run["selections"][0]["selected_agent_id"], manual["id"])
+        self.assertEqual(self.store.get_agent(manual["id"])["config"]["capability_policy"]
+                         ["capabilities"]["filesystem"]["read"]["mode"], "deny")
         event_types = [event["event_type"] for event in run["events"]]
+        self.assertIn("freya.agent_created", event_types)
         self.assertIn("freya.agent_selection.started", event_types)
-        self.assertIn("freya.agent_selection.failed", event_types)
-        self.assertNotIn("freya.agent_selected", event_types)
+        self.assertIn("freya.agent_selected", event_types)
 
     def test_orchestrator_uses_injected_agent_selector(self):
         selector = RecordingSelector()
@@ -441,6 +442,9 @@ class AgentSelectionIntegrationTests(unittest.TestCase):
         self.assertEqual(final["selections"], [])
         self.assertEqual(final["delegations"], [])
         self.assertEqual(final["events"], events_at_cancel)
+        self.assertIn("freya.dynamic_agent.archived",
+                      [event["event_type"] for event in final["events"]])
+        self.assertEqual(len(self.store.list_agents()), 1)
 
 
 if __name__ == "__main__":

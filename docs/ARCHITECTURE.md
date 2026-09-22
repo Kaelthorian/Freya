@@ -7,10 +7,14 @@ for a strict, tool-free interpretation of the original prompt. That result is
 schema-validated and semantically reconciled into an `operational_prompt`; it
 replaces the human wording for every downstream stage while the source remains
 immutable audit evidence. Freya then asks `control_center/planner.py` for a
-strict structured plan and persists that snapshot before asking
-`control_center/agent_selector.py` to rank compatible existing agents,
-then uses `control_center/execution_graph.py` to release dependency-ready tasks,
-delegating bounded tasks through `Runtime`, and requiring
+strict structured plan and persists that snapshot. For each dependency-ready
+task, `control_center/agent_factory.py` creates a validated ephemeral agent from
+the task type, required capabilities and enabled Skill registry. The complete
+policy denies every undeclared capability, dangerous requirements remain
+`ask`, and the concrete Tool surface is derived from that policy.
+`control_center/agent_selector.py` then validates the generated candidate before
+`control_center/execution_graph.py` delegates the bounded task through `Runtime`
+and requires
 `control_center/evaluator.py` to accept technical successes before integration.
 Workers remain the only components allowed to invoke tools;
 Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
@@ -36,7 +40,7 @@ browser → HTTP API → SQLite
              ↓
        Task Analyst → Planner → implementation → conditional QA → read-only Auditor
                               ↓                    ↓                 ↓
-                       immutable plan ─────→ Execution Graph → Agent Selector → Orchestrator
+                       immutable plan ─────→ Execution Graph → Agent Factory → Agent Selector → Orchestrator
                                               ↓              ↓              ↓
                                       dependency state   Capability Policy  scheduler → spawned worker → local Ollama
                                               ↑                                  ↓
@@ -48,9 +52,10 @@ browser → HTTP API → SQLite
 The Task Analyst rewrites **what the user meant** without executing anything;
 its validated operational prompt is authoritative for execution and the human
 prompt remains available only for audit. Deterministic reconciliation prevents
-schema-valid contradictions such as ignoring interactive input. The Planner determines **what** work exists. The Agent Selector determines
-**who** is the safest and most suitable existing candidate for one planned
-task. The deterministic Execution Graph determines **when** dependency-ready
+schema-valid contradictions such as ignoring interactive input. The Planner determines **what** work exists. The Agent Factory determines
+**who** executes each planned task by constructing a task-specific identity,
+Skill set and least-privilege policy. The Agent Selector independently validates
+and classifies that candidate before dispatch. The deterministic Execution Graph determines **when** dependency-ready
 tasks run. The Worker determines **how** one selected task executes. Capability
 Policy remains the sole authority for **whether** each requested action is
 permitted. The Evaluator determines **whether the produced result actually
@@ -82,6 +87,12 @@ planning duration/token counters on `orchestration_runs`. Saving the snapshot
 and changing `Planning → Planned` is one SQLite transaction. The plan can be
 written once, so later edits to agents, Skills, capability definitions or
 planner code cannot alter the plan used by an existing run.
+Dynamic agents are normal validated agent rows with `config.provenance` containing
+`generated_by_freya`, orchestration ID, plan-task ID, attempt, factory version
+and `ephemeral=true`. Runtime task snapshots preserve their exact policy, Tools,
+Skills and provenance. Terminal success, failure, cancellation and startup
+recovery soft-archive every dynamic agent belonging to the orchestration; manual
+agents and their direct-task API remain unchanged.
 Every Agent Selector decision, including `no_eligible_agent`, is stored in
 `orchestration_selections` with the planned task ID, selected agent when any,
 classification status, score, selector version, creation time and complete
@@ -128,6 +139,11 @@ Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
 The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single implementation task. If the Analyst marks user input or interactive validation, it appends one dependent `qa-interactive-test` node with `interactive-testing`; QA may execute supported Python with bounded stdin but cannot modify files. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill, so ordering is implementation → QA when required → Code Auditor. The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
+Agent construction emits `freya.agent_factory.started`, `freya.agent_created`
+and `freya.agent_policy.validated`; construction errors emit
+`freya.agent_factory.failed`. Lifecycle cleanup emits
+`freya.dynamic_agent.archived` with the archived IDs and count. These events
+contain bounded metadata and never change capability authority.
 Selection emits `freya.agent_selection.started`, followed by either
 `freya.agent_selected` or `freya.agent_selection.failed`. The selected event
 contains the planned task ID, agent ID, score, classification and selector
@@ -330,19 +346,20 @@ attempt before persisting.
 allows only `retry_same_agent`, `retry_different_agent`, `replan_subgraph`, or
 `fail`; invalid model output gets one repair. Its Ollama adapter is loopback-only,
 tool-free, non-streaming and independently metered. `--recovery-offline` makes
-no model call and applies deterministic recovery: `needs_revision` retries the
-same enabled agent, `rejected` selects a different enabled agent or fails when
-none exists, `blocked` retries with an explicit objective-evidence instruction,
-and evaluator `error` fails. The normal attempt, action, fingerprint and
+no model call and applies deterministic recovery: `needs_revision` and `blocked`
+reuse the exact generated agent after revalidation, while `rejected` requests a
+new generated variant with the same task-derived policy ceiling. Evaluator
+`error` fails. The normal attempt, action, fingerprint and
 wall-clock limits still apply.
 
 Defaults allow three semantic attempts per task, two plan revisions, eight
 recovery actions and sixteen total recovery/replanning model calls per orchestration.
 The orchestration wall-clock deadline is rechecked after every recovery call. Stable
 fingerprints stop repeated equivalent
-failures. Same-agent retry revalidates the candidate. Different-agent retry
-passes every prior agent ID as a hard `excluded_agent_ids` constraint; there is
-no silent same-agent fallback. Retry prompts include bounded evaluator issues
+failures. Same-agent retry revalidates and reuses the exact dynamic agent ID.
+Different-agent retry creates a new dynamic identity/Skill variant, excludes
+every prior agent ID, and derives the same capability ceiling from the unchanged
+plan task; there is no silent same-agent fallback or policy expansion. Retry prompts include bounded evaluator issues
 and missing evidence, not raw prior model transcripts or private reasoning.
 
 Replanning produces a complete cumulative effective plan. Accepted and
@@ -363,8 +380,9 @@ also verifies that every previously active Runtime task is still tracked by the
 same graph node and runtime ID. Replanning neither cancels nor mutates active
 work in an independent branch, so evaluation continues against the exact task
 snapshot used to start the attempt. The original plan remains available
-separately from the effective plan. Task recovery does not create agents,
-auto-approve capabilities, weaken policy, or add a free-form shell.
+separately from the effective plan. Retry recovery may create only the new
+task-specific variant described above; it never auto-approves capabilities,
+weakens policy, or adds a free-form shell.
 
 ## Post-failure log diagnosis
 
@@ -455,6 +473,12 @@ memory.
 
 ## Agent selection
 
+Normal Freya orchestration does not depend on a preconfigured pool of Programmer,
+QA Tester or Code Auditor agents. `AgentFactory` creates one candidate per ready
+task, assigns at most eight enabled existing Skills, records warnings for unknown
+or incompatible preferred Skills, and never turns Skill requirements into
+capability grants. Manual agents remain available for direct task submission and
+compatibility tests.
 `AgentSelector.select_agent(task, agents, context=None)` is local,
 deterministic and model-free. It deep-copies its inputs, resolves each agent's
 effective structured configuration, evaluates every required capability through
@@ -518,8 +542,9 @@ Selection does not dispatch by itself. The execution graph retains the selected
 agent and waits for both a global slot and per-agent availability. Approval is
 the existing durable Runtime flow and does not fail the graph while pending.
 At timeout, active children are cancelled and all remaining graph nodes become
-terminal before the parent becomes Failed. Selection itself does not replan, create
-agents, retry semantic revisions, or enable agent-to-agent messaging.
+terminal before the parent becomes Failed. The selector itself does not create
+agents, replan, retry semantic revisions, or enable agent-to-agent messaging;
+agent construction remains the factory's separate responsibility.
 
 ## Runtime and control semantics
 

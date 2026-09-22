@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from control_center.agent_factory import AgentFactory
 from control_center.agent_selector import AgentSelector
 from control_center.config import normalize_agent
 from control_center.evaluator import Evaluator
@@ -270,7 +271,8 @@ class GroundedLifecycleTests(unittest.TestCase):
         self.agent = self.store.create_agent(normalize_agent({"name": "Worker", "role": "Engineer"}))
 
     def make(self, *, initial=None, global_model=None, replan_model=None, evaluator=None,
-             recovery=None, replanner=None, config=None, clock=None, selector=None, runtime=None):
+             recovery=None, replanner=None, config=None, clock=None, selector=None, runtime=None,
+             agent_factory=None):
         initial = initial or fixtures.plan([fixtures.task("a"), fixtures.task("b")], [GOAL])
         runtime = runtime or ControlledRuntime(self.store)
         run = self.store.create_orchestration(GOAL)
@@ -283,6 +285,7 @@ class GroundedLifecycleTests(unittest.TestCase):
             })), evaluator=evaluator, recovery=recovery, replanner=replanner,
             wait=lambda seconds: runtime.finish_active(), clock=clock,
             config={"max_wallclock_seconds": 30, **(config or {})},
+            agent_factory=agent_factory,
         )
         return run, runtime, orchestrator
 
@@ -398,7 +401,7 @@ class GroundedLifecycleTests(unittest.TestCase):
                     event = next(item for item in final["events"] if item["event_type"] == "freya.final_response.created")
                     self.assertTrue(json.loads(event["payload_json"])["fallback"])
 
-    def test_integration_task_does_not_gain_denied_capability(self):
+    def test_integration_task_uses_factory_policy_without_mutating_manual_agent(self):
         policy = {"capabilities": {"filesystem": {"create": {"mode": "deny"}}, "execution": {}, "git": {}}}
         agent = self.store.create_agent(normalize_agent({"name": "Denied", "tools": ["write_file"],
                                                        "config": {"capability_policy": policy}}))
@@ -408,12 +411,18 @@ class GroundedLifecycleTests(unittest.TestCase):
             "summary": "Needs create", "tasks": [fixtures.task("c", ["a", "b"], GOAL, ["filesystem.create"])],
         })
         orchestrator._run(run["id"])
+        final = self.store.get_orchestration(run["id"])
+        self.assertEqual(final["status"], "Success", final["error"])
         self.assertEqual(self.store.get_agent(agent["id"])["config"]["capability_policy"], before)
-        self.assertEqual(self.store.get_orchestration(run["id"])["status"], "Failed")
-        self.assertEqual(len(runtime.submissions), 2)
-        selections = self.store.get_orchestration(run["id"])["selections"]
-        self.assertEqual(selections[-1]["status"], "no_eligible_agent")
-
+        self.assertEqual(len(runtime.submissions), 3)
+        task = self.store.get_task(runtime.submissions[-1][2])
+        self.assertNotEqual(task["agent_id"], agent["id"])
+        self.assertEqual(
+            task["capability_policy"]["capabilities"]["filesystem"]["create"]["mode"],
+            "allow",
+        )
+        self.assertEqual(task["tools"], ["write_file"])
+        self.assertEqual(final["selections"][-1]["status"], "selected")
     def test_45_consumes_shared_revision_budget_before_global_recovery(self):
         from tests.test_recovery import evaluation, recovery_decision
         initial = fixtures.plan([fixtures.task("a")], [GOAL])
@@ -473,9 +482,12 @@ class GroundedLifecycleTests(unittest.TestCase):
             def __bool__(self):
                 return True
             def popleft(self):
-                if "Complete c" in json.dumps(server.requests[-1]):
-                    return answer(calls=[("write_file", {"path": "approval.txt", "content": "fixture"})])
-                return answer("Component completed.")
+                request = server.requests[-1]
+                if "Complete c" in json.dumps(request):
+                    return answer(calls=[("run_command", {"argv": ["python", "approval.py"]})])
+                if request["messages"][-1]["role"] == "tool":
+                    return answer("Component completed.")
+                return answer(calls=[("list_files", {"path": "."})])
         server.responses = TaskResponses()
         policy = {"capabilities": {"filesystem": {
             "create": {"mode": "ask"}, "overwrite": {"mode": "ask"},
@@ -490,17 +502,27 @@ class GroundedLifecycleTests(unittest.TestCase):
         runtime = Runtime(self.store, self.root, Path.cwd())
         runtime.start()
         self.addCleanup(runtime.shutdown)
-        def evaluate(prompt, context):
-            criteria = context["planned_task"]["success_criteria"]
-            return {"status": "accepted", "confidence": 1, "summary": "Fixture result",
-                    "criteria": [{"criterion": item, "status": "satisfied", "reason": "Fixture",
-                                  "evidence": ["Controlled component output"]} for item in criteria],
-                    "issues": [], "missing_evidence": [], "recommended_action": "accept"}
+        class FixtureEvaluator:
+            metrics = {}
+            last_context = {}
+
+            def evaluate(self, *, planned_task, runtime_task, execution_node):
+                criteria = planned_task["success_criteria"]
+                return {"status": "accepted", "confidence": 1, "summary": "Fixture result",
+                        "criteria": [{"criterion": item, "status": "satisfied", "reason": "Fixture",
+                                      "evidence": ["Controlled component output"]} for item in criteria],
+                        "issues": [], "missing_evidence": [], "recommended_action": "accept"}
+        initial = fixtures.plan([
+            fixtures.task("a", capabilities=["filesystem.list"]),
+            fixtures.task("b", capabilities=["filesystem.list"]),
+        ], [GOAL])
         run, _, orchestrator = self.make(
-            selector=AgentSelector(), runtime=runtime, evaluator=Evaluator(evaluate),
+            initial=initial, selector=AgentSelector(), runtime=runtime,
+            evaluator=FixtureEvaluator(),
             replan_model=lambda p, c: {"summary": "Create integration evidence", "tasks": [
-                fixtures.task("c", ["a", "b"], GOAL, ["filesystem.create"]),
+                fixtures.task("c", ["a", "b"], GOAL, ["execution.python_script"]),
             ]}, config={"max_wallclock_seconds": 40},
+            agent_factory=AgentFactory(self.store, runtime_config={"endpoint": server.url}),
         )
         orchestrator.wait = time.sleep
         thread = threading.Thread(target=orchestrator._run, args=(run["id"],))
@@ -516,8 +538,8 @@ class GroundedLifecycleTests(unittest.TestCase):
             self.assertEqual(len(pending), 1, self.store.get_orchestration(run["id"])["error"])
             child = self.store.get_task(pending[0]["task_id"])
             self.assertEqual(child["status"], "WaitingForApproval")
-            self.assertEqual(pending[0]["capability"], "filesystem.create")
-            self.assertFalse((Path(child["workspace"]) / "approval.txt").exists())
+            self.assertEqual(pending[0]["capability"], "execution.python_script")
+            self.assertEqual(child["tools"], ["run_command"])
             graph = self.store.get_execution_graph(run["id"])["nodes"]
             self.assertEqual(next(node for node in graph if node["plan_task_id"] == "c")["runtime_task_id"], child["id"])
             self.assertEqual(self.store.get_agent(agent["id"])["config"]["capability_policy"], before)

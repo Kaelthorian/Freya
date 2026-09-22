@@ -34,6 +34,7 @@ class IntegrationOrchestrationMixin:
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.failed", "status": "Failed", "message": message,
             })
+            self._archive_dynamic_agents(oid)
 
     def _timeout_integration(self, oid: str) -> None:
         self._fail_integrating(
@@ -213,6 +214,7 @@ class IntegrationOrchestrationMixin:
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.completed", "status": "Success", "message": response,
             })
+            self._archive_dynamic_agents(oid)
         return False
 
     def _recover_integration(self, oid: str, integration_id: str, prepared: dict,

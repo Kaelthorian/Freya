@@ -74,7 +74,7 @@ def effective_tools_for_policy(policy: dict[str, Any] | None) -> list[str]:
                 tool = tool_for_capability(capability)
                 if tool:
                     active.add(tool)
-    return [item.tool for item in CAPABILITIES if item.tool in active]
+    return list(dict.fromkeys(item.tool for item in CAPABILITIES if item.tool in active))
 
 
 class CapabilityResolver:

@@ -95,6 +95,11 @@ and `freya.failure_analysis.completed`. The completed payload contains
 and `response` expose the same cause and report. The analyzer receives only
 sanitized events already persisted for that run, executes no tools, performs
 no retry, and cannot change policy or permissions.
+Dynamic-agent lifecycle events are `freya.agent_factory.started`,
+`freya.agent_created`, `freya.agent_policy.validated`,
+`freya.agent_factory.failed`, and `freya.dynamic_agent.archived`. Terminal
+success, failure, cancellation and startup interruption all run idempotent
+archive cleanup.
 Integration events are `freya.integration.started`,
 `freya.integration.completed`, `freya.integration.failed`,
 `freya.integration.recovery_started`, `freya.integration.replan_created`, and
@@ -133,11 +138,20 @@ deterministic semantic corrections. Planning then emits either
 `required_capabilities` are validated registry IDs that describe likely task
 needs; they do not grant permission. `preferred_skills` are non-binding semantic
 hints and may name a Skill that is not currently installed. For plans that mutate file/code artifacts, Freya appends one read-only `code-audit` task with `preferred_skills: ["code-review"]` after the implementation tasks.
+For every ready plan task, Freya creates a validated ephemeral agent. Its complete
+policy allows only the declared requirements (`ask` for dangerous capabilities)
+and denies the rest; its Tool list is the deduplicated projection of that policy.
+The factory selects at most eight enabled Skills. Unknown or incompatible
+preferred Skills produce diagnostics and never add capability authority.
 
-After planning, `freya.agent_selection.started` marks deterministic local
-ranking. `freya.agent_selected` records the planned task ID, selected agent ID,
-score, classification and selector version; `freya.agent_selection.failed`
-records that ranking could not produce an executable candidate. The
+After planning, `freya.agent_factory.started` precedes construction.
+`freya.agent_created` identifies the generated agent, role, assigned Skill IDs,
+attempt and factory version; `freya.agent_policy.validated` records required
+capabilities and effective Tools. `freya.agent_factory.failed` records a bounded
+construction error. The generated candidate then passes through
+`freya.agent_selection.started`; `freya.agent_selected` records the planned task
+ID, generated agent ID, score, classification and selector version, while
+`freya.agent_selection.failed` records validation failure. The
 orchestration response includes immutable `selections` entries. Each entry has
 `planned_task_id`, nullable `selected_agent_id`, `status` (`selected`,
 `approval_required`, or `no_eligible_agent`), nullable `score`,
@@ -178,15 +192,17 @@ failure blocks descendants without stopping independent work. Node states are
 evaluation becomes node `success`. Other semantic outcomes enter
 `recovery_pending` and receive exactly one bounded decision for that attempt.
 Retry decisions create a new selection, Runtime task, delegation, evaluation
-and attempt record. Same-agent retry revalidates the agent; different-agent
-retry hard-excludes prior agents. Recovery Advisor `affected_task_ids` are only
+and attempt record. Same-agent retry revalidates and reuses the exact generated
+agent ID. Different-agent retry creates a new generated identity/Skill variant,
+hard-excludes prior IDs and preserves the same task-derived policy ceiling. Recovery Advisor `affected_task_ids` are only
 a proposal: deterministic DAG traversal permits the `recovery_pending` source
 and never-started `pending`/`ready` descendants. Independent, active, accepted
 and historically attempted tasks remain structurally immutable. The Replanner
 validates this allowed/protected split and Storage recomputes it transactionally
 before updating the effective plan. The original plan and all history remain
-unchanged. Recovery does not create agents, auto-approve capabilities, bypass
-policy, or provide direct agent-to-agent messaging.
+unchanged. Recovery creates an agent only for a bounded different-agent retry; it cannot
+auto-approve capabilities, expand the task policy, bypass policy, or provide
+direct agent-to-agent messaging.
 A graph with every active effective task in accepted `success` enters
 `Integrating`; node success alone never produces orchestration `Success`.
 `GlobalVerifier` evaluates the Analyst operational prompt, immutable operational
@@ -274,6 +290,12 @@ optional `secret_env` name. `config.orchestration_role` may be `worker`,
 does not grant any capability. The `capability_policy` belongs inside `config`
 and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
+Freya-generated agents additionally expose validated `config.provenance` with
+the orchestration ID, plan-task ID, attempt, factory version and ephemeral flag.
+They are soft-archived at terminal cleanup; task snapshots and attempt history
+remain readable. Non-empty provenance is reserved to the internal factory and is
+rejected on manual create/import/update. Manual agent CRUD and direct task
+assignment are otherwise unchanged.
 The structured blocks are validated against their supported modes and limits;
 `autonomy` never overrides capability policy. Allow/ask rules derive effective tools; legacy permissions and advanced tool selections do not add authority.
 

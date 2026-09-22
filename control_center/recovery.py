@@ -601,7 +601,8 @@ class RecoveryController:
                 "exclude_agent_ids": [], "affected_task_ids": [task_id]}
 
     def _offline_decision(self, status: str, task_id: str, current_agent: str,
-                          enabled_ids: set[str]) -> dict[str, Any]:
+                          enabled_ids: set[str],
+                          can_create_agent: bool = False) -> dict[str, Any]:
         if status in {"needs_revision", "blocked"} and current_agent not in enabled_ids:
             return self._fail("The current agent is no longer enabled.", task_id)
         if status == "needs_revision":
@@ -616,7 +617,7 @@ class RecoveryController:
                 "instructions": "Produce the missing objective verification evidence.",
                 "exclude_agent_ids": [], "affected_task_ids": [task_id],
             }
-        if status == "rejected" and enabled_ids - {current_agent}:
+        if status == "rejected" and (can_create_agent or enabled_ids - {current_agent}):
             return {
                 "action": "retry_different_agent", "reason": "Use a different enabled agent.",
                 "instructions": "Correct the rejected result and produce objective verification evidence.",
@@ -629,7 +630,8 @@ class RecoveryController:
     def decide(self, *, planned_task: dict[str, Any], execution_node: dict[str, Any],
                evaluation: dict[str, Any], history: list[dict[str, Any]],
                available_agents: list[dict[str, Any]], plan: dict[str, Any],
-               limits: dict[str, Any]) -> dict[str, Any]:
+               limits: dict[str, Any],
+               can_create_agent: bool = False) -> dict[str, Any]:
         self.metrics = {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
                         "total_tokens": 0, "duration_seconds": 0.0}
         task_id = str(planned_task.get("id") or "")
@@ -654,6 +656,7 @@ class RecoveryController:
                                  for item in history[-8:]],
             "available_agent_ids": [item.get("id") for item in available_agents
                                     if isinstance(item, dict) and item.get("enabled") is True],
+            "dynamic_agent_factory_available": bool(can_create_agent),
             "limits": {"max_semantic_attempts_per_task": max_attempts,
                        "max_recovery_actions": max_actions,
                        "max_plan_revisions": max_revisions,
@@ -682,6 +685,7 @@ class RecoveryController:
                 str(evaluation.get("status") or ""), task_id, current_agent,
                 {str(item.get("id")) for item in available_agents
                  if isinstance(item, dict) and item.get("enabled") is True},
+                can_create_agent=bool(can_create_agent),
             )
         elif self.model is None:
             decision = self._fail("No recovery advisor is configured; failing conservatively.", task_id)
@@ -725,7 +729,7 @@ class RecoveryController:
         if action == "retry_different_agent":
             excluded = list(dict.fromkeys([current_agent, *decision["exclude_agent_ids"]]))
             decision["exclude_agent_ids"] = [item for item in excluded if item]
-            if not (enabled_ids - set(decision["exclude_agent_ids"])):
+            if not can_create_agent and not (enabled_ids - set(decision["exclude_agent_ids"])):
                 decision = self._fail("No different enabled agent is available.", task_id)
         if action == "replan_subgraph" and revision_count >= max_revisions:
             decision = self._fail("The plan-revision budget is exhausted.", task_id)

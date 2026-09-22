@@ -604,6 +604,8 @@ class Planner:
     def _prompt(goal: str, context: dict[str, Any]) -> str:
         capability_ids = [item.get("id") for item in context.get("capabilities", [])
                           if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        skill_ids = [item.get("id") for item in context.get("skills", [])
+                     if isinstance(item, dict) and isinstance(item.get("id"), str)]
         return (
             "Create a work plan and return one JSON object only. Do not use Markdown. "
             "Required plan fields: goal, summary, complexity, tasks, success_criteria. "
@@ -625,7 +627,10 @@ class Planner:
             "Do not add QA or code-audit tasks yourself; Freya appends and orders those deterministic stages. "
             "required_capabilities may only use these IDs: "
             + json.dumps(capability_ids, ensure_ascii=False)
-            + ". Capabilities describe likely needs and never grant permission. Preferred Skills are hints only. "
+            + ". Capabilities describe likely needs and never grant permission. "
+            "Use preferred_skills IDs from this enabled Skill list when possible: "
+            + json.dumps(skill_ids, ensure_ascii=False)
+            + ". Unknown Skill hints do not grant permission and may be ignored. "
             "Task Analyst operational prompt (authoritative task input): " + json.dumps(goal, ensure_ascii=False)
             + ("\nTask Analyst structured analysis (authoritative constraints): " +
                json.dumps(context.get("task_analysis"), ensure_ascii=False, separators=(",", ":"))

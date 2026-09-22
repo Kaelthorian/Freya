@@ -8,6 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from .agent_context import build_effective_agent, capability_summary
+from .agent_factory import AgentFactory
 from .agent_selector import AgentSelector
 from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
@@ -42,7 +43,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                  task_analyst: TaskAnalyst | None = None,
                  global_verifier: GlobalVerifier | None = None,
                  integration_replanner: IntegrationReplanner | None = None,
-                 result_integrator: ResultIntegrator | None = None):
+                 result_integrator: ResultIntegrator | None = None,
+                 agent_factory: AgentFactory | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
@@ -59,6 +61,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self.global_verifier = global_verifier or GlobalVerifier(offline=True)
         self.integration_replanner = integration_replanner or IntegrationReplanner()
         self.result_integrator = result_integrator or ResultIntegrator()
+        self.agent_factory = agent_factory or AgentFactory(store)
         self.lock = threading.RLock()
         self._orchestration_workspaces: dict[str, str] = {}
         self.planner_lock = threading.Lock()
@@ -256,6 +259,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         "message": "The execution graph was cancelled by the user.",
                         "summary": graph.summary(),
                     })
+            self._archive_dynamic_agents(oid)
             return self.store.get_orchestration(oid)
 
     @staticmethod
@@ -276,28 +280,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 continue
         return candidates
 
-    def _planning_context(self, agents) -> dict:
+    def _planning_context(self, agents=None) -> dict:
         # Deliberately compact: no Skill procedures, logs, task output, policy
-        # secrets or model transcripts cross the planning boundary.
+        # secrets, model transcripts, or preconfigured-agent availability cross
+        # the planning boundary.
         skills = []
         if self.store is not None:
             skills = [{key: item.get(key) for key in ("id", "name", "category", "tags")}
                       for item in self.store.list_skills(enabled=True)[:200]]
-        planner_agents = []
-        for candidate in self._agent_candidates(agents)[:100]:
-            planner_agents.append({
-                key: candidate.get(key) for key in
-                ("id", "name", "role", "purpose", "description", "availability", "enabled")
-            })
-            planner_agents[-1]["skills"] = [
-                {key: skill.get(key) for key in ("id", "name", "category", "tags")}
-                for skill in candidate.get("skills", [])
-            ]
-            planner_agents[-1]["capabilities_summary"] = candidate.get("capabilities_summary", "")
         return {
             "capabilities": [{key: item[key] for key in ("id", "category", "description")}
                              for item in capability_catalog()],
-            "agents": planner_agents,
             "skills": skills,
         }
 
@@ -349,6 +342,72 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "workspace_path": run.get("config", {}).get("workspace_path") or "",
             "workloads": workloads,
         }
+
+    def _create_dynamic_agent(self, oid: str, task: dict, attempt: int,
+                              *, variant: int = 0) -> dict:
+        planned_task_id = str(task.get("id") or "")
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.agent_factory.started", "status": "Running",
+            "task_id": planned_task_id, "attempt": attempt,
+            "required_capabilities": list(task.get("required_capabilities", [])),
+            "message": "Freya is building a least-privilege agent for the planned task.",
+        })
+        try:
+            created = self.agent_factory.create(
+                task, orchestration_id=oid, attempt=attempt, variant=variant,
+            )
+        except Exception as exc:
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_factory.failed", "status": "Failed",
+                "task_id": planned_task_id, "attempt": attempt,
+                "message": "Dynamic agent creation failed: " + str(exc),
+            })
+            raise
+        agent = created["agent"]
+        event = {
+            "event_type": "freya.agent_created", "status": "Running",
+            "task_id": planned_task_id, "plan_task_id": planned_task_id,
+            "agent_id": agent["id"], "role": created["role"],
+            "skill_ids": created["skill_ids"],
+            "required_capabilities": created["required_capabilities"],
+            "effective_tools": created["effective_tools"],
+            "attempt": attempt, "factory_version": created["factory_version"],
+            "warnings": created["warnings"],
+            "message": "Freya created a task-specific ephemeral agent.",
+        }
+        self.store.add_orchestration_event(oid, event)
+        self.store.add_orchestration_event(oid, {
+            **event,
+            "event_type": "freya.agent_policy.validated",
+            "message": "The dynamic agent policy and derived tool surface were validated.",
+        })
+        return created
+
+    def _archive_dynamic_agents(self, oid: str) -> list[dict]:
+        archiver = getattr(self.store, "archive_dynamic_agents", None)
+        if not callable(archiver):
+            return []
+        try:
+            archived = archiver(oid)
+        except Exception as exc:
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_factory.failed",
+                "status": self.store.get_orchestration(oid)["status"],
+                "message": "Ephemeral agent archival failed: " + str(exc),
+            })
+            return []
+        status = self.store.get_orchestration(oid)["status"]
+        for agent in archived:
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.dynamic_agent.archived", "status": status,
+                "agent_id": agent["agent_id"],
+                "task_id": agent.get("plan_task_id"),
+                "plan_task_id": agent.get("plan_task_id"),
+                "attempt": agent.get("attempt"),
+                "factory_version": agent.get("factory_version"),
+                "message": "Freya archived an ephemeral agent after orchestration completion.",
+            })
+        return archived
 
     def _analyze_prompt(self, oid: str, prompt: str) -> tuple[dict | None, dict]:
         """Rewrite the human prompt once before any downstream planning."""
@@ -473,6 +532,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.failed", "status": "Failed", "message": message,
             })
+            self._archive_dynamic_agents(oid)
 
     def _fail_running(self, oid: str, message: str) -> None:
         with self.lock:
@@ -481,6 +541,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.failed", "status": "Failed", "message": message,
                 })
+                self._archive_dynamic_agents(oid)
 
     def _cancel_active_children(self, oid: str) -> None:
         for delegation in self.store.get_orchestration(oid).get("delegations", []):
@@ -554,43 +615,63 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self._fail_running(oid, message)
 
     def _select_graph_task(self, oid: str, task: dict, run: dict) -> dict | None:
-        """Select once for a ready node; cancellation may safely win while ranking."""
+        """Create or reuse one dynamic agent, then validate it with AgentSelector."""
         planned_task_id = task["id"]
         with self.lock:
             current_run = self.store.get_orchestration(oid)
             if current_run["status"] != "Running":
                 return None
-            node = next(item for item in self.store.get_execution_graph(oid)["nodes"]
-                        if item["plan_task_id"] == planned_task_id)
+            node = next(
+                item for item in self.store.get_execution_graph(oid)["nodes"]
+                if item["plan_task_id"] == planned_task_id
+            )
             selection_attempt = int(node.get("attempt", 0)) + 1
-            agents = self.store.list_agents()
             context = self._selection_context(current_run)
             required_agent_id = None
             excluded_agent_ids: list[str] = []
             if node.get("recovery_action_id"):
-                recovery = self.store.get_recovery(node["recovery_action_id"])
-                prior = next((item for item in self.store.list_execution_attempts(oid)
-                              if item["plan_task_id"] == planned_task_id
-                              and int(item["attempt"]) == int(recovery["source_attempt"])), None)
+                recovery_action = self.store.get_recovery(node["recovery_action_id"])
+                prior = next((
+                    item for item in self.store.list_execution_attempts(oid)
+                    if item["plan_task_id"] == planned_task_id
+                    and int(item["attempt"]) == int(recovery_action["source_attempt"])
+                ), None)
                 prior_agent_id = prior.get("selected_agent_id") if prior else None
-                if recovery["action"] == "retry_same_agent":
+                if recovery_action["action"] == "retry_same_agent":
                     required_agent_id = prior_agent_id
-                    agents = [item for item in agents if item.get("id") == required_agent_id]
-                elif recovery["action"] == "retry_different_agent":
+                elif recovery_action["action"] == "retry_different_agent":
                     prior_agent_ids = [
                         item.get("selected_agent_id")
                         for item in self.store.list_execution_attempts(oid)
                         if item["plan_task_id"] == planned_task_id
                     ]
                     excluded_agent_ids = list(dict.fromkeys([
-                        *recovery.get("exclude_agent_ids", []), *prior_agent_ids,
+                        *recovery_action.get("exclude_agent_ids", []),
+                        *prior_agent_ids,
                     ]))
                     excluded_agent_ids = [item for item in excluded_agent_ids if item]
                     context["excluded_agent_ids"] = excluded_agent_ids
+
+            try:
+                if required_agent_id:
+                    agents = [self.store.get_agent(required_agent_id)]
+                else:
+                    created = self._create_dynamic_agent(
+                        oid, task, selection_attempt,
+                        variant=max(0, selection_attempt - 1),
+                    )
+                    agents = [created["agent"]]
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                return {"error": "Dynamic agent creation or reuse failed: " + str(exc)}
+
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.agent_selection.started", "status": "Running",
                 "task_id": planned_task_id,
-                "message": "Freya is ranking existing agents for the ready planned task.",
+                "agent_id": agents[0].get("id") if agents else None,
+                "message": (
+                    "Freya is validating the task-specific agent against "
+                    "capabilities, Skills, runtime tools and policy."
+                ),
             })
         try:
             selection = self.selector.select_agent(task, agents, context)
@@ -611,7 +692,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             return {"error": "Agent selection failed: " + str(exc)}
         with self.lock:
             if selection["selected_agent_id"] is None:
-                selection["failure_reason"] = self._selection_failure_message(selection, agents)
+                selection["failure_reason"] = self._selection_failure_message(
+                    selection, agents
+                )
             selection_id = self.store.save_agent_selection(oid, selection)
             if selection_id is None:
                 return None
@@ -620,7 +703,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 failure_reason = selection["failure_reason"]
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.agent_selection.failed", "status": "Failed",
-                    "task_id": planned_task_id, "selector_version": selection["selector_version"],
+                    "task_id": planned_task_id,
+                    "selector_version": selection["selector_version"],
                     "selection_id": selection_id,
                     "message": failure_reason,
                 })
@@ -632,7 +716,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "selector_version": selection["selector_version"],
                     "classification": selection["classification"],
                     "approval_required": selection["approval_required"],
-                    "message": "Freya selected an existing agent for the ready planned task.",
+                    "message": "Freya validated and selected the dynamic agent.",
                 })
         return {"selection_id": selection_id, "selection": selection}
 
@@ -814,11 +898,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "recovery_model_calls_used": model_calls_used,
         }
         try:
+            current_agents = []
+            current_agent_id = target.get("selected_agent_id")
+            if current_agent_id:
+                try:
+                    current_agents = [self.store.get_agent(current_agent_id)]
+                except KeyError:
+                    current_agents = []
             with self.recovery_lock:
                 decision = self.recovery.decide(
                     planned_task=planned_task, execution_node=target,
                     evaluation=evaluation, history=history,
-                    available_agents=self.store.list_agents(), plan=plan, limits=limits,
+                    available_agents=current_agents, plan=plan, limits=limits,
+                    can_create_agent=True,
                 )
         except Exception as exc:
             decision = {
@@ -1019,6 +1111,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "event_type": "freya.completed" if status == "Success" else "freya.failed",
             "status": status, "message": message,
         })
+
+        self._archive_dynamic_agents(oid)
 
     def _run_graph(self, oid: str, running: dict, deadline: float,
                    operational_prompt: str = "") -> None:
@@ -1325,7 +1419,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] != "Planning":
                     return
-            context = self._planning_context(self.store.list_agents())
+            context = self._planning_context()
             if analysis is None:
                 raise ValueError("Task Analyst did not produce an operational prompt.")
             context["task_analysis"] = analysis
