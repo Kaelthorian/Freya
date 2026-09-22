@@ -67,19 +67,28 @@ does not turn that task into Python program creation.
 
 After planning, Freya creates one ephemeral least-privilege agent for each ready
 plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
-The factory uses only enabled registry Skills, caps assignments at eight, derives
-Tools from the complete task policy, and persists provenance for audit and
-terminal cleanup.
+The factory uses only enabled registry Skills, selects one minimal primary Skill
+for ordinary work (with at most one additional task-justified specialty), and
+keeps eight only as a safety ceiling. It derives Tools from the complete task
+policy and persists provenance for audit and terminal cleanup. Preferred Skills
+are filtered against task kind, role, recovery evidence and the real capability
+surface; they are not a request to fill the context with every compatible Skill.
+When a retry is selected, the orchestrator forwards only the bounded recovery
+reason/cause to the factory; that genuine recovery state may select `debugging`,
+while ordinary words such as “error” in an implementation objective do not.
 
 For a generic file, the Planner selects the builtin `simple-file-artifact` Skill
 and creates one dynamic worker with `filesystem.create` plus read-back
 `filesystem.read`. A Python Hello World task uses `python-development` and
 derives `filesystem.create`, `filesystem.read`, and `execution.python_script`.
 These low-risk flows finish after the requested artifact is written, read back,
-and, for Python, executed with exit code 0 and expected output. They do not need
+and, for Python, executed with exit code 0 and expected output. Their worker
+prompt is generated from the exact effective `box.schemas` surface, so an
+unassigned operation is neither described nor suggested. They do not need
 Git, a test suite, QA, or a Code Auditor. The Skill requirements are diagnostics
-only and never expand the task policy; an incompatible primary Skill is a
-planning error, while an incompatible optional Skill is omitted.
+only and never expand the task policy; an explicitly requested incompatible
+primary Skill is a planning error, while an irrelevant or incompatible optional
+Skill is omitted.
 
 Semantic evaluation has separate local-model configuration:
 
@@ -141,8 +150,11 @@ and every selected agent's normalized `who`/`where`/`when`/`what`/`how` trace,
 are visible together. A `NoProgressDetected` report means the worker repeated
 successful read-only actions without changing the workspace; raising
 `max_steps` alone is not a corrective action.
-`BlockedActionCycle` means three consecutive actions were denied or repeatedly
-blocked; identical policy denials are intercepted before a second underlying
+`BlockedActionCycle` means three consecutive model decisions were denied or
+otherwise deterministically blocked; an internal retry of one recoverable read
+does not count as additional model decisions. Policy denials, unavailable or
+unknown tools, invalid requests and approval denials are not automatically
+retried. Identical policy denials are intercepted before a second underlying
 tool invocation, then Freya stops that worker and diagnoses/replans instead of
 consuming the remaining step budget. A recovery retry receives bounded prior
 workspace state and may derive read-only inspection, but never overwrite

@@ -373,46 +373,139 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
     return resolved
 
 
-def render_skill(skill: dict[str, Any], *, full: bool = False) -> str:
+_TOOL_NAME_RE = {
+    "list_files": re.compile(r"\blist[_ ]files?\b|\bworkspace root\b|\bdiscover files?\b", re.I),
+    "read_file": re.compile(r"\bread[_ ]file\b", re.I),
+    "write_file": re.compile(r"\bwrite[_ ]file\b", re.I),
+    "edit_file": re.compile(r"\bedit[_ ]file\b", re.I),
+    "search_code": re.compile(r"\bsearch[_ ]code\b", re.I),
+    "git_diff": re.compile(r"\bgit[_ ]diff\b", re.I),
+    "run_command": re.compile(r"\brun[_ ]command\b", re.I),
+}
+
+
+def _step_requirement(step: str) -> tuple[set[str], set[str]]:
+    """Infer only explicit operational dependencies from a Skill step."""
+    lowered = step.casefold()
+    tools: set[str] = {name for name, pattern in _TOOL_NAME_RE.items() if pattern.search(step)}
+    capabilities: set[str] = set()
+    if re.search(r"\b(?:pytest|pytest tests?)\b", lowered):
+        capabilities.add("execution.pytest")
+    if re.search(r"\bunittest\b", lowered):
+        capabilities.add("execution.unittest")
+    if re.search(r"\b(?:py_compile|compile|syntax)\b", lowered):
+        capabilities.add("execution.py_compile")
+    if re.search(r"\b(?:git diff|resulting diff|repository diff)\b", lowered):
+        tools.add("git_diff")
+    if re.search(r"\b(?:search code|search the workspace|locate relevant)\b", lowered):
+        tools.add("search_code")
+    if re.search(r"\b(?:list files|discover files|inspect the workspace root)\b", lowered):
+        tools.add("list_files")
+    if re.search(r"\b(?:run|execute|launch)\b", lowered):
+        tools.add("run_command")
+    if re.search(r"\b(?:read|inspect)\b", lowered):
+        tools.add("read_file")
+    if re.search(r"\b(?:create|write|implement|modify|edit)\b", lowered):
+        tools.add("write_file")
+    return tools, capabilities
+
+
+def _adapt_step(step: str, available_tools: set[str] | None,
+                available_capabilities: set[str] | None) -> str | None:
+    """Keep Skill guidance only when its concrete operation is possible."""
+    if available_tools is None and available_capabilities is None:
+        return step
+    available_tools = available_tools or set()
+    available_capabilities = available_capabilities or set()
+    required_tools, required_capabilities = _step_requirement(step)
+    lowered = step.casefold()
+    if re.search(r"\bvalidate syntax\b", lowered) and "execution.py_compile" not in available_capabilities:
+        if "run_command" in available_tools and "execution.python_script" in available_capabilities:
+            return "Execute the program and verify its observable output."
+        return None
+    if re.search(r"\brun relevant tests? when available\b", lowered):
+        if not ({"execution.pytest", "execution.unittest"} & available_capabilities):
+            return None
+        return "Run the available focused test command."
+    if required_tools - available_tools or required_capabilities - available_capabilities:
+        return None
+    if step.strip().casefold() == "inspect relevant existing files." and "read_file" in available_tools:
+        return "Read a known relevant file only when needed."
+    if step.strip().casefold() == "identify affected code." and "read_file" not in available_tools:
+        return None
+    if re.search(r"\binspect the resulting diff\b", lowered) and "git_diff" not in available_tools:
+        return None
+    if re.search(r"\binspect the implementation\b", lowered) and "read_file" in available_tools:
+        return "Read the implementation file when its path is known."
+    return step
+
+
+def render_skill(skill: dict[str, Any], *, full: bool = False,
+                 available_tools: set[str] | None = None,
+                 available_capabilities: set[str] | None = None) -> str:
     lines = [f"## {skill['name']}", f"Priority: {int(skill.get('priority', 0))}", f"Version: {skill['version']}", f"Category: {skill.get('category', 'General')}",
              f"Operational: {skill.get('operational', False)}"]
     if skill.get("description"):
         lines.extend(["Purpose:", skill["description"]])
+    available_tools = None if available_tools is None else set(available_tools)
+    available_capabilities = None if available_capabilities is None else set(available_capabilities)
     instructions = skill.get("instructions", [])
     if instructions:
         lines.append("Instructions:")
-        lines.extend(f"- {item}" for item in instructions[:12])
+        visible_instructions = [
+            adapted for item in instructions[:12]
+            if (adapted := _adapt_step(item, available_tools, available_capabilities))
+        ]
+        lines.extend(f"- {item}" for item in visible_instructions)
     if full and skill.get("procedures"):
         lines.append("Relevant procedures:")
         for procedure in skill["procedures"][:5]:
+            steps = [
+                adapted for step in procedure.get("steps", [])[:MAX_STEPS]
+                if (adapted := _adapt_step(step, available_tools, available_capabilities))
+            ]
+            if not steps and procedure.get("steps"):
+                continue
             lines.append(f"### {procedure['name']}")
             if procedure.get("description"):
                 lines.append(procedure["description"])
-            lines.extend(f"{index}. {step}" for index, step in enumerate(procedure.get("steps", [])[:MAX_STEPS], 1))
+            lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
     elif skill.get("procedures"):
-        lines.append("Procedures: " + "; ".join(item["name"] for item in skill["procedures"][:5]))
-    if skill.get("required_capabilities"):
-        lines.append("Required capabilities: " + ", ".join(skill["required_capabilities"]))
-    if skill.get("recommended_capabilities"):
-        lines.append("Recommended capabilities: " + ", ".join(skill["recommended_capabilities"][:12]))
-    if skill.get("missing_required_capabilities"):
-        lines.append("Missing required capabilities: " + ", ".join(skill["missing_required_capabilities"]))
-    if skill.get("missing_required_tools"):
-        lines.append("Missing tools/runtime support: " + ", ".join(skill["missing_required_tools"]))
-    if skill.get("missing_recommended_capabilities"):
-        lines.append("Missing recommended capabilities: " + ", ".join(skill["missing_recommended_capabilities"]))
-    if skill.get("missing_recommended_tools"):
-        lines.append("Missing recommended tools/runtime support: " + ", ".join(skill["missing_recommended_tools"]))
+        visible_procedures = []
+        for procedure in skill["procedures"][:5]:
+            steps = [
+                adapted for step in procedure.get("steps", [])[:MAX_STEPS]
+                if (adapted := _adapt_step(step, available_tools, available_capabilities))
+            ]
+            if steps:
+                visible_procedures.append(procedure["name"])
+        if visible_procedures:
+            lines.append("Procedures: " + "; ".join(visible_procedures))
+    # Required capabilities describe the already-authorized contract.  The
+    # recommended and missing fields remain internal diagnostics and are never
+    # operational instructions for the worker.
+    visible_required = [capability for capability in skill.get("required_capabilities", [])
+                        if not available_capabilities or capability in available_capabilities]
+    if visible_required:
+        lines.append("Required capabilities: " + ", ".join(visible_required))
     return "\n".join(lines)
 
 
-def skills_context(skills: Iterable[dict[str, Any]], *, full: bool = False) -> str:
+def skills_context(skills: Iterable[dict[str, Any]], *, full: bool = False,
+                   available_tools: Iterable[str] | None = None,
+                   available_capabilities: Iterable[str] | None = None) -> str:
     selected = [skill for skill in skills if skill.get("active", True)]
     if not selected:
         return "No active skills assigned."
     detailed = len(selected) <= 3
+    tools = None if available_tools is None else set(available_tools)
+    capabilities = None if available_capabilities is None else set(available_capabilities)
     header = "Use skill procedures as guidance. Adapt them when steps are irrelevant or impossible.\n\n"
-    context = header + "\n\n".join(render_skill(skill, full=full or detailed or bool(skill.get("relevance"))) for skill in selected)
+    context = header + "\n\n".join(
+        render_skill(skill, full=full or detailed or bool(skill.get("relevance")),
+                     available_tools=tools, available_capabilities=capabilities)
+        for skill in selected
+    )
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[:MAX_CONTEXT_CHARS - 45].rstrip() + "\n[Skill context truncated for budget.]"
     return context

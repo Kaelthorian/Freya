@@ -43,6 +43,11 @@ TASK_FIELDS = {
     "id", "objective", "description", "depends_on", "required_capabilities",
     "preferred_skills", "success_criteria",
 }
+TASK_METADATA_FIELDS = {"task_kind", "task_characteristics"}
+TASK_KIND_VALUES = {
+    "file_creation", "program_creation", "code_change", "review", "testing",
+    "analysis", "external_action", "general",
+}
 
 PLAN_RESPONSE_FORMAT = {
     "type": "object",
@@ -66,6 +71,8 @@ PLAN_RESPONSE_FORMAT = {
                     },
                     "preferred_skills": {"type": "array", "items": {"type": "string"}},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
+                    "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
+                    "task_characteristics": {"type": "object"},
                 },
                 "required": sorted(TASK_FIELDS),
                 "additionalProperties": False,
@@ -381,6 +388,7 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
             capabilities.append("filesystem.read")
         if (task_kind == "program_creation"
                 and requires_code_execution
+                and python_hint
                 and not windows_script
                 and not any(capability.startswith("execution.") for capability in capabilities)):
             capabilities.append("execution.python_script")
@@ -416,11 +424,18 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
             if "simple-file-artifact" not in preferred:
                 preferred.insert(0, "simple-file-artifact")
             current["preferred_skills"] = preferred[:MAX_PREFERRED_SKILLS]
-        elif task_kind == "program_creation" and (python_hint or requires_code_execution):
+        elif task_kind == "program_creation" and python_hint:
             preferred = list(current.get("preferred_skills", []))
             if "python-development" not in preferred:
                 preferred.insert(0, "python-development")
             current["preferred_skills"] = preferred[:MAX_PREFERRED_SKILLS]
+        # Preserve the analyst's normalized semantic hints in the durable plan
+        # so AgentFactory does not have to rediscover them from loose prose.
+        current["task_kind"] = task_kind
+        current["task_characteristics"] = {
+            key: value for key, value in characteristics.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
         current["required_capabilities"] = capabilities[:MAX_CAPABILITIES]
         updated_tasks.append(current)
 
@@ -513,11 +528,11 @@ class OllamaPlanner:
             self.last_call_metrics["duration_seconds"] = round(time.monotonic() - started, 4)
 
 
-def _object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
+def _object(value: Any, fields: set[str], label: str, *, optional: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PlanValidationError(f"{label} must be an object.")
     missing = fields - value.keys()
-    unknown = value.keys() - fields
+    unknown = value.keys() - (fields | (optional or set()))
     if missing:
         raise PlanValidationError(f"{label} is missing fields: {', '.join(sorted(missing))}.")
     if unknown:
@@ -581,7 +596,7 @@ def normalize_plan(value: Any) -> dict[str, Any]:
         raise PlanValidationError("plan.tasks must not be empty.")
     tasks: list[dict[str, Any]] = []
     for index, item in enumerate(raw_tasks):
-        task = _object(item, TASK_FIELDS, f"plan.tasks[{index}]")
+        task = _object(item, TASK_FIELDS, f"plan.tasks[{index}]", optional=TASK_METADATA_FIELDS)
         capabilities = _text_list(
             task["required_capabilities"], f"plan.tasks[{index}].required_capabilities",
             MAX_CAPABILITIES, identifiers=False,
@@ -589,7 +604,7 @@ def normalize_plan(value: Any) -> dict[str, Any]:
         for capability in capabilities:
             if capability not in CAPABILITY_REGISTRY:
                 raise PlanValidationError(f"Unknown capability: {capability}.")
-        tasks.append({
+        normalized_task = {
             "id": _identifier(task["id"], f"plan.tasks[{index}].id"),
             "objective": _text(task["objective"], f"plan.tasks[{index}].objective", MAX_OBJECTIVE_CHARS),
             "description": _text(task["description"], f"plan.tasks[{index}].description", MAX_DESCRIPTION_CHARS),
@@ -602,7 +617,22 @@ def normalize_plan(value: Any) -> dict[str, Any]:
             "success_criteria": _text_list(task["success_criteria"],
                                             f"plan.tasks[{index}].success_criteria",
                                             MAX_CRITERIA, allow_empty=False),
-        })
+        }
+        if "task_kind" in task:
+            task_kind = _text(task["task_kind"], f"plan.tasks[{index}].task_kind", 64).casefold()
+            if task_kind not in TASK_KIND_VALUES:
+                raise PlanValidationError(f"Unknown task kind: {task_kind}.")
+            normalized_task["task_kind"] = task_kind
+        if "task_characteristics" in task:
+            characteristics = task["task_characteristics"]
+            if not isinstance(characteristics, dict) or any(
+                    not isinstance(key, str) or not isinstance(value, bool)
+                    for key, value in characteristics.items()):
+                raise PlanValidationError(
+                    f"plan.tasks[{index}].task_characteristics must be a boolean object."
+                )
+            normalized_task["task_characteristics"] = dict(characteristics)
+        tasks.append(normalized_task)
     # Task count is the authoritative structural signal. Models sometimes label
     # an otherwise valid multi-task graph as simple; canonicalize that harmless
     # inconsistency instead of preserving contradictory data.

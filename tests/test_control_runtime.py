@@ -156,6 +156,54 @@ class WorkerTests(unittest.TestCase):
                             for item in evidence))
         self.assertTrue(any(item["tool"] == "run_command" for item in result["result"]["actions"]))
 
+    def test_worker_prompt_describes_only_the_effective_toolbox(self):
+        self.run_worker([answer("Finished.")], tools=["read_file", "write_file", "run_command"],
+                         config={"permissions": "execute"})
+        prompt = self.payloads[0]["messages"][0]["content"]
+        for name in ("read_file", "write_file", "run_command"):
+            self.assertIn(name, prompt)
+        for name in ("list_files", "search_code", "git_diff", "edit_file"):
+            self.assertNotIn(name, prompt)
+        self.assertNotIn("filesystem.list", prompt)
+        self.assertNotIn("filesystem.search", prompt)
+        self.assertNotIn("request_missing_capabilities", prompt)
+        self.assertNotIn("request_new_capabilities", prompt)
+
+    def test_unavailable_and_unknown_actions_do_not_request_capabilities_or_cycle(self):
+        result = self.run_worker([
+            answer(calls=[("list_files", {"path": "."})]),
+            answer(calls=[("request_missing_capabilities", {"capability": "filesystem.list"})]),
+            answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')\n"})]),
+            answer("Created hello.py."),
+        ], tools=["read_file", "write_file", "run_command"])
+        self.assertEqual(result["status"], "Success", result["error"])
+        steps = [event["event"] for event in self.events
+                 if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual([item["error_class"] for item in steps[:2]], ["tool_unavailable", "unknown_tool"])
+        self.assertEqual(sum(event.get("event", {}).get("event_type") == "capability.requested"
+                             for event in self.events), 0)
+        self.assertFalse(any(event.get("event", {}).get("event_type") == "task.blocked"
+                             for event in self.events))
+        self.assertEqual((self.workspace / "hello.py").read_text(), "print('Hello World')\n")
+
+    def test_policy_denial_is_not_retried_even_when_read_retries_are_configured(self):
+        policy = {
+            "capabilities": {
+                "filesystem": {"read": {"mode": "allow", "paths": ["allowed/**"]}},
+                "execution": {}, "git": {},
+            }
+        }
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "missing.txt"})]),
+            answer("The file is unavailable."),
+        ], tools=["read_file"], config={"retries": 2, "capability_policy": policy})
+        self.assertEqual(result["status"], "Success")
+        self.assertEqual(result["tool_calls"], 1)
+        steps = [event["event"] for event in self.events
+                 if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["error_class"], "policy_denied")
+
     def test_simple_file_is_verified_by_readback_without_git_or_tests(self):
         result = self.run_worker([
             answer(calls=[("write_file", {"path": "hola_mundo.txt", "content": "hola mundo"})]),

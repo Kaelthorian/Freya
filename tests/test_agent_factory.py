@@ -1,4 +1,5 @@
 import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from control_center.recovery import RecoveryController
 from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.task_analyst import TaskAnalyst
+from control_center.worker import run_task
 
 
 def planned_task(**changes):
@@ -133,6 +135,132 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertIn("read_file", created["agent"]["tools"])
         self.assertIn("write_file", created["agent"]["tools"])
 
+    def test_trivial_program_filters_irrelevant_preferred_skills(self):
+        created = self.create(planned_task(
+            objective="Create a Python program that prints Hello World",
+            description="Implement and execute one non-interactive Python program.",
+            task_kind="program_creation",
+            task_characteristics={
+                "interactive": False, "requires_user_input": False,
+                "requires_code_execution": True,
+            },
+            required_capabilities=[
+                "filesystem.create", "filesystem.read", "execution.python_script",
+            ],
+            preferred_skills=[
+                "python-development", "simple-file-artifact",
+                "interactive-testing", "debugging",
+            ],
+        ))
+        self.assertEqual(created["skill_ids"], ["python-development"])
+        self.assertEqual(created["agent"]["config"]["orchestration_role"], "worker")
+
+    def test_hello_world_python_flow_uses_minimal_agent_and_real_evidence(self):
+        built = self.create(planned_task(
+            objective="Create a Python program that prints Hello World",
+            description="Implement one non-interactive Python program and verify stdout.",
+            task_kind="program_creation",
+            task_characteristics={"interactive": False, "requires_code_execution": True},
+            required_capabilities=[
+                "filesystem.create", "filesystem.read", "execution.python_script",
+            ],
+            preferred_skills=[
+                "python-development", "simple-file-artifact", "interactive-testing", "debugging",
+            ],
+            success_criteria=["The program outputs 'Hello World' when executed"],
+        ))
+        agent = built["agent"]
+        self.assertEqual(built["skill_ids"], ["python-development"])
+        self.assertEqual(agent["tools"], ["read_file", "write_file", "run_command"])
+
+        def answer(content="Finished.", calls=None):
+            value = {"message": {"role": "assistant", "content": content},
+                     "prompt_eval_count": 1, "eval_count": 1}
+            if calls:
+                value["message"]["tool_calls"] = [
+                    {"function": {"name": name, "arguments": args}}
+                    for name, args in calls
+                ]
+            return value
+
+        responses = iter([
+            answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')\n"})]),
+            answer(calls=[("read_file", {"path": "hello.py"})]),
+            answer(calls=[("run_command", {"argv": ["python", "hello.py"]})]),
+            answer("Created and verified hello.py."),
+        ])
+        events = []
+        config = copy.deepcopy(agent["config"])
+        config["verification"] = {
+            "enabled": True, "inspect_changes": False, "run_available_tests": False,
+            "require_tool_evidence": True,
+            "completion_criteria": ["The program outputs 'Hello World' when executed"],
+        }
+        result = run_task(
+            {"config": config, "tools": agent["tools"], "workspace": str(self.root / "workspace"),
+             "prompt": "Create the Hello World Python program."},
+            self.root, events.append, lambda: None,
+            transport=lambda *args, **kwargs: next(responses),
+            approval_handler=lambda request: "approved_task",
+        )
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertTrue(result["verification"]["passed"])
+        command = next(item for item in result["verification"]["evidence"]
+                       if item.get("type") == "command_execution")
+        self.assertEqual(command["exit_code"], 0)
+        self.assertIn("Hello World", command["output"])
+        self.assertFalse(any(event.get("event", {}).get("event_type") == "task.blocked"
+                             for event in events))
+
+    def test_hola_txt_flow_uses_file_skill_readback_and_no_execution_tool(self):
+        built = self.create(planned_task(
+            objective="Create hola.txt with hola mundo",
+            description="Create one text artifact and verify its contents by reading it back.",
+            task_kind="file_creation",
+            required_capabilities=["filesystem.create", "filesystem.read"],
+            preferred_skills=["simple-file-artifact", "python-development", "debugging", "interactive-testing"],
+        ))
+        self.assertEqual(built["skill_ids"], ["simple-file-artifact"])
+        self.assertEqual(built["agent"]["tools"], ["read_file", "write_file"])
+        responses = iter([
+            {"message": {"role": "assistant", "content": "", "tool_calls": [{
+                "function": {"name": "write_file", "arguments": {"path": "hola.txt", "content": "hola mundo"}}
+            }]}, "prompt_eval_count": 1, "eval_count": 1},
+            {"message": {"role": "assistant", "content": "", "tool_calls": [{
+                "function": {"name": "read_file", "arguments": {"path": "hola.txt"}}
+            }]}, "prompt_eval_count": 1, "eval_count": 1},
+            {"message": {"role": "assistant", "content": "Created and verified hola.txt."},
+             "prompt_eval_count": 1, "eval_count": 1},
+        ])
+        config = copy.deepcopy(built["agent"]["config"])
+        config["verification"] = {
+            "enabled": True, "inspect_changes": False, "run_available_tests": False,
+            "require_tool_evidence": True, "completion_criteria": ["The file contains 'hola mundo'"],
+        }
+        result = run_task(
+            {"config": config, "tools": built["agent"]["tools"], "workspace": str(self.root / "workspace"),
+             "prompt": "Create hola.txt with hola mundo."},
+            self.root, lambda event: None, lambda: None,
+            transport=lambda *args, **kwargs: next(responses),
+        )
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertTrue((self.root / "workspace" / "hola.txt").read_text(encoding="utf-8") == "hola mundo")
+
+    def test_trivial_file_filters_program_debug_and_interactive_skills(self):
+        created = self.create(planned_task(
+            objective="Create hola.txt with hola mundo",
+            description="Create one text artifact and verify it by reading it back.",
+            task_kind="file_creation",
+            required_capabilities=["filesystem.create", "filesystem.read"],
+            preferred_skills=[
+                "simple-file-artifact", "python-development",
+                "debugging", "interactive-testing",
+            ],
+        ))
+        self.assertEqual(created["skill_ids"], ["simple-file-artifact"])
+
     def test_recovery_workspace_state_derives_safe_read_without_overwrite(self):
         created = self.create(planned_task(
             required_capabilities=["filesystem.create", "execution.python_script"],
@@ -147,6 +275,16 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertNotIn("filesystem.overwrite", created["required_capabilities"])
         self.assertEqual(self.active_modes(agent)["filesystem.read"], "allow")
         self.assertEqual(self.active_modes(agent).get("filesystem.overwrite"), None)
+
+    def test_recovery_state_selects_debugging_without_debug_words_in_objective(self):
+        created = self.create(planned_task(
+            objective="Create hola.txt with hola mundo",
+            task_kind="file_creation",
+            required_capabilities=["filesystem.create", "filesystem.read"],
+            preferred_skills=["simple-file-artifact", "debugging"],
+            _recovery_reason="The previous attempt did not produce the required artifact.",
+        ))
+        self.assertEqual(created["skill_ids"], ["debugging"])
 
     def test_exact_preferred_skill_is_assigned_when_compatible(self):
         agent = self.create(planned_task())["agent"]

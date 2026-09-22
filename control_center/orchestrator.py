@@ -496,6 +496,23 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 })
         return analysis, metrics
 
+    def _require_ready_analysis(self, oid: str, analysis: dict | None) -> dict:
+        """Fail closed when the Task Analyst requires user input before planning."""
+        if not isinstance(analysis, dict):
+            raise ValueError("Task Analyst did not produce a structured analysis.")
+        if analysis.get("ready_for_execution") is True:
+            return analysis
+        reason = str(analysis.get("blocking_reason") or "The Task Analyst did not authorize execution.").strip()
+        message = "Task Analyst blocked execution: " + reason
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] == "Planning":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.task_analysis.blocked", "status": "Failed",
+                    "blocking_reason": reason,
+                    "message": message,
+                })
+        raise ValueError(message)
+
     def _select_planned_task(self, oid: str, task: dict, run: dict) -> dict | None:
         planned_task_id = task["id"]
         with self.lock:
@@ -666,8 +683,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
             required_agent_id = None
             excluded_agent_ids: list[str] = []
             recovery_workspace_state: dict[str, Any] = {}
+            recovery_reason = ""
+            recovery_cause = ""
+            recovery_failure_class = ""
             if node.get("recovery_action_id"):
                 recovery_action = self.store.get_recovery(node["recovery_action_id"])
+                recovery_reason = str(recovery_action.get("reason") or "").strip()
                 recovery_workspace_state = dict(
                     (recovery_action.get("snapshot") or {}).get("workspace_state") or {}
                 )
@@ -676,6 +697,21 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     if item["plan_task_id"] == planned_task_id
                     and int(item["attempt"]) == int(recovery_action["source_attempt"])
                 ), None)
+                source_runtime_task = (
+                    self.store.get_task(prior.get("runtime_task_id"))
+                    if prior and prior.get("runtime_task_id") else None
+                )
+                if isinstance(source_runtime_task, dict):
+                    recovery_failure_class = str(
+                        source_runtime_task.get("failure_class")
+                        or source_runtime_task.get("error_class")
+                        or ""
+                    ).strip()
+                    recovery_cause = str(source_runtime_task.get("error") or "").strip()
+                    verification = source_runtime_task.get("verification")
+                    if not recovery_cause and isinstance(verification, dict):
+                        recovery_cause = str(verification.get("summary") or "").strip()
+                recovery_cause = recovery_cause or recovery_reason
                 prior_agent_id = prior.get("selected_agent_id") if prior else None
                 if recovery_action["action"] == "retry_same_agent":
                     required_agent_id = prior_agent_id
@@ -699,6 +735,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     factory_task = dict(task)
                     if recovery_workspace_state:
                         factory_task["_recovery_workspace_state"] = recovery_workspace_state
+                    if recovery_reason:
+                        factory_task["_recovery_reason"] = recovery_reason
+                    if recovery_failure_class:
+                        factory_task["_recovery_failure_class"] = recovery_failure_class
+                    if recovery_cause:
+                        factory_task["_recovery_cause"] = recovery_cause
                     created = self._create_dynamic_agent(
                         oid, factory_task, selection_attempt,
                         variant=max(0, selection_attempt - 1),
@@ -1470,8 +1512,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if self.store.get_orchestration(oid)["status"] != "Planning":
                     return
             context = self._planning_context()
-            if analysis is None:
-                raise ValueError("Task Analyst did not produce an operational prompt.")
+            analysis = self._require_ready_analysis(oid, analysis)
             context["task_analysis"] = analysis
             operational_prompt = str(analysis.get("operational_prompt") or "").strip()
             if not operational_prompt:
@@ -1551,8 +1592,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         planning_metrics: dict = {}
         try:
             analysis, analysis_metrics = self._analyze_prompt(oid, planning["prompt"])
-            if analysis is None:
-                raise ValueError("Task Analyst did not produce an operational prompt.")
+            analysis = self._require_ready_analysis(oid, analysis)
             operational_prompt = str(analysis.get("operational_prompt") or "").strip()
             agents = self.store.list_agents()
             context = self._planning_context(agents)

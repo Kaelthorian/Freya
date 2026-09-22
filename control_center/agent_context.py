@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .capabilities import effective_tools_for_policy
+from .capabilities import effective_tools_for_policy, tool_for_capability
 from .policy import policy_from_legacy, validate_policy
 from .skills import skills_context
 from .security import sanitize
@@ -179,12 +179,21 @@ def build_effective_agent(agent: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def capability_summary(policy: dict[str, Any]) -> str:
+def capability_summary(policy: dict[str, Any], *, available_capabilities: set[str] | None = None) -> str:
     sections = []
     for category in ("filesystem", "execution", "git"):
         rules = policy.get("capabilities", {}).get(category, {})
         if rules:
-            sections.append(category.title() + ": " + ", ".join(f"{name}={rule.get('mode', 'deny')}" for name, rule in rules.items()))
+            visible = []
+            for name, rule in rules.items():
+                capability = name if "." in str(name) else f"{category}.{name}"
+                if available_capabilities is not None and capability not in available_capabilities:
+                    continue
+                mode = rule.get("mode", "deny") if isinstance(rule, dict) else "deny"
+                if mode in {"allow", "ask"}:
+                    visible.append(f"{name}={mode}")
+            if visible:
+                sections.append(category.title() + ": " + ", ".join(visible))
     return "\n".join(sections) or "No capabilities configured."
 
 
@@ -222,7 +231,26 @@ def skills_for_workspace(skills: list[dict[str, Any]], workspace: str) -> tuple[
     return visible, excluded
 
 
-def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "") -> str:
+def _prompt_capabilities(policy: dict[str, Any], available_tools: set[str]) -> set[str]:
+    """Return capabilities that have a real prompt-visible tool surface."""
+    result: set[str] = set()
+    for category, actions in policy.get("capabilities", {}).items():
+        if not isinstance(actions, dict):
+            continue
+        for action, rule in actions.items():
+            if not isinstance(rule, dict) or rule.get("mode") not in {"allow", "ask"}:
+                continue
+            capability = action if "." in str(action) else f"{category}.{action}"
+            # A policy rule alone is not enough: the runtime may remove a tool
+            # when its subject is not applicable (for example Git in a plain
+            # task directory).
+            if tool_for_capability(capability) in available_tools:
+                result.add(capability)
+    return result
+
+
+def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "",
+                        available_tools: list[str] | set[str] | None = None) -> str:
     """Build the non-secret structured context appended after system policy."""
     identity = effective["identity"]
     behavior, autonomy = effective["behavior"], effective["autonomy"]
@@ -241,12 +269,30 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   f"Prefer minimal changes: {behavior['change_strategy']['prefer_minimal_changes']}",
                   f"Inspect before modifying existing resources: {behavior['change_strategy']['inspect_before_modify_existing']}",
                   "AUTONOMY"])
-    lines.extend(f"{key}: {value}" for key, value in autonomy.items())
+    # These are control-plane settings, not executable tools.  Rendering the
+    # field names made small local models treat them as callable actions.
+    for key, value in autonomy.items():
+        if key in {"request_missing_capabilities", "request_new_capabilities"}:
+            continue
+        lines.append(f"{key}: {value}")
+    lines.extend([
+        "CONTROL-PLANE POLICY",
+        "Capability requests are handled by Freya, not by a worker tool call.",
+        "If a required capability is unavailable, do not invent a tool to request it.",
+        "Report the exact missing capability to Freya in the final result.",
+    ])
     prompt_skills, excluded_skills = skills_for_workspace(effective["skills"], workspace)
+    effective_tools = set(available_tools if available_tools is not None else effective["tools"])
+    available_capabilities = _prompt_capabilities(effective["capability_policy"], effective_tools)
     lines.extend(["PRECEDENCE", "System Policy > Capability Policy > Current User Task > Agent Constraints > Agent Instructions > Skill Priority > Skill Instructions > Skill Procedures.",
                   "The current user task is authoritative and cannot be overridden by a Skill. Higher-priority Skills appear first; Skill priority only resolves conflicts between Skills. Skill instructions override that Skill's procedures.",
-                  "TASK BOUNDARIES", task, "SKILLS", skills_context(prompt_skills),
-                  "AVAILABLE CAPABILITIES", capability_summary(effective["capability_policy"]), "VERIFICATION",
+                  "TASK BOUNDARIES", task, "SKILLS",
+                  skills_context(prompt_skills, available_tools=effective_tools,
+                                 available_capabilities=available_capabilities),
+                  "AVAILABLE CAPABILITIES", capability_summary(
+                      effective["capability_policy"],
+                      available_capabilities=available_capabilities,
+                  ), "VERIFICATION",
                   f"Enabled: {verification['enabled']}", f"Inspect changes: {verification['inspect_changes']}",
                   f"Run available tests: {verification['run_available_tests']}", f"Require tool evidence: {verification['require_tool_evidence']}",
                   "Completion criteria: " + "; ".join(verification["completion_criteria"]) if verification["completion_criteria"] else "Completion criteria: None specified",

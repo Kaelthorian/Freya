@@ -86,13 +86,16 @@ class AgentFactory:
     def orchestration_role(task: dict[str, Any]) -> str:
         preferred = {_slug(item) for item in task.get("preferred_skills", [])}
         text = " ".join(
-            str(task.get(key) or "") for key in ("objective", "description")
+            str(task.get(key) or "") for key in ("objective", "description", "task_type")
         ).casefold()
-        if ("code-review" in preferred
-                or re.search(r"\b(?:code audit|code auditor|code review)\b", text)):
+        task_kind = AgentFactory.task_kind(task)
+        characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
+        interactive = bool(characteristics.get("interactive") or characteristics.get("requires_user_input"))
+        interactive = interactive or bool(re.search(r"(?<!non-)\b(?:interactive|input|qa|quality assurance)\b", text))
+        explicit_review = bool(re.search(r"\b(?:code audit|code auditor|code review|audit the code|review the code)\b", text))
+        if (task_kind == "review" or explicit_review) and "code_change" not in task_kind:
             return "auditor"
-        if ("interactive-testing" in preferred
-                or re.search(r"\b(?:qa|quality assurance|interactive test)\b", text)):
+        if (task_kind == "testing" and interactive) or (interactive and "interactive-testing" in preferred):
             return "qa"
         return "worker"
 
@@ -108,7 +111,12 @@ class AgentFactory:
 
     def select_skills(self, task: dict[str, Any], skills: Iterable[dict[str, Any]],
                       *, variant: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
-        """Select up to eight enabled existing Skills without changing policy."""
+        """Select the smallest useful Skill set without changing policy.
+
+        ``max_skills`` remains a safety ceiling.  It is deliberately not used
+        as a target: ordinary implementation tasks receive one primary Skill,
+        and only a clearly distinct, task-required specialty may be added.
+        """
         available = [
             item for item in skills
             if isinstance(item, dict) and item.get("enabled") is True
@@ -139,67 +147,158 @@ class AgentFactory:
             str(item).strip() for item in task.get("preferred_skills", [])
             if str(item).strip()
         ]
-        for index, requested in enumerate(preferred):
+        preferred_records: list[tuple[str, dict[str, Any] | None]] = []
+        for requested in preferred:
             skill = by_id.get(requested.casefold())
-            match_priority = 1000 - index
             if skill is None:
                 skill = by_normalized.get(_slug(requested))
-                match_priority = 900 - index
             if skill is None:
                 warnings.append(
                     f"Preferred Skill '{requested}' is not registered and was ignored."
                 )
-                continue
-            missing = sorted(_skill_required(skill) - required)
-            if missing:
-                if not selected:
-                    raise ValueError(
-                        f"Primary Skill '{skill['id']}' is incompatible with the planned capability set: "
-                        + ", ".join(missing)
-                    )
-                warnings.append(
-                    f"Optional Skill '{skill['id']}' was omitted because the plan lacks: "
-                    + ", ".join(missing)
-                )
-                continue
-            add(skill, match_priority)
+            preferred_records.append((requested, skill))
 
         task_text = " ".join([
             str(task.get("objective") or ""),
             str(task.get("description") or ""),
+            str(task.get("task_type") or ""),
             " ".join(preferred),
         ])
-        task_tokens = _tokens(task_text)
-        scored: list[tuple[int, str, dict[str, Any]]] = []
-        for skill in available:
-            if str(skill["id"]) in selected_ids or not _skill_required(skill) <= required:
-                continue
-            metadata = " ".join([
-                str(skill.get("name") or ""),
-                str(skill.get("category") or ""),
-                *[str(item) for item in skill.get("tags", [])],
-            ])
-            score = len(task_tokens & _tokens(metadata))
-            if score:
-                scored.append((score, str(skill["id"]), skill))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        if variant and len(scored) > 1:
-            offset = variant % len(scored)
-            scored = scored[offset:] + scored[:offset]
-        for score, _, skill in scored:
-            add(skill, 100 + score)
-
+        intent_text = " ".join([
+            str(task.get("objective") or ""),
+            str(task.get("description") or ""),
+            str(task.get("task_type") or ""),
+        ])
         role = self.orchestration_role(task)
-        fallback_ids = {
-            "qa": ("interactive-testing", "software-testing"),
-            "auditor": ("code-review",),
-            "worker": (("simple-file-artifact",) if self.task_kind(task) == "file_creation"
-                       else ("python-development", "debugging")),
-        }[role]
-        for fallback_id in fallback_ids:
-            skill = by_id.get(fallback_id)
-            if skill is not None and _skill_required(skill) <= required:
-                add(skill, 10)
+        task_kind = self.task_kind(task)
+        characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
+        interactive = bool(characteristics.get("interactive") or characteristics.get("requires_user_input"))
+        interactive = interactive or bool(re.search(r"(?<!non-)\b(?:interactive|input|qa|quality assurance)\b", task_text, re.I))
+        recovery_text = " ".join(str(task.get(key) or "") for key in (
+            "_recovery_reason", "_recovery_failure_class", "_recovery_cause",
+        )).casefold()
+        # A normal implementation may mention errors or fixes without being a
+        # debugging task.  Reserve the Skill for explicit diagnostic intent or
+        # an actual recovery attempt supplied by the orchestrator.
+        debug_requested = (
+            task_kind == "analysis"
+            or bool(re.search(
+                r"\b(?:debug(?:ging)?|diagnos(?:e|is|tic)?|root cause|bug|arregla(?:r)?|soluciona(?:r)?)\b",
+                intent_text, re.I,
+            ))
+            or any(str(task.get(key) or "").strip() for key in (
+                "_recovery_reason", "_recovery_failure_class", "_recovery_cause",
+            ))
+        )
+        python_requested = bool(re.search(r"\bpython\b|\.py\b|python-development", task_text, re.I))
+        python_requested = python_requested or bool(required & {
+            "execution.python_script", "execution.py_compile", "execution.pytest", "execution.unittest",
+        })
+        if role == "auditor":
+            canonical_ids = ["code-review"]
+        elif role == "qa":
+            canonical_ids = ["interactive-testing", "software-testing"] if interactive else ["software-testing"]
+        elif task_kind == "analysis" or debug_requested:
+            canonical_ids = ["debugging"]
+        elif task_kind == "file_creation":
+            canonical_ids = ["simple-file-artifact"]
+        elif task_kind == "program_creation" and python_requested:
+            canonical_ids = ["python-development"]
+        elif task_kind == "code_change" and python_requested:
+            canonical_ids = ["python-development"]
+        elif task_kind == "testing":
+            canonical_ids = ["software-testing"]
+        else:
+            canonical_ids = []
+
+        primary: dict[str, Any] | None = None
+        for requested, candidate in preferred_records:
+            if (candidate is not None and candidate.get("source") == "user"
+                    and str(candidate["id"]) not in set(canonical_ids)):
+                missing = sorted(_skill_required(candidate) - required)
+                if missing:
+                    raise ValueError(
+                        f"Primary Skill '{candidate['id']}' is incompatible with the planned capability set: "
+                        + ", ".join(missing)
+                    )
+                break
+        for candidate_id in canonical_ids:
+            candidate = by_id.get(candidate_id)
+            if candidate is not None:
+                primary = candidate
+                break
+        if primary is None and preferred_records:
+            # A custom or explicitly requested Skill may be the only useful
+            # guidance for a non-canonical task.  Do not use this escape hatch
+            # for a trivial artifact/program when the canonical Skill exists.
+            for requested, candidate in preferred_records:
+                if candidate is None:
+                    continue
+                if task_kind in {"file_creation", "program_creation"} and str(candidate["id"]) in {
+                    "debugging", "interactive-testing", "software-testing", "code-review",
+                }:
+                    continue
+                primary = candidate
+                break
+        if primary is None:
+            for candidate_id in canonical_ids:
+                candidate = by_id.get(candidate_id)
+                if candidate is not None:
+                    primary = candidate
+                    break
+        if primary is not None:
+            missing = sorted(_skill_required(primary) - required)
+            if missing:
+                explicitly_requested = any(candidate is primary for _, candidate in preferred_records)
+                if explicitly_requested:
+                    raise ValueError(
+                        f"Primary Skill '{primary['id']}' is incompatible with the planned capability set: "
+                        + ", ".join(missing)
+                    )
+                warnings.append(
+                    f"Skill '{primary['id']}' was omitted because the plan lacks: "
+                    + ", ".join(missing)
+                )
+                primary = None
+            if primary is not None:
+                requested_priority = next(
+                    (1000 - index for index, (_, candidate) in enumerate(preferred_records)
+                     if candidate is primary),
+                    100,
+                )
+                add(primary, requested_priority)
+
+        # Do not fill the context with every compatible Skill.  An additional
+        # Skill is reserved for a genuinely separate explicit recovery or QA
+        # concern and is never selected for trivial implementation tasks.
+        if not selected and task_kind not in {"file_creation", "program_creation"}:
+            task_tokens = _tokens(task_text)
+            scored: list[tuple[int, str, dict[str, Any]]] = []
+            for skill in available:
+                if not _skill_required(skill) <= required:
+                    continue
+                metadata = " ".join([
+                    str(skill.get("name") or ""), str(skill.get("category") or ""),
+                    *[str(item) for item in skill.get("tags", [])],
+                ])
+                score = len(task_tokens & _tokens(metadata))
+                if score:
+                    scored.append((score, str(skill["id"]), skill))
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            if variant and len(scored) > 1:
+                offset = variant % len(scored)
+                scored = scored[offset:] + scored[:offset]
+            if scored:
+                score, _, skill = scored[0]
+                add(skill, 100 + score)
+
+        for requested, candidate in preferred_records:
+            if candidate is None or str(candidate["id"]) in selected_ids:
+                continue
+            if task_kind in {"file_creation", "program_creation"}:
+                warnings.append(f"Preferred Skill '{candidate['id']}' was omitted because it is not needed for this task kind.")
+            elif len(selected) >= 1:
+                warnings.append(f"Preferred Skill '{candidate['id']}' was omitted to keep the worker context minimal.")
 
         return (
             [{"skill_id": skill["id"], "priority": priority}

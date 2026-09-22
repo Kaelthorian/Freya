@@ -23,7 +23,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── integration_orchestrator.py orchestration-level integration lifecycle
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
-│   ├── worker.py             bounded Ollama/tool loop, progress guard and per-agent policy
+│   ├── worker.py             bounded Ollama/tool loop, dynamic tool prompt, feedback and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── transport.py          non-redirecting local Ollama HTTP client
 │   ├── storage.py            transactional SQLite repository and metrics
@@ -31,8 +31,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── config.py             agent defaults, catalogue and validation
 │   ├── capabilities.py       capability registry and tool-to-action resolver
 │   ├── policy.py             policy schema, legacy migration and engine
-│   ├── skills.py             reusable Skill registry, builtin artifact Skill, validation and resolution
-│   ├── agent_context.py      structured agent defaults, effective config and worker context
+│   ├── skills.py             reusable Skill registry, minimal-context rendering and validation/resolution
+│   ├── agent_context.py      structured agent defaults, effective config and policy/tool-aware worker context
 │   ├── presets.py            manual/legacy Programmer, Task Analyst, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
@@ -101,9 +101,11 @@ selects them.
    selected workspace or creates an automatic one for the task.
 4. `storage.py` stores an immutable configuration/tool snapshot. The scheduler
    waits for a worker slot and exclusive access to the agent and workspace.
-5. `worker.py` calls local Ollama, resolves each tool request through
-   `capabilities.py`, evaluates the immutable policy in `policy.py`, and only
-   then dispatches to `tools.py` inside the configured workspace root.
+5. `worker.py` builds the AVAILABLE TOOLS prompt from the same effective
+   schemas sent to Ollama, resolves each request through `capabilities.py`,
+   evaluates the immutable policy in `policy.py`, and only then dispatches to
+   `tools.py` inside the configured workspace root. Unknown and unavailable
+   tools are distinct feedback classes; deterministic denials are not retried.
 6. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
    replay changes using monotonic event IDs; WaitingForApproval blocks the worker
    until a durable once/task/deny resolution arrives.
@@ -115,11 +117,11 @@ selects them.
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
-| Tool implementation or controlled stdin | `tools.py`, `worker.py`, `tests/test_tools.py`, `tests/test_control_runtime.py` |
+| Tool implementation, dynamic tool prompt or controlled stdin | `tools.py`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_control_runtime.py`, `tests/test_agent_context.py` |
 | Runtime evidence, structured fallback or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
-| Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
+| Reusable Skills, minimal assignment or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_factory.py`, `agent_context.py`, `tests/test_skills.py`, `tests/test_agent_factory.py`, `tests/test_agent_context.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
 | Prompt rewrite, task kinds or Analyst repair | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py`, `tests/test_planner.py` |
 | Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |

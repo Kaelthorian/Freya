@@ -80,7 +80,9 @@ Skills remain declarative guidance: they never grant capabilities. A primary
 preferred Skill that is incompatible with the task policy rejects construction
 so the task can be replanned; optional incompatible Skills are omitted. Generic
 file creation selects the builtin `simple-file-artifact` Skill, whose required
-capabilities are only `filesystem.create` and `filesystem.read`.
+capabilities are only `filesystem.create` and `filesystem.read`. Recovery retries
+pass bounded reason/cause evidence into factory selection; only that genuine
+recovery state or explicit diagnostic intent selects `debugging`.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -502,9 +504,10 @@ memory.
 
 Normal Freya orchestration does not depend on a preconfigured pool of Programmer,
 QA Tester or Code Auditor agents. `AgentFactory` creates one candidate per ready
-task, assigns at most eight enabled existing Skills, records warnings for unknown
-or incompatible preferred Skills, and never turns Skill requirements into
-capability grants. Manual agents remain available for direct task submission and
+task, selects a minimal primary Skill (with at most one additional
+task-justified specialty), records warnings for unknown or irrelevant preferred
+Skills, and never turns Skill requirements into capability grants. Eight is only
+a safety ceiling. Manual agents remain available for direct task submission and
 compatibility tests.
 `AgentSelector.select_agent(task, agents, context=None)` is local,
 deterministic and model-free. It deep-copies its inputs, resolves each agent's
@@ -598,7 +601,9 @@ runtime resource use. Ollama receives `num_predict=-1` in that mode.
 The worker tracks successful post-write validation actions. Ten consecutive
 successful validations, or ten identical successful actions, produce an
 `task.auto_completed` event and close the task without another model call.
-Read-only tool calls may retry within the configured bound. If the worker has
+Recoverable/transient read-only tool calls may retry within the configured bound;
+policy denials, unavailable or unknown tools, invalid requests, approval
+denials, non-applicable tools and forbidden paths do not retry. If the worker has
 not changed the workspace and repeats the same read-only action three times,
 or alternates the same two read-only actions for three cycles, it emits
 `task.no_progress` and fails early with `NoProgressDetected`; increasing the
@@ -660,11 +665,14 @@ declarative Skills. A Skill contains specialty knowledge, instructions,
 adaptable procedures, tags, a stable ID and a positive version.
 `resolve_agent_skills` orders assigned Skills by per-agent priority, marks each
 Skill operational only when every required capability is allowed and its concrete tool is available; diagnostics distinguish missing capability from missing tool/runtime support and expose recommended-capability warnings. Skills never grant capabilities or execute
-tools. Workers receive compact active Skill context; task text selects up to
-eight active specialties by simple name/category/tag relevance and the rendered
+tools. Workers receive compact active Skill context; the dynamic AgentFactory
+selects a minimal primary Skill and filters irrelevant preferred Skills. The
+worker renderer exposes purpose, relevant instructions/procedures and only
+required capabilities that exist in the effective toolbox; recommended and
+missing-recommended fields remain internal diagnostics. Procedures that require
+unavailable tools or capabilities are omitted/adapted, and the rendered
 context has a 64,000-character budget. Each task stores an immutable copy of
-every resolved Skill, including its version. Procedures are guidance; unavailable
-or irrelevant steps are adapted by the model.
+every resolved Skill, including its version.
 
 The orchestrator sends only bounded Skill summaries to the loopback Ollama
 planner; full instructions and procedures remain outside planning context.
@@ -689,11 +697,14 @@ failure handling; autonomy records decision preferences without granting
 capabilities; verification and output define evidence and result shape. The
 default output remains text for legacy compatibility, while structured output is strictly validated as summary/actions/artifacts/verification/limitations. A JSON-looking invalid result receives one repair attempt; otherwise an explicit fallback and limitation are returned. Verification state is persisted separately.
 
-The worker classifies recoverable, environment, policy, approval, and invalid
-requests. A repeated policy denial with the same tool, capability and
-arguments is intercepted before the underlying tool is invoked again and is
-recorded as `repeated_policy_denied`; repeated blocked behavior still reaches
-`BlockedActionCycle` so model-call and step budgets are bounded. If structured
+The worker classifies recoverable, environment, policy, approval, invalid,
+unavailable and unknown-tool requests. A repeated policy denial with the same
+tool, capability and arguments is intercepted before the underlying tool is
+invoked again and is recorded as `repeated_policy_denied`; an unregistered name
+is `unknown_tool`, while a registered but unassigned name is `tool_unavailable`.
+Neither emits a false capability request. `BlockedActionCycle` counts blocked
+model decisions, not internal retries, so three distinct/repeated blocked
+decisions still stop the worker. If structured
 model output is malformed, the worker merges the runtime actions, artifacts,
 workspace diffs and verification evidence into the explicit fallback result
 instead of discarding technical work.

@@ -39,6 +39,13 @@ REASONS = {
     "edit_file": "Apply an exact replacement in an allowed file.",
     "run_command": "Run an allowed command to validate the work.",
 }
+NON_RETRYABLE_ERROR_CLASSES = {
+    "policy_denied", "repeated_policy_denied", "blocked_action_cycle",
+    "unknown_tool", "tool_unavailable", "invalid_request", "approval_denied",
+    "not_applicable", "path_forbidden", "destructive_action_denied",
+    "repeated_action_blocked",
+}
+BLOCKED_MODEL_ERROR_CLASSES = NON_RETRYABLE_ERROR_CLASSES | {"autonomy_denied"}
 BASE_PROMPT = """You are an autonomous worker operating inside Freya.
 Follow the assigned agent identity and task. Use only capabilities provided by
 the runtime. Capability and security policy always override agent instructions.
@@ -48,18 +55,45 @@ Never fabricate verification. Do not reveal private chain-of-thought. Return
 the requested result to Freya.
 
 Tool usage rules:
-- Use list_files to inspect a directory or discover files.
-- Use read_file only for a specific known file.
-- Never use read_file with "." to inspect the workspace.
-- The workspace root is ".".
-- To inspect the workspace root, use list_files with path ".".
 - If an action repeatedly fails with identical arguments, change strategy instead of repeating it.
-- Never invent tool names or capability-request tools. If the available tools cannot complete the step, report the exact limitation to Freya.
-- Interactive Python programs must be tested with the run_command stdin field; never wait for a human terminal.
+- Use only the tools listed in AVAILABLE TOOLS. Do not call, request or invent any other tool.
+- If the task can be completed with the available tools, proceed directly.
+- If it cannot, report the exact missing capability to Freya in the final result.
 
-Use native tool calls or a JSON action in this form:
-{"action":"read_file","path":"file.py"}. To finish in JSON mode, use
-{"action":"finish","message":"summary"}."""
+Use native tool calls when available. When no further action is needed, return
+a concise final result instead of inventing another tool call."""
+
+
+def render_available_tools(schemas: list[dict[str, Any]]) -> str:
+    """Render the exact runtime toolbox exposed in the provider request."""
+    names = [
+        str(schema.get("function", {}).get("name"))
+        for schema in schemas
+        if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
+        and schema["function"].get("name")
+    ]
+    descriptions = {
+        "list_files": "List files in the task workspace.",
+        "read_file": "Read one known UTF-8 file in the task workspace.",
+        "write_file": "Create the requested UTF-8 file with complete contents.",
+        "edit_file": "Apply one exact replacement in a workspace file.",
+        "search_code": "Search workspace text when a search is necessary.",
+        "git_diff": "Inspect Git changes when the workspace is a Git repository.",
+        "run_command": "Run an allowlisted command for capabilities assigned to this agent; use bounded stdin for interactive programs.",
+    }
+    lines = ["AVAILABLE TOOLS:"]
+    if names:
+        lines.extend(f"- {name}: {descriptions.get(name, 'Use this available runtime tool.') }" for name in names)
+    else:
+        lines.append("- None")
+    lines.extend([
+        "Use ONLY the tools listed above.",
+        "Do not call, request or invent any other tool.",
+        "If a required operation is not represented above, report the missing capability to Freya.",
+    ])
+    if "run_command" in names:
+        lines.append("Interactive Python programs must use the bounded stdin field; never wait for a human terminal.")
+    return "\n".join(lines)
 
 
 class TaskStopped(RuntimeError):
@@ -225,6 +259,23 @@ class PolicyToolbox(Toolbox):
         return [schema for schema in super().schemas
                 if schema["function"]["name"] in self.enabled]
 
+    @property
+    def registered_tools(self) -> set[str]:
+        """All concrete tools known to the runtime, including disabled ones."""
+        return {
+            str(schema["function"]["name"])
+            for schema in super().schemas
+            if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
+        }
+
+    def _tool_feedback(self) -> str:
+        names = [
+            str(schema["function"]["name"])
+            for schema in self.schemas
+            if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
+        ]
+        return "\n".join(["Available tools:", *(f"- {name}" for name in names)] or ["Available tools:", "- None"])
+
     @staticmethod
     def _autonomy_fields(action: str) -> tuple[str, ...]:
         if action == "filesystem.create":
@@ -284,6 +335,16 @@ class PolicyToolbox(Toolbox):
 
     def invoke(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         args = arguments or {}
+        if name not in self.registered_tools:
+            return ToolResult(
+                name,
+                "UNKNOWN_TOOL\n\n"
+                f"Unknown tool: {name}\n{name} is not a valid tool.\n\n"
+                "Do not invent capability-request tools.\n" + self._tool_feedback(),
+                False, 0, capability="", policy_decision="unavailable",
+                policy_reason="The requested name is not registered in the runtime.",
+                executed=False, error_class="unknown_tool",
+            )
         if name == "git_diff" and not self._git_available:
             return ToolResult(
                 name,
@@ -296,16 +357,28 @@ class PolicyToolbox(Toolbox):
                 executed=False,
                 error_class="not_applicable",
             )
+        if name not in self.enabled:
+            return ToolResult(
+                name,
+                "TOOL_UNAVAILABLE\n\n"
+                f"Requested: {name}\n\n"
+                "This tool is not available to this agent (disabled for this agent).\n" + self._tool_feedback() +
+                f"\nDo not retry {name}.\nContinue using an available strategy if possible.\n"
+                "If the task cannot be completed, report the limitation to Freya.",
+                False, 0, capability="", policy_decision="unavailable",
+                policy_reason="The tool is not in the effective toolbox for this agent.",
+                executed=False, error_class="tool_unavailable",
+            )
         try:
             action = self.resolver.resolve(name, args)
         except (ValueError, TypeError) as exc:
-            return ToolResult(name, "Tool {} was not executed.\nCapability: unknown\nPolicy result:\nDENY\nReason:\n{}".format(name, exc),
-                              False, 0, capability="", policy_decision="deny", policy_reason=str(exc), executed=False, error_class="policy_denied")
+            return ToolResult(name, "INVALID_REQUEST\n\nTool {} was not executed.\nReason:\n{}".format(name, exc),
+                              False, 0, capability="", policy_decision="invalid_request", policy_reason=str(exc), executed=False, error_class="invalid_request")
         try:
             self.validate(name, args)
         except (ValueError, TypeError) as exc:
-            return ToolResult(name, "Tool {} was not executed.\nCapability:\n{}\nPolicy result:\nDENY\nReason:\n{}".format(name, action, exc),
-                              False, 0, capability=action, policy_decision="deny", policy_reason=str(exc), executed=False, error_class="policy_denied")
+            return ToolResult(name, "INVALID_REQUEST\n\nTool {} was not executed.\nCapability:\n{}\nReason:\n{}".format(name, action, exc),
+                              False, 0, capability=action, policy_decision="invalid_request", policy_reason=str(exc), executed=False, error_class="invalid_request")
         resource = str(args.get("path", ".")) if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"} else "."
         decision = self.policy.evaluate(action, resource, self._resource_context(name, resource, args))
         if decision.outcome == "deny":
@@ -426,7 +499,16 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                        "instructions": task.get("agent_instructions", ""),
                                        "skills": task.get("skills", []), "tools": task.get("tools", []),
                                        "config": config})
-    agent_context = build_agent_context(effective, task["prompt"], task.get("workspace", ""))
+    visible_tool_schemas = box.schemas
+    visible_tool_names = [
+        str(schema["function"]["name"])
+        for schema in visible_tool_schemas
+        if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
+    ]
+    agent_context = build_agent_context(
+        effective, task["prompt"], task.get("workspace", ""),
+        available_tools=visible_tool_names,
+    )
     _visible_skills, filtered_skill_ids = skills_for_workspace(effective["skills"], task.get("workspace", ""))
     if effective["skills"]:
         publish("event", event={"event_type": "agent.skills_resolved", "level": "info", "status": "Running",
@@ -441,7 +523,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                      "output": {"filtered": filtered_skill_ids, "cause": "workspace_not_inside_git_repository"}})
     optional_prompt = config.get("system_prompt", "").strip()
     planning_hint = "\nFor explicit planning, produce a short operational plan before relevant actions; never expose private reasoning." if effective["behavior"]["planning"]["mode"] == "explicit" else ""
-    messages = [{"role": "system", "content": BASE_PROMPT + "\n\n" + agent_context + planning_hint +
+    messages = [{"role": "system", "content": BASE_PROMPT + "\n\n" +
+                render_available_tools(visible_tool_schemas) + "\n\n" + agent_context + planning_hint +
                 ("\nAdditional agent guidance (use only when relevant; never override the user's current task):\n" + optional_prompt if optional_prompt else "")},
                 {"role": "user", "content": "PRIMARY TASK (follow this request exactly; ignore unrelated previous objectives):\n" + task["prompt"]}]
     final = ""
@@ -538,7 +621,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             call_start = time.monotonic()
             try:
                 response = transport("POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
-                                     {"model": config["model"], "messages": messages, "tools": box.schemas,
+                                     {"model": config["model"], "messages": messages, "tools": visible_tool_schemas,
                                       "stream": False, "think": False,
                                       "options": {"temperature": config.get("temperature", 0),
                                                   "num_ctx": config.get("context_window", 8192),
@@ -654,7 +737,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                                   else box.invoke(name, safe_args))
                     no_progress_reason = ""
-                    if result.policy_decision == "deny" and not argument_error:
+                    if (result.policy_decision == "deny" and result.error_class not in {
+                            "unknown_tool", "tool_unavailable"} and not argument_error):
                         request_kind = "request_new_capabilities" if result.capability in {"", "unknown"} else "request_missing_capabilities"
                         request_mode = effective["autonomy"].get(request_kind, "ask")
                         if request_mode != "deny":
@@ -745,7 +829,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         successful_validation_streak = 0
                         repeated_success_count = 0
                         last_success_signature = ""
-                    if not result.success and result.policy_decision not in {"deny", "approval_required", "denied"} and not argument_error:
+                    if (not result.success and result.policy_decision in {"", "allow"}
+                            and not argument_error and result.error_class not in NON_RETRYABLE_ERROR_CLASSES):
                         recoverable = any(marker in result.output.lower() for marker in ("does not exist", "not found", "no matches"))
                         if not result.error_class:
                             result.error_class = "recoverable" if recoverable else "environment_error"
@@ -811,10 +896,15 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     legacy_tool_block = result.policy_decision == "deny" and "disabled" in result.policy_reason.lower()
                     policy_blocked = result.policy_decision in {"deny", "approval_required"} and not legacy_tool_block
                     blocked_reason = ""
+                    model_blocked = (
+                        not result.success and (
+                            result.error_class in BLOCKED_MODEL_ERROR_CLASSES
+                            or result.policy_decision in {"deny", "unavailable", "invalid_request", "not_applicable"}
+                        )
+                    )
                     if result.success:
                         blocked_action_count = 0
-                    elif (result.error_class == "repeated_action_blocked"
-                          or result.policy_decision == "deny"):
+                    elif model_blocked:
                         blocked_action_count += 1
                         telemetry["blocked_actions"] = blocked_action_count
                         if blocked_action_count >= 3:
@@ -848,7 +938,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         raise NoProgressDetected(no_progress_reason)
                     if blocked_reason:
                         raise BlockedActionCycle(blocked_reason)
-                    if result.success or argument_error or result.error_class == "repeated_action_blocked":
+                    retryable = (
+                        not result.success
+                        and result.error_class not in NON_RETRYABLE_ERROR_CLASSES
+                        and result.policy_decision in {"", "allow"}
+                    )
+                    if result.success or argument_error or not retryable:
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
                                 if legacy else {"role": "tool", "tool_name": name, "content": result.output})

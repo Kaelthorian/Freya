@@ -16,6 +16,7 @@ from control_center.config import normalize_agent
 from control_center.storage import Store
 from control_center.worker import PolicyToolbox, run_task
 from control_center.orchestrator import Orchestrator
+from control_center.skills import normalize_skill, skills_context
 
 
 class AgentContextTests(unittest.TestCase):
@@ -86,6 +87,35 @@ class AgentContextTests(unittest.TestCase):
         ], "C:/workspace-that-is-not-a-checkout")
         self.assertEqual(excluded, ["git-inspection"])
         self.assertEqual([skill["id"] for skill in visible], ["python-development"])
+
+    def test_worker_skill_context_hides_recommendations_and_unavailable_operations(self):
+        skill = normalize_skill({
+            "id": "python-development", "name": "Python Development",
+            "description": "Develop and validate Python software.",
+            "category": "Software Development", "version": 1,
+            "instructions": ["Validate syntax and relevant tests when available."],
+            "procedures": [{"name": "Implement", "steps": [
+                "Inspect relevant existing files.", "Implement the minimal change.",
+                "Validate syntax.", "Run relevant tests when available.",
+                "Inspect the resulting diff.",
+            ]}],
+            "required_capabilities": ["filesystem.read"],
+            "recommended_capabilities": ["filesystem.search", "execution.pytest", "git.diff"],
+            "tags": ["python"], "enabled": True,
+        })
+        context = skills_context(
+            [skill],
+            available_tools={"read_file", "write_file", "run_command"},
+            available_capabilities={"filesystem.read", "filesystem.create", "execution.python_script"},
+        )
+        self.assertIn("Implement the minimal change", context)
+        self.assertIn("Execute the program and verify its observable output", context)
+        self.assertNotIn("Recommended capabilities", context)
+        self.assertNotIn("Missing recommended", context)
+        self.assertNotIn("filesystem.search", context)
+        self.assertNotIn("execution.pytest", context)
+        self.assertNotIn("git.diff", context)
+        self.assertNotIn("list_files", context)
 
 class RepeatedFailureTests(unittest.TestCase):
     def test_repeated_nonrecoverable_action_is_blocked(self):

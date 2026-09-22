@@ -184,6 +184,22 @@ class TaskAnalystTests(unittest.TestCase):
         self.assertNotEqual(result["operational_prompt"], "{}")
         self.assertIn("hello.txt", result["operational_prompt"])
 
+    def test_model_program_evidence_wins_over_broad_file_fallback(self):
+        analysis = deterministic_task_analysis("hace un hola mundo")
+        analysis["task_kind"] = "file_creation"
+        analysis["objective"] = "Execute a simple program that prints Hello World"
+        analysis["operational_prompt"] = "Implement and execute a program; verify its stdout."
+        analysis["task_characteristics"] = dict(analysis["task_characteristics"])
+        analysis["task_characteristics"]["requires_code_execution"] = True
+
+        class ProgramAdapter:
+            metrics = {"model_calls": 1}
+            def analyze(self, _prompt, _agent):
+                return analysis
+
+        result = TaskAnalyst(ProgramAdapter()).analyze("hace un hola mundo", {"id": "analyst"})
+        self.assertEqual(result["task_kind"], "program_creation")
+
 
 if __name__ == "__main__":
     unittest.main()

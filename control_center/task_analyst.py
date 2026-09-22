@@ -506,7 +506,36 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
     if detected["task_type"] != "general_task" and normalized["task_type"] != detected["task_type"]:
         corrected["task_type"] = detected["task_type"]
         changes.append("task_type")
-    if normalized.get("task_kind") != detected.get("task_kind") and detected.get("task_kind") != "general":
+
+    model_text = " ".join([
+        str(normalized.get("operational_prompt") or ""),
+        str(normalized.get("objective") or ""),
+        str(normalized.get("task_type") or ""),
+        " ".join(str(item.get("description") or "") for item in normalized.get("requirements", [])
+                  if isinstance(item, dict)),
+        str(normalized.get("validation", {}).get("strategy") or ""),
+        " ".join(str(item.get("description") or "") for item in normalized.get("validation", {}).get("tests", [])
+                  if isinstance(item, dict)),
+    ]).casefold()
+    model_describes_program = (
+        normalized.get("task_kind") == "program_creation"
+        or (
+            model_characteristics.get("requires_code_execution") is True
+            and bool(re.search(
+                r"\b(?:program|programa|script|execute|execut|run|stdout|output|salida|print|imprima|python)\b",
+                model_text,
+            ))
+        )
+    )
+    # The model's structured evidence is stronger than a broad lexical
+    # fallback.  This preserves a model-backed program interpretation even
+    # when the human wording is intentionally terse (without assuming a
+    # language from words such as "hello world").
+    if model_describes_program and normalized.get("task_kind") != "program_creation":
+        corrected["task_kind"] = "program_creation"
+        changes.append("task_kind")
+    elif (normalized.get("task_kind") != detected.get("task_kind")
+          and detected.get("task_kind") != "general"):
         corrected["task_kind"] = detected["task_kind"]
         changes.append("task_kind")
 

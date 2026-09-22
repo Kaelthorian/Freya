@@ -147,15 +147,18 @@ plans may get a dependent read-only audit.
 Planner reconciliation also repairs model plans that contradict the Analyst:
 local writes/execution receive read-back evidence, accidental overwrite is
 removed, and a debugging task mentioning Python is not reclassified as program
-creation.
+creation. Normalized task metadata also retains `task_kind` and available
+boolean `task_characteristics` hints for AgentFactory selection.
 For every ready plan task, Freya creates a validated ephemeral agent. Its complete
 policy allows only the declared requirements (`ask` for dangerous capabilities)
 and denies the rest; its Tool list is the deduplicated projection of that policy.
-The factory selects at most eight enabled Skills. Skills never add capability
-authority. An incompatible primary preferred Skill makes construction fail for
-replanning; an incompatible optional Skill is omitted. Generic file creation
-uses the builtin `simple-file-artifact` Skill, whose required and recommended
-capabilities are only `filesystem.create` and `filesystem.read`.
+The factory selects a minimal primary Skill and at most one additional
+task-justified specialty; eight is only a safety ceiling. Skills never add
+capability authority. An explicitly requested incompatible primary preferred
+Skill makes construction fail for replanning; irrelevant or incompatible
+optional Skills are omitted. Generic file creation uses the builtin
+`simple-file-artifact` Skill, whose required and recommended capabilities are
+only `filesystem.create` and `filesystem.read`.
 
 After planning, `freya.agent_factory.started` precedes construction.
 `freya.agent_created` identifies the generated agent, role, assigned Skill IDs,
@@ -326,7 +329,9 @@ Skill creation accepts `id`, `name`, `description`, `category`, positive
 `version`, list-valued `instructions`, structured `procedures`, capability
 metadata, `tags`, `source` (`builtin` or `user`), `metadata`, and `enabled`.
 IDs are lowercase stable identifiers. Procedures are recommended operating
-guidance and are adapted when a step is unavailable. List filtering accepts
+guidance and are adapted or omitted when a step needs a tool/capability not in
+the worker's effective toolbox. The worker sees no `recommended_capabilities`,
+`missing_recommended_capabilities` or `missing_recommended_tools` fields. List filtering accepts
 `q` (name, ID, description, category, or tags), `category`, `enabled`, and
 `source`. Compatibility summaries include operational state, priority, missing required or recommended capability IDs, and missing concrete tools/runtime support.
 
@@ -339,9 +344,12 @@ successful command can add a `command_execution` item to
 output, exit-code, or JSON completion criterion. The Planner adds
 `qa-interactive-test` when the Analyst marks a request interactive, followed by
 `code-audit` for complex mutation plans, except for the bounded simple
-non-interactive single-task file/program fast path. Three identical denied
-actions terminate the worker with `BlockedActionCycle`; the third attempt does
-not continue the normal action cycle.
+non-interactive single-task file/program fast path. Policy denials and
+deterministic unavailability are not retried. An unknown tool is reported as
+`error_class=unknown_tool`; a registered but unassigned tool is
+`error_class=tool_unavailable`. Three consecutive blocked model decisions
+terminate the worker with `BlockedActionCycle`; an internal retry of one
+recoverable read does not count as an additional blocked decision.
 
 ## Tasks, observations and metrics
 
