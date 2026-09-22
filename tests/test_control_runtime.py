@@ -168,6 +168,10 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("filesystem.search", prompt)
         self.assertNotIn("request_missing_capabilities", prompt)
         self.assertNotIn("request_new_capabilities", prompt)
+        self.assertIn("Do not invent or", prompt)
+        self.assertIn("read a prerequisite brief file", prompt)
+        self.assertIn("Do not repeat", prompt)
+        self.assertIn("same missing-file read", prompt)
 
     def test_unavailable_and_unknown_actions_do_not_request_capabilities_or_cycle(self):
         result = self.run_worker([
@@ -222,6 +226,24 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(result["verification"]["unavailable"])
         self.assertTrue(any(item.get("check") == "filesystem:read_file:hola_mundo.txt"
                             for item in result["verification"]["evidence"]))
+
+    def test_duplicate_write_after_verified_read_is_completed_without_overwrite(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')"})]),
+            answer(calls=[("read_file", {"path": "hello.py"})]),
+            answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')"})]),
+        ], config={
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual((self.workspace / "hello.py").read_text(), "print('Hello World')")
+        self.assertTrue(result["verification"]["passed"])
+        self.assertEqual(result["result"]["actions"][-1]["error_class"], "already_satisfied")
+        self.assertTrue(any(
+            event.get("event", {}).get("event_type") == "task.auto_completed"
+            and "duplicate write" in event.get("event", {}).get("reason", "")
+            for event in self.events
+        ))
 
     def test_identical_policy_denial_is_intercepted_before_second_tool_execution(self):
         existing = self.workspace / "existing.py"

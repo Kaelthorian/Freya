@@ -56,6 +56,10 @@ the requested result to Freya.
 
 Tool usage rules:
 - If an action repeatedly fails with identical arguments, change strategy instead of repeating it.
+- The operational brief is already present in the task context. Do not invent or
+  read a prerequisite brief file unless the current task explicitly names it.
+- A missing-file read is a missing input, not a permission grant. Do not repeat
+  the same missing-file read; report it or choose a different permitted strategy.
 - Use only the tools listed in AVAILABLE TOOLS. Do not call, request or invent any other tool.
 - If the task can be completed with the available tools, proceed directly.
 - If it cannot, report the exact missing capability to Freya in the final result.
@@ -716,9 +720,39 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             existing_before = box.safe_path(str(safe_args.get("path", ""))).exists()
                         except (OSError, ValueError):
                             existing_before = False
+                    already_satisfied = False
+                    if name == "write_file":
+                        path = safe_args.get("path")
+                        expected = modified_paths.get(path) if isinstance(path, str) else None
+                        observed = observed_files.get(path) if isinstance(path, str) else None
+                        already_satisfied = (
+                            isinstance(path, str)
+                            and path in modified_paths
+                            and isinstance(expected, str)
+                            and isinstance(observed, tuple)
+                            and observed[0]
+                            and safe_args.get("content") == expected
+                        )
                     resolved_capability = common.get("capability", "unknown")
                     denial_signature = _policy_denial_signature(name, resolved_capability, safe_args)
-                    if not argument_error and policy_denials.get(denial_signature, 0) > 0:
+                    if already_satisfied:
+                        result = ToolResult(
+                            name,
+                            "Already satisfied: the requested file exists with the requested content "
+                            "and was read back successfully; no overwrite was performed.",
+                            True, 0, capability=resolved_capability, policy_decision="allow",
+                            policy_reason="The requested artifact was already created and verified.",
+                            executed=False, error_class="already_satisfied",
+                        )
+                        final = result.output
+                        success = True
+                        auto_completed = True
+                        publish("event", event={
+                            "event_type": "task.auto_completed", "level": "info", "status": "Success",
+                            "reason": "The requested artifact was already created and verified; a duplicate write was skipped.",
+                            "path": safe_args.get("path"),
+                        })
+                    elif not argument_error and policy_denials.get(denial_signature, 0) > 0:
                         repeated_count = policy_denials.get(denial_signature, 0)
                         terminal_repeat = repeated_count >= 2
                         result = ToolResult(
@@ -802,7 +836,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "output": str(result.output or "")[:4000],
                                 "supports_acceptance_criteria": supported,
                             })
-                    if result.success and name in WRITE_TOOLS:
+                    if result.success and name in WRITE_TOOLS and result.error_class != "already_satisfied":
                         publish_workspace_diff(name, safe_args, existing_before)
                         telemetry["workspace_changes"] += 1
                         successful_validation_streak = 0

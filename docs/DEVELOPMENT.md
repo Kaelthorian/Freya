@@ -51,6 +51,12 @@ analyst model fails, Freya records the error and uses a deterministic bounded
 interpretation. The role can be selected in the agent editor; a Skill is not
 required for routing or authorization.
 
+`ready_for_execution=false` is a hard pre-planning gate. Freya records
+`freya.task_analysis.blocked`, fails planning with the analyst's
+`blocking_reason`, and does not create a plan, workspace, or delegation. A
+worker must treat the operational brief as task context, not as an implicit
+`task_analyst_operational_brief.txt` workspace file.
+
 The Analyst output includes the canonical internal `task_kind` categories
 `file_creation`, `program_creation`, `code_change`, `analysis`, `testing`,
 `review`, `external_action`, and `general`. If a model response is structurally
@@ -158,7 +164,11 @@ retried. Identical policy denials are intercepted before a second underlying
 tool invocation, then Freya stops that worker and diagnoses/replans instead of
 consuming the remaining step budget. A recovery retry receives bounded prior
 workspace state and may derive read-only inspection, but never overwrite
-authority. Orchestration timeouts also emit failure analysis.
+authority. A deterministic missing-file result is terminal for semantic
+recovery; selecting another agent does not make an absent artifact appear.
+After a successful read-back, an identical write request is recorded as an
+already-satisfied no-op and cannot trigger an overwrite loop. Orchestration
+timeouts also emit failure analysis.
 
 Interactive Python QA uses `run_command` with a bounded `stdin` string. Without
 stdin the worker closes the child stream, so `input()` fails immediately rather

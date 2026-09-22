@@ -158,6 +158,10 @@ Failed, pending approvals are denied as cancelled, and unfinished steps are clos
 
 Planning has explicit `Planning` and `Planned` states and emits
 `freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
+An Analyst result with `ready_for_execution=false` is a hard gate: Freya emits
+`freya.task_analysis.blocked` with its `blocking_reason` and stops before plan,
+workspace, or delegation creation. The operational brief remains task context;
+workers must not invent a hidden brief file or an implicit artifact producer.
 The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single implementation task. If the Analyst marks user input or interactive validation, it appends one dependent `qa-interactive-test` node with `interactive-testing`; QA may execute supported Python with bounded stdin but cannot modify files. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill, so ordering is implementation → QA when required → Code Auditor. The created event contains only the goal, complexity, task count, task IDs and
 schema version; the complete plan stays in its orchestration snapshot.
 For an Analyst-confirmed simple, non-interactive program/script/file creation
@@ -184,7 +188,10 @@ status metadata, never the full evaluation or internal prompts.
 Orchestration transitions are conditional on the stored current state:
 Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
 `freya.recovery.retry_scheduled`, `freya.recovery.replan_created`, or
-`freya.recovery.exhausted`. Full decisions remain in immutable storage. A late
+`freya.recovery.exhausted`. Deterministic missing-file failures fail recovery
+without selecting another agent. A write that repeats already verified content
+is recorded as an already-satisfied no-op rather than an overwrite. Full
+decisions remain in immutable storage. A late
 recovery or replan is discarded if cancellation, timeout, restart, another
 recovery, or a state/attempt change wins first.
 Global integration emits `freya.integration.started`,

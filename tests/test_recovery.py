@@ -154,6 +154,27 @@ class RecoveryContractTests(unittest.TestCase):
         )
         self.assertEqual(failed["action"], "fail")
 
+    def test_missing_workspace_artifact_fails_without_retrying_another_agent(self):
+        calls = []
+
+        def model(prompt, context):
+            calls.append(True)
+            return recovery_decision("retry_different_agent", excluded=["agent-a"])
+
+        result = RecoveryController(model).decide(
+            planned_task=self.task(), execution_node=self.node(), evaluation=evaluation("blocked"),
+            history=[], available_agents=[{"id": "agent-a", "enabled": True}],
+            plan=execution_plan([self.task()]), limits=self.limits(), workspace_state={
+                "actions": [{
+                    "tool": "read_file", "success": False,
+                    "output": "ERROR: File does not exist: required.txt",
+                }],
+            },
+        )
+        self.assertEqual(result["action"], "fail")
+        self.assertIn("workspace artifact is missing", result["reason"])
+        self.assertEqual(calls, [])
+
     def test_attempt_budget_prevents_model_call(self):
         calls = []
         result = RecoveryController(lambda prompt, context: calls.append(True)).decide(

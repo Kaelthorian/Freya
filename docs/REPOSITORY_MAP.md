@@ -85,6 +85,9 @@ selects them.
    Runtime command output that directly satisfies an observable completion
    criterion is promoted to bounded verification evidence, and malformed
    structured output is merged with the runtime action/artifact record.
+   The worker also stops duplicate writes after successful read-back and reports
+   missing-file reads without repeating them unchanged; semantic recovery then
+   fails deterministic absent-artifact inputs instead of rotating agents.
    Recovery carries bounded workspace state into the next attempt and derives
    only read inspection for a new agent; it never grants overwrite.
    When every active effective task is accepted, the run enters `Integrating`.

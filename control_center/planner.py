@@ -776,6 +776,8 @@ class Planner:
             "Do not create separate tasks for locating a workspace, choosing a filename, creating a file, "
             "writing its contents, or verifying it when those actions can naturally be performed by the same agent. "
             "The task workspace already exists and its root is available as '.'. "
+            "The Task Analyst brief is supplied in the structured context; do not invent a prerequisite "
+            "brief file or a hidden producer task unless the user explicitly requests that artifact. "
             "Do not create a task whose only purpose is to identify where inside the workspace an output should go "
             "unless the user's request genuinely requires choosing among multiple existing locations. "
             "A task may require multiple capabilities when one agent needs them to complete the objective. "

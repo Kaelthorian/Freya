@@ -293,6 +293,30 @@ def _failure_text(event: dict[str, Any]) -> str:
     return ""
 
 
+_MISSING_ARTIFACT_MARKERS = (
+    "file does not exist",
+    "no such file",
+    "path does not exist",
+    "directory does not exist",
+)
+
+
+def _workspace_has_missing_artifact(value: Any) -> bool:
+    """Detect a deterministic missing-path failure in bounded workspace state."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"output", "error", "message", "reason"} and isinstance(item, str):
+                lowered = item.casefold()
+                if any(marker in lowered for marker in _MISSING_ARTIFACT_MARKERS):
+                    return True
+            if isinstance(item, (dict, list)) and _workspace_has_missing_artifact(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_workspace_has_missing_artifact(item) for item in value)
+    return False
+
+
 def deterministic_failure_diagnosis(logs: list[dict[str, Any]]) -> dict[str, Any]:
     """Build a conservative report from persisted events without a model call."""
     if not isinstance(logs, list) or not logs:
@@ -714,6 +738,11 @@ class RecoveryController:
             decision = self._fail("The same semantic failure repeated; another retry is unsafe.", task_id)
         elif evaluation.get("status") == "error":
             decision = self._fail("Evaluator infrastructure errors are not task retries.", task_id)
+        elif _workspace_has_missing_artifact(workspace_state):
+            decision = self._fail(
+                "A required workspace artifact is missing; recovery cannot resolve an absent input "
+                "by selecting another agent. Correct the plan or create the artifact first.", task_id,
+            )
         elif self.offline:
             decision = self._offline_decision(
                 str(evaluation.get("status") or ""), task_id, current_agent,

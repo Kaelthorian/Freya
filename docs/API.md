@@ -113,7 +113,10 @@ it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning
 `freya.task_analysis.started` and `freya.task_analysis.completed`; without a
 configured agent the completed event contains a deterministic operational brief.
 The version-2 result includes `operational_prompt`, and `corrected_fields` lists
-deterministic semantic corrections. Planning then emits either
+deterministic semantic corrections. If the result has
+`ready_for_execution=false`, Freya emits `freya.task_analysis.blocked` with the
+`blocking_reason`, creates no plan, and emits `freya.planning.failed`. Planning
+otherwise emits either
 `freya.plan.created` with a safe goal/complexity/task summary or
 `freya.planning.failed`. A plan uses schema version 1:
 

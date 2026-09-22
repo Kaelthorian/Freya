@@ -13,6 +13,13 @@ Ollama and allowlisted tools → selected agent workspace.
 - Preserve the human prompt as audit evidence, but use the Task Analyst's
   schema-validated, semantically reconciled operational prompt as the sole
   downstream input for planning and delegation.
+- Treat `ready_for_execution=false` plus `blocking_reason` as a hard planning
+  gate: emit the blocker, create no plan, and delegate no worker until the
+  missing user input is resolved.
+- Do not invent hidden prerequisite files for the operational brief. A task
+  may consume a workspace artifact only when the user or an explicit producer
+  task establishes it; a deterministic missing-file error must fail or replan,
+  not retry unchanged with another agent.
 - Interactive behavior must use a dependent QA task and bounded `run_command`
   stdin. Never wait on a worker terminal or add a free-form shell.
 - If an enabled agent is marked `config.orchestration_role=task_analyst`, run
@@ -46,6 +53,8 @@ Ollama and allowlisted tools → selected agent workspace.
 - Diagnose terminal task-graph failures from bounded, sanitized persisted logs only.
   The post-failure pass is tool-free, runs once, cites supplied log IDs, and must
   never re-execute work, grant capabilities, or reopen a terminal state.
+- Treat Runtime `Success` as technical completion only; unlock dependencies and
+  emit semantic task success only after the evaluator accepts required evidence.
 - Keep Python support at 3.10+ and avoid runtime dependencies unless setup and
   documentation are updated.
 

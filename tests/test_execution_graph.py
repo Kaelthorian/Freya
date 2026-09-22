@@ -677,6 +677,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(graph_node["state"], "failed")
         self.assertEqual(graph_node["evaluation_status"], "blocked")
         self.assertEqual(final["evaluations"][0]["status"], "blocked")
+        event_types = [item["event_type"] for item in final["events"]]
+        self.assertNotIn("freya.task.succeeded", event_types)
 
     def test_default_evaluator_accepts_objectively_verified_runtime_success(self):
         agent = self.agent("Verified")

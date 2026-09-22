@@ -328,6 +328,35 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertEqual(stored["planning_metrics"]["model_calls"], 2)
         self.assertIn("freya.planning.failed", [event["event_type"] for event in stored["events"]])
 
+    def test_blocked_task_analysis_stops_before_plan_or_delegation(self):
+        analyst = self.store.create_agent(normalize_agent({
+            "name": "Task Analyst", "config": {"orchestration_role": "task_analyst"},
+        }))
+        calls = []
+
+        class BlockedAdapter:
+            metrics = {"model_calls": 1}
+
+            def analyze(self, prompt, agent):
+                analysis = deterministic_task_analysis(prompt)
+                analysis["ready_for_execution"] = False
+                analysis["blocking_reason"] = "The user needs to specify the programming language."
+                return analysis
+
+        run = self.store.create_orchestration("Crea un hola mundo")
+        orchestrator = Orchestrator(
+            self.store, None,
+            task_analyst=TaskAnalyst(BlockedAdapter()),
+            planner=Planner(lambda prompt, context: calls.append(True)),
+        )
+        orchestrator._run(run["id"])
+        stored = self.store.get_orchestration(run["id"])
+        self.assertEqual(stored["status"], "Failed")
+        self.assertIsNone(stored["plan"])
+        self.assertEqual(calls, [])
+        self.assertIn("programming language", stored["error"])
+        self.assertIn("freya.task_analysis.blocked", [event["event_type"] for event in stored["events"]])
+
     def test_graph_timeout_runs_failure_analysis_before_failing(self):
         run = self.store.create_orchestration("Human source prompt")
         enter_planning(self.store, run["id"])

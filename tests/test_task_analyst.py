@@ -146,6 +146,21 @@ class TaskAnalystTests(unittest.TestCase):
         ])
         self.assertEqual(store.events[-1]["agent_id"], analyst["id"])
 
+    def test_orchestrator_blocks_planning_when_analysis_requires_input(self):
+        analyst = normalize_agent({
+            "name": "Interpreter", "config": {"orchestration_role": "task_analyst"},
+        })
+        analyst["id"] = "analyst-1"
+        store = AnalysisStore([analyst])
+        blocked = deterministic_task_analysis("Crea un hola mundo")
+        blocked["ready_for_execution"] = False
+        blocked["blocking_reason"] = "The user needs to specify the programming language."
+        orchestrator = Orchestrator(store, None)
+        with self.assertRaisesRegex(ValueError, "programming language"):
+            orchestrator._require_ready_analysis("run-1", blocked)
+        self.assertEqual(store.events[-1]["event_type"], "freya.task_analysis.blocked")
+        self.assertEqual(store.events[-1]["blocking_reason"], blocked["blocking_reason"])
+
     def test_model_analysis_is_semantically_corrected_before_becoming_operational(self):
         flawed = deterministic_task_analysis("Create a file")
         flawed["operational_prompt"] = "Create a Python file and run it normally."
