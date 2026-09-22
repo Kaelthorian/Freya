@@ -13,6 +13,7 @@ from typing import Any, Callable
 from .capabilities import CAPABILITY_REGISTRY
 from .config import validate_endpoint
 from .transport import request_json
+from .task_analyst import canonical_task_kind
 
 
 PLAN_SCHEMA_VERSION = 1
@@ -105,8 +106,13 @@ def _is_trivial_task(plan: dict[str, Any], analysis: Any) -> bool:
         "requires_gui", "requires_elevated_privileges",
     )):
         return False
-    if str(analysis.get("task_type") or "").casefold() not in {
-        "program creation", "script creation", "file creation",
+    task_kind = str(analysis.get("task_kind") or "").casefold()
+    if not task_kind:
+        task_kind = canonical_task_kind(
+            analysis.get("task_type"), analysis.get("objective"), characteristics,
+        )
+    if task_kind not in {
+        "program_creation", "file_creation",
     }:
         return False
     task = tasks[0]
@@ -297,24 +303,87 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
     if not isinstance(characteristics, dict):
         return plan
     requires_write = characteristics.get("requires_filesystem_write") is True
+    requires_read = characteristics.get("requires_filesystem_read") is True
     interactive = (characteristics.get("interactive") is True
                    or characteristics.get("requires_user_input") is True)
     task_type = str(analysis.get("task_type") or "").strip().casefold()
+    task_kind = str(analysis.get("task_kind") or "").strip().casefold()
     windows_script = task_type == "windows_command_script"
-    if not requires_write and not windows_script:
-        return plan
     tasks = plan.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         return plan
+
+    source_text = " ".join(
+        [str(analysis.get(key) or "") for key in ("operational_prompt", "objective", "task_type")]
+        + [str(item.get("description") or "") for item in analysis.get("requirements", [])
+           if isinstance(item, dict)]
+    ).strip()
+    plan_text = " ".join(
+        [str(plan.get("goal") or ""), str(plan.get("summary") or "")]
+        + [" ".join([
+            str(item.get("objective") or ""), str(item.get("description") or ""),
+            " ".join(str(skill) for skill in item.get("preferred_skills", [])),
+        ]) for item in tasks]
+    ).strip()
+    all_capabilities = {
+        str(capability) for item in tasks
+        for capability in item.get("required_capabilities", [])
+    }
+    plan_has_write = bool(all_capabilities.intersection({
+        "filesystem.create", "filesystem.modify", "filesystem.overwrite",
+    }))
+    plan_has_execution = any(capability.startswith("execution.") for capability in all_capabilities)
+    python_hint = bool(re.search(r"\bpython\b|execution\.python_script|python-development",
+                                 source_text + " " + plan_text, re.I))
+    source_requests_write = bool(re.search(
+        r"\b(?:create|crear|crea|write|escrib|implement|generate|gener|make|hacer)\w*\b",
+        source_text, re.I,
+    ))
+    explicit_overwrite = bool(re.search(
+        r"\b(?:overwrite|sobrescrib|reemplaz|replace)\w*\b|\bexisting\s+(?:file|artifact)|archivo\s+existente",
+        source_text, re.I,
+    ))
+    if not task_kind:
+        task_kind = canonical_task_kind(task_type, source_text, characteristics)
+    elif task_kind not in {"file_creation", "program_creation", "code_change", "review", "testing", "analysis", "external_action", "general"}:
+        task_kind = "general"
+    if task_kind == "file_creation" and (python_hint or "execution.python_script" in all_capabilities):
+        # Model labels sometimes call a Python artifact a generic file. The
+        # executable capability is stronger evidence for Skill and fast-path
+        # selection than that loose label.
+        task_kind = "program_creation"
+    requires_write = requires_write or plan_has_write or (
+        task_kind in {"file_creation", "program_creation"} and source_requests_write
+    )
+    requires_read = requires_read or requires_write or plan_has_execution or task_kind == "program_creation"
+    if not requires_write and not requires_read and not windows_script and not interactive:
+        return plan
+    requires_code_execution = (
+        characteristics.get("requires_code_execution") is True
+        or plan_has_execution
+        or task_kind == "program_creation"
+    )
     reconciled = dict(plan)
     updated_tasks: list[dict[str, Any]] = []
     for task in tasks:
         current = dict(task)
         capabilities = list(current.get("required_capabilities", []))
+        if not explicit_overwrite:
+            capabilities = [capability for capability in capabilities
+                            if capability != "filesystem.overwrite"]
         if requires_write and not any(capability in {
                 "filesystem.create", "filesystem.modify", "filesystem.overwrite"
         } for capability in capabilities):
             capabilities.append("filesystem.create")
+        if requires_read and "filesystem.read" not in capabilities:
+            # Read-back is observation inside the selected workspace, not an
+            # overwrite escalation. Plan it before AgentFactory derives tools.
+            capabilities.append("filesystem.read")
+        if (task_kind == "program_creation"
+                and requires_code_execution
+                and not windows_script
+                and not any(capability.startswith("execution.") for capability in capabilities)):
+            capabilities.append("execution.python_script")
         if windows_script:
             # The runtime intentionally does not allow arbitrary cmd.exe
             # execution. Static creation/read-back is the safe validation path.
@@ -339,8 +408,36 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
             )
             if instruction.casefold() not in description.casefold():
                 current["description"] = (description + " " + instruction).strip()[:MAX_DESCRIPTION_CHARS]
+        if task_kind == "file_creation" and not windows_script:
+            preferred = list(current.get("preferred_skills", []))
+            preferred = [item for item in preferred if str(item).casefold() not in {
+                "python-development", "debugging",
+            }]
+            if "simple-file-artifact" not in preferred:
+                preferred.insert(0, "simple-file-artifact")
+            current["preferred_skills"] = preferred[:MAX_PREFERRED_SKILLS]
+        elif task_kind == "program_creation" and (python_hint or requires_code_execution):
+            preferred = list(current.get("preferred_skills", []))
+            if "python-development" not in preferred:
+                preferred.insert(0, "python-development")
+            current["preferred_skills"] = preferred[:MAX_PREFERRED_SKILLS]
         current["required_capabilities"] = capabilities[:MAX_CAPABILITIES]
         updated_tasks.append(current)
+
+    # A model may append a Code Auditor even after describing a trivial artifact
+    # as multi-step. Once the implementation task is normalized to the safe
+    # single-task shape, remove only that generated audit node; explicit QA and
+    # genuinely multi-part work remain intact.
+    explicit_audit = bool(re.search(
+        r"\b(?:audit|review|code review|auditor|revis(?:a|ar))\b", source_text, re.I,
+    ))
+    if (not interactive and not explicit_audit
+            and task_kind in {"file_creation", "program_creation"}
+            and len(updated_tasks) > 1):
+        implementation = [item for item in updated_tasks if not _is_code_audit_task(item)]
+        if len(implementation) == 1:
+            updated_tasks = implementation
+            reconciled["complexity"] = "simple"
     reconciled["tasks"] = updated_tasks
     return validate_plan(reconciled)
 

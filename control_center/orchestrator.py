@@ -1,6 +1,7 @@
 """Freya orchestration service: structured planning, delegation and integration."""
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -195,6 +196,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
 
     @staticmethod
     def _compact_failure_log(source: str, event: dict, *, task_id: str = "") -> dict:
+        stored_payload = event.get("payload_json") if isinstance(event, dict) else None
+        if isinstance(stored_payload, str) and stored_payload.strip():
+            try:
+                decoded_payload = json.loads(stored_payload)
+            except (TypeError, ValueError):
+                decoded_payload = {}
+            if isinstance(decoded_payload, dict):
+                decoded_payload.update({key: value for key, value in event.items()
+                                        if key != "payload_json"})
+                event = decoded_payload
         event_id = event.get("id")
         log_id = (f"orchestration:{event_id}" if source == "orchestration" else
                   f"task:{task_id}:{event_id}")

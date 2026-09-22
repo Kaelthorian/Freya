@@ -636,15 +636,19 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     resolved_capability = common.get("capability", "unknown")
                     denial_signature = _policy_denial_signature(name, resolved_capability, safe_args)
                     if not argument_error and policy_denials.get(denial_signature, 0) > 0:
+                        repeated_count = policy_denials.get(denial_signature, 0)
+                        terminal_repeat = repeated_count >= 2
                         result = ToolResult(
                             name,
                             "POLICY_DENIED_REPEAT\n\nThis action was denied by policy. Repeating the same action "
                             "without changing permissions, strategy or target will not succeed. Choose another "
                             "permitted strategy, request the capability through the allowed mechanism, or report "
-                            "the limitation to Freya.",
+                            + ("Freya is returning control to recovery now." if terminal_repeat
+                               else "the limitation to Freya."),
                             False, 0, capability=resolved_capability,
                             policy_decision="deny", policy_reason="Repeated materially identical policy denial.",
-                            executed=False, error_class="repeated_policy_denied",
+                            executed=False,
+                            error_class="blocked_action_cycle" if terminal_repeat else "repeated_policy_denied",
                         )
                     else:
                         result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error

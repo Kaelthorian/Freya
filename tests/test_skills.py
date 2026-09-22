@@ -26,6 +26,17 @@ def skill_payload(skill_id="demo-skill", **changes):
 
 
 class SkillRegistryTests(unittest.TestCase):
+    def test_simple_file_artifact_is_builtin_and_least_privilege(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            skill = next(item for item in store.list_skills()
+                         if item["id"] == "simple-file-artifact")
+            self.assertEqual(skill["source"], "builtin")
+            self.assertEqual(set(skill["required_capabilities"]),
+                             {"filesystem.read", "filesystem.create"})
+            self.assertNotIn("filesystem.overwrite", skill["required_capabilities"])
+            self.assertNotIn("filesystem.overwrite", skill["recommended_capabilities"])
+
     def test_api_crud_and_agent_assignment(self):
         class Runtime:
             max_workers = 1

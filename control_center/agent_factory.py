@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from .capabilities import CAPABILITIES, CAPABILITY_REGISTRY, effective_tools_for_policy
 from .config import normalize_agent
+from .task_analyst import canonical_task_kind
 from .policy import validate_policy
 
 
@@ -95,6 +96,16 @@ class AgentFactory:
             return "qa"
         return "worker"
 
+    @staticmethod
+    def task_kind(task: dict[str, Any]) -> str:
+        """Use the canonical analyst category, with a deterministic task fallback."""
+        explicit = str(task.get("task_kind") or "").strip().casefold()
+        if explicit:
+            return explicit
+        return canonical_task_kind(
+            text=" ".join(str(task.get(key) or "") for key in ("objective", "description")),
+        )
+
     def select_skills(self, task: dict[str, Any], skills: Iterable[dict[str, Any]],
                       *, variant: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
         """Select up to eight enabled existing Skills without changing policy."""
@@ -141,10 +152,16 @@ class AgentFactory:
                 continue
             missing = sorted(_skill_required(skill) - required)
             if missing:
+                if not selected:
+                    raise ValueError(
+                        f"Primary Skill '{skill['id']}' is incompatible with the planned capability set: "
+                        + ", ".join(missing)
+                    )
                 warnings.append(
-                    f"Skill '{skill['id']}' is assigned for diagnostics but is incompatible "
-                    "with the planned capability set: " + ", ".join(missing)
+                    f"Optional Skill '{skill['id']}' was omitted because the plan lacks: "
+                    + ", ".join(missing)
                 )
+                continue
             add(skill, match_priority)
 
         task_text = " ".join([
@@ -176,7 +193,8 @@ class AgentFactory:
         fallback_ids = {
             "qa": ("interactive-testing", "software-testing"),
             "auditor": ("code-review",),
-            "worker": ("python-development", "debugging"),
+            "worker": (("simple-file-artifact",) if self.task_kind(task) == "file_creation"
+                       else ("python-development", "debugging")),
         }[role]
         for fallback_id in fallback_ids:
             skill = by_id.get(fallback_id)
@@ -256,8 +274,10 @@ class AgentFactory:
             list(skills) if skills is not None
             else self.store.list_skills(enabled=True)
         )
+        skill_task = dict(task)
+        skill_task["required_capabilities"] = list(required)
         assignments, warnings = self.select_skills(
-            task, records, variant=variant
+            skill_task, records, variant=variant
         )
         name, role_label, identity = self._identity(task, role, attempt)
         required_set = set(required)

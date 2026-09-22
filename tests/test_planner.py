@@ -22,6 +22,7 @@ from control_center.planner import (
     validate_plan,
 )
 from control_center.storage import Store
+from control_center.task_analyst import TaskAnalyst, deterministic_task_analysis
 from control_center.transport import TransportError
 
 
@@ -230,6 +231,24 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_failure_logs_serialize_structured_input_and_output(self):
+        run = self.store.create_orchestration("Create hello.txt")
+        enter_planning(self.store, run["id"])
+        plan = fallback_plan("Create hello.txt")
+        self.store.save_orchestration_plan(run["id"], plan, PLAN_SCHEMA_VERSION)
+        graph = ExecutionGraph(plan)
+        self.store.initialize_execution_graph(run["id"], graph.serialize())
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "freya.test.structured_failure", "status": "Failed",
+            "input": {"argv": ["python", "hello.py"], "nested": [1, {"safe": True}]},
+            "output": {"error": "policy denied", "details": ["existing.py"]},
+            "message": "Structured failure fixture.",
+        })
+        logs = Orchestrator(self.store, None)._failure_logs(run["id"], graph)
+        entry = next(item for item in logs if item.get("event_type") == "freya.test.structured_failure")
+        self.assertIn('"safe":true', entry["input"])
+        self.assertIn('"existing.py"', entry["output"])
+
     def test_orchestration_allocates_one_persisted_workspace_for_all_nodes(self):
         class RuntimeStub:
             def __init__(self, data_dir):
@@ -296,8 +315,8 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertIn("freya.plan.created", event_types)
         created = next(event for event in stored["events"] if event["event_type"] == "freya.plan.created")
         payload = json.loads(created["payload_json"])
-        self.assertEqual(payload["task_count"], 2)
-        self.assertEqual(payload["task_ids"], ["task-1", "code-audit"])
+        self.assertEqual(payload["task_count"], 1)
+        self.assertEqual(payload["task_ids"], ["task-1"])
 
     def test_failed_planning_emits_failure_without_plan(self):
         run = self.store.create_orchestration("Create hello.txt")
@@ -575,6 +594,56 @@ class OrchestrationLifecycleTests(unittest.TestCase):
 
 
 class TaskAnalysisPlannerTests(unittest.TestCase):
+    def test_task_kind_reconciles_verification_capabilities_for_python(self):
+        analysis = deterministic_task_analysis("Crea un programa Python que imprima Hello World")
+        generated = plan(tasks=[task(
+            required_capabilities=["filesystem.create"],
+            preferred_skills=[],
+            success_criteria=["The program outputs 'Hello World' when executed"],
+        )])
+        result = Planner(lambda prompt, context: generated).create_plan(
+            analysis["operational_prompt"], {"task_analysis": analysis},
+        )
+        first = result["tasks"][0]
+        self.assertEqual(analysis["task_kind"], "program_creation")
+        self.assertIn("filesystem.create", first["required_capabilities"])
+        self.assertIn("filesystem.read", first["required_capabilities"])
+        self.assertIn("execution.python_script", first["required_capabilities"])
+        self.assertIn("python-development", first["preferred_skills"])
+        self.assertEqual(len(result["tasks"]), 1)
+
+    def test_inconsistent_model_hello_world_plan_is_repaired_before_factory(self):
+        analysis = deterministic_task_analysis("Execute a simple 'Hello World' program.")
+        analysis["operational_prompt"] = "{}"
+        analysis["task_kind"] = "file_creation"
+        analysis["task_characteristics"] = dict(analysis["task_characteristics"])
+        analysis["task_characteristics"].update(
+            requires_filesystem_read=False, requires_filesystem_write=False,
+        )
+        generated = plan(
+            complexity="multi_step",
+            goal="{}",
+            tasks=[
+                task("t1", "Execute a simple Hello World Python program",
+                     required_capabilities=[
+                         "filesystem.create", "filesystem.overwrite", "execution.python_script",
+                     ], preferred_skills=["python-development"]),
+                task("code-audit", "Audit the generated code", depends_on=["t1"],
+                     required_capabilities=["filesystem.read"], preferred_skills=["code-review"]),
+            ],
+        )
+        result = Planner(lambda prompt, context: generated).create_plan(
+            "Execute a simple 'Hello World' program.", {"task_analysis": analysis},
+        )
+        first = result["tasks"][0]
+        self.assertEqual(result["complexity"], "simple")
+        self.assertEqual([item["id"] for item in result["tasks"]], ["t1"])
+        self.assertEqual(first["preferred_skills"][0], "python-development")
+        self.assertEqual(first["required_capabilities"], [
+            "filesystem.create", "execution.python_script", "filesystem.read",
+        ])
+        self.assertNotIn("filesystem.overwrite", first["required_capabilities"])
+
     def test_windows_script_analysis_prevents_python_only_plan(self):
         generated = plan(tasks=[task(
             required_capabilities=["execution.python_script"],

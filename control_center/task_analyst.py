@@ -23,9 +23,13 @@ MAX_ANALYSIS_INPUT_CHARS = 12000
 MAX_ANALYSIS_ITEMS = 30
 DEFAULT_ANALYST_TIMEOUT_SECONDS = 60.0
 TASK_ANALYST_ROLE = "task_analyst"
+TASK_KINDS = {
+    "file_creation", "program_creation", "code_change", "analysis",
+    "testing", "review", "external_action", "general",
+}
 
 ANALYSIS_FIELDS = {
-    "operational_prompt", "objective", "task_type", "requirements", "assumptions", "task_characteristics",
+    "operational_prompt", "objective", "task_type", "task_kind", "requirements", "assumptions", "task_characteristics",
     "risks", "plan", "acceptance_criteria", "validation", "recommended_agent_role",
     "ready_for_execution", "blocking_reason",
 }
@@ -42,6 +46,7 @@ ANALYSIS_RESPONSE_FORMAT = {
         "operational_prompt": {"type": "string"},
         "objective": {"type": "string"},
         "task_type": {"type": "string"},
+        "task_kind": {"type": "string", "enum": sorted(TASK_KINDS)},
         "requirements": {"type": "array", "items": {"type": "object"}},
         "assumptions": {"type": "array", "items": {"type": "object"}},
         "task_characteristics": {
@@ -106,6 +111,28 @@ def _bounded_prompt(prompt: str, limit: int) -> str:
     return prompt[:head] + "\n...[prompt truncated for analysis]...\n" + prompt[-tail:]
 
 
+def canonical_task_kind(task_type: Any = "", text: Any = "",
+                        characteristics: dict[str, Any] | None = None) -> str:
+    """Map human labels to a stable category shared by planning and factory."""
+    value = " ".join([str(task_type or ""), str(text or "")]).casefold()
+    characteristics = characteristics if isinstance(characteristics, dict) else {}
+    if characteristics.get("requires_external_service") or characteristics.get("requires_network"):
+        return "external_action"
+    if re.search(r"\b(?:audit|review|code review|revis(?:a|ar)|inspecciona el c[oó]digo)\b", value):
+        return "review"
+    if re.search(r"\b(?:test|testing|qa|prueba|probar|validar tests?)\b", value):
+        return "testing"
+    if re.search(r"\b(?:debug|diagnos|root cause|fix|bug|error|arregla)\b", value):
+        return "analysis"
+    if re.search(r"\b(?:python|programa|program|script|c[oó]digo ejecutable|imprima|print)\b", value):
+        return "program_creation"
+    if re.search(r"\b(?:crea|crear|create|archivo|file|documento|document|config|notes?|hola mundo|hello world)\b", value):
+        return "file_creation"
+    if re.search(r"\b(?:implement|modific|modify|edit|refactor|cambio|change)\b", value):
+        return "code_change"
+    return "general"
+
+
 def validate_task_analysis(value: Any) -> dict[str, Any]:
     """Validate and bound the operational rewrite returned by the analyst."""
     if not isinstance(value, dict):
@@ -117,6 +144,11 @@ def validate_task_analysis(value: Any) -> dict[str, Any]:
     supplied_version = value.pop("analysis_version", TASK_ANALYSIS_VERSION)
     if supplied_version != TASK_ANALYSIS_VERSION:
         raise TaskAnalysisError("Unsupported task analysis version.")
+    if "task_kind" not in value:
+        value["task_kind"] = canonical_task_kind(
+            value.get("task_type"), value.get("objective") or value.get("operational_prompt"),
+            value.get("task_characteristics"),
+        )
     missing = ANALYSIS_FIELDS - value.keys()
     unknown = value.keys() - ANALYSIS_FIELDS
     if missing:
@@ -225,12 +257,15 @@ def validate_task_analysis(value: Any) -> dict[str, Any]:
         blocking_reason = _text(blocking_reason, "blocking_reason")
     if not ready and not blocking_reason:
         raise TaskAnalysisError("A blocked analysis requires blocking_reason.")
+    if value["task_kind"] not in TASK_KINDS:
+        raise TaskAnalysisError("task_kind must be a canonical task category.")
 
     return sanitize({
         "analysis_version": TASK_ANALYSIS_VERSION,
         "operational_prompt": _text(value["operational_prompt"], "operational_prompt"),
         "objective": _text(value["objective"], "objective"),
         "task_type": _text(value["task_type"], "task_type"),
+        "task_kind": value["task_kind"],
         "requirements": normalized_requirements,
         "assumptions": normalized_assumptions,
         "task_characteristics": dict(characteristics),
@@ -292,11 +327,14 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
         r"\b(?:crea|crear|create|escrib|write|implement|program|codig|code|archivo|file|script|modific|edit)\w*\b",
         lowered,
     ))
-    requires_read = bool(re.search(
+    requires_read = requires_write or bool(re.search(
         r"\b(?:lee|leer|read|inspect|review|revis|analiz|analy|debug|diagnos)\w*\b",
         lowered,
     ))
     task_type = "windows_command_script" if windows_script else "general_task"
+    task_kind = canonical_task_kind(task_type, objective, {
+        "requires_external_service": False, "requires_network": False,
+    })
     requirements = [{"id": "REQ-1", "description": objective, "source": "explicit"}]
     assumptions = []
     if windows_script:
@@ -309,7 +347,7 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
         "requires_user_input": requires_input,
         "requires_filesystem_read": requires_read,
         "requires_filesystem_write": requires_write,
-        "requires_code_execution": calculator or windows_script or "script" in lowered,
+        "requires_code_execution": calculator or windows_script or "script" in lowered or "python" in lowered,
         "requires_network": False,
         "requires_gui": False,
         "requires_external_service": False,
@@ -346,6 +384,7 @@ def deterministic_task_analysis(prompt: str) -> dict[str, Any]:
         "operational_prompt": operational_prompt,
         "objective": objective,
         "task_type": task_type,
+        "task_kind": task_kind,
         "requirements": requirements,
         "assumptions": assumptions,
         "task_characteristics": characteristics,
@@ -392,33 +431,54 @@ class OllamaTaskAnalyst:
         started = time.monotonic()
         self.metrics = {"model_calls": 1, "prompt_tokens": 0, "generated_tokens": 0,
                         "total_tokens": 0, "duration_seconds": 0.0}
-        response = self.request(
-            "POST", endpoint.rstrip("/") + "/api/chat",
-            {"model": model, "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": "Original user prompt:\n" +
-                 _bounded_prompt(prompt, MAX_ANALYSIS_INPUT_CHARS)},
-            ], "tools": [], "format": ANALYSIS_RESPONSE_FORMAT, "stream": False,
-             "think": False, "options": {"temperature": 0, "num_ctx": int(config.get("context_window", 8192)),
-                                          "num_predict": 4096}},
-            timeout=timeout,
-        )
-        message = response.get("message")
-        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-            raise TaskAnalysisError("Task Analyst returned no content.")
-        for target, source in (("prompt_tokens", "prompt_eval_count"),
-                               ("generated_tokens", "eval_count")):
-            value = response.get(source, 0) or 0
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-                raise TaskAnalysisError("Task Analyst returned invalid token metrics.")
-            self.metrics[target] = int(value)
+        self.metrics["model_calls"] = 0
+
+        def call(user_content: str) -> str:
+            response = self.request(
+                "POST", endpoint.rstrip("/") + "/api/chat",
+                {"model": model, "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ], "tools": [], "format": ANALYSIS_RESPONSE_FORMAT, "stream": False,
+                 "think": False, "options": {"temperature": 0, "num_ctx": int(config.get("context_window", 8192)),
+                                              "num_predict": 4096}},
+                timeout=timeout,
+            )
+            self.metrics["model_calls"] += 1
+            for target, source in (("prompt_tokens", "prompt_eval_count"),
+                                   ("generated_tokens", "eval_count")):
+                value = response.get(source, 0) or 0
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                    raise TaskAnalysisError("Task Analyst returned invalid token metrics.")
+                self.metrics[target] = self.metrics.get(target, 0) + int(value)
+            message = response.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+                raise TaskAnalysisError("Task Analyst returned no content.")
+            return message["content"]
+
+        self.metrics.update({"prompt_tokens": 0, "generated_tokens": 0, "total_tokens": 0})
+        content = call("Original user prompt:\n" + _bounded_prompt(prompt, MAX_ANALYSIS_INPUT_CHARS))
+        try:
+            result = validate_task_analysis(json.loads(content))
+        except (json.JSONDecodeError, TaskAnalysisError) as first_error:
+            repair_prompt = (
+                "Repair only the Task Analyst contract inconsistencies in the previous JSON. "
+                "Return the complete JSON object using exactly the requested schema. "
+                "Do not invent work, permissions, requirements, or a blocking_reason. "
+                "If the task is executable, set ready_for_execution true; otherwise provide a "
+                "blocking_reason grounded in the original prompt. Validation error: "
+                + str(first_error) + "\nPrevious response:\n" + str(content)[:MAX_ANALYSIS_TEXT_CHARS]
+            )
+            try:
+                repaired_content = call(repair_prompt)
+                result = validate_task_analysis(json.loads(repaired_content))
+            except (json.JSONDecodeError, TaskAnalysisError) as second_error:
+                raise TaskAnalysisError(
+                    "Task Analyst output remained invalid after one repair attempt: " + str(second_error)
+                ) from second_error
         self.metrics["total_tokens"] = self.metrics["prompt_tokens"] + self.metrics["generated_tokens"]
         self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
-        try:
-            value = json.loads(message["content"])
-        except json.JSONDecodeError as exc:
-            raise TaskAnalysisError("Task Analyst output is not valid JSON.") from exc
-        return validate_task_analysis(value)
+        return result
 
 
 def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -446,6 +506,9 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
     if detected["task_type"] != "general_task" and normalized["task_type"] != detected["task_type"]:
         corrected["task_type"] = detected["task_type"]
         changes.append("task_type")
+    if normalized.get("task_kind") != detected.get("task_kind") and detected.get("task_kind") != "general":
+        corrected["task_kind"] = detected["task_kind"]
+        changes.append("task_kind")
 
     validation = dict(normalized["validation"])
     if detected["validation"]["interactive_validation_required"] and not validation["interactive_validation_required"]:
@@ -473,6 +536,12 @@ def reconcile_task_analysis(prompt: str, analysis: dict[str, Any]) -> tuple[dict
             "a QA Tester must run it with bounded controlled stdin and verify logical output."
         )
     operational = normalized["operational_prompt"].strip()
+    if operational.casefold() in {"{}", "[]", "null"}:
+        # Some local models satisfy the string schema with a JSON placeholder.
+        # Keep the deterministic operational brief authoritative instead of
+        # sending that placeholder to Planner and workers.
+        operational = detected["operational_prompt"]
+        changes.append("operational_prompt")
     for addition in additions:
         if addition.casefold() not in operational.casefold():
             suffix = "\n\nMandatory constraint: " + addition

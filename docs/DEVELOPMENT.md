@@ -51,11 +51,35 @@ analyst model fails, Freya records the error and uses a deterministic bounded
 interpretation. The role can be selected in the agent editor; a Skill is not
 required for routing or authorization.
 
+The Analyst output includes the canonical internal `task_kind` categories
+`file_creation`, `program_creation`, `code_change`, `analysis`, `testing`,
+`review`, `external_action`, and `general`. If a model response is structurally
+blocked because `ready_for_execution=false` lacks a grounded
+`blocking_reason`, Freya makes exactly one tool-free repair request; it never
+invents a reason or permissions before falling back deterministically.
+
+Planner reconciliation is a safety floor over both sources: if the model plan
+contains a write or local execution, it derives `filesystem.read` for
+read-back; it removes `filesystem.overwrite` unless the user explicitly asked
+to replace an existing artifact; and it collapses an accidental audit node from
+an otherwise simple file/program task. A language mention in a debugging task
+does not turn that task into Python program creation.
+
 After planning, Freya creates one ephemeral least-privilege agent for each ready
 plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
 The factory uses only enabled registry Skills, caps assignments at eight, derives
 Tools from the complete task policy, and persists provenance for audit and
 terminal cleanup.
+
+For a generic file, the Planner selects the builtin `simple-file-artifact` Skill
+and creates one dynamic worker with `filesystem.create` plus read-back
+`filesystem.read`. A Python Hello World task uses `python-development` and
+derives `filesystem.create`, `filesystem.read`, and `execution.python_script`.
+These low-risk flows finish after the requested artifact is written, read back,
+and, for Python, executed with exit code 0 and expected output. They do not need
+Git, a test suite, QA, or a Code Auditor. The Skill requirements are diagnostics
+only and never expand the task policy; an incompatible primary Skill is a
+planning error, while an incompatible optional Skill is omitted.
 
 Semantic evaluation has separate local-model configuration:
 
@@ -169,7 +193,7 @@ data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
 
 SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
-`-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including the final read-only Code Auditor); direct task submissions still get one directory per task. These
+`-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including any conditional QA or audit task); direct task submissions still get one directory per task. These
 generated paths are ignored by Git.
 
 Shareable manual-agent definitions remain available in the versioned data/agents
@@ -186,16 +210,18 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
-Interactive plans append a dependent QA task with `interactive-testing`; mutation
-plans append one dependent read-only audit task with `code-review`. The factory
-creates independent QA and Auditor agents at dispatch time, so the ordered path
-Implementation → QA when needed → Code Auditor appears in Logs without
-preconfigured pipeline agents.
+Interactive plans append a dependent QA task with `interactive-testing`. More
+complex mutation plans may append a dependent read-only audit task with
+`code-review`; the bounded simple file/program path remains one implementation
+task. The factory creates any QA or Auditor agent at dispatch time, so no
+preconfigured pipeline agents are required.
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
 verification, autonomy, output, and limits are compact expandable sections. The
-API presets cover Programmer, Task Analyst, QA Tester and Code Auditor; the
-Agents page keeps the existing Programmer quick-create action.
+API presets cover Programmer, Task Analyst, QA Tester and Code Auditor for
+manual/direct-task and legacy compatibility workflows. The Agents page keeps the
+existing Programmer quick-create action, but those presets are not prerequisites
+for modern dynamic orchestration.
 
 The **Skills** page manages reusable declarative knowledge. Create or edit a
 Skill with a stable lowercase ID, version, instructions, adaptable procedures,

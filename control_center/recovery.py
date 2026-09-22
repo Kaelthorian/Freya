@@ -279,7 +279,14 @@ def validate_failure_diagnosis(value: Any, *, known_log_ids: set[str]) -> dict[s
 
 
 def _failure_text(event: dict[str, Any]) -> str:
-    for key in ("error", "message", "reason"):
+    # Orchestration rows often keep a concise lifecycle message plus a nested
+    # runtime error in their payload. Prefer the lifecycle message there so a
+    # failure such as "Planned task entered failed" is not reduced to the
+    # worker's prompt/error text; runtime rows retain error-first semantics.
+    keys = ("message", "error", "reason") if event.get("source") == "orchestration" else (
+        "error", "message", "reason"
+    )
+    for key in keys:
         value = _normalized(event.get(key))
         if value:
             return value[:MAX_RECOVERY_TEXT_CHARS]

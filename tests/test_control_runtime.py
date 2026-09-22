@@ -130,9 +130,10 @@ class WorkerTests(unittest.TestCase):
     def test_successful_command_output_becomes_acceptance_evidence(self):
         result = self.run_worker([
             answer(calls=[("write_file", {"path": "hello.py", "content": "print('Hello World')"})]),
+            answer(calls=[("read_file", {"path": "hello.py"})]),
             answer(calls=[("run_command", {"argv": ["python", "hello.py"]})]),
             answer("Created and verified hello.py."),
-        ], tools=["write_file", "run_command"], config={
+        ], tools=["write_file", "read_file", "run_command"], config={
             "permissions": "execute",
             "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
             "verification": {
@@ -151,7 +152,28 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("Hello World", command["output"])
         self.assertIn("The program outputs 'Hello World' when executed",
                       command["supports_acceptance_criteria"])
+        self.assertTrue(any(item.get("check") == "filesystem:read_file:hello.py"
+                            for item in evidence))
         self.assertTrue(any(item["tool"] == "run_command" for item in result["result"]["actions"]))
+
+    def test_simple_file_is_verified_by_readback_without_git_or_tests(self):
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "hola_mundo.txt", "content": "hola mundo"})]),
+            answer(calls=[("read_file", {"path": "hola_mundo.txt"})]),
+            answer("Created and verified hola_mundo.txt."),
+        ], tools=["write_file", "read_file"], config={
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {
+                "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": True, "completion_criteria": ["The file contains 'hola mundo'"],
+            },
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertFalse(result["verification"]["unavailable"])
+        self.assertTrue(any(item.get("check") == "filesystem:read_file:hola_mundo.txt"
+                            for item in result["verification"]["evidence"]))
 
     def test_identical_policy_denial_is_intercepted_before_second_tool_execution(self):
         existing = self.workspace / "existing.py"
@@ -172,15 +194,18 @@ class WorkerTests(unittest.TestCase):
         result = self.run_worker([
             answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
             answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
-            answer('{"action":"finish","message":"Policy denied; no safe overwrite."}'),
+            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
         ], tools=["write_file"], config={"capability_policy": policy})
-        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["status"], "Failed")
+        self.assertIn("BlockedActionCycle", result["error"])
         writes = [event["event"] for event in self.events
                   if event.get("event", {}).get("event_type") == "step.finished"]
-        self.assertEqual(len(writes), 2)
+        self.assertEqual(len(writes), 3)
         self.assertEqual(writes[0]["error_class"], "policy_denied")
         self.assertEqual(writes[1]["error_class"], "repeated_policy_denied")
+        self.assertEqual(writes[2]["error_class"], "blocked_action_cycle")
         self.assertIn("POLICY_DENIED_REPEAT", writes[1]["output"])
+        self.assertIn("returning control to recovery", writes[2]["output"])
 
     def test_runtime_actions_and_artifacts_survive_malformed_structured_output(self):
         result = self.run_worker([

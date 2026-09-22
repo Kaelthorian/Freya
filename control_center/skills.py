@@ -30,6 +30,30 @@ MAX_CONTEXT_CHARS = 64000
 
 BUILTIN_SKILLS: tuple[dict[str, Any], ...] = (
     {
+        "id": "simple-file-artifact", "name": "Simple File Artifact", "category": "Artifact Creation",
+        "version": 1,
+        "description": "Create and verify one small local file without unnecessary project scaffolding.",
+        "instructions": [
+            "Create only the requested artifact in the selected workspace.",
+            "Inspect before modifying an existing artifact during recovery.",
+            "Read the artifact after creation and stop when objective evidence is sufficient.",
+            "Never repeat an identical policy-denied write and do not add tests or audits unless requested.",
+        ],
+        "procedures": [{
+            "name": "Create and Verify Artifact",
+            "steps": [
+                "Inspect the target only when needed to distinguish a new file from an existing artifact.",
+                "Create the requested file with the exact requested content.",
+                "Read it back and compare the content with the objective.",
+                "Report the read-back evidence and finish without creating extra files.",
+            ],
+        }],
+        "recommended_capabilities": ["filesystem.read", "filesystem.create"],
+        "required_capabilities": ["filesystem.read", "filesystem.create"],
+        "tags": ["file", "artifact", "local", "creation", "readback", "simple"],
+        "source": "builtin", "enabled": True,
+    },
+    {
         "id": "python-development", "name": "Python Development", "category": "Software Development",
         "version": 1, "description": "Develop, debug and validate Python software.",
         "instructions": ["Follow existing project conventions.", "Prefer small reviewable changes.", "Validate syntax and relevant tests when available."],

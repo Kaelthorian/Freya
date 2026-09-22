@@ -11,9 +11,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── task_analyst.py       tool-free operational-prompt rewrite, reconciliation and fallback
-│   ├── planner.py            plan schema, conditional QA/audit nodes, validation and offline fallback
-│   ├── agent_factory.py      per-task least-privilege agent creation, provenance and Skill assignment
+│   ├── task_analyst.py       tool-free rewrite, canonical task kinds, repair and deterministic fallback
+│   ├── planner.py            plan schema, safe verification derivation, conditional QA/audit and fallback
+│   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          evidence-first checks, schema and tool-free Ollama adapter
@@ -31,9 +31,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── config.py             agent defaults, catalogue and validation
 │   ├── capabilities.py       capability registry and tool-to-action resolver
 │   ├── policy.py             policy schema, legacy migration and engine
-│   ├── skills.py             reusable Skill registry, validation and resolution
+│   ├── skills.py             reusable Skill registry, builtin artifact Skill, validation and resolution
 │   ├── agent_context.py      structured agent defaults, effective config and worker context
-│   ├── presets.py            separated Programmer, Task Analyst, QA Tester and Code Auditor presets
+│   ├── presets.py            manual/legacy Programmer, Task Analyst, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
 │   ├── index.html / styles.css
@@ -68,7 +68,9 @@ selects them.
    adapter in `planner.py`; `orchestrator.py` stores the validated plan snapshot
    atomically. Interactive work receives an independent QA node using bounded
    Python stdin, and mutation work ends with a read-only Code Auditor node.
-   `execution_graph.py` releases ready tasks in plan order. For each ready task,
+   `execution_graph.py` releases ready tasks in plan order. Low-risk generic file
+   and Python artifact requests remain one task; the Planner derives read-back
+   and Python execution needs without adding audit/QA. For each ready task,
    `agent_factory.py` creates one validated ephemeral agent whose complete policy
    comes only from `required_capabilities`, whose Tools are derived from that
    policy, and whose Skills come from the enabled registry without granting
@@ -119,12 +121,12 @@ selects them.
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_context.py`, `tests/test_skills.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
-| Prompt rewrite before planning | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py` |
+| Prompt rewrite, task kinds or Analyst repair | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py`, `tests/test_planner.py` |
 | Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
 | Recovery workspace context or safe retry capabilities | `orchestrator.py`, `recovery.py`, `agent_factory.py`, `agent_selector.py`, `tests/test_agent_factory.py`, `tests/test_recovery.py` |
 | Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py` (normalized actor/workspace traces), `worker.py`, `__main__.py`, `frontend/views.js`, `frontend/components.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
-| Dynamic agent construction, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py` |
+| Dynamic agent construction, Skill compatibility, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `skills.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py`, `tests/test_skills.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |

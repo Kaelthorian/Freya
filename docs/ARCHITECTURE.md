@@ -16,6 +16,9 @@ policy denies every undeclared capability, dangerous requirements remain
 `control_center/execution_graph.py` delegates the bounded task through `Runtime`
 and requires
 `control_center/evaluator.py` to accept technical successes before integration.
+Low-risk file and Python artifact requests use a single dynamic implementation
+task; the Planner derives the minimum read-back and execution capabilities and
+does not add a code audit or recovery stage merely because a file was created.
 Workers remain the only components allowed to invoke tools;
 Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
 before a node can fail or a validated effective-plan revision can replace its subgraph.
@@ -38,7 +41,7 @@ parent process alone writes execution events and state to SQLite.
 ```text
 browser → HTTP API → SQLite
              ↓
-       Task Analyst → Planner → implementation → conditional QA → read-only Auditor
+       Task Analyst → Planner → dynamic implementation → conditional QA/audit
                               ↓                    ↓                 ↓
                        immutable plan ─────→ Execution Graph → Agent Factory → Agent Selector → Orchestrator
                                               ↓              ↓              ↓
@@ -52,7 +55,12 @@ browser → HTTP API → SQLite
 The Task Analyst rewrites **what the user meant** without executing anything;
 its validated operational prompt is authoritative for execution and the human
 prompt remains available only for audit. Deterministic reconciliation prevents
-schema-valid contradictions such as ignoring interactive input. The Planner determines **what** work exists. The Agent Factory determines
+schema-valid contradictions such as ignoring interactive input, assigns a
+canonical internal `task_kind`, and makes one structured repair attempt when a
+model response is blocked without a valid reason. The Planner determines **what**
+work exists and derives safe verification needs: writes normally include
+`filesystem.read`, while Python Hello World includes `execution.python_script`;
+`filesystem.overwrite` is never added unless the task requires it. The Agent Factory determines
 **who** executes each planned task by constructing a task-specific identity,
 Skill set and least-privilege policy. The Agent Selector independently validates
 and classifies that candidate before dispatch. The deterministic Execution Graph determines **when** dependency-ready
@@ -67,6 +75,12 @@ supersede, or rerun accepted tasks. The Result Integrator determines **what
 grounded response to present**, but it cannot change correctness. These
 orchestration-level components are tool-free and consume only bounded,
 sanitized evidence.
+
+Skills remain declarative guidance: they never grant capabilities. A primary
+preferred Skill that is incompatible with the task policy rejects construction
+so the task can be replanned; optional incompatible Skills are omitted. Generic
+file creation selects the builtin `simple-file-artifact` Skill, whose required
+capabilities are only `filesystem.create` and `filesystem.read`.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -93,6 +107,11 @@ and `ephemeral=true`. Runtime task snapshots preserve their exact policy, Tools,
 Skills and provenance. Terminal success, failure, cancellation and startup
 recovery soft-archive every dynamic agent belonging to the orchestration; manual
 agents and their direct-task API remain unchanged.
+The Programmer, QA Tester, Code Auditor and Task Analyst JSON definitions remain
+available as manual/legacy presets for direct tasks and compatibility. Modern
+orchestration only needs a persistent Task Analyst when model-backed analysis is
+desired; implementation, QA and audit roles are created dynamically when the
+plan actually requires them.
 Every Agent Selector decision, including `no_eligible_agent`, is stored in
 `orchestration_selections` with the planned task ID, selected agent when any,
 classification status, score, selector version, creation time and complete

@@ -137,12 +137,25 @@ deterministic semantic corrections. Planning then emits either
 
 `required_capabilities` are validated registry IDs that describe likely task
 needs; they do not grant permission. `preferred_skills` are non-binding semantic
-hints and may name a Skill that is not currently installed. For plans that mutate file/code artifacts, Freya appends one read-only `code-audit` task with `preferred_skills: ["code-review"]` after the implementation tasks.
+hints and may name a Skill that is not currently installed. The Analyst also
+records a canonical internal `task_kind`; the Planner uses it to derive safe
+verification needs. A write normally adds `filesystem.read` for read-back, and
+a Python program adds `execution.python_script`; `filesystem.overwrite` is not
+added unless explicitly required. Low-risk file/program creation stays one task
+without QA or `code-audit`; interactive work gets QA and more complex mutation
+plans may get a dependent read-only audit.
+Planner reconciliation also repairs model plans that contradict the Analyst:
+local writes/execution receive read-back evidence, accidental overwrite is
+removed, and a debugging task mentioning Python is not reclassified as program
+creation.
 For every ready plan task, Freya creates a validated ephemeral agent. Its complete
 policy allows only the declared requirements (`ask` for dangerous capabilities)
 and denies the rest; its Tool list is the deduplicated projection of that policy.
-The factory selects at most eight enabled Skills. Unknown or incompatible
-preferred Skills produce diagnostics and never add capability authority.
+The factory selects at most eight enabled Skills. Skills never add capability
+authority. An incompatible primary preferred Skill makes construction fail for
+replanning; an incompatible optional Skill is omitted. Generic file creation
+uses the builtin `simple-file-artifact` Skill, whose required and recommended
+capabilities are only `filesystem.create` and `filesystem.read`.
 
 After planning, `freya.agent_factory.started` precedes construction.
 `freya.agent_created` identifies the generated agent, role, assigned Skill IDs,
@@ -325,8 +338,10 @@ successful command can add a `command_execution` item to
 `verification.evidence` when its bounded output directly supports a quoted
 output, exit-code, or JSON completion criterion. The Planner adds
 `qa-interactive-test` when the Analyst marks a request interactive, followed by
-`code-audit` for mutation plans except for the bounded simple non-interactive
-single-task creation fast path.
+`code-audit` for complex mutation plans, except for the bounded simple
+non-interactive single-task file/program fast path. Three identical denied
+actions terminate the worker with `BlockedActionCycle`; the third attempt does
+not continue the normal action cycle.
 
 ## Tasks, observations and metrics
 

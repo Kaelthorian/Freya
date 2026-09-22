@@ -12,6 +12,7 @@ from control_center.planner import Planner
 from control_center.recovery import RecoveryController
 from control_center.runtime import Runtime
 from control_center.storage import Store
+from control_center.task_analyst import TaskAnalyst
 
 
 def planned_task(**changes):
@@ -121,6 +122,17 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertNotIn("run_command", agent["tools"])
         self.assertEqual(self.active_modes(agent), {"filesystem.read": "allow"})
 
+    def test_generic_file_task_selects_simple_artifact_skill(self):
+        created = self.create(planned_task(
+            objective="Create hola_mundo.txt with hola mundo",
+            description="Create one local text file and verify its contents.",
+            required_capabilities=["filesystem.create", "filesystem.read"],
+            preferred_skills=[],
+        ))
+        self.assertIn("simple-file-artifact", created["skill_ids"])
+        self.assertIn("read_file", created["agent"]["tools"])
+        self.assertIn("write_file", created["agent"]["tools"])
+
     def test_recovery_workspace_state_derives_safe_read_without_overwrite(self):
         created = self.create(planned_task(
             required_capabilities=["filesystem.create", "execution.python_script"],
@@ -164,19 +176,31 @@ class AgentFactoryTests(unittest.TestCase):
             "source": "user",
             "enabled": True,
         })
-        created = self.create(planned_task(
-            preferred_skills=[skill["id"]],
-            required_capabilities=["filesystem.read"],
-        ))
-        assigned = next(item for item in created["agent"]["skills"]
-                        if item["id"] == skill["id"])
-        self.assertFalse(assigned["operational"])
-        self.assertEqual(
-            created["agent"]["config"]["capability_policy"]["capabilities"]
-            ["filesystem"]["modify"]["mode"],
-            "deny",
-        )
-        self.assertNotIn("edit_file", created["agent"]["tools"])
+        with self.assertRaisesRegex(ValueError, "Primary Skill.*filesystem.modify"):
+            self.create(planned_task(
+                preferred_skills=[skill["id"]],
+                required_capabilities=["filesystem.read"],
+            ))
+
+    def test_incompatible_first_selected_skill_rejects_after_unknown_hint(self):
+        skill = self.store.create_skill({
+            "id": "requires-modify-after-unknown",
+            "name": "Requires Modify After Unknown",
+            "category": "Engineering",
+            "description": "Guidance that requires modification.",
+            "instructions": ["Modify only when authorized."],
+            "procedures": [],
+            "recommended_capabilities": [],
+            "required_capabilities": ["filesystem.modify"],
+            "tags": ["write"],
+            "source": "user",
+            "enabled": True,
+        })
+        with self.assertRaisesRegex(ValueError, "Primary Skill.*filesystem.modify"):
+            self.create(planned_task(
+                preferred_skills=["missing-skill", skill["id"]],
+                required_capabilities=["filesystem.read"],
+            ))
 
     def test_qa_task_is_dynamic_and_has_no_write_surface(self):
         created = self.create(planned_task(
@@ -282,9 +306,15 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertTrue(provenance["generated_by_freya"])
         self.assertTrue(provenance["ephemeral"])
 
-    def run_orchestration(self, statuses):
+    def run_orchestration(self, statuses, *, with_task_analyst=False):
         task = planned_task()
         calls = []
+        analyst = None
+        if with_task_analyst:
+            analyst = self.store.create_agent(normalize_agent({
+                "name": "Persistent Task Analyst",
+                "config": {"orchestration_role": "task_analyst"},
+            }))
 
         def evaluate(prompt, context):
             status = statuses[min(len(calls), len(statuses) - 1)]
@@ -303,12 +333,28 @@ class AgentFactoryTests(unittest.TestCase):
             planner=Planner(lambda prompt, context: json.dumps(plan_for(task))),
             evaluator=Evaluator(evaluate),
             recovery=RecoveryController(offline=True),
+            task_analyst=TaskAnalyst(offline=True),
             wait=lambda seconds: None,
             config={"max_wallclock_seconds": 10},
         )
         run = self.store.create_orchestration(task["objective"])
         orchestrator._run(run["id"])
         return self.store.get_orchestration(run["id"])
+
+    def test_modern_graph_uses_dynamic_worker_with_only_task_analyst_persistent(self):
+        final = self.run_orchestration(["accepted"], with_task_analyst=True)
+        self.assertEqual(final["status"], "Success")
+        roles = {
+            str(agent.get("config", {}).get("orchestration_role"))
+            for agent in self.store.list_agents()
+        }
+        self.assertEqual(roles, {"task_analyst"})
+        events = final["events"]
+        created = next(item for item in events if item["event_type"] == "freya.agent_created")
+        created_payload = json.loads(created["payload_json"])
+        self.assertEqual(created_payload["role"], "worker")
+        self.assertIn("python-development", created_payload["skill_ids"])
+        self.assertIn("freya.dynamic_agent.archived", [item["event_type"] for item in events])
 
     def test_retry_same_agent_reuses_exact_agent_id(self):
         final = self.run_orchestration(["needs_revision", "accepted"])

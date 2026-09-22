@@ -2,6 +2,37 @@
   "version": 1,
   "skills": [
     {
+      "id": "simple-file-artifact",
+      "name": "Simple File Artifact",
+      "description": "Create and verify one small local file without unnecessary project scaffolding.",
+      "category": "Artifact Creation",
+      "version": 1,
+      "instructions": [
+        "Create only the requested artifact in the selected workspace.",
+        "Inspect before modifying an existing artifact during recovery.",
+        "Read the artifact after creation and stop when objective evidence is sufficient.",
+        "Never repeat an identical policy-denied write and do not add tests or audits unless requested."
+      ],
+      "procedures": [
+        {
+          "name": "Create and Verify Artifact",
+          "description": "",
+          "steps": [
+            "Inspect the target only when needed to distinguish a new file from an existing artifact.",
+            "Create the requested file with the exact requested content.",
+            "Read it back and compare the content with the objective.",
+            "Report the read-back evidence and finish without creating extra files."
+          ]
+        }
+      ],
+      "recommended_capabilities": ["filesystem.read", "filesystem.create"],
+      "required_capabilities": ["filesystem.read", "filesystem.create"],
+      "tags": ["file", "artifact", "local", "creation", "readback", "simple"],
+      "enabled": true,
+      "source": "builtin",
+      "metadata": {}
+    },
+    {
       "id": "code-review",
       "name": "Code Review",
       "description": "Review changes for correctness, risks and maintainability.",

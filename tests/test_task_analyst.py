@@ -108,6 +108,27 @@ class TaskAnalystTests(unittest.TestCase):
         self.assertEqual(result["analysis_version"], 2)
         self.assertEqual(adapter.metrics["total_tokens"], 9)
 
+    def test_ollama_adapter_repairs_blocked_contract_once_before_failure(self):
+        first = deterministic_task_analysis("Create a file")
+        first["ready_for_execution"] = False
+        first["blocking_reason"] = None
+        second = deterministic_task_analysis("Create a file")
+        responses = [
+            {"message": {"content": json.dumps(first)}, "prompt_eval_count": 2, "eval_count": 3},
+            {"message": {"content": json.dumps(second)}, "prompt_eval_count": 4, "eval_count": 5},
+        ]
+
+        def request(method, url, payload, timeout):
+            self.assertEqual(payload["tools"], [])
+            return responses.pop(0)
+
+        agent = normalize_agent({"name": "Task Analyst", "role": "Task Analyst Planner"})
+        adapter = OllamaTaskAnalyst(request=request)
+        result = adapter.analyze("Create a file", agent)
+        self.assertTrue(result["ready_for_execution"])
+        self.assertEqual(adapter.metrics["model_calls"], 2)
+        self.assertEqual(len(responses), 0)
+
     def test_orchestrator_runs_analysis_before_planning(self):
         analyst = normalize_agent({
             "name": "Interpreter", "config": {"orchestration_role": "task_analyst"},
@@ -147,6 +168,21 @@ class TaskAnalystTests(unittest.TestCase):
         self.assertTrue(result["validation"]["interactive_validation_required"])
         self.assertIn("controlled stdin", result["operational_prompt"])
         self.assertIn("operational_prompt", wrapper.metrics["corrected_fields"])
+
+    def test_placeholder_operational_prompt_is_replaced_by_deterministic_brief(self):
+        flawed = deterministic_task_analysis("Create hello.txt")
+        flawed["operational_prompt"] = "{}"
+
+        class PlaceholderAdapter:
+            metrics = {"model_calls": 1}
+            def analyze(self, _prompt, _agent):
+                return flawed
+
+        result = TaskAnalyst(PlaceholderAdapter()).analyze(
+            "Create hello.txt", {"id": "analyst"},
+        )
+        self.assertNotEqual(result["operational_prompt"], "{}")
+        self.assertIn("hello.txt", result["operational_prompt"])
 
 
 if __name__ == "__main__":
