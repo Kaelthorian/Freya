@@ -1548,7 +1548,7 @@ class Store(IntegrationStoreMixin):
                 for agent in self._archive_dynamic_agents(c, row["id"], now):
                     archived_event = {
                         "event_type": "freya.dynamic_agent.archived",
-                        "status": "Failed",
+                        "status": "Success", "orchestration_status": "Failed",
                         "orchestration_id": row["id"],
                         "agent_id": agent["agent_id"],
                         "plan_task_id": agent.get("plan_task_id"),
@@ -1559,7 +1559,7 @@ class Store(IntegrationStoreMixin):
                     c.execute(
                         "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,"
                         "status,agent_id,task_id,message,payload_json) VALUES(?,?,?,?,?,?,?,?)",
-                        (row["id"], now, archived_event["event_type"], "Failed",
+                        (row["id"], now, archived_event["event_type"], "Success",
                          agent["agent_id"], agent.get("plan_task_id"),
                          archived_event["message"], _dump(archived_event)),
                     )

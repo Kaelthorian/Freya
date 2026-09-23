@@ -300,6 +300,23 @@ class FailureAnalysisContractTests(unittest.TestCase):
         self.assertEqual(captured, [self.logs()])
         self.assertEqual(analyzer.metrics["model_calls"], 1)
 
+    def test_failure_analysis_keeps_transport_metrics_on_model_error(self):
+        class FailedModel:
+            last_call_metrics = {"transport": {
+                "provider": "ollama", "component": "failure_analyzer",
+                "stop_reason": "OLLAMA_GENERATION_TIMEOUT",
+            }}
+
+            def __call__(self, logs):
+                raise RuntimeError("model timeout")
+
+        analyzer = FailureAnalyzer(FailedModel())
+        with self.assertRaisesRegex(RuntimeError, "model timeout"):
+            analyzer.analyze(self.logs())
+        self.assertEqual(analyzer.metrics["model_calls"], 1)
+        self.assertEqual(analyzer.metrics["model_call_details"][0]["stop_reason"],
+                         "OLLAMA_GENERATION_TIMEOUT")
+
     def test_ollama_analysis_is_one_tool_free_logs_only_call(self):
         requests = []
 

@@ -323,6 +323,17 @@ symlink regression skips when the Windows account cannot create symlinks. A
 full end-to-end task additionally requires local Ollama and an installed model.
 Planner tests cover atomic transitions, cancellation races, restart recovery,
 approval waiting, child failure propagation, deadlines and simulated Ollama.
+They also verify synthesis of omitted global-link rows from success criteria,
+deterministic global/local criterion-ID assignment for missing, blank and
+duplicate IDs, preservation of valid IDs, cross-namespace collisions, safe
+local-criterion reconciliation, safe reference resolution or rejection, and explicit
+coverage before execution. A regression reproduces the Ollama output where one
+Analyst AC placeholder stands in for two concrete plan criteria; each local
+link must resolve by exact text. Another checks `T-N` expansion across task IDs,
+dependencies and local links. Task Analyst tests check REQ/AC normalization and
+`verifies` references. ID-only normalizations do not call the model repair path. Corrected IDs
+are reported as counts in `freya.planner.normalized`; inspect its `stable_ids`
+payload alongside `planning_metrics`.
 Execution-graph tests cover pure DAG transitions, sequential and parallel
 scheduling, joins, branch-local failure propagation, approval waits, paused
 agents, per-agent serialization, concurrency limits, cancellation and migration.
@@ -332,6 +343,8 @@ gating, duplicate prevention, technical failure, cancellation, timeout and
 restart recovery.
 Integration tests cover deterministic preconditions, exact global criteria,
 hard evidence precedence, prompt injection, strict schema/one repair,
+canonical status/action normalization, exact direct-proof fast path, safe
+verifier validation events, separate archival and orchestration statuses,
 fingerprints, immutable snapshots, duplicate rounds, stale/cancel/timeout
 discard, restart and migration, append-only validation, shared limits, global
 loop detection, normal selector/evaluator execution for appended work, grounded
@@ -346,6 +359,48 @@ Fixture model acceptances must cite permitted proof; do not restore empty
 evidence to make a regression pass. See [Integration proof contract](INTEGRATION_PROOF.md).
 
 ## Debugging
+
+### Ollama calls
+
+Production chat requests stream through `control_center/transport.py`. Set
+`--planner-timeout`, `--evaluator-timeout`, `--recovery-timeout`, or
+`--integration-timeout` as inactivity limits; they do not replace the hard
+limits in `MODEL_PROFILES`. The Task Analyst reads its bounded agent setting,
+and the Worker also obeys its remaining task wall-clock budget. Adjust output
+and repair token caps together in `MODEL_PROFILES` when a validated response
+needs more room. The transport reconstructs the existing response shape for
+structured parsers and tool calls.
+
+Current profile defaults (seconds / output tokens; repair column applies only
+to components with a repair call):
+
+| Component | Connect | Inactivity | Hard | Normal | Repair |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Task Analyst | 5 | 90 | 600 | 4096 | 3072 |
+| Planner | 5 | 120 | 600 | 4096 | 2048 |
+| Worker | 5 | 90 | 600 | 2048 | 768 |
+| Evaluator | 5 | 90 | 360 | 1024 | 512 |
+| Global Verifier, Integration Replanner, Result Integrator | 5 | 120 | 600 | 1024 | 512 |
+| Failure Analyzer | 5 | 120 | 360 | 768 | 512 |
+| Recovery Replanner | 5 | 120 | 600 | 768 | 512 |
+
+Inspect `planning_metrics.model_call_details`, Analyst/evaluation/recovery/
+integration metrics, or Worker `model.finished`/`model.failed` events for the
+body-free transport record. `stop_reason` distinguishes `OLLAMA_UNREACHABLE`,
+`OLLAMA_REQUEST_TIMEOUT`, `OLLAMA_GENERATION_TIMEOUT`, `OLLAMA_HTTP_ERROR`,
+and `OLLAMA_INVALID_RESPONSE`; `timeout_type` identifies connect, inactivity,
+or hard. Connection refusal opens a five-second provider circuit. A slow but
+active generation leaves it healthy. The `freya.ollama` logger writes one JSON
+metadata record per chat call and excludes prompts, responses and credentials.
+If a call ends with `stop_reason=stop` but Analyst falls back or Planner fails,
+inspect the schema/validation error: the provider completed generation, so a
+network timeout change will not repair that model output.
+`stop_reason=length` means Ollama reached `num_predict`; if repaired JSON is
+cut off, inspect the component's normal and repair limits in `MODEL_PROFILES`.
+
+Run `python -m unittest tests.test_transport -v` from the repository root for
+connection refusal, slow streaming, hard timeout, HTTP error, tool-call and
+Planner repair coverage. The live model check still requires local Ollama.
 
 Recovery tests cover strict schema/one repair, deterministic offline fallback,
 exact action/model/revision/task budgets, failure fingerprints, same- and

@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable
 
 from .config import validate_endpoint
 from .security import sanitize
-from .transport import request_json
+from .transport import model_profile, model_request, request_json
 
 
 TASK_ANALYSIS_VERSION = 3
@@ -100,6 +100,46 @@ def _text_list(value: Any, field: str) -> list[str]:
     return result
 
 
+def _stable_analysis_ids(items: list[dict[str, Any]], prefix: str
+                         ) -> tuple[list[str], dict[str, str], set[str]]:
+    """Allocate namespace IDs while retaining unique references to old IDs."""
+    pattern = re.compile(rf"{prefix}-([1-9][0-9]*)\Z", re.I)
+    raw_ids = [item.get("id") for item in items]
+    counts: dict[str, int] = {}
+    for raw_id in raw_ids:
+        if isinstance(raw_id, str) and raw_id.strip():
+            key = raw_id.strip().casefold()
+            counts[key] = counts.get(key, 0) + 1
+    assigned: list[str | None] = [None] * len(items)
+    reserved: set[str] = set()
+    for index, raw_id in enumerate(raw_ids):
+        match = (pattern.fullmatch(raw_id.strip())
+                 if isinstance(raw_id, str) and len(raw_id.strip()) <= 64 else None)
+        if match is None:
+            continue
+        candidate = f"{prefix}-{int(match.group(1))}"
+        if candidate not in reserved:
+            assigned[index] = candidate
+            reserved.add(candidate)
+    next_number = 1
+    for index, identifier in enumerate(assigned):
+        if identifier is not None:
+            continue
+        while f"{prefix}-{next_number}" in reserved:
+            next_number += 1
+        assigned[index] = f"{prefix}-{next_number}"
+        reserved.add(assigned[index])
+        next_number += 1
+    lookup = {
+        raw_id.strip().casefold(): assigned[index]
+        for index, raw_id in enumerate(raw_ids)
+        if isinstance(raw_id, str) and raw_id.strip()
+        and counts[raw_id.strip().casefold()] == 1
+    }
+    ambiguous = {key for key, count in counts.items() if count > 1}
+    return [str(identifier) for identifier in assigned], lookup, ambiguous
+
+
 def _bounded_prompt(prompt: str, limit: int) -> str:
     if not isinstance(prompt, str) or not prompt.strip():
         raise TaskAnalysisError("prompt must not be empty.")
@@ -157,15 +197,17 @@ def validate_task_analysis(value: Any) -> dict[str, Any]:
         raise TaskAnalysisError("Task analysis has unknown fields: " + ", ".join(sorted(unknown)))
 
     requirements = _items(value["requirements"], "requirements")
+    requirement_ids, requirement_lookup, ambiguous_requirements = _stable_analysis_ids(
+        requirements, "REQ")
     normalized_requirements = []
-    for item in requirements:
-        if set(item) != {"id", "description", "source"}:
-            raise TaskAnalysisError("Each requirement must contain id, description and source.")
+    for index, item in enumerate(requirements):
+        if not {"description", "source"} <= set(item) or set(item) - {"id", "description", "source"}:
+            raise TaskAnalysisError("Each requirement must contain description and source.")
         source = _text(item["source"], "requirement.source")
         if source not in {"explicit", "inferred"}:
             raise TaskAnalysisError("requirement.source must be explicit or inferred.")
         normalized_requirements.append({
-            "id": _text(item["id"], "requirement.id"),
+            "id": requirement_ids[index],
             "description": _text(item["description"], "requirement.description"),
             "source": source,
         })
@@ -216,16 +258,25 @@ def validate_task_analysis(value: Any) -> dict[str, Any]:
         raise TaskAnalysisError("Task analysis must contain at least one plan step.")
 
     criteria = _items(value["acceptance_criteria"], "acceptance_criteria")
+    criterion_ids, _, _ = _stable_analysis_ids(criteria, "AC")
     normalized_criteria = []
-    requirement_ids = {item["id"] for item in normalized_requirements}
-    for item in criteria:
-        if set(item) != {"id", "description", "verifies"}:
+    for index, item in enumerate(criteria):
+        if not {"description", "verifies"} <= set(item) or set(item) - {"id", "description", "verifies"}:
             raise TaskAnalysisError("Each acceptance criterion has an invalid schema.")
-        verifies = _text_list(item["verifies"], "acceptance_criterion.verifies")
-        if any(ref not in requirement_ids for ref in verifies):
-            raise TaskAnalysisError("Acceptance criteria may only reference known requirements.")
+        verifies = []
+        for ref in _text_list(item["verifies"], "acceptance_criterion.verifies"):
+            key = ref.casefold()
+            if key in ambiguous_requirements:
+                raise TaskAnalysisError("Acceptance criterion reference is ambiguous after requirement ID repair.")
+            mapped = requirement_lookup.get(key)
+            if mapped is None and len(normalized_requirements) == 1 and ref.upper() == requirement_ids[0]:
+                mapped = requirement_ids[0]
+            if mapped is None:
+                raise TaskAnalysisError("Acceptance criteria may only reference known requirements.")
+            if mapped not in verifies:
+                verifies.append(mapped)
         normalized_criteria.append({
-            "id": _text(item["id"], "acceptance_criterion.id"),
+            "id": criterion_ids[index],
             "description": _text(item["description"], "acceptance_criterion.description"),
             "verifies": verifies,
         })
@@ -424,7 +475,9 @@ class OllamaTaskAnalyst:
             "You are Freya's Task Analyst and prompt engineer. Rewrite the human request into a precise, "
             "self-contained operational_prompt for the planner and delegated agents. Return only the strict "
             "JSON schema requested. Preserve every explicit requirement, label assumptions, detect interactive "
-            "input and risks, and include concrete acceptance and validation instructions. For a standalone "
+            "input and risks, and include concrete acceptance and validation instructions. Give requirements "
+            "unique REQ-N IDs and acceptance criteria unique AC-N IDs; verifies may name only existing REQ-N IDs. "
+            "For a standalone "
             "program with no language named, assume Python 3.10+ and state that assumption. For a code change, "
             "preserve the target project's existing language. Do not block only to ask for a language when "
             "these safe choices apply. Preserve an explicitly named language. Never execute tools "
@@ -432,22 +485,30 @@ class OllamaTaskAnalyst:
             + instructions[:16000]
         )
         started = time.monotonic()
-        self.metrics = {"model_calls": 1, "prompt_tokens": 0, "generated_tokens": 0,
+        self.metrics = {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
                         "total_tokens": 0, "duration_seconds": 0.0}
-        self.metrics["model_calls"] = 0
 
-        def call(user_content: str) -> str:
-            response = self.request(
-                "POST", endpoint.rstrip("/") + "/api/chat",
-                {"model": model, "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content},
-                ], "tools": [], "format": ANALYSIS_RESPONSE_FORMAT, "stream": False,
-                 "think": False, "options": {"temperature": 0, "num_ctx": int(config.get("context_window", 8192)),
-                                              "num_predict": 4096}},
-                timeout=timeout,
-            )
+        def call(user_content: str, *, repair: bool = False) -> str:
+            call_metrics: dict[str, Any] = {}
             self.metrics["model_calls"] += 1
+            try:
+                response = model_request(self.request, "task_analyst",
+                    "POST", endpoint.rstrip("/") + "/api/chat",
+                    {"model": model, "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_content},
+                    ], "tools": [], "format": ANALYSIS_RESPONSE_FORMAT, "stream": False,
+                     "think": False, "options": {
+                         "temperature": 0,
+                         "num_ctx": int(config.get("context_window", 8192)),
+                         "num_predict": (model_profile("task_analyst").repair_output_tokens
+                                         if repair else model_profile("task_analyst").max_output_tokens),
+                     }},
+                    timeout=timeout, telemetry=call_metrics,
+                )
+            finally:
+                if isinstance(call_metrics.get("transport"), dict):
+                    self.metrics.setdefault("model_call_details", []).append(call_metrics["transport"])
             for target, source in (("prompt_tokens", "prompt_eval_count"),
                                    ("generated_tokens", "eval_count")):
                 value = response.get(source, 0) or 0
@@ -459,29 +520,30 @@ class OllamaTaskAnalyst:
                 raise TaskAnalysisError("Task Analyst returned no content.")
             return message["content"]
 
-        self.metrics.update({"prompt_tokens": 0, "generated_tokens": 0, "total_tokens": 0})
-        content = call("Original user prompt:\n" + _bounded_prompt(prompt, MAX_ANALYSIS_INPUT_CHARS))
         try:
-            result = validate_task_analysis(json.loads(content))
-        except (json.JSONDecodeError, TaskAnalysisError) as first_error:
-            repair_prompt = (
-                "Repair only the Task Analyst contract inconsistencies in the previous JSON. "
-                "Return the complete JSON object using exactly the requested schema. "
-                "Do not invent work, permissions, requirements, or a blocking_reason. "
-                "If the task is executable, set ready_for_execution true; otherwise provide a "
-                "blocking_reason grounded in the original prompt. Validation error: "
-                + str(first_error) + "\nPrevious response:\n" + str(content)[:MAX_ANALYSIS_TEXT_CHARS]
-            )
+            content = call("Original user prompt:\n" + _bounded_prompt(prompt, MAX_ANALYSIS_INPUT_CHARS))
             try:
-                repaired_content = call(repair_prompt)
-                result = validate_task_analysis(json.loads(repaired_content))
-            except (json.JSONDecodeError, TaskAnalysisError) as second_error:
-                raise TaskAnalysisError(
-                    "Task Analyst output remained invalid after one repair attempt: " + str(second_error)
-                ) from second_error
-        self.metrics["total_tokens"] = self.metrics["prompt_tokens"] + self.metrics["generated_tokens"]
-        self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
-        return result
+                result = validate_task_analysis(json.loads(content))
+            except (json.JSONDecodeError, TaskAnalysisError) as first_error:
+                repair_prompt = (
+                    "Repair only the Task Analyst contract inconsistencies in the previous JSON. "
+                    "Return the complete JSON object using exactly the requested schema. "
+                    "Do not invent work, permissions, requirements, or a blocking_reason. "
+                    "If the task is executable, set ready_for_execution true; otherwise provide a "
+                    "blocking_reason grounded in the original prompt. Validation error: "
+                    + str(first_error) + "\nPrevious response:\n" + str(content)[:MAX_ANALYSIS_TEXT_CHARS]
+                )
+                try:
+                    repaired_content = call(repair_prompt, repair=True)
+                    result = validate_task_analysis(json.loads(repaired_content))
+                except (json.JSONDecodeError, TaskAnalysisError) as second_error:
+                    raise TaskAnalysisError(
+                        "Task Analyst output remained invalid after one repair attempt: " + str(second_error)
+                    ) from second_error
+            return result
+        finally:
+            self.metrics["total_tokens"] = self.metrics["prompt_tokens"] + self.metrics["generated_tokens"]
+            self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
 
 
 _PROGRAMMING_LANGUAGES = (

@@ -306,6 +306,11 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(contract_event["output"]["repair_succeeded"])
         self.assertFalse(contract_event["output"]["fallback_normalization_used"])
         self.assertIn("prose", contract_event["output"]["original_response_preview"])
+        repair_event = next(
+            item["event"] for item in self.events
+            if item.get("event", {}).get("event_type") == "model.repair.finished"
+        )
+        self.assertIn("transport", repair_event["output"])
 
     def test_failed_structured_repair_is_logged_without_becoming_task_failure(self):
         result = self.run_worker([
@@ -382,10 +387,10 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse((self.workspace / "x").exists())
         self.assertEqual(self.payloads[0]["options"]["num_predict"], 128)
 
-    def test_unlimited_token_budget_uses_ollama_unlimited_predict(self):
+    def test_unlimited_cumulative_budget_keeps_per_call_output_bounded(self):
         result = self.run_worker([answer("Finished.")], config={"max_tokens": 0})
         self.assertEqual(result["status"], "Success")
-        self.assertEqual(self.payloads[0]["options"]["num_predict"], -1)
+        self.assertEqual(self.payloads[0]["options"]["num_predict"], 2048)
 
     def test_ten_successful_validations_auto_complete_after_a_write(self):
         responses = [answer(calls=[("write_file", {"path": "verified.txt", "content": "OK"})])]

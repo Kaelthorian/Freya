@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from control_center.tools import IGNORED_DIRECTORIES, Toolbox, ToolResult, argument_summary
-from control_center.transport import request_json
+from control_center.transport import model_profile, model_request, request_json
 from control_center.security import register_secret, sanitize, strip_thinking as strip_private_content
 from control_center.capabilities import CapabilityResolver, effective_tools_for_policy
 from control_center.policy import PolicyEngine, policy_from_legacy
@@ -624,18 +624,19 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             update()
             call_start = time.monotonic()
             try:
-                response = transport("POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
+                response = model_request(transport, "worker", "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
                                      {"model": config["model"], "messages": messages, "tools": visible_tool_schemas,
                                       "stream": False, "think": False,
                                       "options": {"temperature": config.get("temperature", 0),
                                                   "num_ctx": config.get("context_window", 8192),
-                                                  # Ollama uses -1 for unlimited generation.
-                                                  "num_predict": min(token_budget, config.get("context_window", 8192)) if token_limited else -1}},
-                                     timeout=remaining, token=token)
+                                                  "num_predict": min(token_budget, model_profile("worker").max_output_tokens) if token_limited else model_profile("worker").max_output_tokens}},
+                                     timeout=min(remaining, model_profile("worker").inactivity_timeout),
+                                     hard_timeout=remaining, token=token)
             except Exception as exc:
                 publish("event", event={"event_type": "model.failed", "level": "error", "status": "Failed",
                                          "step_id": call_id, "duration_seconds": round(time.monotonic() - call_start, 4),
-                                         "error": "{}: {}".format(type(exc).__name__, exc)})
+                                         "error": "{}: {}".format(type(exc).__name__, exc),
+                                         "output": getattr(exc, "metrics", {})})
                 raise
             guard()
             for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
@@ -648,7 +649,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                      "step_id": call_id, "duration_seconds": round(time.monotonic() - call_start, 4),
                                      "output": {"prompt_tokens": response.get("prompt_eval_count", 0),
                                                 "generated_tokens": response.get("eval_count", 0),
-                                                "eval_duration": response.get("eval_duration", 0)}})
+                                                "eval_duration": response.get("eval_duration", 0),
+                                                "transport": response.get("_freya_transport", {})}})
             update()
             if token_limited and metrics["total_tokens"] > token_limit:
                 raise TaskStopped("Maximum cumulative tokens exceeded by provider-reported usage; no further actions executed.")
@@ -1168,16 +1170,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 repair_id = uuid.uuid4().hex
                 publish("event", event={"event_type": "model.repair.started", "level": "warning", "status": "Running",
                                          "step_id": repair_id, "reason": "Repair the structured output contract once."})
+                repair_call_metrics: dict[str, Any] = {}
                 try:
-                    repair_response = transport(
+                    repair_response = model_request(transport, "worker",
                         "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
                         {"model": config["model"],
                          "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object, array, or string), limitations (array). Preserve only claims supported by the completed work and verification."},
                                       {"role": "user", "content": "Convert this final answer into the required JSON contract. It may be prose, malformed JSON, or JSON with invalid fields. Preserve its useful result without inventing work:\n" + str(final)}],
                          "tools": [], "stream": False, "think": False,
                          "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
-                                     "num_predict": (min(token_limit - metrics["total_tokens"], config.get("context_window", 8192)) if token_limited else -1)}},
-                        timeout=guard(), token=token,
+                                     "num_predict": (min(token_limit - metrics["total_tokens"], model_profile("worker").repair_output_tokens) if token_limited else model_profile("worker").repair_output_tokens)}},
+                        timeout=min(guard(), model_profile("worker").inactivity_timeout),
+                        hard_timeout=guard(), token=token, telemetry=repair_call_metrics,
                     )
                     for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
                         value = repair_response.get(source, 0) or 0
@@ -1191,12 +1195,14 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
                     publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
                                              "step_id": repair_id,
-                                             "output": {"valid": True, "fields": sorted(repaired)}})
+                                             "output": {"valid": True, "fields": sorted(repaired),
+                                                        "transport": repair_call_metrics.get("transport", {})}})
                 except Exception as exc:
                     repaired = None
                     repair_error = sanitize("{}: {}".format(type(exc).__name__, exc))[:1000]
                     publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",
-                                             "step_id": repair_id, "error": repair_error})
+                                             "step_id": repair_id, "error": repair_error,
+                                             "output": {"transport": repair_call_metrics.get("transport", {})}})
             else:
                 repair_error = "The model-call budget was exhausted before the format repair."
         if repaired is None:

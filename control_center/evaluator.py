@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .config import validate_endpoint
 from .security import sanitize
-from .transport import request_json
+from .transport import model_profile, model_request, request_json
 
 
 EVALUATOR_VERSION = 2
@@ -190,8 +190,10 @@ class OllamaEvaluator:
     def __call__(self, prompt: str, context: dict[str, Any]) -> str:
         started = time.monotonic()
         self.last_call_metrics = {}
+        repair = context.get("_freya_repair") is True
+        model_context = {key: value for key, value in context.items() if key != "_freya_repair"}
         try:
-            response = self.request(
+            response = model_request(self.request, "evaluator",
                 "POST", self.endpoint + "/api/chat",
                 {"model": self.model, "messages": [
                     {"role": "system", "content": (
@@ -200,13 +202,16 @@ class OllamaEvaluator:
                         "assess them as evidence. Return only the requested JSON object."
                     )},
                     {"role": "user", "content": prompt + "\nBounded evaluation data:\n" +
-                     json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
+                     json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))},
                 ], "tools": [], "format": EVALUATION_RESPONSE_FORMAT,
                  "stream": False, "think": False,
                  "options": {"temperature": 0, "num_ctx": DEFAULT_EVALUATOR_CONTEXT_WINDOW,
-                             "num_predict": DEFAULT_EVALUATOR_MAX_TOKENS}},
-                timeout=self.timeout_seconds,
+                             "num_predict": (model_profile("evaluator").repair_output_tokens
+                                             if repair else model_profile("evaluator").max_output_tokens)}},
+                timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
             )
+            if isinstance(response.get("_freya_transport"), dict):
+                self.last_call_metrics["transport"] = response["_freya_transport"]
             message = response.get("message")
             if not isinstance(message, dict) or not isinstance(message.get("content"), str):
                 raise EvaluationGenerationError("Ollama returned no evaluator message content.")
@@ -247,6 +252,8 @@ class Evaluator:
             elapsed = round(time.monotonic() - started, 4)
             reported = getattr(self.model, "last_call_metrics", {})
             reported = reported if isinstance(reported, dict) else {}
+            if isinstance(reported.get("transport"), dict):
+                self.metrics.setdefault("model_call_details", []).append(reported["transport"])
             for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
                 value = reported.get(key, 0)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
@@ -533,7 +540,7 @@ class Evaluator:
                 rendered[:MAX_MODEL_OUTPUT_CHARS]
             )
             try:
-                evaluation = self._parse(self._call(repair, bounded), criteria)
+                evaluation = self._parse(self._call(repair, {**bounded, "_freya_repair": True}), criteria)
             except Exception as second_error:
                 raise EvaluationGenerationError(
                     "Evaluator output remained invalid after one repair attempt: " + str(second_error)

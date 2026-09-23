@@ -171,8 +171,9 @@ inventing a second verification actor without changing capability policy.
 Agent construction emits `freya.agent_factory.started`, `freya.agent_created`
 and `freya.agent_policy.validated`; construction errors emit
 `freya.agent_factory.failed`. Lifecycle cleanup emits
-`freya.dynamic_agent.archived` with the archived IDs and count. These events
-contain bounded metadata and never change capability authority.
+one `freya.dynamic_agent.archived` event per archived agent. Its `status=Success`
+describes successful cleanup; `orchestration_status` retains the final run state.
+These events contain bounded metadata and never change capability authority.
 Selection emits `freya.agent_selection.started`, followed by either
 `freya.agent_selected` or `freya.agent_selection.failed`. The selected event
 contains the planned task ID, agent ID, score, classification and selector
@@ -245,25 +246,68 @@ capabilities, and a Skill is optional guidance only—not the routing or securit
 mechanism. Cancellation is rechecked after this phase so a late analyst result
 cannot start a planner call or resurrect a terminal orchestration.
 
+The Analyst normalizes missing, malformed or duplicate requirement IDs into
+unique `REQ-N` values and acceptance IDs into unique `AC-N` values. An
+acceptance criterion's `verifies` list must resolve to known requirements;
+ambiguous references to duplicated source IDs fail before planning.
+
 Plan schema version 1 requires a goal, summary, `simple` or `multi_step`
 complexity, global success criteria and one to twenty tasks. Every task has a
 normalized unique ID, objective, description, dependencies, required
 capabilities, preferred Skills and success criteria. `criterion_links` records
-stable global and local criterion IDs and explicit local-to-global references;
-legacy plans are normalized with exact-text links only. Validation rejects unknown
-fields, wrong types, empty or excessive content, unknown capabilities, missing
-dependencies, self-dependencies and cycles. A depth-first traversal validates
-the complete dependency graph before persistence.
+stable global and local criterion IDs and explicit local-to-global references.
+Model shorthand `T-N` task IDs become `task-N` in task rows, dependencies and
+local links before validation.
+The plan's `success_criteria` list is authoritative: omitted global link rows are
+filled in that order. An Analyst AC ID or description used as a global-row
+placeholder is removed only when its local references uniquely match concrete
+plan criteria by text. Extra, duplicate or unrelated rows fail validation.
+The harness assigns deterministic `gc-N` / `tc-<task>-N` IDs to missing, blank
+or duplicate criterion IDs before final validation while preserving valid unique
+IDs. Model-supplied `AC-N` and `LC-N` IDs are normalized to the plan's lowercase
+identifier convention; supplied `AC-N` global links use generated `ac-N` and
+`lc-N` IDs for missing or conflicting entries.
+Global and local IDs cannot collide. A copied global criterion is scoped to the
+task's concrete check when that mapping is unique; unknown references are
+repaired only from an unambiguous text match. References to duplicated source
+global IDs use the same rule; ambiguous substitutions and
+references still fail the original local-link validation. New model plans with
+explicit links must cover every executable global criterion with a local link;
+reuse of an Analyst `AC-N` ID additionally requires matching that Analyst's
+criterion text. Only normalized, validated plans reach graph initialization;
+structural criteria and legacy plans retain their existing proof rules. Legacy
+plans infer links only from exact matching text. Corrections emit one compact
+`freya.planner.normalized` event with assignment and duplicate counts. Validation
+rejects unknown fields, wrong types, empty or excessive content, unknown
+capabilities, missing dependencies, self-dependencies and cycles. A depth-first
+traversal validates the complete dependency graph before persistence.
 Complexity is canonicalized from task count: one task is `simple`; two or more
 are `multi_step`.
 
-Production uses `OllamaPlanner` through the shared non-redirecting transport.
-It calls the validated loopback endpoint `/api/chat` with no tools,
-`stream=false`, `think=false`, temperature `0.1`, an explicit JSON Schema,
-8192 context tokens, at most 768 generated tokens and a bounded timeout. The
-defaults are model `qwen2.5-coder:7b`, endpoint `http://127.0.0.1:11434` and a
-120-second timeout; command-line options may change them while endpoint
-validation remains loopback-only.
+Production uses `OllamaPlanner` through the shared `transport.py` chat client.
+It calls the validated loopback `/api/chat` endpoint with no tools,
+`stream=true`, `think=false`, temperature `0.1`, an explicit JSON Schema and
+8192 context tokens. The client reconstructs the usual single response object
+from Ollama's streamed messages, so plan validation and one repair still use
+the same contract. Planner output is capped at 4096 tokens (2048 for repair).
+Defaults are model `qwen2.5-coder:7b`, endpoint `http://127.0.0.1:11434`,
+120 seconds of inactivity and a 600-second hard ceiling. The CLI timeout
+overrides inactivity, not the hard ceiling. Endpoint validation remains
+loopback-only.
+
+All production `/api/chat` callers (Analyst, Planner, Worker, Evaluator,
+Recovery and Integration) use the same streamed transport. `MODEL_PROFILES` in
+`transport.py` defines connect, inactivity and hard timeouts plus normal and
+repair output limits for each component. A stream that keeps delivering bytes
+may outlive the inactivity limit, but never its hard ceiling or the Worker's
+remaining task deadline. Connection refusal opens a five-second circuit for
+that provider origin; slow generation does not. The transport classifies
+unreachable provider, no-response timeout, generation timeout, HTTP error and
+invalid response separately. It emits body-free call metrics including connect
+and first-token timing, token counts, stop reason and timeout kind. Component
+metrics and Worker events retain these details without storing prompts or
+credentials. Planner and other fail-closed stages still fail on provider or
+invalid-response errors; Task Analyst preserves its deterministic fallback.
 
 The model receives only the current goal, platform capability catalogue,
 compact agent summaries and compact Skill summaries (bounded to 100 agents and
@@ -387,7 +431,7 @@ attempt before persisting.
 `RecoveryController` is separate from Planner and Evaluator. Its strict schema
 allows only `retry_same_agent`, `retry_different_agent`, `replan_subgraph`, or
 `fail`; invalid model output gets one repair. Its Ollama adapter is loopback-only,
-tool-free, non-streaming and independently metered. `--recovery-offline` makes
+tool-free, streamed through `transport.py`, and independently metered. `--recovery-offline` makes
 no model call and applies deterministic recovery: `needs_revision` and `blocked`
 reuse the exact generated agent after revalidation, while `rejected` requests a
 new generated variant with the same task-derived policy ceiling. Evaluator
@@ -441,7 +485,7 @@ message/reason/error text. File contents, model transcripts, private reasoning,
 tool inputs, and workspace snapshots are excluded; at most 250 entries are sent.
 
 `FailureAnalyzer` uses the recovery model configuration but a separate,
-tool-free, non-streaming call. Its strict result contains `cause`, one or more
+tool-free, streamed call. Its strict result contains `cause`, one or more
 `evidence_log_ids`, `retryable`, and `recommended_action`. Validation rejects
 unknown evidence IDs. `--recovery-offline` skips the call, and provider,
 transport, schema, or citation failures fall back to a deterministic diagnosis
@@ -485,7 +529,13 @@ and evidence text are always untrusted data and never instructions.
 `GlobalVerifier` first applies evidence-first hard checks. Failed objective
 verification cannot be overridden by an accepting model; unavailable required
 evidence blocks acceptance, and test/integration criteria cannot pass without
-objective passing verification evidence. The tool-free `OllamaGlobalVerifier` uses the
+objective passing verification evidence. Exact Planner-scoped local checks with
+satisfied local decisions and criterion-specific direct proof can resolve all
+global criteria deterministically; broader semantics still use the model.
+`GLOBAL_ACTIONS` supplies the sole `accepted/needs_work/blocked/error` action
+mapping, which is applied to model output before strict validation and after
+repair. Invalid responses emit bounded `freya.global_verifier.validation`
+diagnostics. The tool-free `OllamaGlobalVerifier` uses the
 separate integration model/endpoint/timeout configuration and a strict schema:
 `accepted`, `needs_work`, `blocked`, or `error`, with each original global
 criterion exactly once, bounded known evidence refs and existing responsible
@@ -613,7 +663,9 @@ paused. Progress is the greatest fraction of the configured step, model-call and
 tool-call budgets and reaches 100 only at termination. Token usage remains
 visible in metrics, but the task token budget is unlimited when `max_tokens=0`
 (the default); wall-clock, step, model-call and tool-call limits still bound
-runtime resource use. Ollama receives `num_predict=-1` in that mode.
+runtime resource use. Even in that mode, each Worker model call is capped at
+2048 output tokens (768 for structured-output repair); the cumulative task
+token budget remains unlimited.
 
 The worker tracks successful post-write validation actions. Ten consecutive
 successful validations, or ten identical successful actions, produce an

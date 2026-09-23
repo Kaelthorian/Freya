@@ -145,9 +145,6 @@ class IntegrationOrchestrationMixin:
         round_number = len(records_before) + 1
         used_calls = self._integration_model_calls_used(oid)
         remaining_calls = int(self.config["max_integration_model_calls"]) - used_calls
-        if remaining_calls < 1 and not self.global_verifier.offline:
-            self._fail_integrating(oid, "The integration model-call budget is exhausted.")
-            return False
         technical_error = None
         try:
             with self.integration_lock:
@@ -196,6 +193,15 @@ class IntegrationOrchestrationMixin:
         with self.lock:
             if self.store.get_orchestration(oid)["status"] != "Integrating":
                 return False
+            validation = (outcome.get("metrics") or {}).get("validation")
+            if isinstance(validation, dict) and (validation.get("validation_error")
+                                                  or validation.get("normalized")):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.global_verifier.validation",
+                    "status": "Failed" if technical_error else "Integrating",
+                    **validation,
+                    "message": "Global verifier output was checked against the status/action contract.",
+                })
             event_type = ("freya.integration.failed" if technical_error
                           else "freya.integration.completed")
             self.store.add_orchestration_event(oid, {

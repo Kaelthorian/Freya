@@ -8,6 +8,7 @@ from control_center.agent_factory import AgentFactory
 from control_center.capabilities import CAPABILITIES
 from control_center.config import normalize_agent
 from control_center.evaluator import Evaluator
+from control_center.integration import GlobalVerifier
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
 from control_center.recovery import RecoveryController
@@ -444,7 +445,8 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertTrue(provenance["generated_by_freya"])
         self.assertTrue(provenance["ephemeral"])
 
-    def run_orchestration(self, statuses, *, with_task_analyst=False):
+    def run_orchestration(self, statuses, *, with_task_analyst=False,
+                          global_verifier=None):
         task = planned_task()
         calls = []
         analyst = None
@@ -472,6 +474,7 @@ class AgentFactoryTests(unittest.TestCase):
             evaluator=Evaluator(evaluate),
             recovery=RecoveryController(offline=True),
             task_analyst=TaskAnalyst(offline=True),
+            global_verifier=global_verifier,
             wait=lambda seconds: None,
             config={"max_wallclock_seconds": 10},
         )
@@ -528,6 +531,17 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertIn("freya.agent_policy.validated", event_types)
         self.assertIn("freya.dynamic_agent.archived", event_types)
         self.assertEqual(self.store.list_agents(), [])
+
+    def test_successful_agent_archival_does_not_inherit_global_verifier_failure(self):
+        final = self.run_orchestration(["accepted"],
+                                       global_verifier=GlobalVerifier(lambda prompt, context: "bad"))
+        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(final["evaluations"][0]["status"], "accepted")
+        archived = [json.loads(item["payload_json"]) for item in final["events"]
+                    if item["event_type"] == "freya.dynamic_agent.archived"]
+        self.assertTrue(archived)
+        self.assertEqual(archived[0]["status"], "Success")
+        self.assertEqual(archived[0]["orchestration_status"], "Failed")
 
     def test_manual_agent_still_supports_runtime_submit(self):
         manual = self.store.create_agent(normalize_agent({

@@ -59,7 +59,70 @@ def proof_input(criteria=None, *, aligned=True, verification=True, injection=Fal
     )
 
 
+def hello_direct_input(*, second_evidence=True):
+    global_criteria = ["El archivo 'hola_mundo.txt' existe en el directorio actual.",
+                       "El contenido del archivo 'hola_mundo.txt' es 'hola mundo'."]
+    objective = "Crear un archivo de texto"
+    locals_ = [f"Verify the result of task '{objective}': {criterion}"
+               for criterion in global_criteria]
+    worker = fixtures.task("task-1", criterion=locals_[0])
+    worker["objective"] = objective
+    worker["success_criteria"] = locals_
+    current = fixtures.plan([worker], global_criteria)
+    current["criterion_links"] = {
+        "global": [{"id": f"gc-{index}", "criterion": criterion}
+                   for index, criterion in enumerate(global_criteria, 1)],
+        "local": [{"id": f"tc-task-1-{index}", "task_id": "task-1",
+                   "criterion": criterion, "supports_global_criteria": [f"gc-{index}"]}
+                  for index, criterion in enumerate(locals_, 1)],
+    }
+    record = fixtures.evaluation("e-hello", "task-1")
+    record["criteria"] = [{"criterion": criterion, "status": "satisfied",
+                           "reason": "Read-back confirmed the file.",
+                           "evidence": (["file exists"] if index == 1 else
+                                        (["hola mundo"] if second_evidence else []))}
+                          for index, criterion in enumerate(locals_, 1)]
+    return build_integration_input(
+        original_user_prompt="Crea un hola mundo", original_plan=current,
+        effective_plan=current, plan_revision=0,
+        graph_nodes=[{"plan_task_id": "task-1", "evaluation_id": "e-hello",
+                      "state": "success", "evaluation_status": "accepted", "attempt": 1}],
+        evaluations={"e-hello": record}, revision_history=[],
+    )
+
+
 class GroundedProofTests(unittest.TestCase):
+    def test_hello_world_two_direct_proofs_accept_without_model(self):
+        data = hello_direct_input()
+        calls = []
+        result = GlobalVerifier(lambda prompt, context: calls.append(prompt)).verify(data)
+        self.assertEqual(calls, [])
+        self.assertEqual((result["status"], result["recommended_action"]),
+                         ("accepted", "accept"))
+        self.assertTrue(result["deterministic"])
+        self.assertEqual([item["status"] for item in result["criteria"]],
+                         ["satisfied", "satisfied"])
+        self.assertEqual([item["evidence"] for item in result["criteria"]],
+                         [["evidence:e-hello:1"], ["evidence:e-hello:2"]])
+
+    def test_missing_second_direct_proof_cannot_accept(self):
+        data = hello_direct_input(second_evidence=False)
+        result = GlobalVerifier(lambda prompt, context: self.fail("model must not run")).verify(data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("hola_mundo.txt", result["missing_evidence"][0])
+
+    def test_crossed_hello_world_proofs_still_fail_strict_validation(self):
+        data = hello_direct_input()
+        result = GlobalVerifier().verify(data)
+        decision = {key: result[key] for key in (
+            "status", "summary", "criteria", "cross_task_issues", "missing_evidence",
+            "responsible_task_ids", "recommended_action")}
+        decision["criteria"][0]["evidence"] = ["evidence:e-hello:2"]
+        with self.assertRaisesRegex(IntegrationValidationError, "permitted grounded proof"):
+            validate_global_result(decision, data["context"]["global_success_criteria"],
+                                   data["active_task_ids"], data["evidence_refs"],
+                                   data["proof_refs_by_criterion"])
+
     def test_explicit_ids_prove_differently_worded_global_criterion(self):
         task = fixtures.task("a", criterion="Create the requested file and read it back.")
         current = fixtures.plan([task], ["hola_mundo.txt exists with exactly hola mundo."])
@@ -354,18 +417,23 @@ class GroundedLifecycleTests(unittest.TestCase):
         ])
         workspace = self.root / "hello-workspace"
         workspace.mkdir()
-        local = "The file hola_mundo.txt exists and contains exactly hola mundo."
-        global_text = "Artifact hola_mundo.txt has the exact bytes hola mundo."
+        global_criteria = ["El archivo 'hola_mundo.txt' existe en el directorio actual.",
+                           "El contenido del archivo 'hola_mundo.txt' es 'hola mundo'."]
+        objective = "Create hola_mundo.txt containing exactly hola mundo"
+        local_criteria = [f"Verify the result of task '{objective}': {criterion}"
+                          for criterion in global_criteria]
         initial = fixtures.plan([{
-            "id": "create-file", "objective": "Create hola_mundo.txt containing exactly hola mundo",
+            "id": "create-file", "objective": objective,
             "description": "Write the requested file and read it back.", "depends_on": [],
             "required_capabilities": ["filesystem.create", "filesystem.read"],
-            "preferred_skills": ["simple-file-artifact"], "success_criteria": [local],
-        }], [global_text])
+            "preferred_skills": ["simple-file-artifact"], "success_criteria": local_criteria,
+        }], global_criteria)
         initial["criterion_links"] = {
-            "global": [{"id": "gc-file", "criterion": global_text}],
-            "local": [{"id": "tc-file", "task_id": "create-file", "criterion": local,
-                       "supports_global_criteria": ["gc-file"]}],
+            "global": [{"id": f"gc-{index}", "criterion": criterion}
+                       for index, criterion in enumerate(global_criteria, 1)],
+            "local": [{"id": f"tc-file-{index}", "task_id": "create-file",
+                       "criterion": criterion, "supports_global_criteria": [f"gc-{index}"]}
+                      for index, criterion in enumerate(local_criteria, 1)],
         }
         runtime = Runtime(self.store, self.root, Path.cwd())
         runtime.start()
@@ -374,10 +442,11 @@ class GroundedLifecycleTests(unittest.TestCase):
             "Create hola_mundo.txt containing exactly: hola mundo",
             {"workspace_path": str(workspace)},
         )
+        verifier_calls = []
         orchestrator = Orchestrator(
             self.store, runtime, planner=Planner(lambda p, c: initial),
             selector=AgentSelector(), evaluator=Evaluator(offline=True),
-            global_verifier=GlobalVerifier(offline=True),
+            global_verifier=GlobalVerifier(lambda prompt, context: verifier_calls.append(prompt)),
             agent_factory=AgentFactory(self.store, runtime_config={"endpoint": server.url}),
             wait=time.sleep, config={"max_wallclock_seconds": 40},
         )
@@ -388,7 +457,14 @@ class GroundedLifecycleTests(unittest.TestCase):
         self.assertEqual(final["graph_summary"]["successful"], 1)
         self.assertEqual(final["evaluations"][0]["status"], "accepted")
         self.assertEqual(self.store.list_integrations(run["id"])[0]["status"], "accepted")
+        self.assertEqual(verifier_calls, [])
+        self.assertEqual([item["status"] for item in self.store.list_integrations(run["id"])[0]["criteria"]],
+                         ["satisfied", "satisfied"])
         self.assertEqual(final["status"], "Success", final["error"])
+        archived = [json.loads(event["payload_json"]) for event in final["events"]
+                    if event["event_type"] == "freya.dynamic_agent.archived"]
+        self.assertTrue(archived)
+        self.assertTrue(all(item["status"] == "Success" for item in archived))
 
     def test_missing_global_proof_is_obtained_by_real_appended_task_evaluation(self):
         run, runtime, orchestrator = self.make()

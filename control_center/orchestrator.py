@@ -435,7 +435,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         status = self.store.get_orchestration(oid)["status"]
         for agent in archived:
             self.store.add_orchestration_event(oid, {
-                "event_type": "freya.dynamic_agent.archived", "status": status,
+                "event_type": "freya.dynamic_agent.archived", "status": "Success",
+                "orchestration_status": status,
                 "agent_id": agent["agent_id"],
                 "task_id": agent.get("plan_task_id"),
                 "plan_task_id": agent.get("plan_task_id"),
@@ -572,6 +573,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "selection_id": selection_id,
             "selection": selection,
         }
+
+    def _record_planner_normalization(self, oid: str, planning_metrics: dict) -> None:
+        normalization = planning_metrics.get("normalization")
+        stable_ids = normalization.get("stable_ids") if isinstance(normalization, dict) else None
+        if not isinstance(stable_ids, dict) or not stable_ids.get("assigned"):
+            return
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.planner.normalized", "status": "Planned",
+            "message": "Freya assigned stable IDs to planner criteria.",
+            "stable_ids": stable_ids,
+        })
 
     def _fail_planning(self, oid: str, exc: Exception,
                        planning_metrics: dict | None = None) -> None:
@@ -1612,6 +1624,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 )
                 if planned is None:
                     return
+                self._record_planner_normalization(oid, planning_metrics)
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.plan.created", "status": "Planned",
                     "message": "Freya created and saved the structured plan.",
@@ -1686,6 +1699,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             )
             if planned is None:
                 return
+            self._record_planner_normalization(oid, planning_metrics)
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan.created", "status": "Planned",
                 "message": "Freya created and saved the structured plan.",

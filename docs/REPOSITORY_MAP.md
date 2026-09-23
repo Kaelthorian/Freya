@@ -11,21 +11,21 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── task_analyst.py       versioned tool-free rewrite, language assumptions and deterministic reconciliation
-│   ├── planner.py            plan schema, stable criterion IDs/links, recovery ID allocation, safe verification derivation and fallback
+│   ├── task_analyst.py       versioned tool-free rewrite, REQ/AC references, language assumptions and deterministic reconciliation
+│   ├── planner.py            plan schema, distinct global/local IDs, criterion links and coverage, recovery ID allocation and fallback
 │   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          criterion evidence checks, decision schema and tool-free Ollama adapter
 │   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
-│   ├── integration.py        global verifier, append-only replanner and grounded result integrator
+│   ├── integration.py        global verifier contract, direct-proof decision, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and explicit local-to-global criterion proof mapping
-│   ├── integration_orchestrator.py orchestration-level integration lifecycle
+│   ├── integration_orchestrator.py integration lifecycle and verifier validation events
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop, response repair diagnostics and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
-│   ├── transport.py          non-redirecting local Ollama HTTP client
+│   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
@@ -41,7 +41,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── views.js              dashboard and detail views
 │   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
-├── tests/                    API, storage, runtime, policy, Skill and tool tests
+├── tests/                    API, storage, runtime, transport, policy, Skill and tool tests
 ├── data/
 │   ├── agents/              versioned, importable pipeline-agent definitions
 │   └── (runtime files)      ignored databases, logs, locks and workspaces
@@ -123,6 +123,7 @@ selects them.
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
+| Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt or controlled stdin | `tools.py`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_control_runtime.py`, `tests/test_agent_context.py` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |

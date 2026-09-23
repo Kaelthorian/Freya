@@ -10,11 +10,24 @@ a non-accepted decision. A known reference alone is not proof.
 Plan schema version 1 persists `criterion_links.global` entries with stable IDs and
 `criterion_links.local` entries with stable IDs, a `task_id`, and explicit
 `supports_global_criteria` IDs. Criterion text remains descriptive. The Planner
-asks for these links; validation rejects duplicate IDs, unknown targets and
-links that substitute a task criterion. Legacy plans without this field are
-normalized with deterministic `gc-N` and `tc-<task>-N` IDs. Legacy local-to-global
-links are inferred only for equal normalized text, preserving the old safety
-boundary without guessing paraphrases.
+provides the criterion text and relationships; `success_criteria` is authoritative
+when the model omits global link rows, which are reconstructed in list order.
+An Analyst AC ID or description used as a global-row placeholder is removed
+only before a new model plan is validated; its local references must resolve
+through unique exact text matches to the plan's concrete criteria.
+Extra, duplicate or unrelated rows remain invalid. The harness assigns absent,
+blank or duplicate IDs deterministically before validation, while preserving
+valid unique IDs. New model plans keep global and local IDs distinct, reconcile
+copied global text only to an unambiguous task check, and require explicit local
+coverage for executable global obligations before delegation. A reference to
+an unknown global ID is repaired only when the local text uniquely identifies
+the intended global criterion; references to duplicated source IDs use the same
+rule. Reusing a Task Analyst `AC-N` requires its
+acceptance text to match. Validation still rejects malformed IDs, unknown
+or ambiguous targets, and links that substitute a task criterion. Legacy plans without this field are
+normalized with deterministic `gc-N` and `tc-<task>-N` IDs. Legacy
+local-to-global links are inferred only for equal normalized text, preserving
+the old safety boundary without guessing paraphrases.
 
 `integration_proof.py` associates an accepted task's satisfied local evaluation
 criterion with global criteria only through those persisted IDs. Evaluation
@@ -43,6 +56,26 @@ checks and unavailable required verification take precedence. Missing proof
 candidates produce `blocked` before a model call; accepted child tasks alone
 never grant global acceptance. An appended integration task can close the gap
 with new persisted local links.
+
+After hard checks, `GlobalVerifier` accepts without a model call only when every
+global criterion has an explicit local link, every linked local decision is
+`satisfied` with evidence, the local text is the Planner's exact
+`Verify the result of task '<objective>': <global criterion>` check, and the
+catalog contains a permitted direct `evidence:*` or `verification:*` ref tied
+to that global and local ID. Any unmatched or broader semantic criterion still
+uses the model. A proof candidate alone does not set global status. In
+`criteria_diagnostics`, `unknown` is the verifier decision when technical
+verification failed; `proof_refs_found` only lists candidates.
+
+The sole status/action matrix is `GLOBAL_ACTIONS` in `integration.py`:
+`accepted → accept`, `needs_work → add_work`, `blocked → add_evidence`,
+`error → fail`. Model actions are normalized from a valid status before strict
+semantic validation, including after one repair. The repair request includes
+the original output, exact error, schema and this matrix. Invalid model output
+emits `freya.global_verifier.validation` with bounded proposed status/action,
+validation error and repair/normalization flags; no prompt or result body is
+persisted in that event. A technical verifier failure remains distinct from
+the already accepted task result.
 
 ## Persistence and success boundary
 

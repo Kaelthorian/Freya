@@ -12,8 +12,10 @@ from typing import Any, Callable
 
 from .capabilities import CAPABILITY_REGISTRY
 from .config import validate_endpoint
-from .transport import request_json
-from .task_analyst import canonical_task_kind
+from .transport import model_profile, model_request, request_json
+from .task_analyst import (TaskAnalysisError, canonical_task_kind,
+                           validate_task_analysis)
+from .integration_proof import STRUCTURAL_CRITERIA, criterion_key
 
 
 PLAN_SCHEMA_VERSION = 1
@@ -82,13 +84,13 @@ PLAN_RESPONSE_FORMAT = {
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "criterion_links": {"type": "object", "properties": {
             "global": {"type": "array", "items": {"type": "object", "properties": {
-                "id": {"type": "string"}, "criterion": {"type": "string"},
-            }, "required": ["id", "criterion"], "additionalProperties": False}},
+                "id": {"type": ["string", "null"]}, "criterion": {"type": "string"},
+            }, "required": ["criterion"], "additionalProperties": False}},
             "local": {"type": "array", "items": {"type": "object", "properties": {
-                "id": {"type": "string"}, "task_id": {"type": "string"},
+                "id": {"type": ["string", "null"]}, "task_id": {"type": "string"},
                 "criterion": {"type": "string"},
                 "supports_global_criteria": {"type": "array", "items": {"type": "string"}},
-            }, "required": ["id", "task_id", "criterion", "supports_global_criteria"],
+            }, "required": ["task_id", "criterion", "supports_global_criteria"],
                "additionalProperties": False}},
         }, "required": ["global", "local"], "additionalProperties": False},
     },
@@ -518,8 +520,10 @@ class OllamaPlanner:
     def __call__(self, prompt: str, context: dict[str, Any]) -> str:
         started = time.monotonic()
         self.last_call_metrics = {}
+        repair = context.get("_freya_repair") is True
+        model_context = {key: value for key, value in context.items() if key != "_freya_repair"}
         try:
-            response = self.request(
+            response = model_request(self.request, "planner",
                 "POST", self.endpoint + "/api/chat",
                 {
                     "model": self.model,
@@ -529,7 +533,7 @@ class OllamaPlanner:
                             "Do not include private reasoning, Markdown, tool calls, or extra fields."
                         )},
                         {"role": "user", "content": prompt + "\nPlanner context:\n" +
-                         json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
+                         json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))},
                     ],
                     "tools": [],
                     "format": PLAN_RESPONSE_FORMAT,
@@ -538,11 +542,14 @@ class OllamaPlanner:
                     "options": {
                         "temperature": 0.1,
                         "num_ctx": DEFAULT_PLANNER_CONTEXT_WINDOW,
-                        "num_predict": DEFAULT_PLANNER_MAX_TOKENS,
+                        "num_predict": (model_profile("planner").repair_output_tokens
+                                        if repair else model_profile("planner").max_output_tokens),
                     },
                 },
-                timeout=self.timeout_seconds,
+                timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
             )
+            if isinstance(response.get("_freya_transport"), dict):
+                self.last_call_metrics["transport"] = response["_freya_transport"]
             message = response.get("message")
             if not isinstance(message, dict) or not isinstance(message.get("content"), str):
                 raise PlanGenerationError("Ollama returned no planner message content.")
@@ -618,70 +625,275 @@ def _text_list(value: Any, label: str, maximum: int, *, allow_empty: bool = True
 
 
 
-def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+def _ensure_stable_ids(items: list[dict[str, Any]], *, structure: str,
+                       id_factory: Callable[[int, int], str],
+                       forbidden_ids: set[str] | None = None,
+                       diagnostics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Preserve valid unique IDs and deterministically fill absent or conflicting IDs."""
+    normalized = [dict(item) for item in items]
+    identifiers: list[str | None] = [None] * len(normalized)
+    seen: set[str] = set(forbidden_ids or ())
+    duplicates: set[int] = set()
+
+    # Reserve every valid model ID before assigning any missing IDs, so an early
+    # generated value cannot displace a valid ID that appears later in the list.
+    for index, item in enumerate(normalized):
+        raw_id = item.get("id")
+        if raw_id is None:
+            continue
+        if not isinstance(raw_id, str):
+            raise PlanValidationError(f"{structure}[{index}].id must be a string or null.")
+        try:
+            identifier = _identifier(raw_id, f"{structure}[{index}].id")
+        except PlanValidationError:
+            # Empty, whitespace-only, or otherwise unusable strings are
+            # structural metadata and can be replaced deterministically.
+            continue
+        if identifier in seen:
+            duplicates.add(index)
+            continue
+        identifiers[index] = identifier
+        seen.add(identifier)
+
+    assigned = 0
+    next_sequence = 1
+    duplicates_resolved = 0
+    for index, identifier in enumerate(identifiers):
+        if identifier is not None:
+            normalized[index]["id"] = identifier
+            continue
+        if index in duplicates:
+            duplicates_resolved += 1
+        base = _identifier(id_factory(index, next_sequence), f"{structure}[{index}].id")
+        candidate = base
+        suffix = 2
+        while candidate in seen:
+            next_sequence += 1
+            next_base = _identifier(id_factory(index, next_sequence), f"{structure}[{index}].id")
+            if next_base != base:
+                base = next_base
+                candidate = base
+                suffix = 2
+            else:
+                tail = f"-{suffix}"
+                candidate = f"{base[:MAX_IDENTIFIER_CHARS - len(tail)]}{tail}"
+                suffix += 1
+        normalized[index]["id"] = candidate
+        seen.add(candidate)
+        assigned += 1
+        next_sequence += 1
+
+    if diagnostics is not None and (assigned or duplicates_resolved):
+        details = diagnostics.setdefault("stable_ids", {
+            "assigned": 0, "duplicates_resolved": 0, "structures": {},
+        })
+        details["assigned"] += assigned
+        details["duplicates_resolved"] += duplicates_resolved
+        details["structures"][structure] = {
+            "assigned": assigned, "duplicates_resolved": duplicates_resolved,
+        }
+    return normalized
+
+
+def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[str, Any]],
+                               diagnostics: dict[str, Any] | None = None, *,
+                               repair_model_criteria: bool = False) -> dict[str, Any]:
     """Persist identity separately from display text; migrate legacy exact links only."""
     if raw is None:
-        global_links = [{"id": f"gc-{index}", "criterion": criterion}
-                        for index, criterion in enumerate(criteria, 1)]
+        global_links = [{"criterion": criterion} for criterion in criteria]
         local_links = []
     else:
         links = _object(raw, {"global", "local"}, "plan.criterion_links")
         global_links = _list(links["global"], "plan.criterion_links.global", MAX_CRITERIA)
         local_links = _list(links["local"], "plan.criterion_links.local", MAX_PLAN_TASKS * MAX_CRITERIA)
-    if len(global_links) != len(criteria):
-        raise PlanValidationError("Every global criterion requires one stable ID.")
-    normalized_global = []
+    # The plan's success_criteria list is authoritative. Models can omit one or
+    # more redundant link rows, so retain supplied rows by exact criterion text
+    # and deterministically synthesize only the missing rows. Extra, duplicate,
+    # or unrelated rows still indicate a malformed plan and fail closed.
+    supplied_by_criterion: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(global_links):
+        item = _object(entry, {"criterion"}, f"global criterion {index}", optional={"id"})
+        criterion = _text(item["criterion"], "global criterion", MAX_CRITERION_CHARS)
+        if criterion not in criteria or criterion in supplied_by_criterion:
+            raise PlanValidationError(
+                "Global criterion links must each match one unique plan criterion."
+            )
+        supplied_by_criterion[criterion] = {**item, "criterion": criterion}
+    global_entries = [
+        supplied_by_criterion.get(criterion, {"criterion": criterion})
+        for criterion in criteria
+    ]
+    raw_global_id_counts: dict[str, int] = {}
+    for index, entry in enumerate(global_entries):
+        raw_id = entry.get("id")
+        if not isinstance(raw_id, str):
+            continue
+        try:
+            identifier = _identifier(raw_id, f"global criterion {index} id")
+        except PlanValidationError:
+            continue
+        raw_global_id_counts[identifier] = raw_global_id_counts.get(identifier, 0) + 1
+    ambiguous_global_ids = {identifier for identifier, count in raw_global_id_counts.items()
+                            if count > 1}
+    use_ac_namespace = any(re.fullmatch(r"AC-[1-9][0-9]*", str(entry.get("id") or "").strip(), re.I)
+                           for entry in global_entries)
+    normalized_global = _ensure_stable_ids(
+        global_entries, structure="criterion_links.global",
+        id_factory=lambda _index, sequence: (
+            f"ac-{sequence}" if use_ac_namespace else f"gc-{sequence}"
+        ), diagnostics=diagnostics,
+    )
     global_ids = set()
-    for index, (entry, criterion) in enumerate(zip(global_links, criteria)):
-        item = _object(entry, {"id", "criterion"}, f"global criterion {index}")
-        ident = _identifier(item["id"], f"global criterion {index} id")
-        if ident in global_ids or _text(item["criterion"], "global criterion", MAX_CRITERION_CHARS) != criterion:
+    for index, criterion in enumerate(criteria):
+        item = normalized_global[index]
+        ident = item["id"]
+        if ident in global_ids or item["criterion"] != criterion:
             raise PlanValidationError("Global criterion IDs must be unique and match plan criteria.")
         global_ids.add(ident)
-        normalized_global.append({"id": ident, "criterion": criterion})
+        item["criterion"] = criterion
     global_by_text = {item["criterion"].casefold(): item["id"] for item in normalized_global}
+    if len(global_by_text) != len(normalized_global):
+        raise PlanValidationError("Global criteria must have distinct text after normalization.")
+    task_by_id = {task["id"]: task for task in tasks}
+    global_by_wording: dict[str, list[str]] = {}
+    for item in normalized_global:
+        wording = re.sub(r"[\W_]+", " ", item["criterion"], flags=re.UNICODE).strip().casefold()
+        if wording:
+            global_by_wording.setdefault(wording, []).append(item["id"])
+
+    parsed_local = []
+    source_global_ids: list[str | None] = []
+    for index, entry in enumerate(local_links):
+        item = _object(entry, {"task_id", "criterion", "supports_global_criteria"},
+                       f"local criterion {index}", optional={"id"})
+        criterion = _text(item["criterion"], "local criterion", MAX_CRITERION_CHARS)
+        wording = re.sub(r"[\W_]+", " ", criterion, flags=re.UNICODE).strip().casefold()
+        matching_globals = global_by_wording.get(wording, []) if wording else []
+        source_global_ids.append(matching_globals[0] if len(matching_globals) == 1 else None)
+        parsed_local.append({
+            **item,
+            "task_id": _identifier(item["task_id"], f"local criterion {index} task_id"),
+            "criterion": criterion,
+            "supports_global_criteria": _text_list(
+                item["supports_global_criteria"], "supports_global_criteria",
+                MAX_CRITERIA, identifiers=True,
+            ),
+        })
+    # An explicit copy of a global obligation is not a task-level check. Scope
+    # it to the task when this is new model output, or when a reused global ID
+    # makes the mistaken identity explicit. Legacy persisted links stay stable.
+    for index, item in enumerate(parsed_local):
+        task = task_by_id.get(item["task_id"])
+        if task is None or source_global_ids[index] is None:
+            continue
+        raw_id = item.get("id")
+        collides = False
+        if isinstance(raw_id, str):
+            try:
+                collides = _identifier(raw_id, f"local criterion {index} id") in global_ids
+            except PlanValidationError:
+                pass
+        if not (repair_model_criteria or collides):
+            continue
+        matching = [criterion for criterion in task["success_criteria"]
+                    if criterion.casefold() == item["criterion"].casefold()]
+        if len(matching) != 1:
+            continue
+        prefix = f"Verify the result of task '{task['objective']}': "
+        specialized = prefix + matching[0]
+        if len(specialized) > MAX_CRITERION_CHARS:
+            raise PlanValidationError("Task-specific local criterion exceeds the text limit.")
+        task["success_criteria"] = [specialized if criterion == matching[0] else criterion
+                                    for criterion in task["success_criteria"]]
+        item["criterion"] = specialized
+
     expected = {(task["id"], criterion.casefold()): criterion
                 for task in tasks for criterion in task["success_criteria"]}
-    normalized_local = []
+    exact_covered = {(item["task_id"], item["criterion"].casefold()) for item in parsed_local
+                     if (item["task_id"], item["criterion"].casefold()) in expected}
+    repaired_covered: set[tuple[str, str]] = set()
+    for index, item in enumerate(parsed_local):
+        key = (item["task_id"], item["criterion"].casefold())
+        if key in expected or source_global_ids[index] is None:
+            continue
+        task = task_by_id.get(item["task_id"])
+        if task is None:
+            continue
+        candidates = [criterion for criterion in task["success_criteria"]
+                      if (task["id"], criterion.casefold()) not in exact_covered | repaired_covered]
+        if len(task["success_criteria"]) == 1 and len(candidates) == 1:
+            item["criterion"] = candidates[0]
+            repaired_covered.add((task["id"], candidates[0].casefold()))
+
+    for index, item in enumerate(parsed_local):
+        supports = item["supports_global_criteria"]
+        if any(ref in ambiguous_global_ids for ref in supports):
+            source_global_id = source_global_ids[index]
+            if len(supports) == 1 and source_global_id is not None:
+                item["supports_global_criteria"] = [source_global_id]
+            else:
+                raise PlanValidationError("Local criterion links reference an ambiguous global criterion ID.")
+            continue
+        if any(ref not in global_ids for ref in supports):
+            source_global_id = source_global_ids[index]
+            if len(supports) == 1 and source_global_id is not None:
+                item["supports_global_criteria"] = [source_global_id]
+            else:
+                raise PlanValidationError("Local criterion links reference an unknown global criterion ID.")
+    normalized_local = _ensure_stable_ids(
+        parsed_local, structure="criterion_links.local",
+        id_factory=lambda index, sequence: (
+            f"lc-{sequence}" if use_ac_namespace
+            else f"tc-{parsed_local[index]['task_id'][:48]}-{index + 1}"
+        ), diagnostics=diagnostics,
+        forbidden_ids=global_ids,
+    )
     local_ids = set()
     covered = set()
-    for index, entry in enumerate(local_links):
-        item = _object(entry, {"id", "task_id", "criterion", "supports_global_criteria"},
-                       f"local criterion {index}")
-        ident = _identifier(item["id"], f"local criterion {index} id")
-        task_id = _identifier(item["task_id"], f"local criterion {index} task_id")
-        criterion = _text(item["criterion"], "local criterion", MAX_CRITERION_CHARS)
+    validated_local = []
+    for index, item in enumerate(normalized_local):
+        ident = item["id"]
+        task_id = item["task_id"]
+        criterion = item["criterion"]
         key = (task_id, criterion.casefold())
         if ident in local_ids or key in covered or key not in expected:
             raise PlanValidationError("Local criterion links duplicate or substitute a task criterion.")
-        supports = _text_list(item["supports_global_criteria"], "supports_global_criteria",
-                              MAX_CRITERIA, identifiers=True)
+        supports = item["supports_global_criteria"]
         if any(ref not in global_ids for ref in supports):
             raise PlanValidationError("Local criterion links reference an unknown global criterion ID.")
         local_ids.add(ident)
         covered.add(key)
-        normalized_local.append({"id": ident, "task_id": task_id,
-                                 "criterion": expected[key], "supports_global_criteria": supports})
+        validated_local.append({"id": ident, "task_id": task_id,
+                                "criterion": expected[key], "supports_global_criteria": supports})
+    next_local_sequence = 1
     for task in tasks:
         for index, criterion in enumerate(task["success_criteria"], 1):
             key = (task["id"], criterion.casefold())
             if key in covered:
                 continue
-            base = f"tc-{task['id'][:48]}-{index}"
+            base = (f"lc-{next_local_sequence}" if use_ac_namespace
+                    else f"tc-{task['id'][:48]}-{index}")
             ident = base
             suffix = 2
-            while ident in local_ids:
-                ident = f"{base[:MAX_IDENTIFIER_CHARS - len(str(suffix)) - 1]}-{suffix}"
-                suffix += 1
+            while ident in local_ids or ident in global_ids:
+                if use_ac_namespace:
+                    next_local_sequence += 1
+                    ident = f"lc-{next_local_sequence}"
+                else:
+                    ident = f"{base[:MAX_IDENTIFIER_CHARS - len(str(suffix)) - 1]}-{suffix}"
+                    suffix += 1
+            if use_ac_namespace:
+                next_local_sequence += 1
             local_ids.add(ident)
-            normalized_local.append({"id": ident, "task_id": task["id"],
-                                     "criterion": criterion,
-                                     "supports_global_criteria": ([global_by_text[criterion.casefold()]]
-                                                                  if criterion.casefold() in global_by_text else [])})
-    return {"global": normalized_global, "local": normalized_local}
+            validated_local.append({"id": ident, "task_id": task["id"],
+                                    "criterion": criterion,
+                                    "supports_global_criteria": ([global_by_text[criterion.casefold()]]
+                                                                 if criterion.casefold() in global_by_text else [])})
+    return {"global": normalized_global, "local": validated_local}
 
 
-def normalize_plan(value: Any) -> dict[str, Any]:
+def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
+                   repair_model_criteria: bool = False) -> dict[str, Any]:
     """Return a stable representation while enforcing field types and bounds."""
     raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD})
     complexity = _text(raw["complexity"], "plan.complexity", 32).casefold().replace("-", "_")
@@ -742,13 +954,16 @@ def normalize_plan(value: Any) -> dict[str, Any]:
                                         MAX_CRITERIA, allow_empty=False),
     }
     result[CRITERION_LINKS_FIELD] = _normalize_criterion_links(
-        raw.get(CRITERION_LINKS_FIELD), result["success_criteria"], tasks)
+        raw.get(CRITERION_LINKS_FIELD), result["success_criteria"], tasks, diagnostics,
+        repair_model_criteria=repair_model_criteria)
     return result
 
 
-def validate_plan(value: Any) -> dict[str, Any]:
+def validate_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
+                  repair_model_criteria: bool = False) -> dict[str, Any]:
     """Normalize and validate IDs, references and the dependency DAG."""
-    plan = normalize_plan(value)
+    plan = normalize_plan(value, diagnostics=diagnostics,
+                          repair_model_criteria=repair_model_criteria)
     if plan["complexity"] == "simple" and len(plan["tasks"]) != 1:
         raise PlanValidationError("A simple plan must contain exactly one task.")
     if plan["complexity"] == "multi_step" and len(plan["tasks"]) < 2:
@@ -785,6 +1000,114 @@ def validate_plan(value: Any) -> dict[str, Any]:
     for task_id in ids:
         visit(task_id)
     return plan
+
+
+def _require_executable_global_coverage(plan: dict[str, Any]) -> None:
+    """Reject model plans whose executable global obligations have no task link."""
+    covered = {ref for item in plan[CRITERION_LINKS_FIELD]["local"]
+               for ref in item["supports_global_criteria"]}
+    for item in plan[CRITERION_LINKS_FIELD]["global"]:
+        if item["id"] not in covered and criterion_key(item["criterion"]) not in STRUCTURAL_CRITERIA:
+            raise PlanValidationError(
+                f"Global criterion {item['id']} has no explicit local task coverage."
+            )
+
+
+def _check_analyst_acceptance_identity(plan: dict[str, Any], analysis: Any) -> None:
+    """An AC-N reused by the Planner must still name the Analyst's obligation."""
+    if not isinstance(analysis, dict) or not isinstance(analysis.get("acceptance_criteria"), list):
+        return
+    analyst_criteria = {item["id"].casefold(): criterion_key(item["description"])
+                        for item in analysis["acceptance_criteria"]}
+    for item in plan[CRITERION_LINKS_FIELD]["global"]:
+        if item["id"].startswith("ac-") and (
+                analyst_criteria.get(item["id"]) != criterion_key(item["criterion"])):
+            raise PlanValidationError(
+                f"Planner global {item['id']} does not match a Task Analyst acceptance criterion."
+            )
+
+
+def _remove_analyst_acceptance_placeholders(value: Any, analysis: Any,
+                                            diagnostics: dict[str, Any] | None = None) -> Any:
+    """Keep plan criteria authoritative when a global row repeats the Analyst AC."""
+    if not isinstance(value, dict) or not isinstance(analysis, dict):
+        return value
+    analyst_rows = analysis.get("acceptance_criteria")
+    links = value.get(CRITERION_LINKS_FIELD)
+    criteria = value.get("success_criteria")
+    if (not isinstance(analyst_rows, list) or not isinstance(links, dict)
+            or not isinstance(links.get("global"), list) or not isinstance(criteria, list)):
+        return value
+    analyst_values = {criterion_key(value)
+                      for item in analyst_rows if isinstance(item, dict)
+                      for value in (item.get("id"), item.get("description"))
+                      if isinstance(value, str)}
+    criterion_texts = {criterion_key(item)
+                       for item in criteria if isinstance(item, str)}
+    retained = []
+    removed = 0
+    for entry in links["global"]:
+        if isinstance(entry, dict) and set(entry) <= {"id", "criterion"}:
+            text = entry.get("criterion")
+            raw_id = entry.get("id")
+            if (isinstance(text, str) and (raw_id is None or isinstance(raw_id, str))
+                    and criterion_key(text) in analyst_values
+                    and criterion_key(text) not in criterion_texts):
+                removed += 1
+                continue
+        retained.append(entry)
+    if not removed:
+        return value
+    if diagnostics is not None:
+        diagnostics["analyst_acceptance_placeholders_removed"] = removed
+    return {**value, CRITERION_LINKS_FIELD: {**links, "global": retained}}
+
+
+def _expand_model_task_ids(value: Any, diagnostics: dict[str, Any] | None = None) -> Any:
+    """Expand model shorthand T-N and its references without renaming other IDs."""
+    if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
+        return value
+    replacements: dict[str, str] = {}
+    for task in value["tasks"]:
+        if not isinstance(task, dict):
+            continue
+        raw_id = task.get("id")
+        match = (re.fullmatch(r"T-([1-9][0-9]*)", raw_id.strip(), re.I)
+                 if isinstance(raw_id, str) and len(raw_id.strip()) <= MAX_IDENTIFIER_CHARS else None)
+        if match:
+            replacements[f"t-{int(match.group(1))}"] = f"task-{int(match.group(1))}"
+    if not replacements:
+        return value
+
+    def rewrite(ref: Any) -> Any:
+        if not isinstance(ref, str):
+            return ref
+        try:
+            return replacements.get(_identifier(ref, "task reference"), ref)
+        except PlanValidationError:
+            return ref
+
+    tasks = []
+    for task in value["tasks"]:
+        if not isinstance(task, dict):
+            tasks.append(task)
+            continue
+        updated = dict(task)
+        updated["id"] = rewrite(task.get("id"))
+        if isinstance(task.get("depends_on"), list):
+            updated["depends_on"] = [rewrite(ref) for ref in task["depends_on"]]
+        tasks.append(updated)
+    updated_plan = {**value, "tasks": tasks}
+    links = value.get(CRITERION_LINKS_FIELD)
+    if isinstance(links, dict) and isinstance(links.get("local"), list):
+        updated_plan[CRITERION_LINKS_FIELD] = {
+            **links,
+            "local": [{**entry, "task_id": rewrite(entry.get("task_id"))}
+                      if isinstance(entry, dict) else entry for entry in links["local"]],
+        }
+    if diagnostics is not None:
+        diagnostics["task_ids_expanded"] = len(replacements)
+    return updated_plan
 
 
 
@@ -870,6 +1193,8 @@ class Planner:
             call_metrics = getattr(self.decide, "last_call_metrics", {})
             if not isinstance(call_metrics, dict):
                 call_metrics = {}
+            if isinstance(call_metrics.get("transport"), dict):
+                self.metrics.setdefault("model_call_details", []).append(call_metrics["transport"])
             for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
                 value = call_metrics.get(key, 0)
                 if isinstance(value, (int, float)) and value >= 0:
@@ -881,7 +1206,8 @@ class Planner:
             )
 
     @staticmethod
-    def _parse_output(value: Any, analysis: Any = None) -> dict[str, Any]:
+    def _parse_output(value: Any, analysis: Any = None,
+                      diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
         if isinstance(value, dict) and set(value) == {"message"} and isinstance(value["message"], dict):
             value = value["message"].get("content")
         if isinstance(value, str):
@@ -891,10 +1217,18 @@ class Planner:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
-        plan = _collapse_simple_artifact_plan(validate_plan(value))
+        value = _expand_model_task_ids(value, diagnostics)
+        value = _remove_analyst_acceptance_placeholders(value, analysis, diagnostics)
+        declared_links = isinstance(value, dict) and CRITERION_LINKS_FIELD in value
+        plan = _collapse_simple_artifact_plan(validate_plan(
+            value, diagnostics=diagnostics, repair_model_criteria=True))
         plan = _reconcile_task_analysis(plan, analysis)
         plan = _append_qa_task(plan, analysis)
-        return _append_code_audit_task(plan, analysis)
+        plan = _append_code_audit_task(plan, analysis)
+        _check_analyst_acceptance_identity(plan, analysis)
+        if declared_links:
+            _require_executable_global_coverage(plan)
+        return plan
 
     @staticmethod
     def _prompt(goal: str, context: dict[str, Any]) -> str:
@@ -905,9 +1239,21 @@ class Planner:
         return (
             "Create a work plan and return one JSON object only. Do not use Markdown. "
             "Required plan fields: goal, summary, complexity, tasks, success_criteria, criterion_links. "
-            "Give each global and local criterion a stable ID in criterion_links. "
-            "Each local entry names its task_id and supports_global_criteria IDs. "
-            "Link only criteria whose task evidence can prove that global obligation; wording may differ. "
+            "Freya assigns stable IDs to global and local criteria in criterion_links; "
+            "success_criteria and criterion_links.global are plan-wide acceptance obligations. "
+            "Each task's success_criteria are concrete checks of that task's result, and each "
+            "criterion_links.local row must name exactly one of those task checks plus its task_id. "
+            "Global and local rows are different objects with different IDs; never copy a global "
+            "row or its ID into a local row. supports_global_criteria may name only existing global IDs. "
+            "Explicitly link every plan-wide obligation that needs task execution to at least one "
+            "task check whose evidence can prove it; wording may differ. "
+            "The Task Analyst's REQ-N requirements and AC-N acceptance criteria are upstream "
+            "constraints; their verifies references may name only existing REQ-N IDs. "
+            "Reuse an Analyst AC-N as a global link ID only for that exact acceptance criterion; "
+            "use a plan-specific ID for a different global criterion. Each global row's criterion "
+            "must repeat one complete success_criteria text exactly; never put an ID such as AC-1 "
+            "in the criterion text field or copy the Analyst's generic AC text unless that full text "
+            "is also a plan success_criteria entry. "
             "complexity is simple or multi_step. Each task requires id, objective, description, "
             "depends_on, required_capabilities, preferred_skills, success_criteria. "
             "Use at most 20 tasks, unique stable IDs, existing dependency IDs, and an acyclic graph. "
@@ -941,33 +1287,50 @@ class Planner:
     def create_plan(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         goal = _text(prompt, "prompt", MAX_GOAL_CHARS)
         self._reset_metrics()
+        limited_context = dict(context) if isinstance(context, dict) else {}
+        analysis = limited_context.get("task_analysis")
+        if isinstance(analysis, dict) and ("requirements" in analysis or "acceptance_criteria" in analysis):
+            try:
+                limited_context["task_analysis"] = validate_task_analysis(analysis)
+            except TaskAnalysisError as exc:
+                raise PlanGenerationError(f"Task Analyst references are invalid: {exc}") from exc
         if self.decide is None:
             if self.offline:
-                analysis = (context or {}).get("task_analysis")
+                analysis = limited_context.get("task_analysis")
                 plan = _reconcile_task_analysis(fallback_plan(goal), analysis)
                 plan = _append_qa_task(plan, analysis)
-                return _append_code_audit_task(plan, analysis)
+                plan = _append_code_audit_task(plan, analysis)
+                _check_analyst_acceptance_identity(plan, analysis)
+                _require_executable_global_coverage(plan)
+                return plan
             raise PlanGenerationError("No planner model is configured. Use explicit offline mode for fallback planning.")
-        limited_context = context if isinstance(context, dict) else {}
         request = self._prompt(goal, limited_context)
         try:
             output = self._call(request, limited_context)
         except Exception as exc:
             raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
         try:
-            parsed = self._parse_output(output, limited_context.get("task_analysis"))
+            normalization = {}
+            parsed = self._parse_output(output, limited_context.get("task_analysis"), normalization)
             parsed["goal"] = goal
+            if normalization:
+                self.metrics["normalization"] = normalization
             return validate_plan(parsed)
         except (PlanValidationError, TypeError, ValueError) as first_error:
             rendered = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
             repair_prompt = (
-                request + "\nThe previous response was invalid. Repair it once and return only the complete JSON object. "
+                request + "\nThe previous response was invalid. Repair only the field or criterion-link "
+                "structure named by the validation error, preserving the other tasks, criteria, "
+                "dependencies, capabilities, and the Task Analyst's meaning. Return only the complete JSON object. "
                 f"Validation error: {first_error}. Previous response: {rendered[:MAX_MODEL_OUTPUT_CHARS]}"
             )
             try:
-                repaired = self._call(repair_prompt, limited_context)
-                parsed = self._parse_output(repaired, limited_context.get("task_analysis"))
+                repaired = self._call(repair_prompt, {**limited_context, "_freya_repair": True})
+                normalization = {}
+                parsed = self._parse_output(repaired, limited_context.get("task_analysis"), normalization)
                 parsed["goal"] = goal
+                if normalization:
+                    self.metrics["normalization"] = normalization
                 return validate_plan(parsed)
             except Exception as second_error:
                 raise PlanGenerationError(

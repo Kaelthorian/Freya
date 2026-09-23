@@ -17,7 +17,7 @@ from .config import validate_endpoint
 from .planner import (allocate_new_task_ids, MAX_PLAN_TASKS, PLAN_RESPONSE_FORMAT,
                       PlanValidationError, validate_plan)
 from .security import sanitize
-from .transport import request_json
+from .transport import model_profile, model_request, request_json
 
 
 RECOVERY_VERSION = 1
@@ -433,7 +433,7 @@ class OllamaFailureAnalyzer:
         started = time.monotonic()
         self.last_call_metrics = {}
         try:
-            response = self.request(
+            response = model_request(self.request, "failure_analyzer",
                 "POST", self.endpoint + "/api/chat",
                 {"model": self.model, "messages": [
                     {"role": "system", "content": (
@@ -451,9 +451,11 @@ class OllamaFailureAnalyzer:
                 ], "tools": [], "format": FAILURE_ANALYSIS_RESPONSE_FORMAT,
                  "stream": False, "think": False,
                  "options": {"temperature": 0, "num_ctx": DEFAULT_RECOVERY_CONTEXT_WINDOW,
-                             "num_predict": DEFAULT_RECOVERY_MAX_TOKENS}},
-                timeout=self.timeout_seconds,
+                             "num_predict": model_profile("failure_analyzer").max_output_tokens}},
+                timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
             )
+            if isinstance(response.get("_freya_transport"), dict):
+                self.last_call_metrics["transport"] = response["_freya_transport"]
             message = response.get("message")
             if not isinstance(message, dict) or not isinstance(message.get("content"), str):
                 raise FailureAnalysisError("Ollama returned no failure analysis content.")
@@ -498,17 +500,21 @@ class FailureAnalyzer:
             return deterministic_failure_diagnosis(logs)
         started = time.monotonic()
         self.metrics["model_calls"] = 1
-        value = self.model(logs)
-        self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
-        reported = getattr(self.model, "last_call_metrics", {})
-        if isinstance(reported, dict):
-            for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
-                metric = reported.get(key, 0)
-                if isinstance(metric, (int, float)) and not isinstance(metric, bool) and metric >= 0:
-                    self.metrics[key] = int(metric)
-            duration = reported.get("duration_seconds")
-            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
-                self.metrics["duration_seconds"] = round(float(duration), 4)
+        try:
+            value = self.model(logs)
+        finally:
+            self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
+            reported = getattr(self.model, "last_call_metrics", {})
+            if isinstance(reported, dict):
+                if isinstance(reported.get("transport"), dict):
+                    self.metrics.setdefault("model_call_details", []).append(reported["transport"])
+                for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
+                    metric = reported.get(key, 0)
+                    if isinstance(metric, (int, float)) and not isinstance(metric, bool) and metric >= 0:
+                        self.metrics[key] = int(metric)
+                duration = reported.get("duration_seconds")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                    self.metrics["duration_seconds"] = round(float(duration), 4)
         if isinstance(value, str):
             if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
                 raise FailureAnalysisError("Failure analysis output is too large.")
@@ -591,7 +597,7 @@ class OllamaRecoveryAdvisor:
         started = time.monotonic()
         self.last_call_metrics = {}
         try:
-            response = self.request(
+            response = model_request(self.request, "recovery_replanner",
                 "POST", self.endpoint + "/api/chat",
                 {"model": self.model, "messages": [
                     {"role": "system", "content": (
@@ -605,9 +611,11 @@ class OllamaRecoveryAdvisor:
                  "format": REVISION_RESPONSE_FORMAT if revision else RECOVERY_RESPONSE_FORMAT,
                  "stream": False, "think": False,
                  "options": {"temperature": 0, "num_ctx": DEFAULT_RECOVERY_CONTEXT_WINDOW,
-                             "num_predict": DEFAULT_RECOVERY_MAX_TOKENS}},
-                timeout=self.timeout_seconds,
+                             "num_predict": model_profile("recovery_replanner").max_output_tokens}},
+                timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
             )
+            if isinstance(response.get("_freya_transport"), dict):
+                self.last_call_metrics["transport"] = response["_freya_transport"]
             message = response.get("message")
             if not isinstance(message, dict) or not isinstance(message.get("content"), str):
                 raise RecoveryGenerationError("Ollama returned no recovery message content.")
@@ -655,6 +663,8 @@ class RecoveryController:
             reported = getattr(self.model, "last_call_metrics", {})
             if not isinstance(reported, dict):
                 reported = {}
+            if isinstance(reported.get("transport"), dict):
+                self.metrics.setdefault("model_call_details", []).append(reported["transport"])
             for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
                 metric = reported.get(key, 0)
                 if isinstance(metric, (int, float)) and not isinstance(metric, bool) and metric >= 0:

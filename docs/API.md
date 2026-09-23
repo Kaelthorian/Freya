@@ -115,33 +115,51 @@ configured agent the completed event contains a deterministic operational brief.
 The version-3 result includes `operational_prompt`, and `corrected_fields` lists
 deterministic semantic corrections. A standalone program with no requested
 language records Python 3.10+ as an explicit assumption; explicit languages
-and unrelated blockers are preserved. If the result has
+and unrelated blockers are preserved. Requirement IDs normalize to unique
+`REQ-N` values, acceptance IDs to unique `AC-N` values, and `verifies` must
+reference known requirements. Ambiguous references fail before planning. If the result has
 `ready_for_execution=false`, Freya emits `freya.task_analysis.blocked` with the
 `blocking_reason`, creates no plan, and emits `freya.planning.failed`. Planning
 otherwise emits either
 `freya.plan.created` with a safe goal/complexity/task summary or
 `freya.planning.failed`. A new plan uses schema version 1 with `criterion_links`:
+the plan's `success_criteria` remain authoritative if the model omits global link
+rows: the harness fills missing rows in criterion order, then deterministically
+fills absent, blank or duplicate global/local IDs before validation. It preserves
+valid IDs and checks references against the normalized global IDs. Extra,
+duplicate or unrelated global link rows still fail validation. Local IDs cannot
+reuse global IDs. A copied global criterion is mapped to a concrete task check
+only when unambiguous; unknown support IDs require an unambiguous text match.
+An Analyst AC ID or description used as a global-row placeholder is removed
+only when local links resolve to the plan's concrete criteria by exact text.
+The count appears in `planning_metrics.normalization`.
+Model plans declaring links must cover every executable global criterion before
+delegation. When a Planner global ID reuses an Analyst `AC-N`, its criterion
+text must match that Analyst acceptance criterion. When it assigns IDs, the run also emits
+`freya.planner.normalized` with aggregate assignment/duplicate counts and the
+affected criterion-link structures. An ID-only correction does not consume a
+Planner repair call.
 
 ```json
 {
   "goal": "Repair authentication and verify the fix",
   "summary": "Inspect, diagnose, fix and verify authentication.",
-  "complexity": "multi_step",
+  "complexity": "simple",
   "tasks": [{
-    "id": "inspect-auth",
-    "objective": "Inspect authentication",
-    "description": "Identify the relevant files and login flow.",
+    "id": "repair-auth",
+    "objective": "Repair and verify authentication",
+    "description": "Inspect the login flow, repair the fault and verify the result.",
     "depends_on": [],
-    "required_capabilities": ["filesystem.read", "filesystem.search"],
+    "required_capabilities": ["filesystem.read", "filesystem.modify"],
     "preferred_skills": ["python-development"],
-    "success_criteria": ["The current login flow is understood."]
+    "success_criteria": ["A regression check confirms that login works after the fix."]
   }],
-  "success_criteria": ["The root cause and verification result are recorded."],
+  "success_criteria": ["Authentication is repaired and verified."],
   "criterion_links": {
-    "global": [{"id": "gc-1", "criterion": "The root cause and verification result are recorded."}],
-    "local": [{"id": "tc-inspect-1", "task_id": "inspect-auth",
-      "criterion": "The current login flow is understood.",
-      "supports_global_criteria": []}]
+    "global": [{"id": "gc-1", "criterion": "Authentication is repaired and verified."}],
+    "local": [{"id": "tc-repair-auth-1", "task_id": "repair-auth",
+      "criterion": "A regression check confirms that login works after the fix.",
+      "supports_global_criteria": ["gc-1"]}]
   }
 }
 ```
@@ -236,6 +254,17 @@ A graph with every active effective task in accepted `success` enters
 goal/global criteria, current effective plan, accepted results/evaluations and bounded
 verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
 or `error`, and each original global criterion appears exactly once.
+Their canonical actions are respectively `accept`, `add_work`, `add_evidence`
+and `fail`. Model actions are normalized to this matrix before strict validation;
+one repair receives the original invalid output, exact error and schema. An
+exact Planner-scoped local check with satisfied evaluation and its own direct
+permitted proof can make global verification deterministic. A model validation
+problem emits `freya.global_verifier.validation` with proposed status/action,
+error and repair/normalization flags. `criteria_diagnostics.status=unknown`
+after a technical verifier failure means unverified, even if proof candidates
+were found. A successful `freya.dynamic_agent.archived` event has
+`status=Success` and records the final run state separately as
+`orchestration_status`.
 
 Version-3 satisfied criteria must cite nonempty criterion-specific permitted
 proof refs. Context refs (`task:*`, `evaluation:*`) cannot authorize acceptance.
@@ -377,6 +406,17 @@ recoverable read does not count as an additional blocked decision.
 | GET | `/api/health` | API, runtime and optional host telemetry |
 | GET | `/api/events?after=N` | replay/global SSE stream |
 | GET | `/api/tasks/{id}/events?after=N` | replay/task SSE stream |
+
+Ollama chat-call metrics in orchestration stage metrics and Worker
+`model.finished`/`model.failed`/`model.repair.finished` events include provider, model, component,
+connection state/time, first-token state/latency, generation and total time,
+token counts/rate, streaming flag, HTTP status, stop reason and timeout kind.
+These fields contain no prompt, response body or credential. `model_call_details`
+preserves each attempt, including failed calls. Provider errors use stable
+`OLLAMA_UNREACHABLE`, `OLLAMA_REQUEST_TIMEOUT`,
+`OLLAMA_GENERATION_TIMEOUT`, `OLLAMA_HTTP_ERROR`, and
+`OLLAMA_INVALID_RESPONSE` categories; the Analyst fallback remains indicated
+by `analysis_mode=deterministic_fallback`.
 
 Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.

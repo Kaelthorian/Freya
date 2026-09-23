@@ -120,6 +120,210 @@ class PlannerValidationTests(unittest.TestCase):
         self.assertEqual(result["tasks"][0]["preferred_skills"], ["python-development"])
         self.assertEqual(result["tasks"][0]["success_criteria"], ["Evidence found"])
 
+    def test_global_criterion_ids_are_assigned_when_missing(self):
+        criteria = ["archivo existe", "contenido correcto"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [{"criterion": criterion} for criterion in criteria],
+            "local": [],
+        })
+        result = validate_plan(raw)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]],
+                         ["gc-1", "gc-2"])
+        self.assertEqual([item["criterion"] for item in result["criterion_links"]["global"]], criteria)
+
+    def test_missing_global_link_rows_are_synthesized_in_success_criteria_order(self):
+        criteria = ["A", "B", "C"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [
+                {"id": "gc-third", "criterion": "C"},
+                {"criterion": "A"},
+            ],
+            "local": [],
+        })
+        result = validate_plan(raw)
+        self.assertEqual(result["criterion_links"]["global"], [
+            {"id": "gc-1", "criterion": "A"},
+            {"id": "gc-2", "criterion": "B"},
+            {"id": "gc-third", "criterion": "C"},
+        ])
+
+    def test_empty_global_links_are_filled_from_success_criteria(self):
+        criteria = ["A", "B"]
+        raw = plan(success_criteria=criteria, criterion_links={"global": [], "local": []})
+        self.assertEqual(validate_plan(raw)["criterion_links"]["global"], [
+            {"id": "gc-1", "criterion": "A"},
+            {"id": "gc-2", "criterion": "B"},
+        ])
+
+    def test_synthesized_global_link_is_available_to_local_references(self):
+        raw = plan(success_criteria=["First", "Second"], criterion_links={
+            "global": [{"id": "ac-first", "criterion": "First"}],
+            "local": [{"id": "lc-1", "task_id": "task-1",
+                       "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["gc-1"]}],
+        })
+        result = validate_plan(raw)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]],
+                         ["ac-first", "gc-1"])
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"], ["gc-1"])
+
+    def test_local_reusing_global_id_gets_distinct_id_and_task_check(self):
+        raw = plan(
+            tasks=[task("TASK-1", "Crear el artefacto", success_criteria=["Resultado correcto"])],
+            success_criteria=["Resultado correcto"],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "Resultado correcto"}],
+                "local": [{"id": "AC-1", "task_id": "TASK-1", "criterion": "Resultado correcto",
+                           "supports_global_criteria": ["AC-1"]}],
+            },
+        )
+        result = validate_plan(raw)
+        self.assertEqual(result["criterion_links"]["global"][0]["id"], "ac-1")
+        self.assertEqual(result["criterion_links"]["local"][0]["id"], "lc-1")
+        self.assertNotEqual(result["tasks"][0]["success_criteria"][0], "Resultado correcto")
+        self.assertEqual(result["criterion_links"]["local"][0]["criterion"],
+                         result["tasks"][0]["success_criteria"][0])
+
+    def test_unrelated_local_substitution_keeps_strict_error(self):
+        raw = plan(success_criteria=["Overall result is correct"], criterion_links={
+            "global": [{"id": "ac-1", "criterion": "Overall result is correct"}],
+            "local": [{"id": "lc-1", "task_id": "task-1", "criterion": "Unrelated claim",
+                       "supports_global_criteria": ["ac-1"]}],
+        })
+        with self.assertRaisesRegex(PlanValidationError,
+                                    "Local criterion links duplicate or substitute a task criterion"):
+            validate_plan(raw)
+
+    def test_global_link_rows_cannot_add_or_duplicate_plan_criteria(self):
+        for links in (
+            [{"criterion": "A"}, {"criterion": "B"}],
+            [{"criterion": "A"}, {"criterion": "A"}],
+        ):
+            with self.subTest(links=links):
+                raw = plan(success_criteria=["A"], criterion_links={"global": links, "local": []})
+                with self.assertRaisesRegex(PlanValidationError, "match one unique plan criterion"):
+                    validate_plan(raw)
+
+    def test_legacy_plan_synthesizes_local_ids_and_exact_global_reference(self):
+        criterion = "The task outcome is verified."
+        result = validate_plan(plan(success_criteria=[criterion]))
+        self.assertEqual(result["criterion_links"]["global"], [{"id": "gc-1", "criterion": criterion}])
+        self.assertEqual(result["criterion_links"]["local"], [{
+            "id": "tc-task-1-1", "task_id": "task-1", "criterion": criterion,
+            "supports_global_criteria": ["gc-1"],
+        }])
+
+    def test_global_criterion_ids_are_assigned_for_null_and_blank_values(self):
+        criteria = ["A", "B", "C"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [
+                {"id": "", "criterion": "A"},
+                {"id": None, "criterion": "B"},
+                {"id": "   ", "criterion": "C"},
+            ],
+            "local": [],
+        })
+        self.assertEqual([item["id"] for item in normalize_plan(raw)["criterion_links"]["global"]],
+                         ["gc-1", "gc-2", "gc-3"])
+
+    def test_duplicate_global_criterion_ids_are_resolved_deterministically(self):
+        criteria = ["A", "B", "C"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [
+                {"id": "GC-1", "criterion": "A"},
+                {"id": "gc-1", "criterion": "B"},
+                {"id": "gc-2", "criterion": "C"},
+            ],
+            "local": [],
+        })
+        diagnostics = {}
+        first = validate_plan(raw, diagnostics=diagnostics)
+        second = validate_plan(raw)
+        self.assertEqual([item["id"] for item in first["criterion_links"]["global"]],
+                         ["gc-1", "gc-3", "gc-2"])
+        self.assertEqual(first, second)
+        self.assertEqual(diagnostics["stable_ids"]["duplicates_resolved"], 1)
+
+    def test_duplicate_global_id_reference_uses_unambiguous_criterion_text(self):
+        raw = plan(
+            success_criteria=["First result", "Second result"],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "First result"},
+                           {"id": "AC-1", "criterion": "Second result"}],
+                "local": [{"id": "LC-1", "task_id": "task-1", "criterion": "Second result",
+                           "supports_global_criteria": ["AC-1"]}],
+            },
+        )
+        result = validate_plan(raw)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]],
+                         ["ac-1", "ac-2"])
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"],
+                         ["ac-2"])
+
+    def test_duplicate_global_id_reference_without_text_match_fails(self):
+        raw = plan(
+            success_criteria=["First result", "Second result"],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "First result"},
+                           {"id": "AC-1", "criterion": "Second result"}],
+                "local": [{"id": "LC-1", "task_id": "task-1",
+                           "criterion": "The task outcome is verified.",
+                           "supports_global_criteria": ["AC-1"]}],
+            },
+        )
+        with self.assertRaisesRegex(PlanValidationError, "ambiguous global criterion ID"):
+            validate_plan(raw)
+
+    def test_existing_global_id_is_preserved_and_reserved_before_assignment(self):
+        criteria = ["A", "B"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [
+                {"criterion": "A"},
+                {"id": "gc-1", "criterion": "B"},
+            ],
+            "local": [],
+        })
+        result = validate_plan(raw)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]], ["gc-2", "gc-1"])
+
+    def test_local_criterion_id_is_assigned_and_references_generated_global_id(self):
+        global_criterion = "The requested outcome is complete."
+        local_criterion = "The task outcome is verified."
+        raw = plan(criterion_links={
+            "global": [{"criterion": global_criterion}],
+            "local": [{
+                "id": None, "task_id": "task-1", "criterion": local_criterion,
+                "supports_global_criteria": ["gc-1"],
+            }],
+        })
+        result = validate_plan(raw)
+        self.assertEqual(result["criterion_links"]["local"][0]["id"], "tc-task-1-1")
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"], ["gc-1"])
+
+    def test_duplicate_local_criterion_id_is_replaced_without_losing_coverage(self):
+        local_criteria = ["First task check.", "Second task check."]
+        raw = plan(tasks=[task(success_criteria=local_criteria)], criterion_links={
+            "global": [{"id": "gc-overall", "criterion": "The requested outcome is complete."}],
+            "local": [
+                {"id": "tc-shared", "task_id": "task-1", "criterion": local_criteria[0],
+                 "supports_global_criteria": []},
+                {"id": "tc-shared", "task_id": "task-1", "criterion": local_criteria[1],
+                 "supports_global_criteria": []},
+            ],
+        })
+        result = validate_plan(raw)
+        local_links = result["criterion_links"]["local"]
+        self.assertEqual([item["id"] for item in local_links], ["tc-shared", "tc-task-1-2"])
+        self.assertEqual([item["criterion"] for item in local_links], local_criteria)
+
+    def test_non_string_criterion_id_remains_a_contract_error(self):
+        raw = plan(criterion_links={
+            "global": [{"id": 7, "criterion": "The requested outcome is complete."}],
+            "local": [],
+        })
+        with self.assertRaisesRegex(PlanValidationError, "must be a string or null"):
+            validate_plan(raw)
+
     def test_complexity_is_canonicalized_from_task_count(self):
         self.assertEqual(normalize_plan(plan(complexity="multi_step"))["complexity"], "simple")
         mismatched = plan([task("one"), task("two", depends_on=["one"])], complexity="simple")
@@ -165,6 +369,277 @@ class PlannerValidationTests(unittest.TestCase):
 
 
 class PlannerGenerationTests(unittest.TestCase):
+    def test_hello_world_has_distinct_requirement_global_task_and_local_ids(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        generated = plan(
+            goal=analysis["operational_prompt"],
+            tasks=[task("TASK-1", "Crear el artefacto solicitado",
+                        success_criteria=["El artefacto fue creado.",
+                                          "El artefacto representa hola mundo."])],
+            success_criteria=["El resultado cumple el objetivo original del usuario."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion":
+                            "El resultado cumple el objetivo original del usuario."}],
+                "local": [
+                    {"id": "LC-1", "task_id": "TASK-1", "criterion": "El artefacto fue creado.",
+                     "supports_global_criteria": ["AC-1"]},
+                    {"id": "LC-2", "task_id": "TASK-1",
+                     "criterion": "El artefacto representa hola mundo.",
+                     "supports_global_criteria": ["AC-1"]},
+                ],
+            },
+        )
+        result = Planner(lambda prompt, context: generated).create_plan(
+            analysis["operational_prompt"], {"task_analysis": analysis})
+        requirement_ids = {item["id"] for item in analysis["requirements"]}
+        acceptance_ids = {item["id"] for item in analysis["acceptance_criteria"]}
+        global_ids = {item["id"] for item in result["criterion_links"]["global"]}
+        local_ids = {item["id"] for item in result["criterion_links"]["local"]}
+        self.assertTrue(all(identifier.startswith("REQ-") for identifier in requirement_ids))
+        self.assertTrue(all(identifier.startswith("AC-") for identifier in acceptance_ids))
+        self.assertTrue(all(task["id"].startswith("task-") for task in result["tasks"]))
+        self.assertTrue(all(identifier.startswith("ac-") for identifier in global_ids))
+        self.assertTrue(all(identifier.startswith("lc-") for identifier in local_ids))
+        self.assertFalse(global_ids & local_ids)
+        self.assertTrue(all(set(item["verifies"]) <= requirement_ids
+                            for item in analysis["acceptance_criteria"]))
+        self.assertTrue(all(set(item["supports_global_criteria"]) <= global_ids
+                            for item in result["criterion_links"]["local"]))
+
+    def test_real_ollama_analyst_id_placeholder_is_reconciled_by_exact_text(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        criteria = ["El archivo 'hola_mundo.txt' existe en el directorio actual.",
+                    "El contenido del archivo 'hola_mundo.txt' es 'hola mundo'."]
+        generated = plan(
+            goal=analysis["operational_prompt"],
+            tasks=[task("T-1", "Crear hola_mundo.txt", success_criteria=criteria)],
+            success_criteria=criteria,
+            criterion_links={
+                "global": [{"criterion": "AC-1", "id": "CL-1"}],
+                "local": [{"task_id": "T-1", "criterion": criterion,
+                           "supports_global_criteria": ["CL-1"]} for criterion in criteria],
+            },
+        )
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or generated)
+        result = planner.create_plan(analysis["operational_prompt"], {"task_analysis": analysis})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["criterion"] for item in result["criterion_links"]["global"]], criteria)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]],
+                         ["gc-1", "gc-2"])
+        self.assertEqual([item["supports_global_criteria"]
+                          for item in result["criterion_links"]["local"]],
+                         [["gc-1"], ["gc-2"]])
+        self.assertEqual(result["tasks"][0]["id"], "task-1")
+        self.assertTrue(all(item["task_id"] == "task-1"
+                            for item in result["criterion_links"]["local"]))
+        self.assertEqual(planner.metrics["normalization"]["analyst_acceptance_placeholders_removed"], 1)
+
+    def test_model_task_shorthand_updates_dependencies_and_local_links(self):
+        generated = plan(
+            goal="Review inventory", summary="Review inventory in two stages",
+            tasks=[task("T-1", "Inventory items", success_criteria=["Items counted."]),
+                   task("T-2", "Check counts", depends_on=["T-1"],
+                        success_criteria=["Counts reconciled."])],
+            success_criteria=["Items counted.", "Counts reconciled."],
+            criterion_links={
+                "global": [{"id": "gc-1", "criterion": "Items counted."},
+                           {"id": "gc-2", "criterion": "Counts reconciled."}],
+                "local": [{"task_id": "T-1", "criterion": "Items counted.",
+                           "supports_global_criteria": ["gc-1"]},
+                          {"task_id": "T-2", "criterion": "Counts reconciled.",
+                           "supports_global_criteria": ["gc-2"]}],
+            },
+        )
+        planner = Planner(lambda prompt, context: generated)
+        result = planner.create_plan("Review inventory")
+        self.assertEqual([item["id"] for item in result["tasks"]], ["task-1", "task-2"])
+        self.assertEqual(result["tasks"][1]["depends_on"], ["task-1"])
+        self.assertEqual([item["task_id"] for item in result["criterion_links"]["local"]],
+                         ["task-1", "task-2"])
+        self.assertEqual(planner.metrics["normalization"]["task_ids_expanded"], 2)
+
+    def test_real_ollama_analyst_description_placeholder_keeps_two_global_obligations(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        criteria = ["El archivo 'hola_mundo.txt' existe en el directorio actual.",
+                    "El contenido del archivo 'hola_mundo.txt' es 'hola mundo'."]
+        generated = plan(
+            goal=analysis["operational_prompt"],
+            tasks=[task("T-1", "Crear hola_mundo.txt", success_criteria=criteria)],
+            success_criteria=criteria,
+            criterion_links={
+                "global": [{"criterion": analysis["acceptance_criteria"][0]["description"],
+                            "id": "AC-1"}],
+                "local": [{"task_id": "T-1", "criterion": criterion,
+                           "supports_global_criteria": ["AC-1"]} for criterion in criteria],
+            },
+        )
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or generated)
+        result = planner.create_plan(analysis["operational_prompt"], {"task_analysis": analysis})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["criterion"] for item in result["criterion_links"]["global"]], criteria)
+        self.assertEqual([item["supports_global_criteria"]
+                          for item in result["criterion_links"]["local"]],
+                         [["gc-1"], ["gc-2"]])
+        self.assertEqual(planner.metrics["normalization"]["analyst_acceptance_placeholders_removed"], 1)
+
+    def test_analyst_id_placeholder_without_exact_local_match_still_fails(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        generated = plan(
+            tasks=[task(success_criteria=["The task result is checked."])],
+            success_criteria=["The requested result exists."],
+            criterion_links={
+                "global": [{"criterion": "AC-1", "id": "CL-1"}],
+                "local": [{"task_id": "task-1", "criterion": "The task result is checked.",
+                           "supports_global_criteria": ["CL-1"]}],
+            },
+        )
+        with self.assertRaisesRegex(PlanGenerationError, "unknown global criterion ID"):
+            Planner(lambda prompt, context: generated).create_plan(
+                analysis["operational_prompt"], {"task_analysis": analysis})
+
+    def test_unknown_global_reference_is_resolved_only_from_exact_wording(self):
+        generated = plan(
+            tasks=[task(success_criteria=["The artifact is present."])],
+            success_criteria=["The requested artifact exists."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "The requested artifact exists."}],
+                "local": [{"id": "LC-1", "task_id": "task-1",
+                           "criterion": "The requested artifact exists.",
+                           "supports_global_criteria": ["AC-999"]}],
+            },
+        )
+        result = Planner(lambda prompt, context: generated).create_plan("Create the artifact")
+        self.assertEqual(result["criterion_links"]["local"][0]["criterion"],
+                         "The artifact is present.")
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"], ["ac-1"])
+
+    def test_model_copied_global_text_with_distinct_id_becomes_task_check(self):
+        generated = plan(
+            tasks=[task("TASK-1", "Crear hola mundo", success_criteria=["Resultado correcto."])],
+            success_criteria=["Resultado correcto."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "Resultado correcto."}],
+                "local": [{"id": "LC-1", "task_id": "TASK-1",
+                           "criterion": "Resultado correcto.",
+                           "supports_global_criteria": ["AC-1"]}],
+            },
+        )
+        result = Planner(lambda prompt, context: generated).create_plan("Crea un hola mundo")
+        local = result["criterion_links"]["local"][0]
+        self.assertEqual(local["id"], "lc-1")
+        self.assertIn("Crear hola mundo", local["criterion"])
+        self.assertNotEqual(local["criterion"], result["success_criteria"][0])
+
+    def test_ambiguous_global_copy_cannot_pick_one_of_multiple_task_checks(self):
+        generated = plan(
+            tasks=[task(success_criteria=["The file exists.", "The content is correct."])],
+            success_criteria=["The requested artifact is correct."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "The requested artifact is correct."}],
+                "local": [
+                    {"id": "LC-2", "task_id": "task-1", "criterion": "The file exists.",
+                     "supports_global_criteria": []},
+                    {"id": "LC-1", "task_id": "task-1",
+                     "criterion": "The requested artifact is correct.",
+                     "supports_global_criteria": ["AC-1"]},
+                ],
+            },
+        )
+        with self.assertRaisesRegex(PlanGenerationError,
+                                    "Local criterion links duplicate or substitute a task criterion"):
+            Planner(lambda prompt, context: generated).create_plan("Create the artifact")
+
+    def test_unknown_global_reference_without_wording_match_fails(self):
+        generated = plan(success_criteria=["The result is correct."], criterion_links={
+            "global": [{"id": "AC-1", "criterion": "The result is correct."}],
+            "local": [{"id": "LC-1", "task_id": "task-1",
+                       "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["AC-999"]}],
+        })
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or generated)
+        with self.assertRaisesRegex(PlanGenerationError, "unknown global criterion ID"):
+            planner.create_plan("Create the artifact")
+        self.assertEqual(len(calls), 2)
+
+    def test_duplicate_local_ids_remain_distinct_and_can_share_global_support(self):
+        generated = plan(
+            tasks=[task(success_criteria=["The file exists.", "The contents are correct."])],
+            success_criteria=["The requested artifact is correct."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "The requested artifact is correct."}],
+                "local": [
+                    {"id": "LC-1", "task_id": "task-1", "criterion": "The file exists.",
+                     "supports_global_criteria": ["AC-1"]},
+                    {"id": "LC-1", "task_id": "task-1", "criterion": "The contents are correct.",
+                     "supports_global_criteria": ["AC-1"]},
+                ],
+            },
+        )
+        result = Planner(lambda prompt, context: generated).create_plan("Create the artifact")
+        self.assertEqual([item["id"] for item in result["criterion_links"]["local"]],
+                         ["lc-1", "lc-2"])
+
+    def test_two_tasks_may_support_the_same_global_criterion(self):
+        generated = plan(
+            tasks=[task("TASK-1", "Produce component A", success_criteria=["The file exists."]),
+                   task("TASK-2", "Verify component B", depends_on=["TASK-1"],
+                        success_criteria=["The content is correct."])],
+            complexity="multi_step",
+            success_criteria=["The requested artifact is correct."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "The requested artifact is correct."}],
+                "local": [
+                    {"id": "LC-1", "task_id": "TASK-1", "criterion": "The file exists.",
+                     "supports_global_criteria": ["AC-1"]},
+                    {"id": "LC-2", "task_id": "TASK-2", "criterion": "The content is correct.",
+                     "supports_global_criteria": ["AC-1"]},
+                ],
+            },
+        )
+        result = Planner(lambda prompt, context: generated).create_plan("Create and check the artifact")
+        self.assertEqual([item["task_id"] for item in result["criterion_links"]["local"]],
+                         ["task-1", "task-2"])
+        self.assertEqual([item["supports_global_criteria"] for item in result["criterion_links"]["local"]],
+                         [["ac-1"], ["ac-1"]])
+
+    def test_uncovered_global_criterion_fails_before_execution(self):
+        generated = plan(criterion_links={
+            "global": [{"id": "AC-1", "criterion": "The requested result is complete."}],
+            "local": [{"id": "LC-1", "task_id": "task-1",
+                       "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": []}],
+        }, success_criteria=["The requested result is complete."])
+        with self.assertRaisesRegex(PlanGenerationError, "no explicit local task coverage"):
+            Planner(lambda prompt, context: generated).create_plan("Complete the request")
+
+    def test_invalid_analyst_requirement_reference_stops_before_model_call(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        analysis["acceptance_criteria"][0]["verifies"] = ["REQ-999"]
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or plan())
+        with self.assertRaisesRegex(PlanGenerationError, "Task Analyst references are invalid"):
+            planner.create_plan("Crea un hola mundo", {"task_analysis": analysis})
+        self.assertEqual(calls, [])
+
+    def test_planner_cannot_reuse_analyst_ac_id_for_different_obligation(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        generated = plan(
+            success_criteria=["An unrelated result is accepted."],
+            criterion_links={
+                "global": [{"id": "AC-1", "criterion": "An unrelated result is accepted."}],
+                "local": [{"id": "LC-1", "task_id": "task-1",
+                           "criterion": "The task outcome is verified.",
+                           "supports_global_criteria": ["AC-1"]}],
+            },
+        )
+        with self.assertRaisesRegex(PlanGenerationError,
+                                    "does not match a Task Analyst acceptance criterion"):
+            Planner(lambda prompt, context: generated).create_plan(
+                analysis["operational_prompt"], {"task_analysis": analysis})
+
     def test_model_json_can_create_multi_step_plan(self):
         result = Planner(lambda prompt, context: json.dumps(multi_step_plan())).create_plan(
             "Inspect authentication, diagnose it, fix it and run tests.",
@@ -226,7 +701,51 @@ class PlannerGenerationTests(unittest.TestCase):
 
         self.assertEqual(Planner(decide).create_plan("Create hello.txt")["complexity"], "simple")
         self.assertEqual(len(calls), 2)
-        self.assertIn("Repair it once", calls[1])
+        self.assertIn("Repair only the field or criterion-link structure", calls[1])
+
+    def test_missing_criterion_ids_do_not_trigger_model_repair(self):
+        criteria = ["The hello world output is correct."]
+        generated = plan(
+            goal="Crea un hola mundo",
+            success_criteria=criteria,
+            criterion_links={
+                "global": [{"criterion": criteria[0]}],
+                "local": [{"id": "tc-task-1-1", "task_id": "task-1",
+                           "criterion": "The task outcome is verified.",
+                           "supports_global_criteria": ["gc-1"]}],
+            },
+        )
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or generated)
+        result = planner.create_plan("Crea un hola mundo")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["criterion_links"]["global"][0]["id"], "gc-1")
+        self.assertEqual(planner.metrics["normalization"]["stable_ids"]["assigned"], 1)
+
+    def test_missing_global_link_rows_do_not_trigger_model_repair(self):
+        criteria = ["The file exists.", "The content is correct."]
+        generated = plan(
+            goal="Crea un hola mundo",
+            success_criteria=criteria,
+            tasks=[task(success_criteria=["The file is present.", "The file content matches."])],
+            criterion_links={
+                "global": [],
+                "local": [
+                    {"id": "tc-task-1-1", "task_id": "task-1", "criterion": "The file is present.",
+                     "supports_global_criteria": ["gc-1"]},
+                    {"id": "tc-task-1-2", "task_id": "task-1",
+                     "criterion": "The file content matches.",
+                     "supports_global_criteria": ["gc-2"]},
+                ],
+            },
+        )
+        calls = []
+        planner = Planner(lambda prompt, context: calls.append(prompt) or generated)
+        result = planner.create_plan("Crea un hola mundo")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["id"] for item in result["criterion_links"]["global"]],
+                         ["gc-1", "gc-2"])
+        self.assertEqual(planner.metrics["normalization"]["stable_ids"]["assigned"], 2)
 
     def test_second_invalid_output_fails_explicitly(self):
         calls = []
@@ -344,6 +863,41 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertEqual(payload["task_count"], 1)
         self.assertEqual(payload["task_ids"], ["task-1"])
 
+    def test_hello_world_plan_emits_stable_id_normalization_and_reaches_execution(self):
+        criterion = "The Hello World result is verified."
+        generated = plan(
+            goal="Crea un hola mundo",
+            success_criteria=[criterion],
+            criterion_links={
+                "global": [{"criterion": criterion}],
+                "local": [{"id": "tc-task-1-1", "task_id": "task-1",
+                           "criterion": "The task outcome is verified.",
+                           "supports_global_criteria": ["gc-1"]}],
+            },
+        )
+        planner_calls = []
+        planner = Planner(lambda prompt, context: planner_calls.append(prompt) or generated)
+        run = self.store.create_orchestration("Crea un hola mundo")
+        Orchestrator(
+            self.store, None,
+            decide=lambda prompt, agents, results: {"action": "respond", "message": "Planning passed."},
+            planner=planner,
+        )._run(run["id"])
+
+        stored = self.store.get_orchestration(run["id"])
+        event_types = [event["event_type"] for event in stored["events"]]
+        normalized = next(event for event in stored["events"]
+                          if event["event_type"] == "freya.planner.normalized")
+        payload = json.loads(normalized["payload_json"])
+        self.assertEqual(stored["status"], "Success")
+        self.assertEqual(len(planner_calls), 1)
+        self.assertEqual(stored["plan"]["criterion_links"]["global"][0]["id"], "gc-1")
+        self.assertIn("freya.plan.created", event_types)
+        self.assertEqual(payload["stable_ids"]["assigned"], 1)
+        self.assertEqual(payload["stable_ids"]["structures"], {
+            "criterion_links.global": {"assigned": 1, "duplicates_resolved": 0},
+        })
+
     def test_failed_planning_emits_failure_without_plan(self):
         run = self.store.create_orchestration("Create hello.txt")
         broken = Planner(lambda prompt, context: "not json")
@@ -353,6 +907,22 @@ class PlannerPersistenceAndEventsTests(unittest.TestCase):
         self.assertIsNone(stored["plan"])
         self.assertEqual(stored["planning_metrics"]["model_calls"], 2)
         self.assertIn("freya.planning.failed", [event["event_type"] for event in stored["events"]])
+
+    def test_invalid_criterion_reference_never_initializes_graph_or_programmer(self):
+        invalid = plan(success_criteria=["The requested result is complete."], criterion_links={
+            "global": [{"id": "AC-1", "criterion": "The requested result is complete."}],
+            "local": [{"id": "LC-1", "task_id": "task-1",
+                       "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["AC-999"]}],
+        })
+        run = self.store.create_orchestration("Create hello.txt")
+        Orchestrator(self.store, None, planner=Planner(lambda prompt, context: invalid))._run(run["id"])
+        stored = self.store.get_orchestration(run["id"])
+        self.assertEqual(stored["status"], "Failed")
+        self.assertIsNone(stored["plan"])
+        self.assertEqual(self.store.get_execution_graph(run["id"])["nodes"], [])
+        self.assertNotIn("freya.graph.initialized",
+                         [event["event_type"] for event in stored["events"]])
 
     def test_blocked_task_analysis_stops_before_plan_or_delegation(self):
         analyst = self.store.create_agent(normalize_agent({

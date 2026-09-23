@@ -4,14 +4,31 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
-`task_analyst.py` owns the tool-free prompt-rewrite contract and semantic
+`task_analyst.py` owns the tool-free prompt-rewrite contract, deterministic
+REQ/AC ID normalization with checked `verifies` references, and semantic
 reconciliation against observable source-prompt facts.
-`planner.py` owns the versioned orchestration-plan contract, normalization and
-DAG validation. `orchestrator.py` runs the Task Analyst first when an enabled
-agent has `config.orchestration_role=task_analyst` (with a legacy name/role
-fallback), then persists that snapshot before it selects and
+`planner.py` owns the versioned orchestration-plan contract, deterministic
+criterion-ID normalization, `T-N` task-ID expansion with reference updates,
+and DAG validation. It fills omitted global-link
+rows from the plan's authoritative success criteria, assigns absent or
+conflicting global/local criterion IDs before final validation, reconciles
+unambiguous copied local criteria to task checks, and requires explicit local
+coverage for model-declared executable global criteria. Invalid references or
+ambiguous substitutions fail before delegation. An Analyst AC ID or description
+used as a global-row placeholder is removed only when exact local text can
+resolve its references to the plan's authoritative criteria. It reports ID correction counts
+through orchestration events. `orchestrator.py` runs the Task Analyst first when
+an enabled agent has `config.orchestration_role=task_analyst` (with a legacy
+name/role fallback), then persists that snapshot before it selects and
 delegates to existing agents through `Runtime`; workers cannot create agents or
 bypass tool policy.
+
+`integration.py` owns the canonical global status/action matrix, strict result
+validation, one repair, and the narrow exact-check direct-proof decision.
+`integration_orchestrator.py` persists bounded validation diagnostics; proof
+authority remains in `integration_proof.py` and Storage revalidation. An
+archival event reports archival `Success` separately from the run's final
+`orchestration_status`.
 
 ## Boundaries
 
@@ -32,6 +49,10 @@ bypass tool policy.
   and keep cancellation serialized with task submission.
 - The production Planner calls loopback Ollama without tools. Deterministic
   fallback requires the explicit `--planner-offline` mode.
+- Keep production `/api/chat` calls in `transport.py`: streamed reconstruction,
+  per-component timeout/output profiles, refusal-only provider circuit and
+  body-free telemetry. A CLI timeout is inactivity, while the hard ceiling
+  remains bounded. Preserve injected request functions in adapter tests.
 - Task Analyst output is strictly validated JSON. It receives the original
   prompt, has no tools or workspace authority, and may use a deterministic
   fallback if its model call fails. Its `operational_prompt` replaces the human
@@ -78,6 +99,7 @@ python -m unittest tests.test_control_security tests.test_control_storage tests.
 python -m unittest tests.test_capabilities -v
 python -m unittest tests.test_agent_context -v
 python -m unittest tests.test_skills -v
+python -m unittest tests.test_transport -v
 python -m compileall -q control_center
 node --check frontend\app.js
 python -m control_center --help

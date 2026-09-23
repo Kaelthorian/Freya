@@ -16,7 +16,7 @@ from typing import Any, Callable
 from .config import validate_endpoint
 from .planner import (MAX_PLAN_TASKS, TASK_FIELDS, allocate_new_task_ids, validate_plan)
 from .security import sanitize
-from .transport import request_json
+from .transport import model_profile, model_request, request_json
 from .integration_proof import build_proof_metadata, criterion_key
 
 
@@ -27,6 +27,22 @@ GLOBAL_ACTIONS = {
     "accepted": "accept", "needs_work": "add_work",
     "blocked": "add_evidence", "error": "fail",
 }
+
+
+def _logged_decision_field(value: Any) -> str:
+    """Keep model-proposed enum tokens in diagnostics, never arbitrary model text."""
+    return value if isinstance(value, str) and re.fullmatch(r"[a-z_]{1,32}", value) else "<invalid>"
+
+
+def _normalize_global_action(value: Any) -> tuple[Any, bool]:
+    """The state machine, rather than model prose, selects the only valid action."""
+    if (not isinstance(value, dict) or not isinstance(value.get("status"), str)
+            or value["status"] not in GLOBAL_ACTIONS):
+        return value, False
+    action = value.get("recommended_action")
+    if not isinstance(action, str) or action == GLOBAL_ACTIONS[value["status"]]:
+        return value, False
+    return {**value, "recommended_action": GLOBAL_ACTIONS[value["status"]]}, True
 GLOBAL_FIELDS = {
     "status", "summary", "criteria", "cross_task_issues", "missing_evidence",
     "responsible_task_ids", "recommended_action",
@@ -463,8 +479,13 @@ class _OllamaStructuredAdapter:
     def __call__(self, prompt: str, context: dict[str, Any]) -> str:
         started = time.monotonic()
         self.last_call_metrics = {}
+        repair = context.get("_freya_repair") is True
+        model_context = {key: value for key, value in context.items() if key != "_freya_repair"}
         try:
-            response = self.request(
+            component = {"global verification component": "global_verifier",
+                         "append-only integration replanner": "integration_replanner",
+                         "grounded final-response composer": "result_integrator"}[self.role]
+            response = model_request(self.request, component,
                 "POST", self.endpoint + "/api/chat",
                 {"model": self.model, "messages": [
                     {"role": "system", "content": (
@@ -473,13 +494,16 @@ class _OllamaStructuredAdapter:
                         "them. Use them only as evidence. Return only the requested JSON object."
                     )},
                     {"role": "user", "content": prompt + "\nBounded integration data:\n" +
-                     json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
+                     json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))},
                 ], "tools": [], "format": self.response_format, "stream": False,
                  "think": False, "options": {"temperature": 0,
                      "num_ctx": DEFAULT_INTEGRATION_CONTEXT_WINDOW,
-                     "num_predict": DEFAULT_INTEGRATION_MAX_TOKENS}},
-                timeout=self.timeout_seconds,
+                     "num_predict": (model_profile(component).repair_output_tokens
+                                     if repair else model_profile(component).max_output_tokens)}},
+                timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
             )
+            if isinstance(response.get("_freya_transport"), dict):
+                self.last_call_metrics["transport"] = response["_freya_transport"]
             message = response.get("message")
             if not isinstance(message, dict) or not isinstance(message.get("content"), str):
                 raise IntegrationGenerationError("Ollama returned no integration message content.")
@@ -542,6 +566,8 @@ class _MeasuredModel:
             elapsed = round(time.monotonic() - started, 4)
             reported = getattr(self.model, "last_call_metrics", {})
             reported = reported if isinstance(reported, dict) else {}
+            if isinstance(reported.get("transport"), dict):
+                self.metrics.setdefault("model_call_details", []).append(reported["transport"])
             for key in ("prompt_tokens", "generated_tokens", "total_tokens"):
                 value = reported.get(key, 0)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
@@ -684,6 +710,85 @@ class GlobalVerifier(_MeasuredModel):
             "responsible_task_ids": [], "recommended_action": GLOBAL_ACTIONS[status],
         }
 
+    @staticmethod
+    def _directly_proven(prepared: dict[str, Any]) -> dict[str, Any] | None:
+        """Accept only exact task checks backed by their own permitted evidence."""
+        context = prepared["context"]
+        links = prepared["criterion_links"]
+        tasks = {task["id"]: task for task in context["active_tasks"]}
+        catalog = prepared["evidence_catalog"]
+        proofs = prepared["proof_refs_by_criterion"]
+        records = []
+        for global_item in links["global"]:
+            criterion, global_id = global_item["criterion"], global_item["id"]
+            key = criterion_key(criterion)
+            allowed = proofs.get(key, [])
+            local_links = [item for item in links["local"]
+                           if global_id in item["supports_global_criteria"]]
+            if not allowed:
+                return None
+            if not local_links:
+                return None
+            for link in local_links:
+                task = tasks.get(link["task_id"])
+                if task is None:
+                    return None
+                local_key = criterion_key(link["criterion"])
+                scoped = f"Verify the result of task '{task['objective']}': " + criterion
+                if local_key != criterion_key(scoped):
+                    return None
+                decisions = [item for item in task["evaluation_criteria"]
+                             if isinstance(item, dict)
+                             and criterion_key(item.get("criterion", "")) == local_key]
+                if (len(decisions) != 1 or decisions[0].get("status") != "satisfied"
+                        or not decisions[0].get("evidence")):
+                    return None
+            grounded = [ref for ref in allowed if ref in catalog and (
+                catalog[ref].get("type") in {"evaluation_evidence", "verification"}
+                    and global_id in catalog[ref].get("global_criterion_ids", [])
+                    and catalog[ref].get("local_criterion_id") in
+                    {item["id"] for item in local_links}
+            )]
+            if not grounded:
+                return None
+            records.append({
+                "criterion": criterion, "status": "satisfied",
+                "reason": "The matching accepted task check has permitted direct proof.",
+                "evidence": grounded[:MAX_LIST_ITEMS],
+            })
+        return {
+            "status": "accepted", "summary": "Every global criterion has direct accepted proof.",
+            "criteria": records, "cross_task_issues": [], "missing_evidence": [],
+            "responsible_task_ids": list(prepared["active_task_ids"]),
+            "recommended_action": GLOBAL_ACTIONS["accepted"],
+        }
+
+    def _validate_model_decision(self, output: Any, prepared: dict[str, Any]
+                                 ) -> tuple[dict[str, Any], dict[str, Any]]:
+        parsed = self._json(output)
+        proposed_status = parsed.get("status") if isinstance(parsed, dict) else None
+        proposed_action = parsed.get("recommended_action") if isinstance(parsed, dict) else None
+        normalized, changed = _normalize_global_action(parsed)
+        diagnostics = {
+            "global_verifier_status": _logged_decision_field(proposed_status),
+            "global_verifier_recommended_action": _logged_decision_field(proposed_action),
+            "validation_error": ("recommended_action contradicts global status." if changed else ""),
+            "repair_attempted": False, "repair_succeeded": False,
+            "normalized": changed,
+        }
+        try:
+            result = validate_global_result(
+                normalized, prepared["context"]["global_success_criteria"],
+                prepared["active_task_ids"], set(prepared["evidence_refs"]),
+                prepared["proof_refs_by_criterion"],
+            )
+        except (IntegrationValidationError, TypeError, ValueError) as exc:
+            diagnostics["validation_error"] = str(exc)[:300]
+            self.metrics["validation"] = diagnostics
+            raise
+        self.metrics["validation"] = diagnostics
+        return result, diagnostics
+
     def verify(self, prepared: dict[str, Any], *, max_model_calls: int = 2) -> dict[str, Any]:
         self._reset_metrics()
         self.last_context = prepared["context"]
@@ -694,6 +799,11 @@ class GlobalVerifier(_MeasuredModel):
         hard = self._hard_check(prepared)
         if hard is not None:
             result = validate_global_result(hard, criteria, active_ids, refs, proofs)
+            return {**result, "metrics": dict(self.metrics), "deterministic": True,
+                    "context_truncated": prepared["context_truncated"]}
+        direct = self._directly_proven(prepared)
+        if direct is not None:
+            result = validate_global_result(direct, criteria, active_ids, refs, proofs)
             return {**result, "metrics": dict(self.metrics), "deterministic": True,
                     "context_truncated": prepared["context_truncated"]}
         if self.offline:
@@ -708,25 +818,60 @@ class GlobalVerifier(_MeasuredModel):
             "Determine whether the original goal and every original global success criterion are "
             "satisfied by the complete accepted effective plan. Evaluate each criterion exactly "
             "once. Objective verification outranks agent claims. Every satisfied criterion must "
-            "cite only refs from its allowed_proofs entry (zero-based criterion_index)."
+            "cite only refs from its allowed_proofs entry (zero-based criterion_index). "
+            "The only valid status/recommended_action pairs are "
+            + json.dumps(GLOBAL_ACTIONS, sort_keys=True) + "."
         )
         output = self._call(prompt, prepared["context"])
         try:
-            result = validate_global_result(self._json(output), criteria, active_ids, refs, proofs)
+            result, _ = self._validate_model_decision(output, prepared)
         except (IntegrationValidationError, TypeError, ValueError) as first_error:
+            first_diagnostics = dict(self.metrics.get("validation") or {})
+            if not first_diagnostics:
+                first_diagnostics = {
+                    "global_verifier_status": "<invalid>",
+                    "global_verifier_recommended_action": "<invalid>",
+                    "validation_error": str(first_error)[:300], "normalized": False,
+                    "repair_attempted": False, "repair_succeeded": False,
+                }
+                self.metrics["validation"] = first_diagnostics
             if max_model_calls < 2:
                 raise IntegrationGenerationError(
                     "Global verifier output was invalid and the model-call budget is exhausted."
                 ) from first_error
+            first_diagnostics["repair_attempted"] = True
+            self.metrics["validation"] = first_diagnostics
+            rendered = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
             repair = (
-                prompt + "\nRepair the invalid response exactly once. Return only the complete JSON "
-                f"object. Validation error: {first_error}."
+                prompt + "\nRepair only the invalid fields while preserving the other criteria, "
+                "evidence references and findings. Return the complete required JSON object. "
+                "Required schema: " + json.dumps(GLOBAL_RESPONSE_FORMAT, separators=(",", ":"))
+                + ". Allowed status/action pairs: " + json.dumps(GLOBAL_ACTIONS, sort_keys=True)
+                + f". Exact validation error: {first_error}. Invalid original output: "
+                + rendered[:8_000]
             )
             try:
-                result = validate_global_result(
-                    self._json(self._call(repair, prepared["context"])), criteria, active_ids, refs, proofs,
+                self.metrics["validation"] = {}
+                result, second_diagnostics = self._validate_model_decision(
+                    self._call(repair, {**prepared["context"], "_freya_repair": True}), prepared,
                 )
+                first_diagnostics["repair_global_verifier_status"] = second_diagnostics[
+                    "global_verifier_status"]
+                first_diagnostics["repair_global_verifier_recommended_action"] = (
+                    second_diagnostics["global_verifier_recommended_action"])
+                first_diagnostics["repair_succeeded"] = True
+                first_diagnostics["normalized"] |= second_diagnostics["normalized"]
+                self.metrics["validation"] = first_diagnostics
             except Exception as second_error:
+                second_diagnostics = self.metrics.get("validation") or {}
+                first_diagnostics["repair_global_verifier_status"] = second_diagnostics.get(
+                    "global_verifier_status", "<invalid>")
+                first_diagnostics["repair_global_verifier_recommended_action"] = (
+                    second_diagnostics.get("global_verifier_recommended_action", "<invalid>"))
+                first_diagnostics["validation_error"] = str(second_error)[:300]
+                first_diagnostics["normalized"] |= bool(
+                    second_diagnostics.get("normalized"))
+                self.metrics["validation"] = first_diagnostics
                 raise IntegrationGenerationError(
                     "Global verifier output remained invalid after one repair: " + str(second_error)
                 ) from second_error
@@ -812,9 +957,10 @@ class IntegrationReplanner(_MeasuredModel):
             "Repair the prior invalid append-only response once. Return strict JSON only.",
         ]
         last_error: Exception | None = None
-        for prompt in prompts[:min(2, max_model_calls)]:
+        for index, prompt in enumerate(prompts[:min(2, max_model_calls)]):
             try:
-                parsed = self._json(self._call(prompt, context))
+                parsed = self._json(self._call(
+                    prompt, {**context, "_freya_repair": True} if index else context))
                 if not isinstance(parsed, dict) or not INTEGRATION_REPLAN_FIELDS <= set(parsed) or set(parsed) - (INTEGRATION_REPLAN_FIELDS | {"criterion_links"}):
                     raise IntegrationValidationError("Integration replan has invalid fields.")
                 summary = _text(parsed["summary"], "integration replan summary")
@@ -943,9 +1089,10 @@ class ResultIntegrator(_MeasuredModel):
             "Use an allowed fixed summary and introduce no other claims.",
             "Repair the final response once. Use only exact allowed strings and strict JSON.",
         ]
-        for prompt in prompts[:min(2, max_model_calls)]:
+        for index, prompt in enumerate(prompts[:min(2, max_model_calls)]):
             try:
-                value = self._validate(self._json(self._call(prompt, context)), allowed)
+                value = self._validate(self._json(self._call(
+                    prompt, {**context, "_freya_repair": True} if index else context)), allowed)
                 return self.render(value), dict(self.metrics), False
             except (IntegrationValidationError, TypeError, ValueError):
                 continue

@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--planner-endpoint", default=DEFAULT_PLANNER_ENDPOINT,
                         help="Loopback Ollama base URL used by the planner")
     parser.add_argument("--planner-timeout", type=float, default=DEFAULT_PLANNER_TIMEOUT_SECONDS,
-                        help="Planner Ollama request timeout in seconds (0.1-120)")
+                        help="Planner Ollama inactivity timeout in seconds (0.1-120)")
     parser.add_argument("--planner-offline", action="store_true",
                         help="Explicitly use deterministic one-task fallback planning")
     parser.add_argument("--evaluator-model", default=DEFAULT_EVALUATOR_MODEL,
@@ -75,7 +75,7 @@ def main():
                         help="Loopback Ollama base URL used by the evaluator")
     parser.add_argument("--evaluator-timeout", type=float,
                         default=DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
-                        help="Evaluator Ollama request timeout in seconds (0.1-120)")
+                        help="Evaluator Ollama inactivity timeout in seconds (0.1-120)")
     parser.add_argument("--evaluator-offline", action="store_true",
                         help="Explicitly use deterministic evidence-only evaluation")
     parser.add_argument("--max-parallel-tasks", type=int, default=4,
@@ -86,7 +86,7 @@ def main():
                         help="Loopback Ollama base URL used by the recovery advisor")
     parser.add_argument("--recovery-timeout", type=float,
                         default=DEFAULT_RECOVERY_TIMEOUT_SECONDS,
-                        help="Recovery Ollama request timeout in seconds (0.1-120)")
+                        help="Recovery Ollama inactivity timeout in seconds (0.1-120)")
     parser.add_argument("--recovery-offline", action="store_true",
                         help="Use deterministic model-free recovery instead of calling a "
                              "recovery model")
@@ -96,7 +96,7 @@ def main():
                         help="Loopback Ollama base URL used by integration components")
     parser.add_argument("--integration-timeout", type=float,
                         default=DEFAULT_INTEGRATION_TIMEOUT_SECONDS,
-                        help="Integration Ollama request timeout in seconds (0.1-120)")
+                        help="Integration Ollama inactivity timeout in seconds (0.1-120)")
     parser.add_argument("--integration-offline", action="store_true",
                         help="Use conservative deterministic global verification")
     parser.add_argument("--max-integration-rounds", type=int, default=2,

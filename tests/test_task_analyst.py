@@ -7,6 +7,7 @@ from control_center.orchestrator import Orchestrator
 from control_center.task_analyst import (
     OllamaTaskAnalyst,
     TaskAnalyst,
+    TaskAnalysisError,
     deterministic_task_analysis,
     reconcile_task_analysis,
     select_task_analyst,
@@ -43,6 +44,42 @@ class StubAnalysisAdapter:
 
 
 class TaskAnalystTests(unittest.TestCase):
+    def test_requirement_and_acceptance_ids_are_normalized_with_references(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        analysis["requirements"] = [
+            {"id": None, "description": "Crear un artefacto", "source": "explicit"},
+            {"id": "REQ-2", "description": "Representar hola mundo", "source": "explicit"},
+        ]
+        analysis["acceptance_criteria"] = [
+            {"description": "El artefacto existe", "verifies": ["REQ-2"]},
+            {"id": "AC-1", "description": "El contenido es correcto", "verifies": ["REQ-2"]},
+            {"id": "AC-1", "description": "El resultado se comprobó", "verifies": ["REQ-2"]},
+        ]
+        result = validate_task_analysis(analysis)
+        self.assertEqual([item["id"] for item in result["requirements"]], ["REQ-1", "REQ-2"])
+        self.assertEqual([item["id"] for item in result["acceptance_criteria"]],
+                         ["AC-2", "AC-1", "AC-3"])
+        self.assertTrue(all(item["verifies"] == ["REQ-2"]
+                            for item in result["acceptance_criteria"]))
+
+    def test_ambiguous_or_unknown_requirement_reference_is_rejected(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        analysis["requirements"].append(
+            {"id": "REQ-1", "description": "Otro requisito", "source": "explicit"})
+        with self.assertRaisesRegex(TaskAnalysisError, "ambiguous"):
+            validate_task_analysis(analysis)
+        analysis["requirements"][1]["id"] = "REQ-2"
+        analysis["acceptance_criteria"][0]["verifies"] = ["REQ-999"]
+        with self.assertRaisesRegex(TaskAnalysisError, "known requirements"):
+            validate_task_analysis(analysis)
+
+    def test_single_missing_requirement_id_keeps_its_unambiguous_reference(self):
+        analysis = deterministic_task_analysis("Crea un hola mundo")
+        analysis["requirements"][0].pop("id")
+        result = validate_task_analysis(analysis)
+        self.assertEqual(result["requirements"][0]["id"], "REQ-1")
+        self.assertEqual(result["acceptance_criteria"][0]["verifies"], ["REQ-1"])
+
     def test_explicit_role_wins_and_disabled_agents_are_ignored(self):
         legacy = normalize_agent({"name": "Task Analyst", "role": "Task Analyst Planner"})
         explicit = normalize_agent({
@@ -219,6 +256,29 @@ class TaskAnalystTests(unittest.TestCase):
             "freya.task_analysis.started", "freya.task_analysis.completed",
         ])
         self.assertEqual(store.events[-1]["agent_id"], analyst["id"])
+
+    def test_unreachable_ollama_keeps_task_analyst_fallback(self):
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        analyst = normalize_agent({
+            "name": "Analyst", "config": {
+                "orchestration_role": "task_analyst", "model": "fixture",
+                "endpoint": f"http://127.0.0.1:{port}",
+            },
+        })
+        analyst["id"] = "analyst-unreachable"
+        store = AnalysisStore([analyst])
+        orchestrator = Orchestrator(store, None,
+                                    task_analyst=TaskAnalyst(OllamaTaskAnalyst()))
+        analysis, metrics = orchestrator._analyze_prompt("run-1", "Crea un hola mundo")
+        self.assertTrue(analysis["ready_for_execution"])
+        self.assertEqual(metrics["mode"], "deterministic_fallback")
+        self.assertEqual(metrics["model_calls"], 1)
+        self.assertEqual(metrics["model_call_details"][0]["stop_reason"],
+                         "OLLAMA_UNREACHABLE")
+        self.assertEqual(store.events[-1]["analysis_mode"], "deterministic_fallback")
 
     def test_deterministic_modes_apply_the_language_default(self):
         prompt = "Create a program that prints Hello World."

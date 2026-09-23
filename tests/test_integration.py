@@ -199,6 +199,50 @@ class GlobalVerifierTests(unittest.TestCase):
         self.assertEqual(GlobalVerifier(model).verify(data)["status"], "accepted")
         self.assertEqual(len(calls), 2)
 
+    def test_accepted_with_wrong_action_is_canonicalized_without_repair(self):
+        calls = []
+        def model(prompt, context):
+            calls.append(prompt)
+            value = global_result(context["global_success_criteria"])
+            value["recommended_action"] = "retry"
+            return value
+        result = GlobalVerifier(model).verify(prepared())
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["recommended_action"], "accept")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["metrics"]["validation"]["global_verifier_recommended_action"],
+                         "retry")
+        self.assertTrue(result["metrics"]["validation"]["normalized"])
+
+    def test_needs_work_with_accept_action_cannot_escape_as_accept(self):
+        value = global_result(["The graph reaches a terminal state."], "needs_work")
+        value["recommended_action"] = "accept"
+        result = GlobalVerifier(lambda prompt, context: value).verify(prepared())
+        self.assertEqual((result["status"], result["recommended_action"]),
+                         ("needs_work", "add_work"))
+        self.assertTrue(result["metrics"]["validation"]["normalized"])
+
+    def test_repair_receives_original_output_error_matrix_and_schema_then_normalizes(self):
+        calls = []
+        def model(prompt, context):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return "{invalid json"
+            value = global_result(context["global_success_criteria"])
+            value["recommended_action"] = "add_work"
+            return value
+        result = GlobalVerifier(model).verify(prepared())
+        self.assertEqual((result["status"], result["recommended_action"]),
+                         ("accepted", "accept"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("{invalid json", calls[1])
+        self.assertIn("not valid JSON", calls[1])
+        self.assertIn("Required schema", calls[1])
+        self.assertIn('"accepted": "accept"', calls[1])
+        self.assertTrue(result["metrics"]["validation"]["repair_attempted"])
+        self.assertTrue(result["metrics"]["validation"]["repair_succeeded"])
+        self.assertTrue(result["metrics"]["validation"]["normalized"])
+
     def test_second_invalid_output_is_error(self):
         calls = []
         with self.assertRaises(IntegrationGenerationError):
@@ -699,6 +743,15 @@ class IntegrationSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(final["status"], "Failed")
         self.assertEqual(len(runtime.submissions), 1)
+        self.assertEqual(final["evaluations"][0]["status"], "accepted")
+        validation = next(json.loads(item["payload_json"]) for item in final["events"]
+                          if item["event_type"] == "freya.global_verifier.validation")
+        self.assertEqual(validation["global_verifier_status"], "<invalid>")
+        self.assertEqual(validation["global_verifier_recommended_action"], "<invalid>")
+        self.assertTrue(validation["repair_attempted"])
+        self.assertFalse(validation["repair_succeeded"])
+        self.assertFalse(validation["normalized"])
+        self.assertIn("not valid JSON", validation["validation_error"])
 
     def test_cancel_during_global_verification_discards_late_accept(self):
         started, release = threading.Event(), threading.Event()
