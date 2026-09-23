@@ -12,14 +12,14 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── task_analyst.py       versioned tool-free rewrite, language assumptions and deterministic reconciliation
-│   ├── planner.py            plan schema, safe verification derivation, conditional QA/audit and fallback
+│   ├── planner.py            plan schema, stable criterion IDs/links, recovery ID allocation, safe verification derivation and fallback
 │   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          criterion evidence checks, decision schema and tool-free Ollama adapter
 │   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier, append-only replanner and grounded result integrator
-│   ├── integration_proof.py  bounded evidence catalog and deterministic criterion-to-proof association
+│   ├── integration_proof.py  bounded evidence catalog and explicit local-to-global criterion proof mapping
 │   ├── integration_orchestrator.py orchestration-level integration lifecycle
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration

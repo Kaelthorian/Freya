@@ -1193,6 +1193,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     return
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.recovery.replan_created", "status": "Running",
+                    "id_allocation": revision.get("id_allocation", {}),
                     "task_id": task_id, "recovery_id": recovery_id,
                     "plan_revision_id": revision_id, "revision": saved["revision"],
                     "message": "Freya committed a validated effective-plan revision.",

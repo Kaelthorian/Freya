@@ -120,7 +120,7 @@ and unrelated blockers are preserved. If the result has
 `blocking_reason`, creates no plan, and emits `freya.planning.failed`. Planning
 otherwise emits either
 `freya.plan.created` with a safe goal/complexity/task summary or
-`freya.planning.failed`. A plan uses schema version 1:
+`freya.planning.failed`. A new plan uses schema version 1 with `criterion_links`:
 
 ```json
 {
@@ -136,7 +136,13 @@ otherwise emits either
     "preferred_skills": ["python-development"],
     "success_criteria": ["The current login flow is understood."]
   }],
-  "success_criteria": ["The root cause and verification result are recorded."]
+  "success_criteria": ["The root cause and verification result are recorded."],
+  "criterion_links": {
+    "global": [{"id": "gc-1", "criterion": "The root cause and verification result are recorded."}],
+    "local": [{"id": "tc-inspect-1", "task_id": "inspect-auth",
+      "criterion": "The current login flow is understood.",
+      "supports_global_criteria": []}]
+  }
 }
 ```
 
@@ -231,9 +237,11 @@ goal/global criteria, current effective plan, accepted results/evaluations and b
 verification evidence. Its strict status is `accepted`, `needs_work`, `blocked`,
 or `error`, and each original global criterion appears exactly once.
 
-Version-2 satisfied criteria must cite nonempty criterion-specific permitted
+Version-3 satisfied criteria must cite nonempty criterion-specific permitted
 proof refs. Context refs (`task:*`, `evaluation:*`) cannot authorize acceptance.
-Missing proof is blocked before inference. The private snapshot now includes
+Missing proof is blocked before inference. Explicit local criterion IDs and
+`supports_global_criteria` links permit differently worded criteria to share
+proof without fuzzy matching. Legacy plans get only exact-text links. The private snapshot includes
 `evidence_catalog` and `proof_refs_by_criterion`; the history API still omits
 the snapshot. Historical version-1 records remain readable. Final-response
 event payloads include composition metrics. See

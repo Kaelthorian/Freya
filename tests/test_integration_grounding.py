@@ -60,6 +60,61 @@ def proof_input(criteria=None, *, aligned=True, verification=True, injection=Fal
 
 
 class GroundedProofTests(unittest.TestCase):
+    def test_explicit_ids_prove_differently_worded_global_criterion(self):
+        task = fixtures.task("a", criterion="Create the requested file and read it back.")
+        current = fixtures.plan([task], ["hola_mundo.txt exists with exactly hola mundo."])
+        current["criterion_links"] = {
+            "global": [{"id": "gc-file", "criterion": current["success_criteria"][0]}],
+            "local": [{"id": "tc-file", "task_id": "a", "criterion": task["success_criteria"][0],
+                       "supports_global_criteria": ["gc-file"]}],
+        }
+        record = fixtures.evaluation("e-a", "a")
+        record["criteria"][0]["criterion"] = task["success_criteria"][0]
+        data = build_integration_input(
+            original_user_prompt=GOAL, original_plan=current, effective_plan=current,
+            plan_revision=0, graph_nodes=[{"plan_task_id": "a", "evaluation_id": "e-a",
+            "state": "success", "evaluation_status": "accepted", "attempt": 1}],
+            evaluations={"e-a": record}, revision_history=[],
+        )
+        result = GlobalVerifier(offline=True).verify(data)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(data["evidence_catalog"]["evidence:e-a:1"]["local_criterion_id"], "tc-file")
+        self.assertEqual(data["snapshot"]["global_criterion_ids"], ["gc-file"])
+
+    def test_explicit_link_without_local_evidence_does_not_prove_global(self):
+        local = "The requested file was created."
+        task = fixtures.task("a", criterion=local)
+        current = fixtures.plan([task], [GOAL])
+        current["criterion_links"] = {
+            "global": [{"id": "gc-1", "criterion": GOAL}],
+            "local": [{"id": "tc-1", "task_id": "a", "criterion": local,
+                       "supports_global_criteria": ["gc-1"]}],
+        }
+        record = fixtures.evaluation("e-a", "a")
+        record["criteria"][0]["criterion"] = local
+        record["criteria"][0]["evidence"] = []
+        record["snapshot"]["input"]["runtime_task"]["verification"] = {}
+        data = build_integration_input(
+            original_user_prompt=GOAL, original_plan=current, effective_plan=current,
+            plan_revision=0, graph_nodes=[{"plan_task_id": "a", "evaluation_id": "e-a",
+            "state": "success", "evaluation_status": "accepted", "attempt": 1}],
+            evaluations={"e-a": record}, revision_history=[],
+        )
+        self.assertEqual(GlobalVerifier(offline=True).verify(data)["status"], "blocked")
+        self.assertEqual(data["proof_refs_by_criterion"][GOAL.casefold()], [])
+
+    def test_evidence_for_other_local_id_cannot_prove_global(self):
+        data = proof_input([GOAL, "Database migration completes."], verification=False)
+        data["evidence_catalog"].pop("evidence:e1:1")
+        # A known ref from the first task remains unusable for the second criterion.
+        decision = fixtures.global_result(data["context"]["global_success_criteria"])
+        decision["criteria"][0]["evidence"] = ["evidence:e0:1"]
+        decision["criteria"][1]["evidence"] = ["evidence:e0:1"]
+        with self.assertRaisesRegex(IntegrationValidationError, "permitted grounded proof"):
+            validate_global_result(decision, data["context"]["global_success_criteria"],
+                                   data["active_task_ids"], data["evidence_refs"],
+                                   data["proof_refs_by_criterion"])
+
     def test_model_cannot_accept_global_criterion_without_evidence(self):
         calls = []
         data = proof_input()
@@ -289,6 +344,52 @@ class GroundedLifecycleTests(unittest.TestCase):
         )
         return run, runtime, orchestrator
 
+    def test_real_hello_world_file_reaches_orchestration_success(self):
+        server = FakeOllama()
+        self.addCleanup(server.close)
+        server.responses.extend([
+            answer(calls=[("write_file", {"path": "hola_mundo.txt", "content": "hola mundo"})]),
+            answer(calls=[("read_file", {"path": "hola_mundo.txt"})]),
+            answer("Created and verified hola_mundo.txt."),
+        ])
+        workspace = self.root / "hello-workspace"
+        workspace.mkdir()
+        local = "The file hola_mundo.txt exists and contains exactly hola mundo."
+        global_text = "Artifact hola_mundo.txt has the exact bytes hola mundo."
+        initial = fixtures.plan([{
+            "id": "create-file", "objective": "Create hola_mundo.txt containing exactly hola mundo",
+            "description": "Write the requested file and read it back.", "depends_on": [],
+            "required_capabilities": ["filesystem.create", "filesystem.read"],
+            "preferred_skills": ["simple-file-artifact"], "success_criteria": [local],
+        }], [global_text])
+        initial["criterion_links"] = {
+            "global": [{"id": "gc-file", "criterion": global_text}],
+            "local": [{"id": "tc-file", "task_id": "create-file", "criterion": local,
+                       "supports_global_criteria": ["gc-file"]}],
+        }
+        runtime = Runtime(self.store, self.root, Path.cwd())
+        runtime.start()
+        self.addCleanup(runtime.shutdown)
+        run = self.store.create_orchestration(
+            "Create hola_mundo.txt containing exactly: hola mundo",
+            {"workspace_path": str(workspace)},
+        )
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=Planner(lambda p, c: initial),
+            selector=AgentSelector(), evaluator=Evaluator(offline=True),
+            global_verifier=GlobalVerifier(offline=True),
+            agent_factory=AgentFactory(self.store, runtime_config={"endpoint": server.url}),
+            wait=time.sleep, config={"max_wallclock_seconds": 40},
+        )
+        orchestrator._run(run["id"])
+        final = self.store.get_orchestration(run["id"])
+        self.assertEqual((workspace / "hola_mundo.txt").read_text(encoding="utf-8"), "hola mundo")
+        self.assertTrue(final["graph_summary"]["complete"])
+        self.assertEqual(final["graph_summary"]["successful"], 1)
+        self.assertEqual(final["evaluations"][0]["status"], "accepted")
+        self.assertEqual(self.store.list_integrations(run["id"])[0]["status"], "accepted")
+        self.assertEqual(final["status"], "Success", final["error"])
+
     def test_missing_global_proof_is_obtained_by_real_appended_task_evaluation(self):
         run, runtime, orchestrator = self.make()
         orchestrator._run(run["id"])
@@ -303,6 +404,50 @@ class GroundedLifecycleTests(unittest.TestCase):
         for objective in ("Complete a", "Complete b", "Complete c"):
             self.assertTrue(any(objective in prompt for prompt in prompts))
         self.assertTrue(all(GOAL in prompt for prompt in prompts))
+
+    def test_recovery_persists_explicit_link_with_different_wording(self):
+        local = "The communication check for component c passes."
+        run, _, orchestrator = self.make(replan_model=lambda p, c: {
+            "summary": "Verify component c", "tasks": [fixtures.task("c", ["a", "b"], local)],
+            "criterion_links": [{"id": "tc-c", "task_id": "c", "criterion": local,
+                                 "supports_global_criteria": ["gc-1"]}],
+        })
+        orchestrator._run(run["id"])
+        final = self.store.get_orchestration(run["id"])
+        self.assertEqual(final["status"], "Success", final["error"])
+        self.assertEqual([item["status"] for item in self.store.list_integrations(run["id"])],
+                         ["blocked", "accepted"])
+        link = next(item for item in final["effective_plan"]["criterion_links"]["local"]
+                    if item["task_id"] == "c")
+        self.assertEqual(link["supports_global_criteria"], ["gc-1"])
+        completed = [event for event in final["events"]
+                     if event["event_type"] == "freya.integration.completed"]
+        first, second = [json.loads(event["payload_json"]) for event in completed]
+        self.assertEqual(first["criteria_diagnostics"][0]["global_criterion_id"], "gc-1")
+        self.assertEqual(first["criteria_diagnostics"][0]["proof_refs_found"], [])
+        self.assertIn("proof_refs_rejected", first["criteria_diagnostics"][0])
+        self.assertEqual(second["criteria_diagnostics"][0]["local_criteria"][0]["id"], "tc-c")
+        created = next(event for event in final["events"]
+                       if event["event_type"] == "freya.integration.replan_created")
+        self.assertEqual(json.loads(created["payload_json"])["id_allocation"]["final_ids"], ["c"])
+
+    def test_integration_replanner_assigns_unique_id_after_normalization(self):
+        current = fixtures.plan([fixtures.task("a")], [GOAL])
+        revision = IntegrationReplanner(lambda p, c: {
+            "summary": "Add proof", "tasks": [fixtures.task("A", ["a"], GOAL)],
+            "criterion_links": [{"id": "tc-new", "task_id": "A", "criterion": GOAL,
+                                 "supports_global_criteria": ["gc-1"]}],
+        }).create_revision(
+            current_plan=current, integration=fixtures.global_result([GOAL], status="blocked"),
+            accepted_task_ids={"a"}, historical_task_ids={"a"},
+        )
+        self.assertEqual(revision["new_task_ids"], ["a-2"])
+        self.assertEqual(revision["id_allocation"]["normalized_ids"], ["a"])
+        self.assertEqual(revision["id_allocation"]["final_ids"], ["a-2"])
+        linked = next(item for item in revision["plan"]["criterion_links"]["local"]
+                      if item["id"] == "tc-new")
+        self.assertEqual(linked["task_id"], "a-2")
+        self.assertEqual(linked["supports_global_criteria"], ["gc-1"])
 
     def test_integration_added_task_uses_45_retry_without_rerunning_a_b(self):
         def evaluator_model(prompt, context):

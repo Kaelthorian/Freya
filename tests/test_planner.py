@@ -74,6 +74,32 @@ class PlannerValidationTests(unittest.TestCase):
         self.assertEqual(result["complexity"], "simple")
         self.assertEqual(len(result["tasks"]), 1)
 
+    def test_simple_artifact_collapse_keeps_explicit_criterion_link(self):
+        global_text = "hola_mundo.txt contains exactly hola mundo."
+        first = task("create", "Create hola_mundo.txt", required_capabilities=["filesystem.create"],
+                     success_criteria=["The file exists."])
+        second = task("verify", "Read hola_mundo.txt", depends_on=["create"],
+                      required_capabilities=["filesystem.read"],
+                      success_criteria=["The exact contents were checked."])
+        generated = plan(tasks=[first, second], complexity="multi_step",
+                         goal="Create hola_mundo.txt", success_criteria=[global_text],
+                         criterion_links={
+                             "global": [{"id": "gc-file", "criterion": global_text}],
+                             "local": [
+                                 {"id": "tc-create", "task_id": "create", "criterion": first["success_criteria"][0],
+                                  "supports_global_criteria": []},
+                                 {"id": "tc-verify", "task_id": "verify", "criterion": second["success_criteria"][0],
+                                  "supports_global_criteria": ["gc-file"]},
+                             ],
+                         })
+        result = Planner(lambda prompt, context: generated).create_plan(
+            "Create hola_mundo.txt", {"task_analysis": deterministic_task_analysis("Create hola_mundo.txt")})
+        self.assertEqual(len(result["tasks"]), 1)
+        linked = next(item for item in result["criterion_links"]["local"]
+                      if item["id"] == "tc-verify")
+        self.assertEqual(linked["task_id"], "create")
+        self.assertEqual(linked["supports_global_criteria"], ["gc-file"])
+
     def test_valid_multi_step_plan_preserves_dependency_order(self):
         result = validate_plan(multi_step_plan())
         self.assertGreater(len(result["tasks"]), 1)

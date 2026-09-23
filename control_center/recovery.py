@@ -14,7 +14,8 @@ import time
 from typing import Any, Callable
 
 from .config import validate_endpoint
-from .planner import MAX_PLAN_TASKS, PLAN_RESPONSE_FORMAT, validate_plan
+from .planner import (allocate_new_task_ids, MAX_PLAN_TASKS, PLAN_RESPONSE_FORMAT,
+                      PlanValidationError, validate_plan)
 from .security import sanitize
 from .transport import request_json
 
@@ -129,6 +130,8 @@ def validate_replan_revision(*, current_plan: dict[str, Any], revised_plan: dict
             raise RecoveryValidationError(
                 "Recovery revision cannot modify the Task Analyst operational goal or global plan fields."
             )
+    if revised_plan["criterion_links"]["global"] != current_plan["criterion_links"]["global"]:
+        raise RecoveryValidationError("Recovery revision cannot change global criterion IDs.")
     if len(revised_plan["tasks"]) > int(max_tasks):
         raise RecoveryValidationError("Revised plan exceeds the configured task limit.")
     current = {item["id"]: item for item in current_plan["tasks"]}
@@ -154,6 +157,13 @@ def validate_replan_revision(*, current_plan: dict[str, Any], revised_plan: dict
     for task_id in immutable:
         if task_id not in current or revised.get(task_id) != current[task_id]:
             raise RecoveryValidationError("Protected task snapshots must remain unchanged.")
+    for task_id in immutable:
+        old_links = [item for item in current_plan["criterion_links"]["local"]
+                     if item["task_id"] == task_id]
+        new_links = [item for item in revised_plan["criterion_links"]["local"]
+                     if item["task_id"] == task_id]
+        if new_links != old_links:
+            raise RecoveryValidationError("Protected criterion links must remain unchanged.")
     current_protected_order = [item["id"] for item in current_plan["tasks"]
                                if item["id"] in protected]
     revised_protected_order = [item["id"] for item in revised_plan["tasks"]
@@ -822,7 +832,7 @@ class Replanner:
         if not isinstance(value, dict) or set(value) != REVISION_FIELDS:
             raise RecoveryValidationError("Plan revision has invalid fields.")
         return {"summary": _text(value["summary"], "revision.summary"),
-                "plan": validate_plan(value["plan"]),
+                "plan": value["plan"],
                 "superseded_task_ids": _ids(value["superseded_task_ids"],
                                                 "revision.superseded_task_ids")}
 
@@ -862,6 +872,53 @@ class Replanner:
                 parsed = None
         if parsed is None:
             raise RecoveryGenerationError("Replanner failed strict validation after one repair.")
+        raw_plan = deepcopy(parsed["plan"])
+        if not isinstance(raw_plan, dict) or not isinstance(raw_plan.get("tasks"), list):
+            raise RecoveryValidationError("Recovery effective plan must contain tasks.")
+        from .planner import _identifier
+        current_ids = {item["id"] for item in current_plan["tasks"]}
+        seen_existing = set()
+        additions = []
+        addition_indexes = []
+        for index, task in enumerate(raw_plan["tasks"]):
+            if not isinstance(task, dict):
+                raise RecoveryValidationError("Recovery task must be an object.")
+            ident = _identifier(task.get("id"), f"recovery task {index} id")
+            if ident in current_ids and ident not in seen_existing:
+                seen_existing.add(ident)
+            else:
+                additions.append(task)
+                addition_indexes.append(index)
+        allocated, allocation = allocate_new_task_ids(
+            additions, current_ids | historical_task_ids, current_ids)
+        for index, task in zip(addition_indexes, allocated):
+            raw_plan["tasks"][index] = task
+        remap = {base: final for base, final in zip(
+            allocation["normalized_ids"], allocation["final_ids"])
+            if allocation["normalized_ids"].count(base) == 1 and base not in current_ids}
+        for task in raw_plan["tasks"]:
+            if isinstance(task, dict) and isinstance(task.get("depends_on"), list):
+                task["depends_on"] = [remap.get(_identifier(dep, "recovery dependency"), dep)
+                                      for dep in task["depends_on"]]
+        if "criterion_links" not in raw_plan:
+            inherited = deepcopy(validate_plan(current_plan)["criterion_links"])
+            by_id = {str(task.get("id", "")).casefold(): task for task in raw_plan["tasks"]
+                     if isinstance(task, dict)}
+            inherited["local"] = [item for item in inherited["local"]
+                                  if any(str(text).casefold() == item["criterion"].casefold()
+                                         for text in by_id.get(item["task_id"], {}).get("success_criteria", []))]
+            raw_plan["criterion_links"] = inherited
+        links = raw_plan.get("criterion_links")
+        if isinstance(links, dict) and isinstance(links.get("local"), list):
+            for link in links["local"]:
+                if isinstance(link, dict) and isinstance(link.get("task_id"), str):
+                    link["task_id"] = remap.get(_identifier(link["task_id"], "criterion task_id"),
+                                                link["task_id"])
+        parsed["id_allocation"] = allocation
+        try:
+            parsed["plan"] = validate_plan(raw_plan)
+        except PlanValidationError as exc:
+            raise RecoveryGenerationError("Replanner produced an invalid effective plan: " + str(exc)) from exc
         parsed["plan"] = validate_replan_revision(
             current_plan=current_plan, revised_plan=parsed["plan"],
             source_task_id=source_task_id, affected_task_ids=set(affected_task_ids),

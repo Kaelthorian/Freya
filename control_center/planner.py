@@ -39,6 +39,7 @@ DEFAULT_PLANNER_CONTEXT_WINDOW = 8_192
 DEFAULT_PLANNER_MAX_TOKENS = 2048
 
 PLAN_FIELDS = {"goal", "summary", "complexity", "tasks", "success_criteria"}
+CRITERION_LINKS_FIELD = "criterion_links"
 TASK_FIELDS = {
     "id", "objective", "description", "depends_on", "required_capabilities",
     "preferred_skills", "success_criteria",
@@ -79,8 +80,19 @@ PLAN_RESPONSE_FORMAT = {
             },
         },
         "success_criteria": {"type": "array", "items": {"type": "string"}},
+        "criterion_links": {"type": "object", "properties": {
+            "global": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"}, "criterion": {"type": "string"},
+            }, "required": ["id", "criterion"], "additionalProperties": False}},
+            "local": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"}, "task_id": {"type": "string"},
+                "criterion": {"type": "string"},
+                "supports_global_criteria": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["id", "task_id", "criterion", "supports_global_criteria"],
+               "additionalProperties": False}},
+        }, "required": ["global", "local"], "additionalProperties": False},
     },
-    "required": sorted(PLAN_FIELDS),
+    "required": sorted(PLAN_FIELDS | {CRITERION_LINKS_FIELD}),
     "additionalProperties": False,
 }
 
@@ -192,6 +204,21 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
     collapsed = dict(plan)
     collapsed["complexity"] = "simple"
     collapsed["tasks"] = [merged]
+    links = plan.get(CRITERION_LINKS_FIELD)
+    if isinstance(links, dict):
+        merged_links = []
+        for criterion in merged["success_criteria"]:
+            sources = [item for item in links["local"]
+                       if item["criterion"].casefold() == criterion.casefold()]
+            if not sources:
+                continue
+            supported = list(dict.fromkeys(
+                global_id for item in sources
+                for global_id in item["supports_global_criteria"]
+            ))
+            merged_links.append({**sources[0], "task_id": merged["id"],
+                                 "supports_global_criteria": supported})
+        collapsed[CRITERION_LINKS_FIELD] = {"global": links["global"], "local": merged_links}
     return validate_plan(collapsed)
 
 def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[str, Any]:
@@ -454,6 +481,11 @@ def _reconcile_task_analysis(plan: dict[str, Any], analysis: Any) -> dict[str, A
             updated_tasks = implementation
             reconciled["complexity"] = "simple"
     reconciled["tasks"] = updated_tasks
+    if CRITERION_LINKS_FIELD in reconciled:
+        remaining = {task["id"] for task in updated_tasks}
+        links = dict(reconciled[CRITERION_LINKS_FIELD])
+        links["local"] = [item for item in links["local"] if item["task_id"] in remaining]
+        reconciled[CRITERION_LINKS_FIELD] = links
     return validate_plan(reconciled)
 
 
@@ -585,9 +617,73 @@ def _text_list(value: Any, label: str, maximum: int, *, allow_empty: bool = True
     return result
 
 
+
+def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist identity separately from display text; migrate legacy exact links only."""
+    if raw is None:
+        global_links = [{"id": f"gc-{index}", "criterion": criterion}
+                        for index, criterion in enumerate(criteria, 1)]
+        local_links = []
+    else:
+        links = _object(raw, {"global", "local"}, "plan.criterion_links")
+        global_links = _list(links["global"], "plan.criterion_links.global", MAX_CRITERIA)
+        local_links = _list(links["local"], "plan.criterion_links.local", MAX_PLAN_TASKS * MAX_CRITERIA)
+    if len(global_links) != len(criteria):
+        raise PlanValidationError("Every global criterion requires one stable ID.")
+    normalized_global = []
+    global_ids = set()
+    for index, (entry, criterion) in enumerate(zip(global_links, criteria)):
+        item = _object(entry, {"id", "criterion"}, f"global criterion {index}")
+        ident = _identifier(item["id"], f"global criterion {index} id")
+        if ident in global_ids or _text(item["criterion"], "global criterion", MAX_CRITERION_CHARS) != criterion:
+            raise PlanValidationError("Global criterion IDs must be unique and match plan criteria.")
+        global_ids.add(ident)
+        normalized_global.append({"id": ident, "criterion": criterion})
+    global_by_text = {item["criterion"].casefold(): item["id"] for item in normalized_global}
+    expected = {(task["id"], criterion.casefold()): criterion
+                for task in tasks for criterion in task["success_criteria"]}
+    normalized_local = []
+    local_ids = set()
+    covered = set()
+    for index, entry in enumerate(local_links):
+        item = _object(entry, {"id", "task_id", "criterion", "supports_global_criteria"},
+                       f"local criterion {index}")
+        ident = _identifier(item["id"], f"local criterion {index} id")
+        task_id = _identifier(item["task_id"], f"local criterion {index} task_id")
+        criterion = _text(item["criterion"], "local criterion", MAX_CRITERION_CHARS)
+        key = (task_id, criterion.casefold())
+        if ident in local_ids or key in covered or key not in expected:
+            raise PlanValidationError("Local criterion links duplicate or substitute a task criterion.")
+        supports = _text_list(item["supports_global_criteria"], "supports_global_criteria",
+                              MAX_CRITERIA, identifiers=True)
+        if any(ref not in global_ids for ref in supports):
+            raise PlanValidationError("Local criterion links reference an unknown global criterion ID.")
+        local_ids.add(ident)
+        covered.add(key)
+        normalized_local.append({"id": ident, "task_id": task_id,
+                                 "criterion": expected[key], "supports_global_criteria": supports})
+    for task in tasks:
+        for index, criterion in enumerate(task["success_criteria"], 1):
+            key = (task["id"], criterion.casefold())
+            if key in covered:
+                continue
+            base = f"tc-{task['id'][:48]}-{index}"
+            ident = base
+            suffix = 2
+            while ident in local_ids:
+                ident = f"{base[:MAX_IDENTIFIER_CHARS - len(str(suffix)) - 1]}-{suffix}"
+                suffix += 1
+            local_ids.add(ident)
+            normalized_local.append({"id": ident, "task_id": task["id"],
+                                     "criterion": criterion,
+                                     "supports_global_criteria": ([global_by_text[criterion.casefold()]]
+                                                                  if criterion.casefold() in global_by_text else [])})
+    return {"global": normalized_global, "local": normalized_local}
+
+
 def normalize_plan(value: Any) -> dict[str, Any]:
     """Return a stable representation while enforcing field types and bounds."""
-    raw = _object(value, PLAN_FIELDS, "plan")
+    raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD})
     complexity = _text(raw["complexity"], "plan.complexity", 32).casefold().replace("-", "_")
     if complexity not in {"simple", "multi_step"}:
         raise PlanValidationError("plan.complexity must be simple or multi_step.")
@@ -637,7 +733,7 @@ def normalize_plan(value: Any) -> dict[str, Any]:
     # an otherwise valid multi-task graph as simple; canonicalize that harmless
     # inconsistency instead of preserving contradictory data.
     complexity = "simple" if len(tasks) == 1 else "multi_step"
-    return {
+    result = {
         "goal": _text(raw["goal"], "plan.goal", MAX_GOAL_CHARS),
         "summary": _text(raw["summary"], "plan.summary", MAX_SUMMARY_CHARS),
         "complexity": complexity,
@@ -645,6 +741,9 @@ def normalize_plan(value: Any) -> dict[str, Any]:
         "success_criteria": _text_list(raw["success_criteria"], "plan.success_criteria",
                                         MAX_CRITERIA, allow_empty=False),
     }
+    result[CRITERION_LINKS_FIELD] = _normalize_criterion_links(
+        raw.get(CRITERION_LINKS_FIELD), result["success_criteria"], tasks)
+    return result
 
 
 def validate_plan(value: Any) -> dict[str, Any]:
@@ -686,6 +785,46 @@ def validate_plan(value: Any) -> dict[str, Any]:
     for task_id in ids:
         visit(task_id)
     return plan
+
+
+
+def allocate_new_task_ids(tasks: list[dict[str, Any]], reserved_ids: set[str],
+                          protected_ids: set[str] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Assign deterministic unique IDs to proposed additions without changing existing IDs."""
+    reserved = set(reserved_ids)
+    proposed, normalized, final, collisions = [], [], [], []
+    allocated = []
+    for index, source in enumerate(tasks):
+        if not isinstance(source, dict):
+            raise PlanValidationError("New recovery task must be an object.")
+        item = dict(source)
+        raw = item.get("id")
+        base = _identifier(raw, f"new task {index} id")
+        ident = base
+        suffix = 2
+        if ident in reserved:
+            collisions.append({"proposed": str(raw)[:MAX_IDENTIFIER_CHARS], "normalized": base})
+        while ident in reserved:
+            tail = f"-{suffix}"
+            ident = base[:MAX_IDENTIFIER_CHARS - len(tail)] + tail
+            suffix += 1
+        reserved.add(ident)
+        item["id"] = ident
+        allocated.append(item)
+        proposed.append(str(raw)[:MAX_IDENTIFIER_CHARS])
+        normalized.append(base)
+        final.append(ident)
+    protected = set(protected_ids or ())
+    unique = {base: final[index] for index, base in enumerate(normalized)
+              if normalized.count(base) == 1 and base not in protected}
+    for item in allocated:
+        dependencies = item.get("depends_on")
+        if isinstance(dependencies, list):
+            item["depends_on"] = [
+                unique.get(_identifier(dep, "new task dependency"), dep) for dep in dependencies
+            ]
+    return allocated, {"proposed_ids": proposed, "normalized_ids": normalized,
+                       "collisions": collisions, "final_ids": final}
 
 
 def fallback_plan(prompt: str) -> dict[str, Any]:
@@ -765,7 +904,10 @@ class Planner:
                      if isinstance(item, dict) and isinstance(item.get("id"), str)]
         return (
             "Create a work plan and return one JSON object only. Do not use Markdown. "
-            "Required plan fields: goal, summary, complexity, tasks, success_criteria. "
+            "Required plan fields: goal, summary, complexity, tasks, success_criteria, criterion_links. "
+            "Give each global and local criterion a stable ID in criterion_links. "
+            "Each local entry names its task_id and supports_global_criteria IDs. "
+            "Link only criteria whose task evidence can prove that global obligation; wording may differ. "
             "complexity is simple or multi_step. Each task requires id, objective, description, "
             "depends_on, required_capabilities, preferred_skills, success_criteria. "
             "Use at most 20 tasks, unique stable IDs, existing dependency IDs, and an acyclic graph. "

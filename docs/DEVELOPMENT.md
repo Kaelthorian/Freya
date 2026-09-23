@@ -200,6 +200,11 @@ Git Inspection is only prompt-visible when the task workspace is inside a Git
 checkout. Non-Git workspaces omit `git_diff` from the worker schemas and report
 direct requests as `not_applicable`, avoiding misleading successful Git checks.
 
+Plan schema version 1 persists global and local criterion IDs plus explicit
+local-to-global references. Old plans receive deterministic IDs and only their
+previous exact-text associations. Recovery and integration replanning assign
+unique new task IDs after normalization and log the proposed and final IDs.
+
 Global integration uses its own tool-free local-model configuration and
 independent budget:
 

@@ -1,4 +1,4 @@
-# Integration proof contract (4.6, version 2)
+# Integration proof contract (4.6, version 3)
 
 An accepted global integration requires every original global criterion exactly
 once, satisfied, with nonempty evidence consisting only of proof references
@@ -7,34 +7,42 @@ a non-accepted decision. A known reference alone is not proof.
 
 ## Catalog and deterministic association
 
-`integration_proof.py` builds bounded metadata from active accepted tasks and
-their immutable evaluations. `task:*` and `evaluation:*` are context only.
-`evidence:*` is proof when its evaluation criterion is satisfied, is declared
-by that task, and matches the global criterion after whitespace and case
-normalization. `verification:*` must be a passed runtime check on a task with
-a declared, satisfied local criterion matching the global criterion. The
-association is task-scoped; check output and model explanations cannot create
-new associations. Unrelated task verification cannot be reused.
+Plan schema version 1 persists `criterion_links.global` entries with stable IDs and
+`criterion_links.local` entries with stable IDs, a `task_id`, and explicit
+`supports_global_criteria` IDs. Criterion text remains descriptive. The Planner
+asks for these links; validation rejects duplicate IDs, unknown targets and
+links that substitute a task criterion. Legacy plans without this field are
+normalized with deterministic `gc-N` and `tc-<task>-N` IDs. Legacy local-to-global
+links are inferred only for equal normalized text, preserving the old safety
+boundary without guessing paraphrases.
+
+`integration_proof.py` associates an accepted task's satisfied local evaluation
+criterion with global criteria only through those persisted IDs. Evaluation
+criterion text must still match its own declared task criterion. Nonempty local
+evaluator evidence may then produce `evidence:*` proof refs. A passed runtime
+check may produce `verification:*` proof refs only when it explicitly names the
+local criterion through `supports_acceptance_criteria`, or when the task has a
+single declared criterion. Failed or unavailable verification suppresses proof.
+`task:*` and `evaluation:*` remain context refs, never proof. A model explanation
+or check output cannot create or alter a link.
 
 At most one evaluator evidence candidate and one runtime verification candidate
-are retained per global criterion, plus two context refs per active task.
-Only catalogued refs are exposed. Metadata contains type, task ID and relevant
-criterion/status, never raw output or logs. The model sees `allowed_proofs`
-indexed by the zero-based position in `global_success_criteria`. The immutable
-snapshot contains the catalog and `proof_refs_by_criterion`, keyed by normalized
-criterion, alongside the existing active task/evaluation IDs and fingerprint.
+are retained per global criterion, plus two context refs per active task. The
+catalog records task ID, local criterion ID and supported global criterion IDs,
+without raw output or logs. The model sees `allowed_proofs` with both criterion
+index and ID. The immutable snapshot includes the catalog, global IDs, and
+criterion-specific permitted proof refs.
 
-Two exact deterministic invariants are supported:
+Two exact deterministic invariants remain supported:
 
 - `The graph reaches a terminal state.` → `structural:graph-terminal`
 - `All active tasks are accepted.` → `structural:all-active-tasks-accepted`
 
-These refs are created only after accepted-graph preconditions pass. Keyword
-matches such as an arbitrary sentence containing “all”, “tasks” and “complete”
-are insufficient. Failed checks, including those outside the display limit,
-and unavailable required verification still take precedence. Missing proof
-candidates produce `blocked` before a model call. A normal appended integration
-task can supply the missing matching local criterion and evidence.
+These refs arise only after the accepted-graph preconditions pass. Failed
+checks and unavailable required verification take precedence. Missing proof
+candidates produce `blocked` before a model call; accepted child tasks alone
+never grant global acceptance. An appended integration task can close the gap
+with new persisted local links.
 
 ## Persistence and success boundary
 
@@ -50,7 +58,7 @@ uses only `Integrating → finalize_accepted_integration → Success`.
 The explicit injected `decide` compatibility path remains legacy: it has no
 execution graph and uses `legacy_without_graph=True`. This flag is internal,
 not an HTTP option, and is rejected for graph runs. The CLI does not inject
-legacy decision hooks. Existing historical version-1 records remain readable;
+legacy decision hooks. Existing historical version-1 and version-2 records remain readable;
 their missing proof metadata cannot authorize a new finalization.
 
 ## Composition, limits and races
@@ -76,7 +84,6 @@ immutable task fields, proof-backed recovery, an appended task retry through
 provider, shared budgets and late results. Existing integration tests remain.
 
 Proof authority is based on trusted platform records, not an independent
-mathematical verification of a program. Exact matching is deliberately
-conservative: paraphrased or cross-task semantic criteria can require an
-explicit integration task. Tests use fixtures and simulated model responses;
+mathematical verification of a program. Legacy exact matching is deliberately conservative: paraphrased criteria
+require a validated explicit ID link or an integration task. Tests use fixtures and simulated model responses;
 they do not establish behavior or quality of an actual Ollama model.

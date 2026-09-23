@@ -13,7 +13,7 @@ from control_center.config import normalize_agent
 from control_center.evaluator import Evaluator
 from control_center.execution_graph import ExecutionGraph
 from control_center.orchestrator import Orchestrator
-from control_center.planner import Planner
+from control_center.planner import Planner, validate_plan
 from control_center.recovery import (
     FailureAnalyzer,
     OllamaFailureAnalyzer,
@@ -628,7 +628,7 @@ class RecoveryPersistenceTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertTrue(payload)
-        self.assertEqual(self.store.get_orchestration(run["id"])["plan"], plan)
+        self.assertEqual(self.store.get_orchestration(run["id"])["plan"], validate_plan(plan))
         self.assertEqual(self.store.get_execution_graph(run["id"])["nodes"][0]["state"],
                          "superseded")
 
@@ -714,9 +714,9 @@ class RecoveryPersistenceTests(unittest.TestCase):
         self.assertEqual(tracked[0]["state"], "running")
         self.assertEqual(tracked[0]["delegation_id"], fixture["c_delegation_id"])
         self.assertEqual(self.store.get_orchestration(fixture["run"]["id"])["plan"],
-                         fixture["plan"])
+                         validate_plan(fixture["plan"]))
         self.assertEqual(self.store.get_orchestration(fixture["run"]["id"])["effective_plan"],
-                         revised)
+                         validate_plan(revised))
 
     def test_schema_rejects_duplicate_active_runtime_tracking(self):
         fixture = self.parallel_replan_fixture()
@@ -821,13 +821,16 @@ class ReplannerTests(unittest.TestCase):
                 accepted_task_ids={"a"}, historical_task_ids={"a", "child"},
             )
 
-    def test_revision_rejects_historical_id_reuse(self):
-        with self.assertRaisesRegex(RecoveryValidationError, "historical"):
-            Replanner(lambda prompt, context, revision=False: self.valid_revision()).create_revision(
-                current_plan=self.current(), source_task_id="a", affected_task_ids=["a", "child"],
-                allowed_task_ids={"a", "child"}, protected_task_ids=set(),
-                accepted_task_ids=set(), historical_task_ids={"a", "child", "replacement"},
-            )
+    def test_revision_renames_historical_id_and_rewrites_new_dependencies(self):
+        result = Replanner(lambda prompt, context, revision=False: self.valid_revision()).create_revision(
+            current_plan=self.current(), source_task_id="a", affected_task_ids=["a", "child"],
+            allowed_task_ids={"a", "child"}, protected_task_ids=set(),
+            accepted_task_ids=set(), historical_task_ids={"a", "child", "replacement"},
+        )
+        self.assertIn("replacement-2", {task["id"] for task in result["plan"]["tasks"]})
+        self.assertEqual(result["id_allocation"]["collisions"][0]["normalized"], "replacement")
+        child = next(task for task in result["plan"]["tasks"] if task["id"] == "child")
+        self.assertEqual(child["depends_on"], ["replacement-2"])
 
 
     def test_protected_task_snapshot_cannot_change(self):
@@ -1064,8 +1067,8 @@ class RecoverySchedulerTests(unittest.TestCase):
         states = {item["plan_task_id"]: item["state"]
                   for item in self.store.get_execution_graph(run["id"])["nodes"]}
         self.assertEqual(final["status"], "Success")
-        self.assertEqual(final["plan"], original)
-        self.assertEqual(final["effective_plan"], revised)
+        self.assertEqual(final["plan"], validate_plan(original))
+        self.assertEqual(final["effective_plan"], validate_plan(revised))
         self.assertEqual(states, {"a": "superseded", "replacement": "success"})
         self.assertEqual(len(final["plan_revisions"]), 1)
         self.assertIn("1 executable task", final["response"])

@@ -14,13 +14,13 @@ import time
 from typing import Any, Callable
 
 from .config import validate_endpoint
-from .planner import (MAX_PLAN_TASKS, TASK_FIELDS, validate_plan)
+from .planner import (MAX_PLAN_TASKS, TASK_FIELDS, allocate_new_task_ids, validate_plan)
 from .security import sanitize
 from .transport import request_json
 from .integration_proof import build_proof_metadata, criterion_key
 
 
-INTEGRATION_VERSION = 2
+INTEGRATION_VERSION = 3
 GLOBAL_STATUSES = {"accepted", "needs_work", "blocked", "error"}
 CRITERION_STATUSES = {"satisfied", "unsatisfied", "partial", "unknown"}
 GLOBAL_ACTIONS = {
@@ -70,6 +70,12 @@ INTEGRATION_REPLAN_RESPONSE_FORMAT = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
+        "criterion_links": {"type": "array", "items": {"type": "object", "properties": {
+            "id": {"type": "string"}, "task_id": {"type": "string"},
+            "criterion": {"type": "string"},
+            "supports_global_criteria": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["id", "task_id", "criterion", "supports_global_criteria"],
+           "additionalProperties": False}},
         "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
                   "items": {"type": "object", "properties": {
                       "id": {"type": "string"}, "objective": {"type": "string"},
@@ -237,6 +243,8 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
     """Enforce deterministic preconditions and build one immutable bounded snapshot."""
     original = validate_plan(deepcopy(original_plan))
     effective = validate_plan(deepcopy(effective_plan))
+    if original["criterion_links"]["global"] != effective["criterion_links"]["global"]:
+        raise IntegrationPreconditionError("Effective plan changed global criterion IDs.")
     node_by_id = {str(node.get("plan_task_id")): node for node in graph_nodes}
     if (len(node_by_id) != len(graph_nodes)
             or set(node_by_id) != {task["id"] for task in effective["tasks"]}):
@@ -266,6 +274,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
     snapshot = {
         "original_goal": original["goal"],
         "global_criteria": list(original["success_criteria"]),
+        "global_criterion_ids": [item["id"] for item in original["criterion_links"]["global"]],
         "effective_plan_revision": int(plan_revision),
         "active_task_ids": active_ids,
         "accepted_evaluation_ids": accepted_evaluation_ids,
@@ -342,6 +351,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         )
     catalog, proofs = build_proof_metadata(
         original["success_criteria"], effective["tasks"], active_nodes, evaluations,
+        effective["criterion_links"],
     )
     snapshot["evidence_catalog"] = catalog
     snapshot["proof_refs_by_criterion"] = proofs
@@ -360,11 +370,13 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         "original_user_prompt": original_user_prompt,
         "original_goal": original["goal"],
         "global_success_criteria": list(original["success_criteria"]),
+        "global_criterion_ids": [item["id"] for item in original["criterion_links"]["global"]],
         "effective_plan_revision": int(plan_revision),
         "active_tasks": active_tasks,
         "plan_revision_history": revisions,
         "allowed_proofs": [
-            {"criterion_index": index, "refs": proofs[criterion_key(criterion)]}
+            {"criterion_index": index, "criterion_id": original["criterion_links"]["global"][index]["id"],
+             "refs": proofs[criterion_key(criterion)]}
             for index, criterion in enumerate(original["success_criteria"])],
     })
     def rendered_size() -> int:
@@ -427,6 +439,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         "snapshot": snapshot, "context": context, "context_truncated": context_truncated,
         "evidence_refs": evidence_refs, "active_task_ids": active_ids,
         "evidence_catalog": catalog, "proof_refs_by_criterion": proofs,
+        "criterion_links": effective["criterion_links"],
     }
 
 
@@ -723,17 +736,21 @@ class GlobalVerifier(_MeasuredModel):
 
 def validate_integration_revision(*, current_plan: dict[str, Any], new_tasks: list[dict[str, Any]],
                                   accepted_task_ids: set[str], historical_task_ids: set[str],
-                                  max_tasks: int) -> dict[str, Any]:
+                                  max_tasks: int, criterion_links: dict[str, Any] | None = None) -> dict[str, Any]:
     """Validate a cumulative append-only plan; every current task stays byte-for-byte equivalent."""
     current = validate_plan(deepcopy(current_plan))
     if not isinstance(new_tasks, list) or not new_tasks:
         raise IntegrationValidationError("Integration revision must append at least one task.")
     candidate = deepcopy(current)
     candidate["tasks"].extend(deepcopy(new_tasks))
+    if criterion_links is not None:
+        candidate["criterion_links"] = deepcopy(criterion_links)
     candidate["complexity"] = "simple" if len(candidate["tasks"]) == 1 else "multi_step"
     revised = validate_plan(candidate)
     if len(revised["tasks"]) > int(max_tasks):
         raise IntegrationValidationError("Integration revision exceeds the configured task limit.")
+    if revised["criterion_links"]["global"] != current["criterion_links"]["global"]:
+        raise IntegrationValidationError("Integration revision cannot change global criterion IDs.")
     current_by_id = {item["id"]: item for item in current["tasks"]}
     revised_by_id = {item["id"]: item for item in revised["tasks"]}
     if set(current_by_id) - set(revised_by_id):
@@ -749,6 +766,12 @@ def validate_integration_revision(*, current_plan: dict[str, Any], new_tasks: li
     if set(appended_ids) & set(historical_task_ids):
         raise IntegrationValidationError("Integration revision reused a historical task ID.")
     appended = set(appended_ids)
+    old_links = [item for item in current["criterion_links"]["local"]
+                 if item["task_id"] in current_by_id]
+    new_old_links = [item for item in revised["criterion_links"]["local"]
+                     if item["task_id"] in current_by_id]
+    if new_old_links != old_links:
+        raise IntegrationValidationError("Integration revision cannot change existing criterion links.")
     for task_id in appended_ids:
         for dependency in revised_by_id[task_id]["depends_on"]:
             if dependency in current_by_id and dependency not in accepted_task_ids:
@@ -784,22 +807,53 @@ class IntegrationReplanner(_MeasuredModel):
         })
         prompts = [
             "Return only new tasks needed to close the global gap. Do not repeat, modify, delete, "
-            "or supersede any existing task. Dependencies on existing tasks require accepted status.",
+            "or supersede any existing task. Dependencies on existing tasks require accepted status. "
+            "Give each new local criterion an explicit criterion_links entry when it proves a global ID.",
             "Repair the prior invalid append-only response once. Return strict JSON only.",
         ]
         last_error: Exception | None = None
         for prompt in prompts[:min(2, max_model_calls)]:
             try:
                 parsed = self._json(self._call(prompt, context))
-                if not isinstance(parsed, dict) or set(parsed) != INTEGRATION_REPLAN_FIELDS:
+                if not isinstance(parsed, dict) or not INTEGRATION_REPLAN_FIELDS <= set(parsed) or set(parsed) - (INTEGRATION_REPLAN_FIELDS | {"criterion_links"}):
                     raise IntegrationValidationError("Integration replan has invalid fields.")
                 summary = _text(parsed["summary"], "integration replan summary")
+                allocated, allocation = allocate_new_task_ids(
+                    parsed["tasks"], historical_task_ids | {task["id"] for task in current_plan["tasks"]},
+                    {task["id"] for task in current_plan["tasks"]},
+                )
                 revised = validate_integration_revision(
-                    current_plan=current_plan, new_tasks=parsed["tasks"],
+                    current_plan=current_plan, new_tasks=allocated,
                     accepted_task_ids=accepted_task_ids,
                     historical_task_ids=historical_task_ids, max_tasks=max_tasks,
                 )
-                return {"summary": summary, "plan": revised,
+                if "criterion_links" in parsed:
+                    candidate = deepcopy(revised)
+                    proposed = deepcopy(parsed["criterion_links"])
+                    if not isinstance(proposed, list):
+                        raise IntegrationValidationError("Integration criterion_links must be a list.")
+                    remap = {base: final for base, final in zip(
+                        allocation["normalized_ids"], allocation["final_ids"])
+                        if allocation["normalized_ids"].count(base) == 1}
+                    for item in proposed:
+                        if not isinstance(item, dict) or not isinstance(item.get("task_id"), str):
+                            raise IntegrationValidationError("Integration criterion link is invalid.")
+                        from .planner import _identifier
+                        task_id = _identifier(item["task_id"], "integration link task_id")
+                        item["task_id"] = remap.get(task_id, task_id)
+                    linked_keys = {(item.get("task_id"), criterion_key(item.get("criterion", "")))
+                                   for item in proposed}
+                    candidate["criterion_links"]["local"] = [
+                        item for item in candidate["criterion_links"]["local"]
+                        if (item["task_id"], criterion_key(item["criterion"])) not in linked_keys
+                    ] + proposed
+                    revised = validate_integration_revision(
+                        current_plan=current_plan, new_tasks=allocated,
+                        accepted_task_ids=accepted_task_ids,
+                        historical_task_ids=historical_task_ids, max_tasks=max_tasks,
+                        criterion_links=candidate["criterion_links"],
+                    )
+                return {"summary": summary, "plan": revised, "id_allocation": allocation,
                         "new_task_ids": [item["id"] for item in revised["tasks"]
                                          if item["id"] not in {task["id"] for task in current_plan["tasks"]}],
                         "metrics": dict(self.metrics)}

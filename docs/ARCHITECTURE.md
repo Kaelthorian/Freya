@@ -200,7 +200,10 @@ Global integration emits `freya.integration.started`,
 `freya.integration.completed`, `freya.integration.failed`,
 `freya.integration.recovery_started`, `freya.integration.replan_created`, and
 `freya.final_response.created`. Event payloads contain IDs, round, revision,
-status and criterion count rather than model prompts or full output.
+status and criterion count rather than model prompts or full output. Failed integration
+events also include bounded per-criterion IDs, related local IDs and task IDs,
+permitted proof refs, and rejected refs with reasons. Recovery revision events
+record proposed, normalized, collided, and final new task IDs.
 
 
 ```text
@@ -245,7 +248,9 @@ cannot start a planner call or resurrect a terminal orchestration.
 Plan schema version 1 requires a goal, summary, `simple` or `multi_step`
 complexity, global success criteria and one to twenty tasks. Every task has a
 normalized unique ID, objective, description, dependencies, required
-capabilities, preferred Skills and success criteria. Validation rejects unknown
+capabilities, preferred Skills and success criteria. `criterion_links` records
+stable global and local criterion IDs and explicit local-to-global references;
+legacy plans are normalized with exact-text links only. Validation rejects unknown
 fields, wrong types, empty or excessive content, unknown capabilities, missing
 dependencies, self-dependencies and cycles. A depth-first traversal validates
 the complete dependency graph before persistence.
@@ -459,7 +464,7 @@ failure class, stop reason, workspace-change count and no-progress flag.
 
 ## Global integration and result composition
 
-Integration version 2 requires criterion-specific grounded proof, not merely
+Integration version 3 requires criterion-specific grounded proof, not merely
 known evidence refs. The bounded catalog, exact association rules, Storage
 reconstruction and the explicitly isolated legacy exception are specified in
 [Integration proof contract](INTEGRATION_PROOF.md). Generic state updates cannot

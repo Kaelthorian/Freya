@@ -5,9 +5,43 @@ from uuid import uuid4
 
 from .integration import (INTEGRATION_VERSION, IntegrationPreconditionError,
                           build_integration_input, global_problem_fingerprint)
+from .integration_proof import criterion_key
+from .security import sanitize
 
 
 class IntegrationOrchestrationMixin:
+    @staticmethod
+    def _criterion_diagnostics(prepared: dict, result: dict) -> list[dict]:
+        links = prepared["criterion_links"]
+        catalog = prepared["evidence_catalog"]
+        diagnostics = []
+        for global_item in links["global"]:
+            gid = global_item["id"]
+            key = criterion_key(global_item["criterion"])
+            related = [item for item in links["local"]
+                       if gid in item["supports_global_criteria"]]
+            allowed = prepared["proof_refs_by_criterion"].get(key, [])
+            rejected = []
+            for ref, metadata in catalog.items():
+                if ref in allowed or len(rejected) >= 6:
+                    continue
+                reason = ("context_only" if metadata["type"].endswith("context") else
+                          "linked_to_different_global_criterion")
+                rejected.append({"ref": ref, "reason": reason})
+            diagnostics.append(sanitize({
+                "global_criterion_id": gid,
+                "criterion": global_item["criterion"][:200],
+                "local_criteria": [{"id": item["id"], "task_id": item["task_id"],
+                                    "criterion": item["criterion"][:180]}
+                                   for item in related[:8]],
+                "proof_refs_found": allowed[:8],
+                "proof_refs_rejected": rejected,
+                "responsible_task_ids": sorted({item["task_id"] for item in related}
+                                               | set(result.get("responsible_task_ids") or []))[:20],
+                "status": next((item["status"] for item in result["criteria"]
+                                if criterion_key(item["criterion"]) == key), "unknown"),
+            }))
+        return diagnostics
     def _integration_model_calls_used(self, oid: str) -> int:
         records = self.store.list_integrations(oid)
         revisions = [item for item in self.store.list_plan_revisions(oid)
@@ -170,7 +204,9 @@ class IntegrationOrchestrationMixin:
                 "integration_id": integration_id, "round": round_number,
                 "plan_revision": run.get("current_plan_revision", 0),
                 "integration_status": result["status"],
-                "criteria_count": len(result["criteria"]), "message": result["summary"],
+                "criteria_count": len(result["criteria"]),
+                "criteria_diagnostics": self._criterion_diagnostics(prepared, result),
+                "message": result["summary"],
             })
         if result["status"] == "accepted":
             return self._finalize_integration(oid, integration_id, prepared, result, deadline)
@@ -295,6 +331,7 @@ class IntegrationOrchestrationMixin:
                 "event_type": "freya.integration.replan_created", "status": "Running",
                 "integration_id": integration_id, "plan_revision_id": revision_id,
                 "revision": saved["revision"], "new_task_ids": revision["new_task_ids"],
+                "id_allocation": revision.get("id_allocation", {}),
                 "message": "Freya committed an append-only integration revision.",
             })
         return True

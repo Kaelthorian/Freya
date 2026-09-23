@@ -269,6 +269,7 @@ class IntegrationStoreMixin:
 
             accepted = {task_id for task_id, node in nodes.items()
                         if node["state"] == "success" and node["evaluation_status"] == "accepted"}
+            submitted_links = normalized["criterion_links"]
             normalized = validate_integration_revision(
                 current_plan=current_plan,
                 new_tasks=[task for task in normalized["tasks"] if task["id"] not in {
@@ -276,6 +277,7 @@ class IntegrationStoreMixin:
                 }],
                 accepted_task_ids=accepted, historical_task_ids=set(nodes),
                 max_tasks=int(config.get("max_delegated_tasks", MAX_PLAN_TASKS)),
+                criterion_links=submitted_links,
             )
             actual_new_ids = [task["id"] for task in normalized["tasks"] if task["id"] not in nodes]
             if actual_new_ids != list(new_task_ids):

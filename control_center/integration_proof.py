@@ -15,17 +15,17 @@ STRUCTURAL_CRITERIA = {
 }
 
 
-def build_proof_metadata(criteria, tasks, nodes, evaluations):
-    """At most two proof candidates per criterion plus two context refs per task.
-
-    A passed runtime check supports only the declared, satisfied local criteria
-    of its task. Evaluation evidence must match both that declaration and the
-    global criterion exactly after whitespace/case normalization. This is a
-    conservative scope rule, not a semantic claim inferred from check prose.
-    """
+def build_proof_metadata(criteria, tasks, nodes, evaluations, criterion_links=None):
+    """Map accepted local decisions to global IDs through persisted plan links."""
     catalog = {}
     proofs = {criterion_key(item): [] for item in criteria}
     task_by_id = {task["id"]: task for task in tasks}
+    links = criterion_links or {"global": [], "local": []}
+    global_by_id = {item["id"]: criterion_key(item["criterion"])
+                    for item in links["global"]}
+    local_by_task = {}
+    for item in links["local"]:
+        local_by_task[(item["task_id"], criterion_key(item["criterion"]))] = item
     for node in nodes:
         tid, eid = node["plan_task_id"], node["evaluation_id"]
         catalog[f"task:{tid}"] = {"type": "task_context", "task_id": tid}
@@ -35,7 +35,15 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations):
         local = evaluation.get("criteria") or []
         satisfied = {criterion_key(item.get("criterion", "")) for item in local
                      if isinstance(item, dict) and item.get("status") == "satisfied"}
-        aligned = declared & satisfied & proofs.keys()
+        aligned = {}
+        for key in declared & satisfied:
+            link = local_by_task.get((tid, key))
+            if link is None:
+                continue
+            for global_id in link["supports_global_criteria"]:
+                global_key = global_by_id.get(global_id)
+                if global_key in proofs:
+                    aligned.setdefault(key, []).append((global_id, global_key, link["id"]))
         verification = (((evaluation.get("snapshot") or {}).get("input") or {})
                         .get("runtime_task") or {}).get("verification") or {}
         items = verification.get("evidence") or []
@@ -45,7 +53,6 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations):
             verification.get("unavailable") or not verification.get("attempted"))
         if failed or unavailable:
             continue
-        # Use the same stable enumeration as the bounded evidence view.
         evidence_index = 0
         for decision in local:
             if not isinstance(decision, dict):
@@ -57,24 +64,40 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations):
                     break
                 if key not in aligned or not value or decision.get("status") != "satisfied":
                     continue
-                if any(catalog[ref]["type"] == "evaluation_evidence" for ref in proofs[key]):
-                    continue
                 ref = f"evidence:{eid}:{evidence_index}"
-                catalog[ref] = {"type": "evaluation_evidence", "task_id": tid,
-                                "criterion": key, "criterion_status": "satisfied"}
-                proofs[key].append(ref)
+                for global_id, global_key, local_id in aligned[key]:
+                    if any(catalog[old]["type"] == "evaluation_evidence" for old in proofs[global_key]):
+                        continue
+                    if ref not in catalog:
+                        catalog[ref] = {"type": "evaluation_evidence", "task_id": tid,
+                                        "criterion": key, "local_criterion_id": local_id,
+                                        "global_criterion_ids": [],
+                                        "criterion_status": "satisfied"}
+                    catalog[ref]["global_criterion_ids"].append(global_id)
+                    proofs[global_key].append(ref)
         for index, item in enumerate(items[:20], 1):
             if not isinstance(item, dict) or item.get("status") != "passed":
                 continue
             ref = f"verification:{eid}:{index}"
-            for key in sorted(aligned):
-                if any(catalog[old]["type"] == "verification" for old in proofs[key]):
-                    continue
-                catalog[ref] = {"type": "verification", "task_id": tid, "status": "passed"}
-                proofs[key].append(ref)
+            supported = item.get("supports_acceptance_criteria")
+            if isinstance(supported, list):
+                applicable = {criterion_key(value) for value in supported if isinstance(value, str)}
+            elif len(declared) == 1:
+                applicable = declared
+            else:
+                applicable = set()
+            for key in sorted(applicable & aligned.keys()):
+                for global_id, global_key, local_id in aligned[key]:
+                    if any(catalog[old]["type"] == "verification" for old in proofs[global_key]):
+                        continue
+                    if ref not in catalog:
+                        catalog[ref] = {"type": "verification", "task_id": tid,
+                                        "local_criterion_id": local_id,
+                                        "global_criterion_ids": [], "status": "passed"}
+                    catalog[ref]["global_criterion_ids"].append(global_id)
+                    proofs[global_key].append(ref)
     for key, ref in STRUCTURAL_CRITERIA.items():
         if key in proofs:
-            # Caller has already proved every active node is success + accepted.
             catalog[ref] = {"type": "structural", "status": "satisfied", "criterion": key}
             proofs[key] = [ref]
     return catalog, proofs
