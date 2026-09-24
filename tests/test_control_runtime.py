@@ -156,6 +156,61 @@ class WorkerTests(unittest.TestCase):
                             for item in evidence))
         self.assertTrue(any(item["tool"] == "run_command" for item in result["result"]["actions"]))
 
+    def test_calculator_create_run_and_identical_write_finishes_from_evidence(self):
+        content = "first = float(input())\nsecond = float(input())\nprint(f'The sum is: {first + second:.1f}')\n"
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+            answer(calls=[("run_command", {"argv": ["python", "calculator.py"], "stdin": "3\n5"})]),
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+        ], tools=["write_file", "read_file", "run_command"], config={
+            "permissions": "execute",
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {
+                "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": True,
+                "completion_criteria": ["The program outputs 'The sum is: 8.0' when executed"],
+            },
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertNotIn("BlockedActionCycle", result["error"])
+        self.assertEqual(result["workspace_changes"], 1)
+        self.assertTrue(result["verification"]["requested"])
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertTrue(result["verification"]["passed"])
+        evidence = next(item for item in result["verification"]["evidence"]
+                        if item.get("type") == "command_execution")
+        self.assertEqual(evidence["exit_code"], 0)
+        self.assertIn("The sum is: 8.0", evidence["output"])
+        duplicate = next(item for item in result["result"]["actions"] if item.get("already_satisfied"))
+        self.assertFalse(duplicate["changed"])
+        self.assertEqual(duplicate["error_class"], "already_satisfied")
+        diffs = [event["event"] for event in self.events
+                 if event.get("event", {}).get("event_type") == "workspace.diff"]
+        self.assertEqual(len(diffs), 1)
+
+    def test_changed_arguments_after_policy_denial_allow_a_new_strategy(self):
+        existing = self.workspace / "existing.py"
+        existing.write_text("old", encoding="utf-8")
+        policy = {
+            "capabilities": {
+                "filesystem": {"create": {"mode": "allow"}, "read": {"mode": "allow"},
+                               "modify": {"mode": "deny"}, "overwrite": {"mode": "deny"}},
+                "execution": {}, "git": {},
+            }
+        }
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "existing.py", "content": "new"})]),
+            answer(calls=[("write_file", {"path": "alternate.py", "content": "new"})]),
+            answer("Created alternate.py."),
+        ], tools=["write_file"], config={"capability_policy": policy})
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+        self.assertEqual((self.workspace / "alternate.py").read_text(encoding="utf-8"), "new")
+        steps = [event["event"] for event in self.events
+                 if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual([item["error_class"] for item in steps[:2]], ["policy_denied", ""])
+        self.assertEqual(result["tool_calls"], 3)  # includes the bounded read-back verifier
+
     def test_worker_prompt_describes_only_the_effective_toolbox(self):
         self.run_worker([answer("Finished.")], tools=["read_file", "write_file", "run_command"],
                          config={"permissions": "execute"})
@@ -261,11 +316,19 @@ class WorkerTests(unittest.TestCase):
                 "git": {"status": {"mode": "deny"}, "diff": {"mode": "deny"}},
             }
         }
-        result = self.run_worker([
-            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
-            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
-            answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
-        ], tools=["write_file"], config={"capability_policy": policy})
+        config = {
+            **DEFAULT_CONFIG,
+            "capability_policy": policy,
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+        }
+        box = PolicyToolbox(self.root, self.workspace, config, ["write_file"])
+        with patch.object(box, "invoke", wraps=box.invoke) as invoke:
+            result = self.run_worker([
+                answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
+                answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
+                answer(calls=[("write_file", {"path": "existing.py", "content": "print('new')"})]),
+            ], tools=["write_file"], config=config, toolbox=box)
+        self.assertEqual(invoke.call_count, 1)
         self.assertEqual(result["status"], "Failed")
         self.assertIn("BlockedActionCycle", result["error"])
         writes = [event["event"] for event in self.events
@@ -274,8 +337,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(writes[0]["error_class"], "policy_denied")
         self.assertEqual(writes[1]["error_class"], "repeated_policy_denied")
         self.assertEqual(writes[2]["error_class"], "blocked_action_cycle")
-        self.assertIn("POLICY_DENIED_REPEAT", writes[1]["output"])
-        self.assertIn("returning control to recovery", writes[2]["output"])
+        self.assertIn("ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE", writes[1]["output"])
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertTrue(result["result"]["actions"])
+        self.assertEqual(result["result"]["actions"][0]["error_class"], "policy_denied")
+        self.assertIn("blocked_action_cycle", result["result"]["limitations"][0])
+        self.assertTrue(any(event.get("event", {}).get("event_type") == "task.result_contract"
+                            and event["event"]["output"].get("deterministic_runtime_result")
+                            for event in self.events))
+        self.assertFalse(any(event.get("event", {}).get("event_type") == "model.repair.started"
+                             for event in self.events))
 
     def test_runtime_actions_and_artifacts_survive_malformed_structured_output(self):
         result = self.run_worker([

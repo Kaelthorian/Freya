@@ -30,7 +30,7 @@ from .tools import argument_summary
 TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
 AGENT_STATUSES = {"Idle", "Running", "Waiting", "Paused", "Error", "Offline"}
 ACTIVE_TASK_STATUSES = ("Queued", "Running", "WaitingForApproval", "Paused")
-ORCHESTRATION_ACTIVE_STATUSES = ("Queued", "Planning", "Planned", "Running", "Integrating")
+ORCHESTRATION_ACTIVE_STATUSES = ("Queued", "Analyzing", "NeedsClarification", "Planning", "Planned", "Running", "Integrating")
 ORCHESTRATION_TERMINAL_STATUSES = ("Success", "Failed", "Cancelled")
 ORCHESTRATION_STATUSES = set(ORCHESTRATION_ACTIVE_STATUSES + ORCHESTRATION_TERMINAL_STATUSES)
 EXECUTION_FIELDS = {
@@ -85,6 +85,7 @@ class Store(IntegrationStoreMixin):
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
             orchestration_columns = {row[1] for row in connection.execute("PRAGMA table_info(orchestration_runs)")}
             for name, definition in (
+                ("task_spec_json", "TEXT"),
                 ("plan_json", "TEXT"),
                 ("plan_schema_version", "INTEGER"),
                 ("plan_created_at", "TEXT"),
@@ -423,11 +424,94 @@ class Store(IntegrationStoreMixin):
             c.execute("INSERT INTO orchestration_runs(id,prompt,config_json,created_at,updated_at) VALUES(?,?,?,?,?)", (oid, sanitize(prompt), _dump(config or {}), now, now))
         return self.get_orchestration(oid)
 
+
+    def save_task_spec(self, oid: str, spec: dict[str, Any]) -> dict | None:
+        """Persist a new canonical revision and its orchestration gate atomically."""
+        from .task_spec import validate_task_spec
+        normalized = validate_task_spec(spec)
+        target = ("NeedsClarification" if normalized["status"] == "NEEDS_CLARIFICATION"
+                  else "Planning" if normalized["status"] == "READY_FOR_PLANNING" else "Analyzing")
+        now = utcnow()
+        with self._connection(write=True) as c:
+            row = c.execute("SELECT status,prompt,task_spec_json,plan_json FROM orchestration_runs WHERE id=?",
+                            (oid,)).fetchone()
+            if row is None:
+                raise KeyError(oid)
+            if row["status"] != "Analyzing":
+                return None
+            if row["plan_json"] is not None:
+                raise ValueError("Task Spec cannot change after a plan exists.")
+            if normalized["source_prompt"] != row["prompt"]:
+                raise ValueError("Task Spec source prompt differs from the immutable user prompt.")
+            prior = _load(row["task_spec_json"])
+            expected_version = prior["version"] + 1 if prior else 1
+            if normalized["version"] != expected_version:
+                raise ValueError("Task Spec revisions must be sequential.")
+            c.execute("INSERT INTO orchestration_task_specs(orchestration_id,version,spec_json,created_at) VALUES(?,?,?,?)",
+                      (oid, expected_version, _dump(normalized), now))
+            c.execute("UPDATE orchestration_runs SET task_spec_json=?,status=?,updated_at=? WHERE id=? AND status='Analyzing'",
+                      (_dump(normalized), target, now, oid))
+        return self.get_orchestration(oid)
+
+    def revise_unplanned_task_spec(self, oid: str, *, field: str, value: str,
+                                   user_message: str) -> dict:
+        """Queue a new spec revision only before the immutable plan is saved."""
+        from .task_spec import revise_ready_task_spec
+        now = utcnow()
+        with self._connection(write=True) as c:
+            row = c.execute("SELECT status,task_spec_json,plan_json FROM orchestration_runs WHERE id=?",
+                            (oid,)).fetchone()
+            if row is None:
+                raise KeyError(oid)
+            if row["status"] != "Planning" or row["plan_json"] is not None:
+                raise ValueError("Task Spec changes require an unplanned ready orchestration.")
+            current = _load(row["task_spec_json"])
+            updated = revise_ready_task_spec(current, field=field, value=value,
+                                             user_message=user_message)
+            if updated["version"] == current["version"]:
+                raise ValueError("Task Spec revision has no change.")
+            c.execute("INSERT INTO orchestration_task_specs(orchestration_id,version,spec_json,created_at) VALUES(?,?,?,?)",
+                      (oid, updated["version"], _dump(updated), now))
+            c.execute("UPDATE orchestration_runs SET task_spec_json=?,status='Queued',updated_at=? WHERE id=? AND status='Planning' AND plan_json IS NULL",
+                      (_dump(updated), now, oid))
+        return self.get_orchestration(oid)
+
+    def record_clarification_answers(self, oid: str, answers: dict[str, str]) -> dict:
+        """Save answers separately from approvals and atomically resume analysis."""
+        if not isinstance(answers, dict) or not answers:
+            raise ValueError("Clarification answers must be a nonempty object.")
+        now = utcnow()
+        with self._connection(write=True) as c:
+            row = c.execute("SELECT status,task_spec_json FROM orchestration_runs WHERE id=?",
+                            (oid,)).fetchone()
+            if row is None:
+                raise KeyError(oid)
+            if row["status"] != "NeedsClarification":
+                raise ValueError("Orchestration is not waiting for clarification.")
+            spec = _load(row["task_spec_json"])
+            questions = {item["id"]: item for item in spec["clarification_questions"]}
+            if set(answers) - set(questions):
+                raise ValueError("Unknown clarification question.")
+            if any(item["required"] and not str(answers.get(qid) or "").strip()
+                   for qid, item in questions.items()):
+                raise ValueError("Every required clarification question needs an answer.")
+            for qid, answer in answers.items():
+                if not isinstance(answer, str) or not answer.strip() or len(answer) > 4000:
+                    raise ValueError("Clarification answer must be nonempty bounded text.")
+                c.execute("INSERT INTO orchestration_clarification_answers(orchestration_id,spec_version,question_id,answer,created_at) VALUES(?,?,?,?,?)",
+                          (oid, spec["version"], qid, sanitize(answer.strip()), now))
+            c.execute("UPDATE orchestration_runs SET status='Analyzing',updated_at=? WHERE id=? AND status='NeedsClarification'",
+                      (now, oid))
+        return self.get_orchestration(oid)
+
     def get_orchestration(self, oid: str) -> dict:
         with self._connection() as c:
             row = c.execute("SELECT * FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
             if row is None: raise KeyError(oid)
             result = dict(row); result["config"] = _load(result.pop("config_json")) or {}
+            result["task_spec"] = _load(result.pop("task_spec_json"))
+            result["task_spec_revisions"] = [dict(version=x["version"], spec=_load(x["spec_json"]), created_at=x["created_at"]) for x in c.execute("SELECT * FROM orchestration_task_specs WHERE orchestration_id=? ORDER BY version", (oid,))]
+            result["clarification_answers"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_clarification_answers WHERE orchestration_id=? ORDER BY created_at,question_id", (oid,))]
             result["plan"] = _load(result.pop("plan_json"))
             result["effective_plan"] = _load(result.pop("effective_plan_json")) or result["plan"]
             result["planning_metrics"] = _load(result.pop("planning_metrics_json")) or {}
@@ -751,7 +835,8 @@ class Store(IntegrationStoreMixin):
         return self.get_orchestration(oid)
 
     def save_orchestration_plan(self, oid: str, plan: dict[str, Any], schema_version: int,
-                                planning_metrics: dict[str, Any] | None = None) -> dict | None:
+                                planning_metrics: dict[str, Any] | None = None,
+                                expected_task_spec: dict[str, Any] | None = None) -> dict | None:
         """Atomically persist the immutable snapshot and transition Planning to Planned."""
         if schema_version != PLAN_SCHEMA_VERSION:
             raise ValueError(f"Unsupported plan schema version: {schema_version}.")
@@ -761,15 +846,19 @@ class Store(IntegrationStoreMixin):
             cursor = c.execute(
                 "UPDATE orchestration_runs SET plan_json=?,effective_plan_json=?,plan_schema_version=?,plan_created_at=?,"
                 "planning_metrics_json=?,status='Planned',updated_at=? "
-                "WHERE id=? AND status='Planning' AND plan_json IS NULL",
+                "WHERE id=? AND status='Planning' AND plan_json IS NULL"
+                + (" AND task_spec_json=?" if expected_task_spec is not None else ""),
                 (_dump(normalized), _dump(normalized), schema_version, now,
-                 _dump(planning_metrics or {}), now, oid),
+                 _dump(planning_metrics or {}), now, oid,
+                 *([_dump(expected_task_spec)] if expected_task_spec is not None else [])),
             )
             if cursor.rowcount != 1:
-                row = c.execute("SELECT status,plan_json FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
+                row = c.execute("SELECT status,plan_json,task_spec_json FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
                 if row is None:
                     raise KeyError(oid)
                 if row["status"] != "Planning":
+                    return None
+                if expected_task_spec is not None and _load(row["task_spec_json"]) != expected_task_spec:
                     return None
                 raise ValueError("The orchestration plan snapshot already exists.")
         return self.get_orchestration(oid)
@@ -1511,16 +1600,17 @@ class Store(IntegrationStoreMixin):
         now = utcnow()
         message = "Orchestration interrupted by a server restart. Submit a new request to retry."
         with self._connection(write=True) as c:
-            placeholders = ",".join("?" for _ in ORCHESTRATION_ACTIVE_STATUSES)
+            recoverable = tuple(status for status in ORCHESTRATION_ACTIVE_STATUSES if status != "NeedsClarification")
+            placeholders = ",".join("?" for _ in recoverable)
             rows = c.execute(
                 f"SELECT id FROM orchestration_runs WHERE status IN ({placeholders}) ORDER BY created_at,id",
-                ORCHESTRATION_ACTIVE_STATUSES,
+                recoverable,
             ).fetchall()
             for row in rows:
                 cursor = c.execute(
                     f"UPDATE orchestration_runs SET status='Failed',error=?,updated_at=? "
                     f"WHERE id=? AND status IN ({placeholders})",
-                    (message, now, row["id"], *ORCHESTRATION_ACTIVE_STATUSES),
+                    (message, now, row["id"], *recoverable),
                 )
                 if cursor.rowcount != 1:
                     continue

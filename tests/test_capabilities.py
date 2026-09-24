@@ -115,6 +115,28 @@ class EnforcementTests(unittest.TestCase):
         self.assertTrue(result.executed)
         self.assertEqual(result.capability, "filesystem.create")
         self.assertEqual(result.policy_decision, "allow")
+        self.assertEqual((self.workspace / "src" / "a.py").read_text(encoding="utf-8"), "x")
+
+    def test_identical_existing_write_skips_overwrite_policy_but_changed_content_does_not(self):
+        target = self.workspace / "same.txt"
+        target.write_bytes(b"same")
+        self.config["capability_policy"]["capabilities"]["filesystem"]["overwrite"] = {"mode": "deny"}
+        same_box = PolicyToolbox(self.root, self.workspace, self.config, ["write_file"])
+        self.assertEqual(same_box.resolve_action("write_file", {"path": "same.txt", "content": "same"}), "filesystem.create")
+        same = same_box.invoke("write_file", {"path": "same.txt", "content": "same"})
+        self.assertTrue(same.success)
+        self.assertTrue(same.already_satisfied)
+        self.assertFalse(same.changed)
+        self.assertFalse(same.executed)
+        self.assertEqual(same.error_class, "already_satisfied")
+        self.assertIn("already_satisfied", same.output)
+        self.assertEqual(same.policy_decision, "allow")
+        box = PolicyToolbox(self.root, self.workspace, self.config, ["write_file"])
+        changed = box.invoke("write_file", {"path": "same.txt", "content": "changed"})
+        self.assertFalse(changed.success)
+        self.assertEqual(changed.capability, "filesystem.overwrite")
+        self.assertEqual(changed.error_class, "policy_denied")
+        self.assertEqual(target.read_bytes(), b"same")
 
     def test_deny_and_ask_never_execute(self):
         self.config["capability_policy"]["capabilities"]["filesystem"]["create"] = {"mode": "deny"}

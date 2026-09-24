@@ -17,7 +17,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
-from control_center.tools import IGNORED_DIRECTORIES, Toolbox, ToolResult, argument_summary
+from control_center.tools import IGNORED_DIRECTORIES, MAX_WRITE_BYTES, Toolbox, ToolResult, argument_summary
 from control_center.transport import model_profile, model_request, request_json
 from control_center.security import register_secret, sanitize, strip_thinking as strip_private_content
 from control_center.capabilities import CapabilityResolver, effective_tools_for_policy
@@ -115,7 +115,12 @@ class BlockedActionCycle(TaskStopped):
 def _policy_denial_signature(tool: str, capability: str, arguments: dict[str, Any]) -> str:
     """Identify a materially identical denied action without retaining output text."""
     relevant = {key: value for key, value in arguments.items() if key != "timeout_seconds"}
-    payload = {"tool": tool, "capability": capability or "unknown", "arguments": relevant}
+    target = relevant.get("path")
+    if isinstance(target, str):
+        target = os.path.normcase(os.path.normpath(target.replace("\\", "/")))
+        relevant["path"] = target
+    payload = {"tool": tool, "capability": capability or "unknown",
+               "target": target, "arguments": relevant}
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -314,6 +319,30 @@ class PolicyToolbox(Toolbox):
             return True, "one-time approval"
         return False, ""
 
+    def write_is_already_satisfied(self, arguments: dict[str, Any]) -> bool:
+        """Check an in-scope UTF-8 write without invoking overwrite policy."""
+        path = arguments.get("path")
+        content = arguments.get("content")
+        if not isinstance(path, str) or not isinstance(content, str):
+            return False
+        try:
+            self.validate("write_file", arguments)
+            target = self.safe_path(path)
+            expected = content.encode("utf-8")
+            return (
+                len(expected) <= MAX_WRITE_BYTES and target.is_file()
+                and target.stat().st_size == len(expected)
+                and target.read_bytes() == expected
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def resolve_action(self, name: str, arguments: dict[str, Any] | None = None) -> str:
+        args = arguments or {}
+        if name == "write_file" and self.write_is_already_satisfied(args):
+            return "filesystem.create"
+        return self.resolver.resolve(name, args)
+
     def _resource_context(self, name: str, resource: str, args: dict[str, Any]) -> dict[str, Any]:
         context: dict[str, Any] = {}
         if name in {"read_file", "search_code"}:
@@ -373,6 +402,22 @@ class PolicyToolbox(Toolbox):
                 policy_reason="The tool is not in the effective toolbox for this agent.",
                 executed=False, error_class="tool_unavailable",
             )
+        # Compare exact UTF-8 bytes before classifying a write as create or
+        # overwrite. Identical content is a no-op and never reaches overwrite policy.
+        if name == "write_file" and self.write_is_already_satisfied(args):
+            path = str(args.get("path", ""))
+            output = json.dumps({
+                "success": True, "changed": False,
+                "already_satisfied": True, "path": path,
+                "message": "File already contains the requested content.",
+            }, ensure_ascii=False, sort_keys=True)
+            return ToolResult(
+                name, "ALREADY_SATISFIED\n" + output, True, 0,
+                capability="filesystem.create", policy_decision="allow",
+                policy_reason="No workspace mutation was necessary.",
+                executed=False, error_class="already_satisfied",
+                changed=False, already_satisfied=True,
+            )
         try:
             action = self.resolver.resolve(name, args)
         except (ValueError, TypeError) as exc:
@@ -414,6 +459,8 @@ class PolicyToolbox(Toolbox):
         result.policy_decision = "allow"
         result.policy_reason = decision.reason + (f" ({grant_reason})" if grant_reason else "")
         result.executed = True
+        if name in WRITE_TOOLS and result.success:
+            result.changed = True
         return result
 
     def validate(self, name: str, arguments: dict[str, Any]) -> None:
@@ -544,6 +591,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "blocked_actions": 0,
         "stop_reason": "",
         "failure_class": "",
+        "runtime_exception": False,
     }
 
     def publish_workspace_diff(name: str, arguments: dict[str, Any], existing_before: bool = False) -> None:
@@ -598,6 +646,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     runtime_artifacts: list[dict[str, Any]] = []
     command_evidence: list[dict[str, Any]] = []
     policy_denials: dict[str, int] = {}
+    repeated_denial_feedback: dict[str, int] = {}
     failure_history: dict[str, int] = {}
     blocked_action_count = 0
     successful_validation_streak = 0
@@ -698,14 +747,14 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 attempts = 1 + (config.get("retries", 0) if name in READ_TOOLS else 0)
                 for attempt in range(1, attempts + 1):
                     remaining = guard()
-                    if metrics["tool_calls"] >= config.get("max_tool_calls", 40):
-                        raise TaskStopped("Maximum tool calls reached.")
+                    # Count provisionally so repeated-denial fingerprints can
+                    # be recognized even when the execution budget is full.
                     metrics["tool_calls"] += 1
                     common = {"step_id": step_id, "step_number": metrics["steps"], "tool": name,
                               "input": args, "attempt": attempt,
                               "reason": REASONS.get(name, "Validate the requested tool against the agent's permissions.")}
                     try:
-                        common["capability"] = box.resolver.resolve(name, args)
+                        common["capability"] = box.resolve_action(name, args)
                     except Exception:
                         common["capability"] = "unknown"
                     publish("event", event={**common, "event_type": "step.started", "level": "info", "status": "Running"})
@@ -722,53 +771,37 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             existing_before = box.safe_path(str(safe_args.get("path", ""))).exists()
                         except (OSError, ValueError):
                             existing_before = False
-                    already_satisfied = False
-                    if name == "write_file":
-                        path = safe_args.get("path")
-                        expected = modified_paths.get(path) if isinstance(path, str) else None
-                        observed = observed_files.get(path) if isinstance(path, str) else None
-                        already_satisfied = (
-                            isinstance(path, str)
-                            and path in modified_paths
-                            and isinstance(expected, str)
-                            and isinstance(observed, tuple)
-                            and observed[0]
-                            and safe_args.get("content") == expected
-                        )
                     resolved_capability = common.get("capability", "unknown")
                     denial_signature = _policy_denial_signature(name, resolved_capability, safe_args)
-                    if already_satisfied:
+                    repeated_denial = False
+                    if not argument_error and policy_denials.get(denial_signature, 0):
+                        resource = str(safe_args.get("path", ".")) if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"} else "."
+                        try:
+                            current_decision = box.policy.evaluate(
+                                resolved_capability, resource,
+                                box._resource_context(name, resource, safe_args),
+                            ).outcome
+                        except (AttributeError, TypeError, ValueError):
+                            current_decision = "deny"
+                        repeated_denial = current_decision == "deny"
+                    if not repeated_denial and metrics["tool_calls"] > config.get("max_tool_calls", 40):
+                        metrics["tool_calls"] -= 1
+                        raise TaskStopped("Maximum tool calls reached.")
+                    if repeated_denial:
+                        feedback_count = repeated_denial_feedback.get(denial_signature, 0) + 1
+                        repeated_denial_feedback[denial_signature] = feedback_count
                         result = ToolResult(
                             name,
-                            "Already satisfied: the requested file exists with the requested content "
-                            "and was read back successfully; no overwrite was performed.",
-                            True, 0, capability=resolved_capability, policy_decision="allow",
-                            policy_reason="The requested artifact was already created and verified.",
-                            executed=False, error_class="already_satisfied",
-                        )
-                        final = result.output
-                        success = True
-                        auto_completed = True
-                        publish("event", event={
-                            "event_type": "task.auto_completed", "level": "info", "status": "Success",
-                            "reason": "The requested artifact was already created and verified; a duplicate write was skipped.",
-                            "path": safe_args.get("path"),
-                        })
-                    elif not argument_error and policy_denials.get(denial_signature, 0) > 0:
-                        repeated_count = policy_denials.get(denial_signature, 0)
-                        terminal_repeat = repeated_count >= 2
-                        result = ToolResult(
-                            name,
-                            "POLICY_DENIED_REPEAT\n\nThis action was denied by policy. Repeating the same action "
-                            "without changing permissions, strategy or target will not succeed. Choose another "
-                            "permitted strategy, request the capability through the allowed mechanism, or report "
-                            + ("Freya is returning control to recovery now." if terminal_repeat
-                               else "the limitation to Freya."),
+                            "ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE\n\n"
+                            "Repeating this action cannot succeed without a state or strategy change. "
+                            "Choose another permitted action, request approval if supported, or finish/report the limitation.",
                             False, 0, capability=resolved_capability,
-                            policy_decision="deny", policy_reason="Repeated materially identical policy denial.",
+                            policy_decision="deny", policy_reason="An identical action was already denied under the current policy.",
                             executed=False,
-                            error_class="blocked_action_cycle" if terminal_repeat else "repeated_policy_denied",
+                            error_class="blocked_action_cycle" if feedback_count > 1 else "repeated_policy_denied",
                         )
+                        # The ledger responds locally; do not charge another tool call.
+                        metrics["tool_calls"] -= 1
                     else:
                         result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                                   else box.invoke(name, safe_args))
@@ -809,7 +842,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 policy_reason="Approval denied by operator.", executed=False,
                                 error_class="approval_denied",
                             )
-                    if result.policy_decision == "deny" and result.capability:
+                    if result.policy_decision == "deny" and result.capability and result.error_class == "policy_denied":
                         policy_denials[denial_signature] = policy_denials.get(denial_signature, 0) + 1
                     runtime_actions.append({
                         "tool": name,
@@ -821,14 +854,16 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         "exit_code": result.exit_code,
                         "output": str(result.output or "")[:4000],
                         "error_class": result.error_class or "",
+                        "changed": result.changed,
+                        "already_satisfied": bool(result.already_satisfied),
                     })
-                    if result.success and name == "run_command":
+                    if result.success and name == "run_command" and verification["enabled"]:
                         supported = _command_evidence_criteria(
                             verification.get("completion_criteria", []),
                             safe_args.get("argv", []), result,
                         )
                         if supported:
-                            command_evidence.append({
+                            evidence = {
                                 "type": "command_execution",
                                 "check": "command_output:" + " ".join(str(item) for item in safe_args.get("argv", [])),
                                 "status": "passed",
@@ -837,7 +872,17 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "exit_code": result.exit_code,
                                 "output": str(result.output or "")[:4000],
                                 "supports_acceptance_criteria": supported,
-                            })
+                            }
+                            command_evidence.append(evidence)
+                            verification_state["attempted"] = True
+                            verification_state["evidence"].append(evidence)
+                            criteria = [str(item).strip() for item in verification.get("completion_criteria", []) if str(item).strip()]
+                            if criteria and all(item in {
+                                criterion for row in command_evidence
+                                for criterion in row.get("supports_acceptance_criteria", [])
+                            } for item in criteria):
+                                verification_state["passed"] = True
+                                verification_state["unavailable"] = False
                     if result.success and name in WRITE_TOOLS and result.error_class != "already_satisfied":
                         publish_workspace_diff(name, safe_args, existing_before)
                         telemetry["workspace_changes"] += 1
@@ -856,6 +901,35 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "tool": name,
                             })
                         modified = True
+                    if result.already_satisfied:
+                        if verification_state["requested"]:
+                            verification_state["attempted"] = True
+                            verification_state["evidence"].append({
+                                "type": "file_content_match",
+                                "check": "filesystem:content_match:" + str(safe_args.get("path", "")),
+                                "status": "passed", "path": safe_args.get("path", ""),
+                                "content_sha256": hashlib.sha256(
+                                    str(safe_args.get("content", "")).encode("utf-8")
+                                ).hexdigest(),
+                                "supports_acceptance_criteria": [],
+                            })
+                        criteria = [str(item).strip() for item in verification.get("completion_criteria", []) if str(item).strip()]
+                        supported = {
+                            criterion for row in command_evidence
+                            for criterion in row.get("supports_acceptance_criteria", [])
+                        }
+                        criteria_satisfied = bool(criteria) and all(item in supported for item in criteria)
+                        path = safe_args.get("path")
+                        verified_artifact = isinstance(path, str) and path in modified_paths
+                        if runtime_artifacts and (criteria_satisfied or (not criteria and verified_artifact)):
+                            success = True
+                            auto_completed = True
+                            final = "Completed from the recorded artifact and verification evidence."
+                            publish("event", event={
+                                "event_type": "task.auto_completed", "level": "info", "status": "Success",
+                                "reason": "The duplicate write was skipped because acceptance criteria or verified artifact evidence already satisfies the requested work.",
+                                "path": path,
+                            })
                     if result.success and name == "read_file":
                         path = safe_args.get("path")
                         if isinstance(path, str) and path in modified_paths:
@@ -943,8 +1017,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     elif model_blocked:
                         blocked_action_count += 1
                         telemetry["blocked_actions"] = blocked_action_count
-                        if blocked_action_count >= 3:
+                        if result.error_class == "blocked_action_cycle" or blocked_action_count >= 3:
                             blocked_reason = (
+                                "BlockedActionCycle: the worker repeated a permanently denied action "
+                                "without changing the current state or strategy."
+                                if result.error_class == "blocked_action_cycle" else
                                 "BlockedActionCycle: the worker requested three consecutive denied or "
                                 "repeatedly blocked actions. Freya must diagnose or replan the task."
                             )
@@ -1042,6 +1119,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                                            "output": result.output[:4000]})
                 else:
                     verification_state["failed"] = True
+                    verification_state["passed"] = False
                     verification_state["evidence"].append({"check": label, "status": "failed",
                                                            "output": result.output[:4000]})
             if modified and verification["inspect_changes"]:
@@ -1071,7 +1149,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 else:
                     verification_state["unavailable"] = True
                     verification_state["skipped_with_reason"] += "No permitted test suite is available. "
-            if modified_paths and not verification_state["attempted"] and not verification_state["failed"]:
+            if modified_paths and not verification_state["failed"]:
                 read_tool_available = "read_file" in getattr(box, "enabled", set())
                 readback_passed = bool(modified_paths)
                 for path, expected in modified_paths.items():
@@ -1119,7 +1197,6 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     verification_state["skipped_with_reason"] += "Used read-back filesystem evidence."
             if command_evidence:
                 verification_state["attempted"] = True
-                verification_state["evidence"].extend(command_evidence)
                 criteria = [str(item).strip() for item in verification.get("completion_criteria", []) if str(item).strip()]
                 supported = {
                     criterion
@@ -1141,7 +1218,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         elif not verification_state["requested"]:
             verification_state["skipped_with_reason"] = "Verification disabled by configuration."
     except Exception as exc:
-        error = "{}: {}".format(type(exc).__name__, exc)
+        telemetry["runtime_exception"] = True
+        error = str(exc)
+        if not error.startswith(type(exc).__name__):
+            error = "{}: {}".format(type(exc).__name__, error)
         telemetry["failure_class"] = (
             "no_progress" if isinstance(exc, NoProgressDetected)
             else "blocked_action_cycle" if isinstance(exc, BlockedActionCycle)
@@ -1151,110 +1231,135 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             telemetry["stop_reason"] = error
     result_output: Any = final
     if effective["output"]["format"] == "structured":
-        repaired = None
-        model_response_valid = False
-        repair_attempted = False
-        validation_error = ""
-        repair_error = ""
-        try:
-            repaired = validate_structured_output(final)
-            model_response_valid = True
-        except (TypeError, ValueError) as exc:
-            validation_error = sanitize(str(exc))[:1000]
-            # A response-format repair is useful for prose as well as malformed
-            # JSON. Keep it bounded to one call and record its outcome separately
-            # from whether the requested work itself succeeded.
-            if metrics["model_calls"] < config.get("max_model_calls", 20):
-                repair_attempted = True
-                metrics["model_calls"] += 1
-                repair_id = uuid.uuid4().hex
-                publish("event", event={"event_type": "model.repair.started", "level": "warning", "status": "Running",
-                                         "step_id": repair_id, "reason": "Repair the structured output contract once."})
-                repair_call_metrics: dict[str, Any] = {}
-                try:
-                    repair_response = model_request(transport, "worker",
-                        "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
-                        {"model": config["model"],
-                         "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object, array, or string), limitations (array). Preserve only claims supported by the completed work and verification."},
-                                      {"role": "user", "content": "Convert this final answer into the required JSON contract. It may be prose, malformed JSON, or JSON with invalid fields. Preserve its useful result without inventing work:\n" + str(final)}],
-                         "tools": [], "stream": False, "think": False,
-                         "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
-                                     "num_predict": (min(token_limit - metrics["total_tokens"], model_profile("worker").repair_output_tokens) if token_limited else model_profile("worker").repair_output_tokens)}},
-                        timeout=min(guard(), model_profile("worker").inactivity_timeout),
-                        hard_timeout=guard(), token=token, telemetry=repair_call_metrics,
-                    )
-                    for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
-                        value = repair_response.get(source, 0) or 0
-                        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-                            raise ValueError("Ollama returned invalid repair usage metrics.")
-                        metrics[key] += int(value)
-                    metrics["total_tokens"] = metrics["prompt_tokens"] + metrics["generated_tokens"]
-                    repair_message = repair_response.get("message")
-                    if not isinstance(repair_message, dict):
-                        raise ValueError("Ollama returned no repair message.")
-                    repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
-                    publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
-                                             "step_id": repair_id,
-                                             "output": {"valid": True, "fields": sorted(repaired),
-                                                        "transport": repair_call_metrics.get("transport", {})}})
-                except Exception as exc:
-                    repaired = None
-                    repair_error = sanitize("{}: {}".format(type(exc).__name__, exc))[:1000]
-                    publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",
-                                             "step_id": repair_id, "error": repair_error,
-                                             "output": {"transport": repair_call_metrics.get("transport", {})}})
-            else:
-                repair_error = "The model-call budget was exhausted before the format repair."
-        if repaired is None:
-            result_output = normalize_result_output(final, effective["output"])
-        else:
-            result_output = repaired
-        if isinstance(result_output, dict):
-            try:
-                validate_structured_output(result_output)
-                normalized_contract_valid = True
-            except (TypeError, ValueError):
-                normalized_contract_valid = False
-                result_output = {
-                    "summary": str(final or "").strip() or "No final response was provided.",
-                    "actions": [], "artifacts": [], "verification": [], "limitations": [],
-                }
-                normalized_contract_valid = True
-            result_output["actions"] = list(result_output.get("actions") or []) + runtime_actions
-            result_output["artifacts"] = list(result_output.get("artifacts") or []) + runtime_artifacts
+        if telemetry.get("runtime_exception"):
+            failure = telemetry.get("failure_class") or type(error).__name__
+            limitation = "Runtime failure class: {}.".format(failure)
+            if error:
+                limitation += " " + sanitize(error)[:1000]
+            result_output = {
+                "summary": "Task execution stopped before completion.",
+                "actions": runtime_actions,
+                "artifacts": runtime_artifacts,
+                "verification": verification_state,
+                "limitations": [limitation],
+            }
             if workspace_diffs:
                 result_output["workspace_diffs"] = workspace_diffs
-            result_output["verification"] = verification_state
-            if verification_state.get("skipped_with_reason"):
-                result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
+            publish("event", event={
+                "event_type": "task.result_contract", "level": "warning", "status": "Warning",
+                "message": "Built the structured result from the runtime action ledger after an exception.",
+                "output": {
+                    "format": "structured", "deterministic_runtime_result": True,
+                    "model_repair_skipped": True, "failure_class": failure,
+                    "action_count": len(runtime_actions), "artifact_count": len(runtime_artifacts),
+                    "verification_attempted": bool(verification_state.get("attempted")),
+                },
+            })
         else:
-            normalized_contract_valid = False
-        contract_diagnostics = {
-            "format": "structured",
-            "required_fields": ["summary", "actions", "artifacts", "verification", "limitations"],
-            "model_response_valid": model_response_valid,
-            "repair_attempted": repair_attempted,
-            "repair_succeeded": repaired is not None and repair_attempted,
-            "fallback_normalization_used": repaired is None,
-            "normalized_result_valid": normalized_contract_valid,
-            "validation_error": validation_error,
-            "repair_error": repair_error,
-        }
-        if not model_response_valid:
-            contract_diagnostics["original_response_preview"] = sanitize(
-                str(final or "")
-            )[:4000]
-        publish("event", event={
-            "event_type": "task.result_contract",
-            "level": "warning" if not model_response_valid else "info",
-            "status": "Warning" if not model_response_valid else "Success",
-            "message": (
-                "The final response required structured-format repair or normalization."
-                if not model_response_valid else
-                "The final response satisfied the structured output contract."
-            ),
-            "output": contract_diagnostics,
-        })
+            repaired = None
+            model_response_valid = False
+            repair_attempted = False
+            validation_error = ""
+            repair_error = ""
+            try:
+                repaired = validate_structured_output(final)
+                model_response_valid = True
+            except (TypeError, ValueError) as exc:
+                validation_error = sanitize(str(exc))[:1000]
+                # A response-format repair is useful for prose as well as malformed
+                # JSON. Keep it bounded to one call and record its outcome separately
+                # from whether the requested work itself succeeded.
+                if metrics["model_calls"] < config.get("max_model_calls", 20):
+                    repair_attempted = True
+                    metrics["model_calls"] += 1
+                    repair_id = uuid.uuid4().hex
+                    publish("event", event={"event_type": "model.repair.started", "level": "warning", "status": "Running",
+                                             "step_id": repair_id, "reason": "Repair the structured output contract once."})
+                    repair_call_metrics: dict[str, Any] = {}
+                    try:
+                        repair_response = model_request(transport, "worker",
+                            "POST", config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
+                            {"model": config["model"],
+                             "messages": [{"role": "system", "content": "Return only valid JSON with exactly these fields: summary (non-empty string), actions (array), artifacts (array), verification (object, array, or string), limitations (array). Preserve only claims supported by the completed work and verification."},
+                                          {"role": "user", "content": "Convert this final answer into the required JSON contract. It may be prose, malformed JSON, or JSON with invalid fields. Preserve its useful result without inventing work:\n" + str(final)}],
+                             "tools": [], "stream": False, "think": False,
+                             "options": {"temperature": 0, "num_ctx": config.get("context_window", 8192),
+                                         "num_predict": (min(token_limit - metrics["total_tokens"], model_profile("worker").repair_output_tokens) if token_limited else model_profile("worker").repair_output_tokens)}},
+                            timeout=min(guard(), model_profile("worker").inactivity_timeout),
+                            hard_timeout=guard(), token=token, telemetry=repair_call_metrics,
+                        )
+                        for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
+                            value = repair_response.get(source, 0) or 0
+                            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                                raise ValueError("Ollama returned invalid repair usage metrics.")
+                            metrics[key] += int(value)
+                        metrics["total_tokens"] = metrics["prompt_tokens"] + metrics["generated_tokens"]
+                        repair_message = repair_response.get("message")
+                        if not isinstance(repair_message, dict):
+                            raise ValueError("Ollama returned no repair message.")
+                        repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
+                        publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
+                                                 "step_id": repair_id,
+                                                 "output": {"valid": True, "fields": sorted(repaired),
+                                                            "transport": repair_call_metrics.get("transport", {})}})
+                    except Exception as exc:
+                        repaired = None
+                        repair_error = sanitize("{}: {}".format(type(exc).__name__, exc))[:1000]
+                        publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",
+                                                 "step_id": repair_id, "error": repair_error,
+                                                 "output": {"transport": repair_call_metrics.get("transport", {})}})
+                else:
+                    repair_error = "The model-call budget was exhausted before the format repair."
+            if repaired is None:
+                result_output = normalize_result_output(final, effective["output"])
+            else:
+                result_output = repaired
+            if isinstance(result_output, dict):
+                try:
+                    validate_structured_output(result_output)
+                    normalized_contract_valid = True
+                except (TypeError, ValueError):
+                    normalized_contract_valid = False
+                    result_output = {
+                        "summary": str(final or "").strip() or "No final response was provided.",
+                        "actions": [], "artifacts": [], "verification": [], "limitations": [],
+                    }
+                    normalized_contract_valid = True
+                result_output["actions"] = list(result_output.get("actions") or []) + runtime_actions
+                result_output["artifacts"] = list(result_output.get("artifacts") or []) + runtime_artifacts
+                if workspace_diffs:
+                    result_output["workspace_diffs"] = workspace_diffs
+                result_output["verification"] = verification_state
+                if verification_state.get("skipped_with_reason"):
+                    result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
+            else:
+                normalized_contract_valid = False
+            contract_diagnostics = {
+                "format": "structured",
+                "required_fields": ["summary", "actions", "artifacts", "verification", "limitations"],
+                "model_response_valid": model_response_valid,
+                "repair_attempted": repair_attempted,
+                "repair_succeeded": repaired is not None and repair_attempted,
+                "fallback_normalization_used": repaired is None,
+                "normalized_result_valid": normalized_contract_valid,
+                "validation_error": validation_error,
+                "repair_error": repair_error,
+            }
+            if not model_response_valid:
+                contract_diagnostics["original_response_preview"] = sanitize(
+                    str(final or "")
+                )[:4000]
+            publish("event", event={
+                "event_type": "task.result_contract",
+                "level": "warning" if not model_response_valid else "info",
+                "status": "Warning" if not model_response_valid else "Success",
+                "message": (
+                    "The final response required structured-format repair or normalization."
+                    if not model_response_valid else
+                    "The final response satisfied the structured output contract."
+                ),
+                "output": contract_diagnostics,
+            })
     update()
     return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,

@@ -4,9 +4,10 @@ This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
-`task_analyst.py` owns the tool-free prompt-rewrite contract, deterministic
-REQ/AC ID normalization with checked `verifies` references, and semantic
-reconciliation against observable source-prompt facts.
+`task_spec.py` owns the production tool-free canonical intent contract,
+clarification questions, sequential revisions and deterministic rendering.
+`task_analyst.py` retains the legacy version-3 compatibility contract.
+`plan_compiler.py` assigns execution IDs and checks semantic dependencies.
 `planner.py` owns the versioned orchestration-plan contract, deterministic
 criterion-ID normalization, `T-N` task-ID expansion with reference updates,
 and DAG validation. It fills omitted global-link
@@ -53,10 +54,11 @@ archival event reports archival `Success` separately from the run's final
   per-component timeout/output profiles, refusal-only provider circuit and
   body-free telemetry. A CLI timeout is inactivity, while the hard ceiling
   remains bounded. Preserve injected request functions in adapter tests.
-- Task Analyst output is strictly validated JSON. It receives the original
-  prompt, has no tools or workspace authority, and may use a deterministic
-  fallback if its model call fails. Its `operational_prompt` replaces the human
-  wording for Planner and workers; the original remains immutable audit evidence.
+- Production Task Analyst output is a validated CanonicalTaskSpec. It receives
+  the source prompt and prior spec, has no tools or workspace authority, and
+  conservatively asks when a model fails on an ambiguous request. Planner and
+  workers consume only a deterministic rendering of the ready Task Spec; the
+  original remains immutable audit evidence.
 - A program_creation request without a named language uses an explicit Python
   3.10+ assumption. A code_change follows the existing project stack. Preserve
   explicit languages and keep unrelated missing-input blockers fail-closed.

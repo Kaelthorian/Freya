@@ -40,35 +40,25 @@ when explicitly choosing the deterministic one-task fallback, such as an
 offline test environment. Provider errors fail planning and do not trigger the
 fallback.
 
-Before the planner, Freya uses the first enabled agent whose
-`config.orchestration_role` is `task_analyst` to rewrite the original prompt.
-The agent is tool-free. Its schema-validated, semantically reconciled
-`operational_prompt` replaces the human text for Planner and workers; the
-original is retained only as immutable audit evidence and capability policy
-remains authoritative. If no such agent exists, Freya produces a deterministic
-operational brief. If the
-analyst model fails, Freya records the error and uses a deterministic bounded
-interpretation. The role can be selected in the agent editor; a Skill is not
-required for routing or authorization.
+Before planning, production Freya uses `TaskSpecAnalyst` to build
+one canonical, versioned Task Spec from the user's request. An enabled agent
+with `config.orchestration_role=task_analyst` supplies the loopback model;
+without one, conservative deterministic analysis still runs. The Analyst
+has no tools and never assigns workers or capabilities. It records explicit,
+clarified and assumed requirements, asks only high-impact questions and
+leaves an ambiguous run in `NeedsClarification`. The user answers through
+`POST /api/orchestrations/{id}/clarifications`; the same run resumes and
+stores both question and answer. A ready spec can be revised through
+`POST /api/orchestrations/{id}/revise-spec` only before a plan is persisted;
+the store fences late output from a planner using the previous version. `TaskSpecAnalyst` repairs one malformed
+model response, then falls back conservatively on technical failure.
 
-For a standalone program request with no language specified, the Analyst
-records Python 3.10+ as an assumption and adds it to the operational brief.
-An explicit language is preserved. This default does not clear unrelated
-missing-input blockers or select a language for code changes in an existing
-project.
-
-`ready_for_execution=false` is a hard pre-planning gate. Freya records
-`freya.task_analysis.blocked`, fails planning with the analyst's
-`blocking_reason`, and does not create a plan, workspace, or delegation. A
-worker must treat the operational brief as task context, not as an implicit
-`task_analyst_operational_brief.txt` workspace file.
-
-The Analyst output includes the canonical internal `task_kind` categories
-`file_creation`, `program_creation`, `code_change`, `analysis`, `testing`,
-`review`, `external_action`, and `general`. If a model response is structurally
-blocked because `ready_for_execution=false` lacks a grounded
-`blocking_reason`, Freya makes exactly one tool-free repair request; it never
-invents a reason or permissions before falling back deterministically.
+The Planner receives the ready Task Spec, chooses tasks, capabilities, Skills
+and QA, and emits semantic task keys/dependencies. `plan_compiler.py`
+generates all runtime IDs, links criteria and validates the DAG. Workers
+receive a deterministic rendering of the Task Spec, never an independent
+`operational_prompt`. The old Analyst v3 path is retained for injected
+compatibility adapters and historical tests.
 
 Planner reconciliation is a safety floor over both sources: if the model plan
 contains a write or local execution, it derives `filesystem.read` for
@@ -177,19 +167,26 @@ and every selected agent's normalized `who`/`where`/`when`/`what`/`how` trace,
 are visible together. A `NoProgressDetected` report means the worker repeated
 successful read-only actions without changing the workspace; raising
 `max_steps` alone is not a corrective action.
-`BlockedActionCycle` means three consecutive model decisions were denied or
-otherwise deterministically blocked; an internal retry of one recoverable read
-does not count as additional model decisions. Policy denials, unavailable or
-unknown tools, invalid requests and approval denials are not automatically
-retried. Identical policy denials are intercepted before a second underlying
-tool invocation, then Freya stops that worker and diagnoses/replans instead of
-consuming the remaining step budget. A recovery retry receives bounded prior
-workspace state and may derive read-only inspection, but never overwrite
-authority. A deterministic missing-file result is terminal for semantic
-recovery; selecting another agent does not make an absent artifact appear.
-After a successful read-back, an identical write request is recorded as an
-already-satisfied no-op and cannot trigger an overwrite loop. Orchestration
-timeouts also emit failure analysis.
+`BlockedActionCycle` stops a worker after it repeats a policy-denied action
+under unchanged state, or after the existing bounded guard sees three blocked
+decisions. The first materially identical request after a denial is intercepted
+by a fingerprint of tool, capability, normalized target and relevant arguments;
+it receives `ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE` without another tool
+execution or tool-call budget charge. The worker rechecks policy so a changed
+permission state, target or strategy can proceed normally. Policy denials,
+unavailable or unknown tools, invalid requests and approval denials are not
+automatically retried. A recovery retry receives bounded prior workspace state
+and may derive read-only inspection, but never overwrite authority. A
+deterministic missing-file result is terminal for semantic recovery; selecting
+another agent does not make an absent artifact appear.
+
+`write_file` compares exact UTF-8 bytes before overwrite policy. Identical
+content returns `already_satisfied=true` and `changed=false`, emits no workspace
+diff and does not count as workspace progress. The action ledger records this
+state for the model. A created artifact plus successful command evidence linked
+to every configured completion criterion can satisfy a task and stop further
+model actions. A no-op alone does not satisfy unrelated configured criteria.
+Orchestration timeouts also emit failure analysis.
 
 Interactive Python QA uses `run_command` with a bounded `stdin` string. Without
 stdin the worker closes the child stream, so `input()` fails immediately rather

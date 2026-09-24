@@ -10,27 +10,27 @@ Ollama and allowlisted tools → selected agent workspace.
   use an existing absolute folder or a generated per-task folder.
 - Create and persist a validated orchestration plan before delegation. Planner
   capability declarations are requirements only and never grant access.
-- Preserve the human prompt as audit evidence, but use the Task Analyst's
-  schema-validated, semantically reconciled operational prompt as the sole
-  downstream input for planning and delegation.
+- Preserve the human prompt as audit evidence. Use the versioned, validated
+  CanonicalTaskSpec as the sole downstream intent source; render worker/model
+  context deterministically from it.
 - For program_creation without a named language, record Python 3.10+ as an
   explicit assumption. For code_change, inspect and preserve the existing
   project language; use Python only if no stack exists for standalone work.
   Preserve explicit user choices and do not clear unrelated blockers.
-- Treat `ready_for_execution=false` plus `blocking_reason` as a hard planning
-  gate: emit the blocker, create no plan, and delegate no worker until the
-  missing user input is resolved.
-- Do not invent hidden prerequisite files for the operational brief. A task
+- Treat `NEEDS_CLARIFICATION` as a hard planning gate: persist structured
+  questions and answers on the same orchestration, create no plan or worker
+  until the Task Spec reaches `READY_FOR_PLANNING`.
+- Do not invent hidden prerequisite files for the canonical Task Spec. A task
   may consume a workspace artifact only when the user or an explicit producer
   task establishes it; a deterministic missing-file error must fail or replan,
   not retry unchanged with another agent.
 - Interactive behavior must use a dependent QA task and bounded `run_command`
   stdin. Never wait on a worker terminal or add a free-form shell.
-- If an enabled agent is marked `config.orchestration_role=task_analyst`, run
-  its bounded, tool-free rewrite before planning. The reconciled operational
-  prompt becomes downstream task authority; capability policy remains the sole
-  action authority. A Skill can provide guidance but never selects this role
-  or grants it access.
+- Run the tool-free Task Analyst before production planning. It resolves user
+  intent and asks material questions, but never chooses agents, capabilities,
+  Skills, dependencies or runtime IDs. Planner chooses strategy; Plan Compiler
+  assigns internal IDs and validates the DAG. Capability policy remains the
+  sole action authority. A Skill never grants access.
 - Keep orchestration state transitions conditional and terminal states final.
   Cancellation must serialize with delegation creation and include children
   waiting for approval.

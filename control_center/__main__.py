@@ -20,7 +20,7 @@ from .recovery import (DEFAULT_RECOVERY_ENDPOINT, DEFAULT_RECOVERY_MODEL,
                        DEFAULT_RECOVERY_TIMEOUT_SECONDS, FailureAnalyzer,
                        OllamaFailureAnalyzer, OllamaRecoveryAdvisor,
                        RecoveryController, Replanner)
-from .task_analyst import OllamaTaskAnalyst, TaskAnalyst
+from .task_spec import TaskSpecAnalyst
 from .integration import (DEFAULT_INTEGRATION_ENDPOINT, DEFAULT_INTEGRATION_MODEL,
                           DEFAULT_INTEGRATION_TIMEOUT_SECONDS, GlobalVerifier,
                           IntegrationReplanner, OllamaGlobalVerifier,
@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--planner-timeout", type=float, default=DEFAULT_PLANNER_TIMEOUT_SECONDS,
                         help="Planner Ollama inactivity timeout in seconds (0.1-120)")
     parser.add_argument("--planner-offline", action="store_true",
-                        help="Explicitly use deterministic one-task fallback planning")
+                        help="Use deterministic Task Spec analysis and minimal fallback planning")
     parser.add_argument("--evaluator-model", default=DEFAULT_EVALUATOR_MODEL,
                         help="Ollama model used for semantic evaluation")
     parser.add_argument("--evaluator-endpoint", default=DEFAULT_EVALUATOR_ENDPOINT,
@@ -140,8 +140,7 @@ def main():
         # Task Analyst is selected from the enabled agents at run time.  Its
         # adapter is deliberately separate from the planner so prompt
         # interpretation is a distinct, tool-free preplanning phase.
-        task_analyst = (TaskAnalyst(offline=True) if args.planner_offline else
-                        TaskAnalyst(OllamaTaskAnalyst()))
+        task_analyst = TaskSpecAnalyst(offline=args.planner_offline)
         evaluator = (Evaluator(offline=True) if args.evaluator_offline else
                      Evaluator(OllamaEvaluator(args.evaluator_model, args.evaluator_endpoint,
                                                args.evaluator_timeout)))

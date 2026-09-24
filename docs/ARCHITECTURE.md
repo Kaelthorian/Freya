@@ -1,13 +1,17 @@
 # Architecture
 
-Freya includes a first-class orchestration layer. User prompts enter
-`control_center/orchestrator.py`. When an enabled agent is marked with
-`config.orchestration_role=task_analyst`, it first asks `control_center/task_analyst.py`
-for a strict, tool-free interpretation of the original prompt. That result is
-schema-validated and semantically reconciled into an `operational_prompt`; it
-replaces the human wording for every downstream stage while the source remains
-immutable audit evidence. Freya then asks `control_center/planner.py` for a
-strict structured plan and persists that snapshot. For each dependency-ready
+Freya includes a first-class orchestration layer. New production runs enter
+`control_center/orchestrator.py` and pass through the tool-free
+`control_center/task_spec.py` Task Analyst. It records one versioned
+`CanonicalTaskSpec`: the objective, deliverables, sourced requirements,
+constraints, decisions, assumptions and validation expectations. Missing
+high-impact choices put the existing run in `NeedsClarification`; the Planner
+and workers do not start. Answers are stored against structured questions and
+update the same run. A ready Task Spec is the sole downstream intent source.
+`control_center/planner.py` decides the work strategy and
+`control_center/plan_compiler.py` assigns internal IDs, criterion links and
+dependency graph metadata before the immutable plan snapshot is saved.
+For each dependency-ready
 task, `control_center/agent_factory.py` creates a validated ephemeral agent from
 the task type, required capabilities and enabled Skill registry. The complete
 policy denies every undeclared capability, dangerous requirements remain
@@ -52,15 +56,12 @@ browser → HTTP API → SQLite
                                               capability resolver → policy engine → tools → workspace
 ```
 
-The Task Analyst rewrites **what the user meant** without executing anything;
-its validated operational prompt is authoritative for execution and the human
-prompt remains available only for audit. Deterministic reconciliation prevents
-schema-valid contradictions such as ignoring interactive input, assigns a
-canonical internal `task_kind`, and makes one structured repair attempt when a
-model response is blocked without a valid reason. The Planner determines **what**
-work exists and derives safe verification needs: writes normally include
-`filesystem.read`, while Python Hello World includes `execution.python_script`;
-`filesystem.overwrite` is never added unless the task requires it. The Agent Factory determines
+The Task Analyst determines **what** the user wants and whether a material
+question remains. Its output cannot choose agents, tools, capabilities, Skills
+or dependencies. The Planner determines **how** to accomplish the canonical
+Task Spec, including task count, capabilities and validation. The Plan Compiler
+generates runtime IDs and verifies all references and cycles.
+The Agent Factory determines
 **who** executes each planned task by constructing a task-specific identity,
 Skill set and least-privilege policy. The Agent Selector independently validates
 and classifies that candidate before dispatch. The deterministic Execution Graph determines **when** dependency-ready
@@ -156,18 +157,20 @@ events build the reconstructable timeline while every attempt remains in `log_ev
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
 
-Planning has explicit `Planning` and `Planned` states and emits
-`freya.planning.started`, `freya.plan.created`, or `freya.planning.failed`.
-An Analyst result with `ready_for_execution=false` is a hard gate: Freya emits
-`freya.task_analysis.blocked` with its `blocking_reason` and stops before plan,
-workspace, or delegation creation. The operational brief remains task context;
-workers must not invent a hidden brief file or an implicit artifact producer.
-The planner also collapses short linear create/write/verify workflows for one file-like artifact into a single implementation task. If the Analyst marks user input or interactive validation, it appends one dependent `qa-interactive-test` node with `interactive-testing`; QA may execute supported Python with bounded stdin but cannot modify files. For code/file mutation plans it then appends exactly one dependent, read-only `code-audit` task with the `code-review` Skill, so ordering is implementation → QA when required → Code Auditor. The created event contains only the goal, complexity, task count, task IDs and
-schema version; the complete plan stays in its orchestration snapshot.
-For an Analyst-confirmed simple, non-interactive program/script/file creation
-with one implementation task and no audit/review criterion, the planner keeps
-the implementation task as the complete plan; this bounded fast path avoids
-inventing a second verification actor without changing capability policy.
+Production runs transition `Queued → Analyzing → NeedsClarification` when
+the Analyst must ask the user. Each response returns that same run to
+`Analyzing`. A user change to a ready spec may create a new version while
+planning has not yet saved its immutable plan. The old in-flight plan is
+fenced by the Task Spec snapshot; changes after plan creation are rejected. A ready Task Spec enters `Planning → Planned`; no plan or worker
+exists while clarification is pending. The Task Spec and its revisions are
+persisted before planning; responses are stored separately from approvals.
+Events include `task_analysis.started`, `task_analysis.updated`,
+`task_analysis.clarification_required`,
+`task_analysis.clarification_received`, and `task_analysis.ready`.
+The Planner emits `freya.planning.started` and `freya.plan.created`.
+Workers receive only a deterministic rendering of the Task Spec plus their
+compiled task step. The planner may add controlled Python QA for an interactive
+calculator; a simple task need not create an auditor.
 Agent construction emits `freya.agent_factory.started`, `freya.agent_created`
 and `freya.agent_policy.validated`; construction errors emit
 `freya.agent_factory.failed`. Lifecycle cleanup emits
@@ -208,129 +211,38 @@ record proposed, normalized, collided, and final new task IDs.
 
 
 ```text
-Queued → Planning → Planned → Running → Integrating → Success
-                                  ↑          │
-                                  └──────────┘ append-only global recovery
-                                             └→ Failed | Cancelled
+Queued → Analyzing → NeedsClarification ──answer──→ Analyzing
+                   └→ Planning → Planned → Running → Integrating → Success
+                                        ↑                     │
+                                        └─────────────────────┘ append-only recovery
 ```
 
-`Queued`, `Planning`, `Planned`, `Running` and `Integrating` are active. Terminal states never
-become active again. The orchestrator serializes cancellation with task
-submission; after cancellation returns, no later plan, event or delegation can
-appear. Repeated cancellation of a terminal run is idempotent. Startup atomically
-changes abandoned active runs to `Failed`, preserves their plan and writes one
-`freya.interrupted` event; repeating recovery produces no duplicate event.
+`NeedsClarification` survives a server restart and can be cancelled. In-flight
+analysis and execution are interrupted on restart. Terminal states are final.
+Cancellation serializes with planning and delegation.
 
 ## Structured planning
 
-### Prompt interpretation
+### Canonical intent and semantic compilation
 
-`task_analyst.py` validates a version-3 bounded JSON result containing the
-self-contained `operational_prompt`, explicit and inferred requirements,
-assumptions, risks, task characteristics, a
-recommended role, acceptance criteria and validation strategy. The orchestrator
-selects one enabled agent with `config.orchestration_role=task_analyst`; older
-agents named or described as “Task Analyst” / “Analyst Planner” remain
-discoverable through a compatibility fallback. It emits
-`freya.task_analysis.started` and `freya.task_analysis.completed` before
-planning. If no enabled Analyst exists, Freya emits a deterministic operational
-brief rather than bypassing the phase.
-The analyst adapter calls loopback Ollama with `tools=[]`, and a deterministic
-interpretation is used if the model is unavailable. A standalone
-`program_creation` request without a named language receives an explicit
-Python 3.10+ assumption; a language named by the user is preserved. Other
-missing-input blockers remain fail-closed. Deterministic facts can only
-strengthen model characteristics and required interactive validation;
-corrections are logged in `corrected_fields`. The role does not grant
-capabilities, and a Skill is optional guidance only—not the routing or security
-mechanism. Cancellation is rechecked after this phase so a late analyst result
-cannot start a planner call or resurrect a terminal orchestration.
+`task_spec.py` validates Task Spec schema version 1 and sequential revisions.
+Each requirement, deliverable and constraint has an `explicit`, `clarified`
+or `assumed` source. Questions have a generated ID, question, reason, field
+and required flag. The Analyst asks only about material ambiguity without a
+safe default; internal engineering decisions stay with Planner and workers.
+A malformed model response gets one bounded repair attempt. If the model
+fails, conservative deterministic analysis keeps vague requests pending
+instead of inventing requirements. The legacy version-3
+`task_analyst.py` contract remains for injected compatibility adapters.
 
-The Analyst normalizes missing, malformed or duplicate requirement IDs into
-unique `REQ-N` values and acceptance IDs into unique `AC-N` values. An
-acceptance criterion's `verifies` list must resolve to known requirements;
-ambiguous references to duplicated source IDs fail before planning.
-
-Plan schema version 1 requires a goal, summary, `simple` or `multi_step`
-complexity, global success criteria and one to twenty tasks. Every task has a
-normalized unique ID, objective, description, dependencies, required
-capabilities, preferred Skills and success criteria. `criterion_links` records
-stable global and local criterion IDs and explicit local-to-global references.
-Model shorthand `T-N` task IDs become `task-N` in task rows, dependencies and
-local links before validation.
-The plan's `success_criteria` list is authoritative: omitted global link rows are
-filled in that order. An Analyst AC ID or description used as a global-row
-placeholder is removed only when its local references uniquely match concrete
-plan criteria by text. Extra, duplicate or unrelated rows fail validation.
-The harness assigns deterministic `gc-N` / `tc-<task>-N` IDs to missing, blank
-or duplicate criterion IDs before final validation while preserving valid unique
-IDs. Model-supplied `AC-N` and `LC-N` IDs are normalized to the plan's lowercase
-identifier convention; supplied `AC-N` global links use generated `ac-N` and
-`lc-N` IDs for missing or conflicting entries.
-Global and local IDs cannot collide. A copied global criterion is scoped to the
-task's concrete check when that mapping is unique; unknown references are
-repaired only from an unambiguous text match. References to duplicated source
-global IDs use the same rule; ambiguous substitutions and
-references still fail the original local-link validation. New model plans with
-explicit links must cover every executable global criterion with a local link;
-reuse of an Analyst `AC-N` ID additionally requires matching that Analyst's
-criterion text. Only normalized, validated plans reach graph initialization;
-structural criteria and legacy plans retain their existing proof rules. Legacy
-plans infer links only from exact matching text. Corrections emit one compact
-`freya.planner.normalized` event with assignment and duplicate counts. Validation
-rejects unknown fields, wrong types, empty or excessive content, unknown
-capabilities, missing dependencies, self-dependencies and cycles. A depth-first
-traversal validates the complete dependency graph before persistence.
-Complexity is canonicalized from task count: one task is `simple`; two or more
-are `multi_step`.
-
-Production uses `OllamaPlanner` through the shared `transport.py` chat client.
-It calls the validated loopback `/api/chat` endpoint with no tools,
-`stream=true`, `think=false`, temperature `0.1`, an explicit JSON Schema and
-8192 context tokens. The client reconstructs the usual single response object
-from Ollama's streamed messages, so plan validation and one repair still use
-the same contract. Planner output is capped at 4096 tokens (2048 for repair).
-Defaults are model `qwen2.5-coder:7b`, endpoint `http://127.0.0.1:11434`,
-120 seconds of inactivity and a 600-second hard ceiling. The CLI timeout
-overrides inactivity, not the hard ceiling. Endpoint validation remains
-loopback-only.
-
-All production `/api/chat` callers (Analyst, Planner, Worker, Evaluator,
-Recovery and Integration) use the same streamed transport. `MODEL_PROFILES` in
-`transport.py` defines connect, inactivity and hard timeouts plus normal and
-repair output limits for each component. A stream that keeps delivering bytes
-may outlive the inactivity limit, but never its hard ceiling or the Worker's
-remaining task deadline. Connection refusal opens a five-second circuit for
-that provider origin; slow generation does not. The transport classifies
-unreachable provider, no-response timeout, generation timeout, HTTP error and
-invalid response separately. It emits body-free call metrics including connect
-and first-token timing, token counts, stop reason and timeout kind. Component
-metrics and Worker events retain these details without storing prompts or
-credentials. Planner and other fail-closed stages still fail on provider or
-invalid-response errors; Task Analyst preserves its deterministic fallback.
-
-The model receives only the current goal, platform capability catalogue,
-compact agent summaries and compact Skill summaries (bounded to 100 agents and
-200 Skills). It receives no Skill procedures, logs, task outputs, secret
-configuration or previous results. Its output must be a JSON object; one
-controlled repair call is allowed, then planning fails explicitly. Provider
-errors never fall back silently. Deterministic one-task planning exists only for
-tests and the explicit `--planner-offline` mode. Planner calls are serialized per
-orchestrator so concurrent runs cannot mix provider metrics; cancellation uses a
-separate lifecycle lock and remains responsive while a planner call is pending.
-
-`tools.py` supports optional `stdin` only on the restricted Python branch of
-`run_command`, capped at 16,000 characters and never through a shell. Without
-stdin, child stdin is closed, so an accidental `input()` raises immediately with
-`interactive_input_required` instead of waiting until orchestration timeout.
-Three consecutive denied or repeatedly blocked actions trigger
-`task.blocked`; Freya then evaluates/replans or reports the cause. Graph timeouts
-also pass through the persisted logs-only failure-analysis path.
-
-Preferred Skills remain unvalidated semantic hints so planning is not coupled
-to the mutable Skill registry. Required capabilities must exist in the platform
-registry, but remain declarations: the planner never edits agent configuration
-or policy. Replanning never grants capabilities and revalidates the complete effective plan.
+`Planner.create_plan_for_spec` receives the canonical Task Spec. Its model
+output describes semantic task keys, dependencies, required capabilities,
+preferred Skills and local checks. `plan_compiler.py` assigns task and
+criterion IDs, resolves dependencies, rejects unknown references and cycles,
+then produces the existing durable plan schema. The source human prompt is
+retained for audit and omitted from Planner context; a worker sees a
+deterministic rendering of the ready Task Spec. Capability Policy remains the
+only permission authority.
 
 ## Execution graph and scheduling
 
@@ -716,8 +628,11 @@ prevents later actions from relying on invented tool results.
 ## Capability authorization
 
 `capabilities.py` is the registry and `CapabilityResolver` maps each tool call
-to one concrete action. `write_file` becomes `filesystem.create` or
-`filesystem.overwrite` after inspecting the workspace target; `run_command`
+to one concrete action. `PolicyToolbox` checks an in-scope `write_file` target
+for exact UTF-8 byte equality before policy classification. A match returns an
+`already_satisfied` no-op with `changed=false`, no overwrite capability, and no
+workspace mutation; different bytes remain `filesystem.overwrite` and use normal
+policy. `run_command`
 maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
 actions. `policy.py` validates the per-agent JSON policy and returns explicit
 `allow`, `deny`, or `approval_required` decisions. Allow and ask rules are the only source used to derive the model-visible tool list; stale legacy tool selections cannot expose a capability. Deny and approval results never invoke the underlying tool. Filesystem rules support paths, extensions and max_bytes for every filesystem action. Agents with
@@ -769,19 +684,24 @@ output is strictly validated as summary/actions/artifacts/verification/limitatio
 Any invalid structured response, including prose, receives one repair attempt.
 If fallback normalization is needed, `task.result_contract` logs a bounded,
 sanitized preview and repair details; format failure stays separate from task
-limitations and objective success. Verification state is persisted separately.
+limitations and objective success. Runtime exceptions skip model repair and
+build the factual contract from the action ledger, artifacts, verification,
+workspace diffs and failure class. Verification state is persisted separately.
 
 The worker classifies recoverable, environment, policy, approval, invalid,
-unavailable and unknown-tool requests. A repeated policy denial with the same
-tool, capability and arguments is intercepted before the underlying tool is
-invoked again and is recorded as `repeated_policy_denied`; an unregistered name
-is `unknown_tool`, while a registered but unassigned name is `tool_unavailable`.
-Neither emits a false capability request. `BlockedActionCycle` counts blocked
-model decisions, not internal retries, so three distinct/repeated blocked
-decisions still stop the worker. If structured
-model output is malformed, the worker merges the runtime actions, artifacts,
-workspace diffs and verification evidence into the explicit fallback result
-instead of discarding technical work.
+unavailable and unknown-tool requests. A fingerprint includes tool, capability,
+normalized target and material arguments. After a denial, the worker rechecks
+current policy state; an unchanged denied fingerprint receives
+`ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE` without invoking the tool or
+charging another tool call. A changed target/argument or policy state can proceed
+through normal authorization. Repeating that local block terminates as
+`BlockedActionCycle`; distinct blocked actions retain the bounded cycle guard.
+An unregistered name is `unknown_tool`, while a registered but unassigned name
+is `tool_unavailable`. Neither emits a false capability request. Successful
+commands become verification evidence only when their exit/output directly
+supports configured completion criteria. Once the action ledger contains a
+created artifact and evidence for every configured criterion, an already-
+satisfied duplicate write can end the task without consuming more model steps.
 
 ## Feature scope
 

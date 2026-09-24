@@ -19,7 +19,7 @@ function skillContextPreview(skill) {
 }
 
 const FREYA_ACTIVE_STATUSES = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating', 'WaitingForApproval', 'Paused']);
-const FREYA_ORCHESTRATION_ACTIVE = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating']);
+const FREYA_ORCHESTRATION_ACTIVE = new Set(['Queued', 'Analyzing', 'NeedsClarification', 'Planning', 'Planned', 'Running', 'Integrating']);
 
 function freyaHistoryEntry(kind, id, data, agent) {
   const existing = state.freyaHistory.find(item => item.kind === kind && item.id === id);
@@ -71,7 +71,7 @@ function freyaRunRow(item) {
   const run = item.run || {}, active = FREYA_ORCHESTRATION_ACTIVE.has(run.status);
   const startedAt = run.created_at, elapsed = active && startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : Number(run.duration_seconds) || 0;
   const failed = run.status === 'Failed', failure = failed ? taskTitle(uiText(run.error || run.response || 'Failure cause unavailable.'), 120) : '';
-  const action = active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<a class="text-link" href="#/logs?orchestration_id=' + encodeURIComponent(run.id || '') + '">' + (failed ? 'Diagnosis' : 'Logs') + ' ' + icon('arrow') + '</a>';
+  const action = run.status === 'NeedsClarification' ? '<a class="text-link" href="#freya-clarification-' + esc(run.id) + '">Responder</a>' : active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<a class="text-link" href="#/logs?orchestration_id=' + encodeURIComponent(run.id || '') + '">' + (failed ? 'Diagnosis' : 'Logs') + ' ' + icon('arrow') + '</a>';
   return [
     '<tr>',
     '<td>' + badge(run.status || 'Pending') + '</td>',
@@ -117,11 +117,15 @@ export async function freya() {
     return freyaStartedAt(b) - freyaStartedAt(a);
   });
   const activeCount = rows.filter(item => item.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(item.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(item.run.status)).length;
+  const clarificationForms = state.orchestrations.filter(run => run.status === 'NeedsClarification' && run.task_spec?.clarification_questions?.length).map(run =>
+    '<section class="panel" id="freya-clarification-' + esc(run.id) + '"><h2>Freya necesita aclarar</h2><p class="small muted">' + esc(taskTitle(run.prompt)) + '</p><form class="stack-form freya-clarification-form" data-run-id="' + esc(run.id) + '">' +
+    run.task_spec.clarification_questions.map(question => '<label for="' + esc(run.id + '-' + question.id) + '">' + esc(question.question) + '</label><textarea id="' + esc(run.id + '-' + question.id) + '" name="' + esc(question.id) + '" rows="2" maxlength="4000" ' + (question.required ? 'required' : '') + '></textarea>').join('') +
+    '<button class="button primary" type="submit">Responder y continuar</button></form></section>').join('');
   const table = rows.length ? '<div class="table-wrap"><table class="freya-current-table" aria-label="Freya task history"><thead><tr><th>STATUS</th><th>TASK</th><th>AGENT</th><th>STARTED</th><th>ELAPSED</th><th>TOKENS</th><th>MODEL CALLS</th><th></th></tr></thead><tbody>' + rows.map(item => item.kind === 'task' ? freyaTaskRow(item) : freyaRunRow(item)).join('') + '</tbody></table></div>' : '<div class="freya-empty-live">No task is running right now. Assign a task to start live activity.</div>';
   const label = activeCount ? activeCount + ' active · ' + rows.length + ' total' : rows.length ? rows.length + ' completed' : 'Idle';
   return heading('Freya', 'Tell Freya what you need and it will coordinate the available agents.', '', 'ORCHESTRATOR') +
     '<section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want...">' + esc(state.freyaDraft.prompt || '') + '</textarea><label for="freya-workspace">Workspace folder (existing files)</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="' + esc(state.freyaDraft.workspace_path || '') + '" placeholder="Select an existing folder, or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><p class="small muted workspace-help">A selected folder is used directly, so Freya can act on its existing files. Leave it empty to create an isolated workspace.</p><button class="button primary" type="submit">Ask Freya</button></form></section>' +
-    '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>';
+    clarificationForms + '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>';
 }
 export function dashboard() {
   const m = state.metrics || {}, h = state.health || {}, system = h.system || {};

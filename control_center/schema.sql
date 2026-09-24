@@ -153,10 +153,26 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
     plan_schema_version INTEGER,
     plan_created_at TEXT,
     planning_metrics_json TEXT NOT NULL DEFAULT '{}',
+    task_spec_json TEXT,
     effective_plan_json TEXT,
     current_plan_revision INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orchestration_task_specs (
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    version INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (orchestration_id, version)
+);
+CREATE TABLE IF NOT EXISTS orchestration_clarification_answers (
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    spec_version INTEGER NOT NULL,
+    question_id TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (orchestration_id, spec_version, question_id)
 );
 CREATE TABLE IF NOT EXISTS orchestration_selections (
     id TEXT PRIMARY KEY,

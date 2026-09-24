@@ -536,7 +536,7 @@ class OllamaPlanner:
                          json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))},
                     ],
                     "tools": [],
-                    "format": PLAN_RESPONSE_FORMAT,
+                    "format": "json" if context.get("_semantic_plan") else PLAN_RESPONSE_FORMAT,
                     "stream": False,
                     "think": False,
                     "options": {
@@ -630,6 +630,18 @@ def _ensure_stable_ids(items: list[dict[str, Any]], *, structure: str,
                        forbidden_ids: set[str] | None = None,
                        diagnostics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Preserve valid unique IDs and deterministically fill absent or conflicting IDs."""
+    identifiers, assigned, duplicates_resolved = _stable_id_values(
+        items, structure=structure, id_factory=id_factory, forbidden_ids=forbidden_ids,
+    )
+    normalized = [dict(item, id=identifier) for item, identifier in zip(items, identifiers)]
+    _record_stable_id_diagnostics(diagnostics, structure, assigned, duplicates_resolved)
+    return normalized
+
+
+def _stable_id_values(items: list[dict[str, Any]], *, structure: str,
+                      id_factory: Callable[[int, int], str],
+                      forbidden_ids: set[str] | None = None) -> tuple[list[str], int, int]:
+    """Calculate stable IDs without mutating items or recording diagnostics."""
     normalized = [dict(item) for item in items]
     identifiers: list[str | None] = [None] * len(normalized)
     seen: set[str] = set(forbidden_ids or ())
@@ -683,17 +695,21 @@ def _ensure_stable_ids(items: list[dict[str, Any]], *, structure: str,
         assigned += 1
         next_sequence += 1
 
-    if diagnostics is not None and (assigned or duplicates_resolved):
-        details = diagnostics.setdefault("stable_ids", {
-            "assigned": 0, "duplicates_resolved": 0, "structures": {},
-        })
-        details["assigned"] += assigned
-        details["duplicates_resolved"] += duplicates_resolved
-        details["structures"][structure] = {
-            "assigned": assigned, "duplicates_resolved": duplicates_resolved,
-        }
-    return normalized
+    return [str(item["id"]) for item in normalized], assigned, duplicates_resolved
 
+
+def _record_stable_id_diagnostics(diagnostics: dict[str, Any] | None, structure: str,
+                                  assigned: int, duplicates_resolved: int) -> None:
+    if diagnostics is None or not (assigned or duplicates_resolved):
+        return
+    details = diagnostics.setdefault("stable_ids", {
+        "assigned": 0, "duplicates_resolved": 0, "structures": {},
+    })
+    details["assigned"] += assigned
+    details["duplicates_resolved"] += duplicates_resolved
+    details["structures"][structure] = {
+        "assigned": assigned, "duplicates_resolved": duplicates_resolved,
+    }
 
 def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[str, Any]],
                                diagnostics: dict[str, Any] | None = None, *,
@@ -737,12 +753,30 @@ def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[s
                             if count > 1}
     use_ac_namespace = any(re.fullmatch(r"AC-[1-9][0-9]*", str(entry.get("id") or "").strip(), re.I)
                            for entry in global_entries)
-    normalized_global = _ensure_stable_ids(
-        global_entries, structure="criterion_links.global",
-        id_factory=lambda _index, sequence: (
-            f"ac-{sequence}" if use_ac_namespace else f"gc-{sequence}"
-        ), diagnostics=diagnostics,
+    global_id_factory = lambda _index, sequence: (
+        f"ac-{sequence}" if use_ac_namespace else f"gc-{sequence}"
     )
+    normalized_ids, assigned, duplicates_resolved = _stable_id_values(
+        global_entries, structure="criterion_links.global", id_factory=global_id_factory,
+    )
+    # Construct one old->new mapping before rewriting any row or reference.
+    # Duplicate source IDs are intentionally omitted: they cannot identify one
+    # target, so only the existing exact wording relationship may disambiguate.
+    global_id_mapping: dict[str, str] = {}
+    for index, (entry, normalized_id) in enumerate(zip(global_entries, normalized_ids)):
+        raw_id = entry.get("id")
+        if isinstance(raw_id, str):
+            try:
+                old_id = _identifier(raw_id, f"global criterion {index} id")
+            except PlanValidationError:
+                old_id = None
+            if old_id is not None and raw_global_id_counts.get(old_id) == 1:
+                global_id_mapping[old_id] = normalized_id
+        entry["id"] = normalized_id
+    _record_stable_id_diagnostics(
+        diagnostics, "criterion_links.global", assigned, duplicates_resolved,
+    )
+    normalized_global = global_entries
     global_ids = set()
     for index, criterion in enumerate(criteria):
         item = normalized_global[index]
@@ -827,19 +861,30 @@ def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[s
 
     for index, item in enumerate(parsed_local):
         supports = item["supports_global_criteria"]
-        if any(ref in ambiguous_global_ids for ref in supports):
-            source_global_id = source_global_ids[index]
-            if len(supports) == 1 and source_global_id is not None:
-                item["supports_global_criteria"] = [source_global_id]
+        source_global_id = source_global_ids[index]
+        remapped_supports = []
+        for ref in supports:
+            if ref in global_id_mapping:
+                remapped_supports.append(global_id_mapping[ref])
+            elif ref in ambiguous_global_ids:
+                if len(supports) == 1 and source_global_id is not None:
+                    remapped_supports.append(source_global_id)
+                else:
+                    raise PlanValidationError(
+                        "Local criterion links reference an ambiguous global criterion ID."
+                    )
+            elif ref in global_ids:
+                # Already-normalized references remain unchanged.
+                remapped_supports.append(ref)
+            elif len(supports) == 1 and source_global_id is not None:
+                # Exact normalized wording is the model's existing structural
+                # relation. Do not infer identity from arbitrary text similarity.
+                remapped_supports.append(source_global_id)
             else:
-                raise PlanValidationError("Local criterion links reference an ambiguous global criterion ID.")
-            continue
-        if any(ref not in global_ids for ref in supports):
-            source_global_id = source_global_ids[index]
-            if len(supports) == 1 and source_global_id is not None:
-                item["supports_global_criteria"] = [source_global_id]
-            else:
-                raise PlanValidationError("Local criterion links reference an unknown global criterion ID.")
+                raise PlanValidationError(
+                    "Local criterion links reference an unknown global criterion ID."
+                )
+        item["supports_global_criteria"] = list(dict.fromkeys(remapped_supports))
     normalized_local = _ensure_stable_ids(
         parsed_local, structure="criterion_links.local",
         id_factory=lambda index, sequence: (
@@ -1336,3 +1381,81 @@ class Planner:
                 raise PlanGenerationError(
                     f"Planner output remained invalid after one repair attempt: {second_error}"
                 ) from second_error
+
+    def create_plan_for_spec(self, task_spec: dict[str, Any],
+                             context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Plan HOW from canonical intent, then compile runtime identifiers."""
+        from .plan_compiler import compile_semantic_plan
+        from .task_spec import render_task_spec, validate_task_spec
+
+        spec = validate_task_spec(task_spec)
+        if spec["status"] != "READY_FOR_PLANNING":
+            raise PlanGenerationError("Task Spec is not ready for planning.")
+        self._reset_metrics()
+        public_spec = {key: value for key, value in spec.items()
+                       if key not in {"source_prompt", "clarification_history", "clarification_questions"}}
+        limited_context = {**(context or {}), "task_spec": public_spec, "_semantic_plan": True}
+        capability_ids = [item.get("id") for item in limited_context.get("capabilities", [])
+                          if isinstance(item, dict)]
+        skill_ids = [item.get("id") for item in limited_context.get("skills", [])
+                     if isinstance(item, dict)]
+        request = (
+            "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
+            "success_criteria and tasks. Each task has a meaningful key, objective, description, "
+            "depends_on (semantic task keys), required_capabilities, preferred_skills and "
+            "success_criteria. Do not supply runtime IDs, criterion IDs, criterion links, "
+            "execution nodes or UUIDs; Freya compiles those deterministically. Use the fewest "
+            "workers needed. Decide implementation, controlled QA, research and audit only when "
+            "justified. No task may reinterpret the original human prompt. Capabilities describe "
+            "requirements and do not grant permission. Available capabilities: "
+            + json.dumps(capability_ids, ensure_ascii=False) + ". Available Skills: "
+            + json.dumps(skill_ids, ensure_ascii=False) + ". Canonical Task Spec: "
+            + render_task_spec(spec)
+        )
+        if self.decide is None:
+            if not self.offline:
+                raise PlanGenerationError("No planner model is configured.")
+            objective = spec["objective"]
+            lower = objective.casefold()
+            programming = any(word in lower for word in ("calculadora", "calculator", "programa", "script"))
+            capabilities = ["filesystem.create", "filesystem.read"] if programming else ["filesystem.read"]
+            if programming and "python" in lower:
+                capabilities.append("execution.python_script")
+            semantic = {"summary": objective, "tasks": [{
+                "key": "implement", "objective": objective,
+                "description": "Complete the specified deliverable in the selected workspace and verify it.",
+                "depends_on": [], "required_capabilities": capabilities,
+                "preferred_skills": [], "success_criteria": [
+                    "The requested artifact exists and can be inspected."],
+            }]}
+            self.metrics["mode"] = "deterministic"
+        else:
+            try:
+                semantic = self._call(request, limited_context)
+            except Exception as exc:
+                raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
+        for attempt in range(2):
+            try:
+                value = json.loads(semantic) if isinstance(semantic, str) else semantic
+                plan = compile_semantic_plan(value, spec)
+                objective = spec["objective"].casefold()
+                if ("python" in objective and any(word in objective for word in
+                    ("calculadora", "calculator"))):
+                    plan = _append_qa_task(plan, {"task_characteristics": {"requires_user_input": True}})
+                    behavior_globals = [item["id"] for item in plan["criterion_links"]["global"]
+                                        if any(word in item["criterion"].casefold() for word in
+                                               ("output", "input", "resultado", "suma", "sum", "correct"))]
+                    for link in plan["criterion_links"]["local"]:
+                        if (link["task_id"].startswith("qa-interactive-test")
+                                and "output is logically correct" in link["criterion"].casefold()):
+                            link["supports_global_criteria"] = list(dict.fromkeys([
+                                *link["supports_global_criteria"], *behavior_globals]))
+                self.metrics["semantic_compiler"] = {
+                    "task_ids": [task["id"] for task in plan["tasks"]],
+                    "global_criteria": len(plan["success_criteria"])}
+                return validate_plan(plan)
+            except (ValueError, TypeError, PlanValidationError) as exc:
+                if attempt or self.decide is None:
+                    raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
+                repair = request + "\nRepair this semantic plan without adding internal IDs. Error: " + str(exc)
+                semantic = self._call(repair, {**limited_context, "_freya_repair": True})

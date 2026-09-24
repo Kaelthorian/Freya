@@ -246,6 +246,19 @@ class Application:
             if workspace:
                 workspace = normalize_workspace_path(workspace)
             return 201, self.orchestrator.submit(prompt.strip(), workspace)
+        if method == "POST" and len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "clarifications":
+            if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
+            answers = body.get("answers") if isinstance(body, dict) else None
+            if not isinstance(answers, dict):
+                raise ValueError("Clarification answers must be an object.")
+            return 200, self.orchestrator.answer_clarification(parts[1], answers)
+        if method == "POST" and len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "revise-spec":
+            if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
+            if not isinstance(body, dict):
+                raise ValueError("Task Spec revision must be an object.")
+            return 200, self.orchestrator.revise_task_spec(
+                parts[1], field=body.get("field"), value=body.get("value"),
+                user_message=body.get("user_message"))
         if method == "POST" and len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "cancel":
             if not self.orchestrator: raise ApiError(503, "Freya orchestrator is unavailable.")
             return 200, self.orchestrator.cancel(parts[1])

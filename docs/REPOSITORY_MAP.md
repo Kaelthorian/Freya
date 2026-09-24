@@ -11,8 +11,10 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
-│   ├── task_analyst.py       versioned tool-free rewrite, REQ/AC references, language assumptions and deterministic reconciliation
-│   ├── planner.py            plan schema, distinct global/local IDs, criterion links and coverage, recovery ID allocation and fallback
+│   ├── task_spec.py          canonical intent, clarification questions, revisions and deterministic rendering
+│   ├── task_analyst.py       legacy version-3 rewrite compatibility
+│   ├── planner.py            semantic strategy and legacy plan schema compatibility
+│   ├── plan_compiler.py      deterministic task/criterion IDs, semantic dependencies and DAG validation
 │   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
@@ -23,7 +25,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── integration_orchestrator.py integration lifecycle and verifier validation events
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
-│   ├── worker.py             bounded Ollama/tool loop, response repair diagnostics and per-agent policy
+│   ├── worker.py             bounded Ollama/tool loop, action fingerprints, verification ledger and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── storage.py            transactional SQLite repository and metrics
@@ -59,15 +61,15 @@ selects them.
 
 1. `frontend/` calls `control_center/http.py`, which applies same-origin and
    loopback Host checks before dispatching to `api.py`.
-2. `api.py` validates agents and browses local folders. `orchestrator.py` first
-   sends the human prompt to the enabled Task Analyst through `task_analyst.py`
-   without tools. The validated version-3 `operational_prompt` is reconciled
-   against deterministic facts and replaces the human wording downstream; the
-   human prompt remains stored only as audit evidence. Freya sends that brief
-   and its structured constraints through the loopback Ollama
-   adapter in `planner.py`; `orchestrator.py` stores the validated plan snapshot
-   atomically. Interactive work receives an independent QA node using bounded
-   Python stdin, and mutation work ends with a read-only Code Auditor node.
+2. `api.py` validates agents and receives task requests. Production
+   `orchestrator.py` asks `task_spec.py` to derive a canonical Task Spec.
+   High-impact gaps persist `NeedsClarification` questions and pause the
+   same run; `POST /orchestrations/{id}/clarifications` stores answers and
+   resumes analysis. A ready Task Spec is rendered deterministically and
+   passed to `planner.py`, whose semantic task output is compiled by
+   `plan_compiler.py` into the existing durable plan and DAG. Planner decides
+   whether QA or audit is needed. The legacy `task_analyst.py` contract is
+   retained for injected compatibility adapters.
    `execution_graph.py` releases ready tasks in plan order. Low-risk generic file
    and Python artifact requests remain one task; the Planner derives read-back
    and Python execution needs without adding audit/QA. For each ready task,
@@ -85,9 +87,10 @@ selects them.
    Runtime command output that directly satisfies an observable completion
    criterion is promoted to bounded verification evidence and can satisfy that
    exact criterion deterministically. Invalid structured final text receives
-   one repair attempt; `task.result_contract` logs sanitized format diagnostics,
-   while `freya.evaluation.completed` logs criterion decisions and bounded
-   input evidence for non-accepted outcomes.
+   one repair attempt; runtime exceptions instead build a factual contract from
+   the action ledger without model repair. `task.result_contract` logs sanitized
+   diagnostics, while `freya.evaluation.completed` logs criterion decisions and
+   bounded input evidence for non-accepted outcomes.
    The worker also stops duplicate writes after successful read-back and reports
    missing-file reads without repeating them unchanged; semantic recovery then
    fails deterministic absent-artifact inputs instead of rotating agents.

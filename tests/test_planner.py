@@ -274,6 +274,76 @@ class PlannerValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "ambiguous global criterion ID"):
             validate_plan(raw)
 
+    def test_normalized_global_id_and_legacy_local_reference_stay_linked(self):
+        raw = plan(success_criteria=["A"], criterion_links={
+            "global": [{"id": "Criteria_Foo", "criterion": "A"}],
+            "local": [{"id": "lc-1", "task_id": "task-1",
+                       "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["Criteria_Foo"]}],
+        })
+        result = normalize_plan(raw)
+        global_ids = {item["id"] for item in result["criterion_links"]["global"]}
+        self.assertEqual(global_ids, {"criteria-foo"})
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"],
+                         ["criteria-foo"])
+        self.assertTrue(all(set(item["supports_global_criteria"]) <= global_ids
+                            for item in result["criterion_links"]["local"]))
+
+    def test_multiple_local_links_keep_one_normalized_global_reference(self):
+        raw = plan(tasks=[task(success_criteria=["First check", "Second check"])],
+                   success_criteria=["A"], criterion_links={
+            "global": [{"id": "GC_001", "criterion": "A"}],
+            "local": [
+                {"task_id": "task-1", "criterion": "First check",
+                 "supports_global_criteria": ["GC_001"]},
+                {"task_id": "task-1", "criterion": "Second check",
+                 "supports_global_criteria": ["gc-001"]},
+            ],
+        })
+        result = normalize_plan(raw)
+        self.assertEqual([item["supports_global_criteria"]
+                          for item in result["criterion_links"]["local"]],
+                         [["gc-001"], ["gc-001"]])
+
+    def test_multiple_global_ids_are_normalized_without_merging_criteria(self):
+        criteria = ["First obligation", "Second obligation"]
+        raw = plan(success_criteria=criteria, criterion_links={
+            "global": [{"id": "GC_010", "criterion": criteria[0]},
+                       {"id": "GC_020", "criterion": criteria[1]}],
+            "local": [{"task_id": "task-1", "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["GC_010", "GC_020"]}],
+        })
+        result = normalize_plan(raw)
+        global_rows = result["criterion_links"]["global"]
+        self.assertEqual([item["criterion"] for item in global_rows], criteria)
+        self.assertEqual([item["id"] for item in global_rows], ["gc-010", "gc-020"])
+        self.assertEqual(result["criterion_links"]["local"][0]["supports_global_criteria"],
+                         ["gc-010", "gc-020"])
+
+    def test_unknown_local_global_reference_keeps_strict_validator_error(self):
+        raw = plan(criterion_links={
+            "global": [{"id": "gc-known", "criterion": "The requested outcome is complete."}],
+            "local": [{"task_id": "task-1", "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["gc-unknown"]}],
+        })
+        with self.assertRaisesRegex(
+                PlanValidationError,
+                "Local criterion links reference an unknown global criterion ID"):
+            validate_plan(raw)
+
+    def test_normalized_local_references_all_belong_to_global_ids(self):
+        raw = plan(success_criteria=["A", "B"], criterion_links={
+            "global": [{"id": "GC_1", "criterion": "A"},
+                       {"id": "GC_2", "criterion": "B"}],
+            "local": [{"task_id": "task-1", "criterion": "The task outcome is verified.",
+                       "supports_global_criteria": ["GC_1", "GC_2"]}],
+        })
+        result = normalize_plan(raw)
+        global_ids = {item["id"] for item in result["criterion_links"]["global"]}
+        self.assertTrue(all(ref in global_ids
+                            for item in result["criterion_links"]["local"]
+                            for ref in item["supports_global_criteria"]))
+
     def test_existing_global_id_is_preserved_and_reserved_before_assignment(self):
         criteria = ["A", "B"]
         raw = plan(success_criteria=criteria, criterion_links={

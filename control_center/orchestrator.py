@@ -27,6 +27,7 @@ from .skills import skill_summary
 from .task_analyst import (TaskAnalyst, reconciled_deterministic_task_analysis,
                             select_task_analyst)
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
+from .task_spec import TaskSpecAnalyst, render_task_spec, validate_task_spec
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -98,6 +99,54 @@ class Orchestrator(IntegrationOrchestrationMixin):
                          name="freya-orchestrator").start()
         return run
 
+    def answer_clarification(self, oid: str, answers: dict[str, str]) -> dict:
+        """Resume the same orchestration with answers to its pending questions."""
+        with self.lock:
+            run = self.store.record_clarification_answers(oid, answers)
+            self.store.add_orchestration_event(oid, {
+                "event_type": "task_analysis.clarification_received",
+                "status": "Analyzing", "spec_version": run["task_spec"]["version"],
+                "answers": [{"question_id": key, "answer": value} for key, value in answers.items()],
+                "message": "User answered the pending clarification questions.",
+            })
+        threading.Thread(target=self._run, args=(oid, dict(answers)), daemon=True,
+                         name="freya-clarification").start()
+        return run
+
+    def revise_task_spec(self, oid: str, *, field: str, value: str,
+                         user_message: str) -> dict:
+        """Replan a user change only while no immutable plan or worker exists."""
+        with self.lock:
+            run = self.store.revise_unplanned_task_spec(
+                oid, field=field, value=value, user_message=user_message)
+            spec = run["task_spec"]
+            self.store.add_orchestration_event(oid, {
+                "event_type": "task_analysis.updated", "status": "Queued",
+                "spec_version": spec["version"], "task_spec": spec,
+                "revision_change": spec["revision_changes"][-1],
+                "message": "User revised the ready Task Spec before planning.",
+            })
+        threading.Thread(target=self._run, args=(oid,), daemon=True,
+                         name="freya-spec-revision").start()
+        return run
+
+    def _analyze_task_spec(self, oid: str, run: dict, answers: dict[str, str]) -> tuple[dict, dict]:
+        analyst_agent = select_task_analyst(self.store.list_agents())
+        analyzer = self.task_analyst if hasattr(self.task_analyst, "analyze_spec") else TaskSpecAnalyst(offline=True)
+        previous = run.get("task_spec")
+        self.store.add_orchestration_event(oid, {
+            "event_type": "task_analysis.started", "status": "Analyzing",
+            "analysis_version": 1, "spec_version": previous["version"] if previous else 0,
+            "agent_id": analyst_agent["id"] if analyst_agent else None,
+            "message": "Task Analyst is updating the canonical user intent.",
+        })
+        spec = analyzer.analyze_spec(run["prompt"], analyst_agent, previous, answers)
+        spec = validate_task_spec(spec)
+        if spec["status"] == "ANALYZING":
+            raise ValueError("Task Analyst did not resolve the analysis state.")
+        metrics = dict(getattr(analyzer, "metrics", {}) or {})
+        return spec, metrics
+
     def _workspace_for_run(self, run: dict) -> str | None:
         """Return the one workspace shared by every node in an orchestration."""
         config = run.get("config") or {}
@@ -130,9 +179,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
     def _execution_prompt(operational_prompt: str, planned_task: dict,
                           attempt_prompt: str = "") -> str:
         """Send the Task Analyst's operational brief to every delegated worker."""
+        spec_text = str(operational_prompt or "").strip()
+        canonical = spec_text.startswith("{") and '"deliverables":' in spec_text
+        heading = ("CANONICAL TASK SPEC (authoritative user intent):\n" if canonical else
+                   "TASK ANALYST OPERATIONAL BRIEF (authoritative for execution):\n")
         sections = [
-            "TASK ANALYST OPERATIONAL BRIEF (authoritative for execution):\n"
-            + str(operational_prompt or "").strip(),
+            heading + spec_text,
             "DELEGATED PLAN STEP:\n" + str(planned_task.get("objective") or "").strip(),
         ]
         description = str(planned_task.get("description") or "").strip()
@@ -143,7 +195,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
             sections.append("Step success criteria:\n" + "\n".join("- " + str(item) for item in criteria))
         if attempt_prompt.strip():
             sections.append("RECOVERY INSTRUCTIONS:\n" + attempt_prompt.strip())
-        sections.append("Complete this step without inventing requirements outside the Task Analyst operational brief.")
+        sections.append("Complete this step without inventing requirements outside the " +
+                        ("Canonical Task Spec." if canonical else "Task Analyst operational brief."))
         return "\n\n".join(section for section in sections if section.strip())
 
     def _snapshot_delegation(self, delegation_id: str, task: dict) -> None:
@@ -591,7 +644,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             message = str(exc)
             metrics = planning_metrics or {}
             failed = self.store.transition_orchestration(
-                oid, ("Planning",), "Failed", error=message,
+                oid, ("Analyzing", "Planning"), "Failed", error=message,
                 planning_metrics=metrics,
             )
             if failed is None:
@@ -1569,7 +1622,146 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 continue
             self.wait(min(.2, max(0, deadline - self.clock())))
 
-    def _run(self, oid):
+    def _run(self, oid, answers: dict[str, str] | None = None):
+        # The injected legacy decision callback retains its historical test API.
+        if self.decide is not None:
+            return self._run_legacy(oid)
+        if (self.task_analyst is None or not hasattr(self.task_analyst, "analyze_spec")
+                or not hasattr(self.planner, "create_plan_for_spec")):
+            return self._run_with_legacy_analysis(oid)
+        started = self.clock()
+        deadline = started + float(self.config["max_wallclock_seconds"])
+        answers = answers or {}
+        with self.lock:
+            run = self.store.get_orchestration(oid)
+            reuse_ready = bool(run.get("task_spec") and
+                               run["task_spec"].get("status") == "READY_FOR_PLANNING")
+            if run["status"] == "Queued":
+                target = "Planning" if reuse_ready else "Analyzing"
+                run = self.store.transition_orchestration(oid, ("Queued",), target)
+            elif run["status"] != "Analyzing":
+                return
+        if run is None:
+            return
+        planning_metrics: dict = {}
+        try:
+            if reuse_ready:
+                spec = validate_task_spec(run["task_spec"])
+                analysis_metrics = {"mode": "user_revision", "model_calls": 0}
+                with self.lock:
+                    if self.store.get_orchestration(oid)["status"] != "Planning":
+                        return
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "task_analysis.ready", "status": "Planning",
+                        "spec_version": spec["version"],
+                        "readiness_reason": spec["readiness_reason"],
+                        "message": "Revised Task Spec is ready for replanning.",
+                    })
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.planning.started", "status": "Planning",
+                        "spec_version": spec["version"],
+                        "message": "Planner is using the revised Task Spec.",
+                    })
+            else:
+                spec, analysis_metrics = self._analyze_task_spec(oid, run, answers)
+                with self.lock:
+                    if self.store.get_orchestration(oid)["status"] != "Analyzing":
+                        return
+                    updated = self.store.save_task_spec(oid, spec)
+                    if updated is None:
+                        return
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "task_analysis.updated", "status": updated["status"],
+                        "analysis_version": 1, "spec_version": spec["version"],
+                        "task_spec": spec, "metrics": analysis_metrics,
+                        "fields_resolved": list(spec["user_decisions"]),
+                        "assumptions": spec["assumptions"],
+                        "readiness_reason": spec["readiness_reason"],
+                        "message": "Task Analyst persisted the canonical Task Spec.",
+                    })
+                    if spec["status"] == "NEEDS_CLARIFICATION":
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "task_analysis.clarification_required",
+                            "status": "NeedsClarification", "spec_version": spec["version"],
+                            "questions": spec["clarification_questions"],
+                            "message": "Freya needs user clarification before planning.",
+                        })
+                        return
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "task_analysis.ready", "status": "Planning",
+                        "spec_version": spec["version"], "readiness_reason": spec["readiness_reason"],
+                        "message": "Task Spec is ready for planning.",
+                    })
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "freya.planning.started", "status": "Planning",
+                        "spec_version": spec["version"],
+                        "message": "Planner is creating work from the canonical Task Spec.",
+                    })
+            context = self._planning_context()
+            operational_prompt = render_task_spec(spec)
+            with self.planner_lock:
+                try:
+                    plan = self.planner.create_plan_for_spec(spec, context)
+                finally:
+                    planning_metrics = dict(self.planner.metrics)
+            planning_metrics["task_analysis"] = {
+                key: value for key, value in analysis_metrics.items()
+                if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
+                           "total_tokens", "duration_seconds"}}
+            if len(plan["tasks"]) > int(self.config["max_delegated_tasks"]):
+                raise ValueError(
+                    f"Plan contains {len(plan['tasks'])} tasks but max_delegated_tasks is "
+                    f"{self.config['max_delegated_tasks']}.")
+        except Exception as exc:
+            with self.lock:
+                current = self.store.get_orchestration(oid)
+                if current.get("task_spec") != locals().get("spec"):
+                    return
+            self._fail_planning(oid, exc, planning_metrics)
+            return
+
+        try:
+            with self.lock:
+                planned = self.store.save_orchestration_plan(
+                    oid, plan, PLAN_SCHEMA_VERSION, planning_metrics,
+                    expected_task_spec=spec,
+                )
+                if planned is None:
+                    return
+                self._record_planner_normalization(oid, planning_metrics)
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.created", "status": "Planned",
+                    "message": "Freya created and saved the structured plan.",
+                    "goal": plan["goal"], "complexity": plan["complexity"],
+                    "task_count": len(plan["tasks"]),
+                    "task_ids": [task["id"] for task in plan["tasks"]],
+                    "plan_schema_version": PLAN_SCHEMA_VERSION,
+                    "planning_metrics": planning_metrics,
+                })
+                self._workspace_for_run(planned)
+                graph = ExecutionGraph(plan)
+                self.store.initialize_execution_graph(oid, graph.serialize())
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.graph.initialized", "status": "Planned",
+                    "message": "Freya initialized the durable execution graph.",
+                    "summary": graph.summary(),
+                })
+                self._record_graph_transitions(oid, [
+                    {"task_id": task["id"], "from": "pending", "to": "ready"}
+                    for task in graph.ready_tasks()
+                ])
+                running = self.store.transition_orchestration(oid, ("Planned",), "Running")
+                if running is None:
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.analyzing", "status": "Running",
+                    "message": "Freya is scheduling ready tasks from the execution graph.",
+                })
+            self._run_graph(oid, running, deadline, operational_prompt)
+        except Exception as exc:
+            self._abort_graph(oid, str(exc))
+
+    def _run_with_legacy_analysis(self, oid):
         # Explicitly injected decision functions retain the pre-4.3 test and
         # extension contract. The production path is the durable DAG scheduler.
         if self.decide is not None:

@@ -238,6 +238,25 @@ document.addEventListener('change', event => {
 });
 document.addEventListener('submit', event => { if (event.target.id === 'log-filters') event.preventDefault(); });
 document.addEventListener('submit', async event => {
+  if (!event.target.classList.contains('freya-clarification-form')) return;
+  event.preventDefault();
+  const form = event.target;
+  if (form.dataset.submitting === 'true') return;
+  const answers = Object.fromEntries(new FormData(form).entries());
+  form.dataset.submitting = 'true';
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
+  try {
+    await api('/orchestrations/' + encodeURIComponent(form.dataset.runId) + '/clarifications', 'POST', { answers });
+    toast('Freya recibió tu respuesta.');
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+    form.dataset.submitting = 'false';
+    if (submitButton) submitButton.disabled = false;
+  }
+});
+document.addEventListener('submit', async event => {
   if (event.target.id !== 'freya-form') return;
   event.preventDefault();
   const form = event.target;

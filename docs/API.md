@@ -28,6 +28,22 @@ immutable Skill snapshots, including version and procedures.
 `POST /api/orchestrations` with `{ "prompt": "...", "workspace_path": "..." }` queues a bounded run. An existing absolute workspace is used directly; when omitted or empty, Freya creates one isolated workspace for the orchestration and shares it across all planned nodes.
 The trimmed prompt must be non-empty. The application does not impose an
 artificial character limit before creating a run.
+When the Analyst needs a high-impact answer, the run has status
+`NeedsClarification` and `task_spec.clarification_questions` contains bounded
+`{id, question, reason, field, required}` objects. Submit answers with
+`POST /api/orchestrations/{id}/clarifications` and body
+`{"answers":{"CQ-1":"Python de consola"}}`. This resumes the same run;
+it creates neither an approval nor a new orchestration. The route rejects
+unknown IDs, missing required answers and runs that are not waiting.
+`task_spec`, `task_spec_revisions` and `clarification_answers` are returned
+by the run detail API. While a ready run is still `Planning` and has no saved
+plan, `POST /api/orchestrations/{id}/revise-spec` accepts
+`{"field":"interface","value":"desktop_gui","user_message":"mejor quiero interfaz gráfica"}`.
+It records Task Spec v2, queues replanning and rejects a late plan from the old
+version. Once a plan exists, the route rejects the revision; active work is not
+silently changed. The current spec is canonical; each revision is
+immutable and versioned.
+
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
 `planning_metrics`, selection snapshots, delegations, execution attempts,
@@ -106,23 +122,17 @@ Integration events are `freya.integration.started`,
 `freya.final_response.created`. They contain compact IDs/status/counts, not
 model prompts or complete output.
 
-The orchestration moves through `Queued`, `Planning`, `Planned`, `Running`, and
-`Integrating` before success. A globally requested append-only revision returns
-it to `Running`; `Integrating` may also end in `Failed` or `Cancelled`. Planning emits
-`freya.planning.started`. Before the planner, configured Task Analyst runs emit
-`freya.task_analysis.started` and `freya.task_analysis.completed`; without a
-configured agent the completed event contains a deterministic operational brief.
-The version-3 result includes `operational_prompt`, and `corrected_fields` lists
-deterministic semantic corrections. A standalone program with no requested
-language records Python 3.10+ as an explicit assumption; explicit languages
-and unrelated blockers are preserved. Requirement IDs normalize to unique
-`REQ-N` values, acceptance IDs to unique `AC-N` values, and `verifies` must
-reference known requirements. Ambiguous references fail before planning. If the result has
-`ready_for_execution=false`, Freya emits `freya.task_analysis.blocked` with the
-`blocking_reason`, creates no plan, and emits `freya.planning.failed`. Planning
-otherwise emits either
-`freya.plan.created` with a safe goal/complexity/task summary or
-`freya.planning.failed`. A new plan uses schema version 1 with `criterion_links`:
+Production runs pass through `Queued`, `Analyzing`, optional
+`NeedsClarification`, `Planning`, `Planned`, `Running` and
+`Integrating`. `task_analysis.started`, `task_analysis.updated`,
+`task_analysis.clarification_required`,
+`task_analysis.clarification_received` and `task_analysis.ready` expose
+the Analyst's decisions. A pending clarification creates no plan or worker.
+A ready Task Spec is rendered deterministically for Planner and workers.
+Planner model output uses semantic task keys; the Plan Compiler generates
+all internal task/criterion IDs and validates dependency references.
+
+A new plan uses schema version 1 with `criterion_links`:
 the plan's `success_criteria` remain authoritative if the model omits global link
 rows: the harness fills missing rows in criterion order, then deterministically
 fills absent, blank or duplicate global/local IDs before validation. It preserves
@@ -422,7 +432,7 @@ Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and
 and `Offline`. Step states use the corresponding running/terminal values.
 
 Logs group delegated runtime events by `orchestration_id` when present, so one Freya request is shown in one expandable group while each row keeps its responsible `agent_name`. `GET /api/logs?orchestration_id=...` also merges the persisted orchestration timeline (for example `freya.task_analysis.completed` and failure-analysis events); those rows use a string `id` such as `orchestration:12` and `source=orchestration`. Every log row includes a normalized trace: `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how`, `trace_id`, plus the relevant status/tool/input/output/error/duration fields. This makes Task Analyst, Planner, Programmer, Code Auditor and any other participating actor visible in the same audit trail. `how` is bounded to operational metadata (tool, capability, policy, attempt and related IDs), never private model reasoning. Every SSE update has an integer `id`, `event_type`, timestamp, agent/task IDs
-and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
+and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. An identical `write_file` produces no `workspace.diff`, no workspace progress and an action result with `already_satisfied=true`, `changed=false`. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
 
@@ -436,11 +446,16 @@ It does not expose evaluator prompts or private reasoning.
 
 Structured task results preserve runtime truth even when the model's final
 structured response is invalid: `actions` contains bounded tool outcomes,
-`artifacts` contains successful file changes, and `verification.evidence` may
-contain `command_execution` records with `command`, `exit_code`, `output` and
+including `changed` and `already_satisfied` for no-op writes; `artifacts` contains
+successful file changes, and `verification.evidence` may contain
+`command_execution` records with `command`, `exit_code`, `output` and
 `supports_acceptance_criteria`. A passed command record linked to every exact
-planned criterion produces deterministic acceptance. Recovery snapshots and
-retry prompts carry a bounded `workspace_state` with prior verification, actions, artifacts, diffs
+planned criterion produces deterministic acceptance. Runtime exceptions build
+this contract from the action ledger and skip model repair. An identical denied
+action is fingerprinted and answered locally with
+`ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE`; the response does not execute
+the tool or increment `tool_calls`. Recovery snapshots and retry prompts carry
+a bounded `workspace_state` with prior verification, actions, artifacts, diffs
 and error; a newly generated recovery agent may gain only `filesystem.read`
 for that inspection, never `filesystem.overwrite`.
 
