@@ -1,22 +1,34 @@
 # Control Center subsystem
 
 This directory owns the local web API, SQLite state and spawned execution
-runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
-filesystem, command and Git implementations.
+runtime. `frontend/` is its browser client; `tools.py` owns workspace-scoped
+filesystem operations and `sandbox.py` runs commands and Git in Docker copies.
 
 `task_spec.py` owns the production tool-free canonical intent contract,
 clarification questions, sequential revisions and deterministic rendering. It
 defines the Task Analyst response schema, canonical status/source enums, safe
 pre-validation normalization and structured contract diagnostics. Runtime-only
-history and revision metadata are not model-authored.
+history and revision metadata are not model-authored. The clarification reducer
+preserves pending IDs, allocates monotonic new IDs, records answered fields once,
+and removes resolved, duplicate or optional model questions before persistence.
+`storage.py` keeps answers keyed by spec version and treats exact replays as
+idempotent. Three answered clarification rounds are the limit; an unresolved
+material question then fails the run.
 `task_analyst.py` retains the legacy version-3 compatibility contract.
 `activity.py` builds the backend orchestration timeline and performance read
 model from persisted timestamps/events; phase durations can overlap and must not
 be summed into wall-clock totals. Keep actor identity independent of `agent_id`.
 `runtime_resources.py` builds the planning catalog from the global capability
-registry, global `Toolbox` schemas and enabled Store Skills. It resolves exact
+registry, global `Toolbox` schemas and `freya-core`. It resolves exact
 IDs/aliases, derives tool-compatible capabilities and reports typed resource
-mismatches; Skill instructions remain in worker snapshots. `plan_compiler.py`
+mismatches; Skill instructions remain in worker snapshots. It replaces Planner
+Skill preferences with `freya-core` and records an ignored-preference warning.
+`plan_scope.py` compares semantic work with explicit/clarified Task Spec intent
+before resource validation. It removes unsupported external-only tasks and
+criteria, rewires dependencies, and rejects mixed or uncovered work.
+`skills.py` defines the one active Skill and validates its tool IDs at startup.
+`agent_factory.py` assigns it to every dynamic role without Skill capability
+prerequisites. `plan_compiler.py`
 derives missing resource links, assigns execution IDs and checks semantic
 dependencies.
 `planner.py` owns the versioned orchestration-plan contract, deterministic
@@ -60,15 +72,22 @@ archival event reports archival `Success` separately from the run's final
   derived from the global capability and Toolbox registries plus enabled Skills;
   context-provided tool IDs must not extend the global worker tool catalog.
   Do not duplicate IDs in Planner prompts.
-  Validate capability, tool and Skill IDs, plus declared unique aliases,
+  Validate capability and tool IDs, plus declared unique aliases,
   immediately after parse and again at the compiler/factory boundary. Unknown
   resource errors are fail-closed and do not trigger an LLM repair call.
 - Keep `semantic_needs`, `required_capabilities`, `required_tools` and
-  `preferred_skills` distinct. The resolver derives registered compatible
-  capabilities when tools are supplied without capabilities; when both are
-  supplied, reject incompatible pairs with `ToolCapabilityMismatch`. A tool
+  `preferred_skills` distinct. The resolver derives a capability only when a
+  specific operation in the task objective or semantic needs identifies it;
+  tool registration alone is insufficient. An unneeded `run_command` proposal
+  is removed. Reject genuinely required unsupported pairs with
+  `ToolCapabilityMismatch` and unclear inference with `AmbiguousToolCapability`. A tool
   selection never grants access: the Agent Factory derives worker schemas from
   the capability policy and every action still passes through `policy.py`.
+- Compare model-proposed external work with explicit or clarified Task Spec
+  intent before resolving tools. Do not infer deployment, publication, remote
+  hosting or network side effects from web artifact creation. Preserve Task
+  Spec validation criteria and fail closed if optional work cannot be removed
+  without losing one.
 - Use `storage.py` conditional transitions for orchestration state. Save the
   plan with `Planning → Planned` atomically, never reactivate a terminal run,
   and keep cancellation serialized with task submission.
@@ -87,9 +106,8 @@ archival event reports archival `Success` separately from the run's final
   3.10+ assumption. A code_change follows the existing project stack. Preserve
   explicit languages and keep unrelated missing-input blockers fail-closed.
 - Interactive plans append a dependent QA node with the registered
-  `execution.python_script` capability. Ordinary interactive QA can select the
-  `interactive-testing` Skill; the single-case console calculator omits its
-  multi-case guidance. Keep Python execution on QA; implementation tasks receive
+  `execution.python_script` capability. QA uses `freya-core`; keep Python
+  execution on QA while implementation tasks receive
   only the file capabilities they need. The calculator runs one QA case with
   stdin lines `3` and `5`, produces integer output `8`, and creates no helper or
   test files. Its worker stops after one successful command supplies evidence
@@ -116,9 +134,12 @@ archival event reports archival `Success` separately from the run's final
   and stable evidence IDs when extending it. Every persisted row must retain
   the normalized actor/workspace trace (`who`, `where`, `when`, `what`, `how`,
   `phase`, `trace_id`) so Task Analyst and every delegated agent are auditable.
-- Keep Skill validation, resolution, compatibility diagnostics and compact
-  rendering in `skills.py`; Skills never execute tools or modify policy. Task
+- Keep `freya-core` validation and compact rendering in `skills.py`; its tool
+  declarations never execute tools or modify policy. Task
   records must retain immutable Skill snapshots and versions.
+- All agent Python, test, Ruff and Git commands go through `sandbox.py` on a
+  disposable workspace copy. Docker failure is `SandboxUnavailable`; never
+  fall back to host execution or copy command writes into the real workspace.
 - Preserve spawned-process containment and descendant cleanup for cancel,
   restart, timeout and shutdown.
 - Never persist secret values or private model thinking. `secret_env` contains

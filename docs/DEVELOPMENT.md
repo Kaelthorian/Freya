@@ -5,6 +5,17 @@
 - Python 3.10 or later.
 - Ollama running locally with at least one installed model.
 - A modern browser. Node is needed only for JavaScript syntax validation.
+- Docker Desktop with a running Linux engine for agent Python, test, Ruff and Git commands.
+
+Build the local sandbox image before allowing agent command execution:
+
+```powershell
+docker build -t freya-sandbox:py311 .\sandbox
+docker image inspect freya-sandbox:py311
+```
+
+If Docker or the image is unavailable, `run_command` and Git inspection fail
+with `SandboxUnavailable`; Freya never executes agent code on the host.
 
 The runtime uses the Python standard library. If `psutil` is installed,
 `/api/health` reports CPU and RAM; otherwise telemetry is unavailable.
@@ -48,7 +59,12 @@ has no tools and never assigns workers or capabilities. It records explicit,
 clarified and assumed requirements, asks only high-impact questions and
 leaves an ambiguous run in `NeedsClarification`. The user answers through
 `POST /api/orchestrations/{id}/clarifications`; the same run resumes and
-stores both question and answer. A ready spec can be revised through
+stores both question and answer. The runtime keeps question IDs across
+versions, assigns a new ID only for a new semantic field, and discards answered
+or optional model questions. `user_decisions` is a container, never a question
+field. Exact answer submission replays are idempotent. After three answer
+rounds, an unresolved material question fails with a cycle diagnostic rather
+than opening another clarification. A ready spec can be revised through
 `POST /api/orchestrations/{id}/revise-spec` only before a plan is persisted;
 the store fences late output from a planner using the previous version. `TaskSpecAnalyst` repairs one malformed
 model response, then falls back conservatively on technical failure. It sends
@@ -59,17 +75,39 @@ metrics to identify the exact field if a repair still fails.
 
 The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
 The catalog is rebuilt from `capabilities.py`, worker schemas exposed by
-`Toolbox`, and all enabled Skills from the current Store. It sends capability
-operation summaries, tool purposes and Skill descriptions/use cases, without
+`Toolbox`, and the one active Skill, `freya-core`. It sends capability
+operation summaries, tool purposes, and Skill descriptions/use cases plus
+required/recommended capability metadata, without
 Skill instruction bodies. Resource ID enums in the Ollama response schema are
 dynamic. The Planner chooses semantic needs, capabilities, tool references,
-Skills and QA. Resource references are validated immediately after JSON parse;
+preferred Skills and QA. `plan_scope.py` first removes optional unrequested
+external actions/criteria and rewires dependencies. Mixed external/artifact
+tasks or loss of a Task Spec validation check fail closed. Resource references
+are then validated;
 unknown or ambiguous IDs fail as `UnsupportedResourceRequirement` without a
 second LLM repair call. `plan_compiler.py` checks those references again,
 generates runtime IDs, links criteria and validates the DAG. Workers
 receive a deterministic rendering of the Task Spec, never an independent
 `operational_prompt`. The old Analyst v3 path is retained for injected
 compatibility adapters and historical tests.
+
+Planner `preferred_skills` values, including obsolete IDs, are normalized to
+`freya-core`; the resolver can record one ignored-preference warning. Every
+dynamic agent receives that Skill. Its declared tool list is validated against
+the global `Toolbox` registry at Store startup. Task capabilities and Policy
+still determine the effective tool surface. Unknown tools and incompatible
+tool/capability pairs remain errors.
+
+Resource Resolver derives a capability only from a specific task operation
+(for example,
+`run_command` plus “Execute a Python script” yields
+`execution.python_script`; “Run pytest” yields `execution.pytest`). A tool
+proposal alone gives no authority. An unneeded `run_command` is removed;
+an ambiguous needed command raises `ToolCapabilityMismatch` when its declared
+capabilities do not support it. `planning_metrics.planner_semantic_plan` and
+`freya.plan_compiler.started.planner_semantic_plan` retain a bounded sanitized
+pre-resolution task view. `freya.plan.scope_adjusted` records omitted external
+work and compiler details include resource resolutions.
 
 Planner reconciliation is a safety floor over both sources: if the model plan
 contains a write or local execution, it derives `filesystem.read` for
@@ -80,37 +118,25 @@ does not turn that task into Python program creation.
 
 After planning, Freya creates one ephemeral least-privilege agent for each ready
 plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
-The factory uses only enabled registry Skills, selects one minimal primary Skill
-for ordinary work (with at most one additional task-justified specialty), and
-keeps eight only as a safety ceiling. It derives Tools from the complete task
-policy and persists provenance for audit and terminal cleanup. Selected tools
-must be registered and associated with a requested capability; the policy
-engine still decides every action. Preferred Skills
-are filtered against task kind, role, recovery evidence and the real capability
-surface; they are not a request to fill the context with every compatible Skill.
-When a retry is selected, the orchestrator forwards only the bounded recovery
-reason/cause to the factory; that genuine recovery state may select `debugging`,
-while ordinary words such as “error” in an implementation objective do not.
+The factory assigns `freya-core` to every dynamic worker, QA and auditor. Its
+seven declared tools come from the Skill, while Policy selects the effective
+worker schemas and evaluates every invocation. Planner Skill preferences do
+not affect assignment. Provenance is persisted for audit and terminal cleanup.
 
-For a generic file, the Planner selects the builtin `simple-file-artifact` Skill
-and creates one dynamic worker with `filesystem.create` plus read-back
-`filesystem.read`. A Python Hello World task uses `python-development` and
-derives `filesystem.create`, `filesystem.read`, and `execution.python_script`.
+For a generic file, the Planner creates one dynamic worker with
+`filesystem.create` plus read-back `filesystem.read`. A Python Hello World
+task additionally needs `execution.python_script` to run the result.
 These low-risk flows finish after the requested artifact is written, read back,
 and, for Python, executed with exit code 0 and expected output. Their worker
 prompt is generated from the exact effective `box.schemas` surface, so an
 unassigned operation is neither described nor suggested. They do not need
-Git, a test suite, QA, or a Code Auditor. The Skill requirements are diagnostics
-only and never expand the task policy; an explicitly requested incompatible
-primary Skill is a planning error, while an irrelevant or incompatible optional
-Skill is omitted.
+Git, a test suite, QA, or a Code Auditor. Skill tools never expand task policy.
 
 For a Python console calculator that needs interactive input, the semantic
 plan normalizer collapses model-created file/function/test subtasks into one
 implementation node, then appends one dependent QA node. QA receives
-`filesystem.read` and `execution.python_script`, selects the `interactive-testing`
-Skill for ordinary interactive QA plans. For this exact one-case calculator
-request, Freya omits multi-case Skill guidance and uses `run_command` once with
+`filesystem.read` and `execution.python_script`, with `freya-core` assigned.
+For this exact one-case calculator request, Freya uses `run_command` once with
 bounded stdin lines `3` and `5` to verify output `8` and exit code `0`. The
 implementation receives only `filesystem.create` and `filesystem.read`;
 execution authority stays with QA. Whole-number results omit a trailing `.0`.
@@ -216,6 +242,17 @@ to every configured completion criterion can satisfy a task and stop further
 model actions. A no-op alone does not satisfy unrelated configured criteria.
 Orchestration timeouts also emit failure analysis.
 
+Docker receives an ephemeral workspace copy for every Python, pytest, unittest,
+py_compile, Ruff or Git command. The container has no network, Docker socket,
+host HOME/USERPROFILE, inherited secrets or host project mount. Its root is
+read-only, and memory, PID, CPU and time limits apply. Only `HOME=/tmp`,
+`TMPDIR=/tmp`, `PYTHONDONTWRITEBYTECODE`, `PYTHONNOUSERSITE`,
+`PYTHONPATH=/workspace` and Git isolation variables are passed. Command writes
+are discarded with the copy; use `write_file` or `edit_file` for persistent
+changes. The snapshot omits symlinks and large generated dependency folders
+and is limited to 10,000 files and 256 MiB. A Git checkout must be rooted in
+the assigned workspace; a parent repository is outside the allowed boundary.
+
 Interactive Python QA uses `run_command` with a bounded `stdin` string. Without
 stdin the worker closes the child stream, so `input()` fails immediately rather
 than waiting for a human terminal. This does not add shell access and QA Tester
@@ -283,9 +320,9 @@ workspace when left empty. Task retries reuse the original folder. Editing an
 agent requires it to be idle. If a chosen folder is removed later, submissions
 that select it fail. Tasks that resolve to the same folder run serially.
 
-Interactive plans append a dependent QA task with `interactive-testing`. More
-complex mutation plans may append a dependent read-only audit task with
-`code-review`; the bounded simple file/program path remains one implementation
+Interactive plans append a dependent QA task. More complex mutation plans may
+append a dependent read-only audit task; every dynamic role uses `freya-core`.
+The bounded simple file/program path remains one implementation
 task. The factory creates any QA or Auditor agent at dispatch time, so no
 preconfigured pipeline agents are required.
 The agent editor uses progressive disclosure: identity fields stay visible for
@@ -296,14 +333,14 @@ manual/direct-task and legacy compatibility workflows. The Agents page keeps the
 existing Programmer quick-create action, but those presets are not prerequisites
 for modern dynamic orchestration.
 
-The **Skills** page manages reusable declarative knowledge. Create or edit a
-Skill with a stable lowercase ID, version, instructions, adaptable procedures,
-tags, and required/recommended capabilities. Assign it to an agent with a
-priority from the agent editor. Required capability diagnostics never change
-the agent's policy; a Skill is operational only when its requirements are
-allowed. Tasks snapshot the resolved Skill version and content.
+The active Skills catalog contains only `freya-core`. The server archives older
+Skill rows on startup without deleting historical snapshots. Creation/import
+of other Skills is disabled during this configuration. `freya-core.tools`
+lists every registered tool; startup rejects unknown entries. Manual agents
+still use their own policy. Tasks snapshot the assigned Skill version/content.
 
-The Skills page can export one Skill or the whole visible catalogue as JSON. Import accepts either one Skill object or a skills array; the server validates the complete batch, skips identical existing definitions, rejects conflicting IDs or names, and never partially applies a failing import.
+The Skills page can export the visible `freya-core` definition. Import requests
+are rejected while the single-Skill configuration is active.
 
 ### Secrets
 
@@ -464,8 +501,9 @@ local end-to-end run.
   endpoint and `freya.evaluation.*` events.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
-- `run_command` is allowlisted and uses argv without a shell. Permission
-  `execute` still runs code with the local Windows user's privileges.
+- `run_command` is allowlisted and uses argv without a shell. Agent code runs
+  inside Docker on a disposable copy. If Docker cannot start, inspect
+  `SandboxUnavailable` and check the daemon and local image.
 - A non-accepted evaluation briefly enters `recovery_pending`. Inspect the
   recovery action and attempt history before treating it as terminal. Offline
   mode records a conservative `fail`; online mode may schedule a bounded retry

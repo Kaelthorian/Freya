@@ -8,10 +8,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from typing import Any, Iterable
 
 from .capabilities import capability_catalog
-from .skills import BUILTIN_SKILLS
+from .plan_scope import semantic_categories
+from .skills import BUILTIN_SKILLS, CORE_SKILL_ID, validate_skill_tools
 from .tools import Toolbox
 
 
@@ -48,6 +50,22 @@ class UnknownTool(UnsupportedResourceRequirement):
         )
 
 
+class UnknownSkill(UnsupportedResourceRequirement):
+    error_type = "UnknownSkill"
+
+    def __init__(self, skill_id: str, *, semantic_need: str = ""):
+        super().__init__("skill", skill_id, semantic_need=semantic_need,
+                         reason="The Skill ID is not registered or uniquely aliased.")
+
+
+class UnknownCapability(UnsupportedResourceRequirement):
+    error_type = "UnknownCapability"
+
+    def __init__(self, capability_id: str, *, semantic_need: str = ""):
+        super().__init__("capability", capability_id, semantic_need=semantic_need,
+                         reason="The capability ID is not registered or uniquely aliased.")
+
+
 class ToolCapabilityMismatch(UnsupportedResourceRequirement):
     """A registered tool cannot satisfy any capability declared by a task."""
 
@@ -67,6 +85,22 @@ class ToolCapabilityMismatch(UnsupportedResourceRequirement):
         )
 
 
+class AmbiguousToolCapability(UnsupportedResourceRequirement):
+    """A tool maps to several capabilities and the task does not distinguish one."""
+
+    error_type = "AmbiguousToolCapability"
+
+    def __init__(self, tool_id: str, compatible_capabilities: Iterable[str]):
+        self.tool_id = tool_id
+        self.compatible_capabilities = sorted(set(compatible_capabilities))
+        super().__init__(
+            "tool_capability", tool_id,
+            reason=("The tool maps to multiple capabilities ("
+                    + ", ".join(self.compatible_capabilities)
+                    + "); declare the required capability or a specific semantic need."),
+        )
+
+
 class RuntimeResourceCatalog:
     """A fresh, serializable view of capabilities, worker tools, and Skills."""
 
@@ -77,6 +111,8 @@ class RuntimeResourceCatalog:
         self.capabilities = self._ordered(capability_records)
         self.tools = self._ordered(tool_records)
         self.skills = self._ordered(skill_records)
+        self.preferred_skill_warnings: list[dict[str, Any]] = []
+        self.resource_resolutions: list[dict[str, str]] = []
         for resource_type, records in (("capability", capability_records),
                                        ("tool", tool_records), ("skill", skill_records)):
             ids = [item.get("id") for item in records if isinstance(item, dict)
@@ -135,11 +171,14 @@ class RuntimeResourceCatalog:
     @classmethod
     def build(cls, skills: Iterable[dict[str, Any]] | None = None) -> "RuntimeResourceCatalog":
         """Derive catalog contents from the capability, Toolbox, and Skill registries."""
-        skill_records = BUILTIN_SKILLS if skills is None else skills
+        skill_records = list(BUILTIN_SKILLS if skills is None else skills)
+        if not any(isinstance(item, dict) and item.get("id") == CORE_SKILL_ID for item in skill_records):
+            skill_records.extend(BUILTIN_SKILLS)
         skill_summaries = []
         for skill in skill_records:
-            if not isinstance(skill, dict) or skill.get("enabled", True) is not True:
+            if not isinstance(skill, dict) or skill.get("enabled", True) is not True or skill.get("id") != CORE_SKILL_ID:
                 continue
+            declared_tools = validate_skill_tools(skill)
             metadata = skill.get("metadata") if isinstance(skill.get("metadata"), dict) else {}
             description = str(skill.get("description") or "").strip()
             use_when = metadata.get("use_when")
@@ -155,8 +194,11 @@ class RuntimeResourceCatalog:
                 "use_when": str(use_when).strip(),
                 "category": str(skill.get("category") or "General"),
                 "tags": [item for item in skill.get("tags", []) if isinstance(item, str)],
+                "tools": declared_tools,
                 "required_capabilities": [item for item in skill.get("required_capabilities", [])
                                            if isinstance(item, str)],
+                "recommended_capabilities": [item for item in skill.get("recommended_capabilities", [])
+                                              if isinstance(item, str)],
                 "aliases": [item for item in aliases if isinstance(item, str) and item.strip()],
             })
         return cls(capability_catalog(), Toolbox.tool_catalog(), skill_summaries)
@@ -170,7 +212,7 @@ class RuntimeResourceCatalog:
         registered_tools = Toolbox.tool_catalog()
         if not isinstance(skills, list):
             skills = BUILTIN_SKILLS
-        return cls(registered_capabilities, registered_tools, skills)
+        return cls(registered_capabilities, registered_tools, cls.build(skills).skills)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -213,6 +255,87 @@ class RuntimeResourceCatalog:
             raise UnknownTool(tool_id)
         return list(self._capabilities_by_tool.get(tool_id, []))
 
+    def _infer_tool_capability(self, tool_id: str, task: dict[str, Any]) -> str:
+        """Infer one operation from task meaning, never from tool existence alone."""
+        compatible = self.capabilities_for_tool(tool_id)
+        parts = [str(task.get("objective") or ""), str(task.get("description") or "")]
+        parts.extend(task.get("semantic_needs", []))
+        text = " ".join(parts).lower()
+        execution_intent = bool(re.search(r"\b(run|execute|ejecut\w*|test|probar|"
+                                          r"compile|compilar)\b", text))
+        patterns = {
+            "read_file": {"filesystem.read": r"\b(read|inspect|review|verify|check|leer|inspeccion\w*|revis\w*|verificar)\b"},
+            "list_files": {"filesystem.list": r"\b(list|enumerate|listar|enumerar)\b"},
+            "search_code": {"filesystem.search": r"\b(search|find|buscar|encontrar)\b"},
+            "edit_file": {"filesystem.modify": r"\b(edit|modify|change|patch|editar|modificar|cambiar)\b"},
+            "git_diff": {"git.diff": r"\bgit\s+diff\b|\bdiff\b"},
+            "write_file": {
+                "filesystem.create": r"\b(create|write|save|generate|crea(?:r)?|crear|guardar|generar)\b",
+                "filesystem.overwrite": r"\b(overwrite|replace existing|rewrite|sobrescribir|reemplazar existente)\b",
+            },
+            "run_command": {
+                "git.status": r"\bgit\s+status\b",
+                "execution.python_script": r"\b(python script|python program|python file|script de python|programa python|archivo python|bounded stdin)\b|\.py\b",
+                "execution.pytest": r"\bpytest\b",
+                "execution.unittest": r"\bunittest\b",
+                "execution.py_compile": r"\b(py_compile|bytecode compil|compile[- ]check python|compile python|compilar python)\b",
+                "execution.ruff": r"\bruff\b",
+            },
+        }
+        matches = [capability_id for capability_id, pattern in patterns.get(tool_id, {}).items()
+                   if capability_id in compatible and re.search(pattern, text)]
+        if tool_id == "run_command":
+            matches = [item for item in matches
+                       if item != "execution.python_script" or execution_intent]
+            if any(item != "execution.python_script" for item in matches):
+                matches = [item for item in matches if item != "execution.python_script"]
+        if len(matches) == 1:
+            return matches[0]
+        raise AmbiguousToolCapability(tool_id, compatible)
+
+    @staticmethod
+    def _command_intent(task: dict[str, Any]) -> bool:
+        text = " ".join([str(task.get("objective") or ""),
+                         str(task.get("description") or ""),
+                         *[str(item) for item in task.get("semantic_needs", [])]]).lower()
+        return "external_action" in semantic_categories(text) or bool(re.search(
+            r"\b(run|execute|ejecut\w*|test|probar|pytest|unittest|ruff|compile|compilar|"
+            r"git\s+status|command|comando|deploy\w*|despleg\w*|publish\w*|publica\w*)\b",
+            text,
+        ))
+
+    @staticmethod
+    def _semantic_file_capabilities(task: dict[str, Any]) -> list[str]:
+        """Derive only explicit local file operations from task meaning."""
+        text = " ".join([str(task.get("objective") or ""),
+                         *[str(item) for item in task.get("semantic_needs", [])]]).lower()
+        if "external_action" in semantic_categories(text):
+            return []
+        artifact = re.search(
+            r"\b(file|source|script|program|artifact|website|web\s+page|web\s+calculator|"
+            r"ui|html|archivo|c[oó]digo|programa|sitio\s+web|p[aá]gina)\b|\.[a-z0-9]{1,8}\b",
+            text,
+        )
+        if not artifact:
+            return []
+        result = []
+        if re.search(r"\b(create|generate|crear|crea|generar|genera)\b", text):
+            result.append("filesystem.create")
+        if re.search(r"\b(read|leer|inspect|inspeccionar)\b", text):
+            result.append("filesystem.read")
+        if re.search(r"\b(edit|modify|patch|editar|modificar)\b", text):
+            result.append("filesystem.modify")
+        return result
+
+    def preferred_skill_warnings_for_tasks(self, tasks: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Planner Skill preferences are ignored under the single-Skill model."""
+        warnings = []
+        for index, task in enumerate(tasks, 1):
+            if task.get("preferred_skills") and task["preferred_skills"] != [CORE_SKILL_ID]:
+                warnings.append({"task_id": str(task.get("id") or f"task-{index}"),
+                                 "message": "planner skill preference ignored; freya-core selected"})
+        return warnings
+
     def tools_for_capabilities(self, capability_ids: Iterable[str]) -> list[str]:
         """Resolve required tool transports from registered capability records."""
         tools = []
@@ -227,6 +350,7 @@ class RuntimeResourceCatalog:
         if not isinstance(value, dict):
             raise ValueError("Semantic plan must be an object.")
         plan = copy.deepcopy(value)
+        self.resource_resolutions = []
         unsupported = plan.get("unsupported_requirements", [])
         if not isinstance(unsupported, list):
             raise ValueError("unsupported_requirements must be a list.")
@@ -251,10 +375,16 @@ class RuntimeResourceCatalog:
                 raise ValueError(f"Semantic task {index} semantic_needs must be a list of non-empty strings.")
             if "semantic_needs" in task:
                 task["semantic_needs"] = list(dict.fromkeys(needs))
+            requested_skills = task.get("preferred_skills", [])
+            if requested_skills and requested_skills != [CORE_SKILL_ID]:
+                warning = {"task_id": str(task.get("id") or f"task-{index + 1}"),
+                           "message": "planner skill preference ignored; freya-core selected"}
+                if warning not in self.preferred_skill_warnings:
+                    self.preferred_skill_warnings.append(warning)
+            task["preferred_skills"] = [CORE_SKILL_ID]
             references = (
                 ("required_capabilities", "capability"),
                 ("required_tools", "tool"),
-                ("preferred_skills", "skill"),
             )
             for field, resource_type in references:
                 if field not in task:
@@ -274,6 +404,10 @@ class RuntimeResourceCatalog:
                         semantic_need = needs[0] if len(needs) == 1 else ""
                         if resource_type == "tool":
                             raise UnknownTool(reference, semantic_need=semantic_need)
+                        if resource_type == "skill":
+                            raise UnknownSkill(reference, semantic_need=semantic_need)
+                        if resource_type == "capability":
+                            raise UnknownCapability(reference, semantic_need=semantic_need)
                         raise UnsupportedResourceRequirement(
                             resource_type, reference, semantic_need=semantic_need,
                             reason="No exact ID or unique declared alias exists in the runtime catalog.",
@@ -281,28 +415,71 @@ class RuntimeResourceCatalog:
                     if canonical not in normalized:
                         normalized.append(canonical)
                 task[field] = normalized
-            required_tools = set(task.get("required_tools", []))
+            selected_capabilities = list(task.get("required_capabilities", []))
+            proposed_tools = list(task.get("required_tools", []))
+            has_supported_proposal = any(
+                set(self.capabilities_for_tool(tool_id)) & set(selected_capabilities)
+                for tool_id in proposed_tools
+            )
+            infer_file_operation = (not selected_capabilities or
+                ("run_command" in proposed_tools and not has_supported_proposal
+                 and not self._command_intent(task)))
+            semantic_file_capabilities = (self._semantic_file_capabilities(task)
+                                          if infer_file_operation else [])
+            if semantic_file_capabilities:
+                selected = list(selected_capabilities)
+                for capability_id in semantic_file_capabilities:
+                    if capability_id not in selected:
+                        selected.append(capability_id)
+                        self.resource_resolutions.append({
+                            "task_key": str(task.get("key") or task.get("objective") or index),
+                            "tool": self._global_capability_tools[capability_id],
+                            "action": "capability_derived",
+                            "resolved_capability": capability_id,
+                            "reason": "explicit_semantic_file_operation",
+                        })
+                task["required_capabilities"] = selected
+            required_tools = task.get("required_tools", [])
             if required_tools:
                 requested_capabilities = list(task.get("required_capabilities", []))
-                derived_capabilities = list(dict.fromkeys(
-                    capability_id
-                    for tool_id in task["required_tools"]
-                    for capability_id in self.capabilities_for_tool(tool_id)
-                ))
-                if requested_capabilities:
-                    mismatched = [
-                        tool_id for tool_id in task["required_tools"]
-                        if not set(self.capabilities_for_tool(tool_id)) & set(requested_capabilities)
-                    ]
-                    if mismatched:
-                        tool_id = sorted(mismatched)[0]
-                        raise ToolCapabilityMismatch(
-                            tool_id, requested_capabilities,
-                            compatible_capabilities=self.capabilities_for_tool(tool_id),
-                            semantic_need=needs[0] if len(needs) == 1 else "",
-                        )
-                else:
-                    task["required_capabilities"] = derived_capabilities
+                derived_capabilities = []
+                retained_tools = []
+                for tool_id in required_tools:
+                    compatible = self.capabilities_for_tool(tool_id)
+                    if set(compatible) & set(requested_capabilities):
+                        retained_tools.append(tool_id)
+                        continue
+                    try:
+                        inferred = self._infer_tool_capability(tool_id, task)
+                    except AmbiguousToolCapability:
+                        if (tool_id == "run_command" and not self._command_intent(task)
+                                and (requested_capabilities or len(required_tools) > 1)):
+                            self.resource_resolutions.append({
+                                "task_key": str(task.get("key") or task.get("objective") or index),
+                                "tool": tool_id, "action": "removed",
+                                "reason": "no_semantic_execution_requirement",
+                            })
+                            continue
+                        if requested_capabilities:
+                            raise ToolCapabilityMismatch(
+                                tool_id, requested_capabilities,
+                                compatible_capabilities=compatible,
+                                semantic_need=needs[0] if len(needs) == 1 else "",
+                            ) from None
+                        raise
+                    if inferred not in derived_capabilities:
+                        derived_capabilities.append(inferred)
+                        self.resource_resolutions.append({
+                            "task_key": str(task.get("key") or task.get("objective") or index),
+                            "tool": tool_id, "action": "capability_derived",
+                            "resolved_capability": inferred,
+                            "reason": "specific_semantic_operation",
+                        })
+                    retained_tools.append(tool_id)
+                task["required_tools"] = retained_tools
+                if derived_capabilities:
+                    task["required_capabilities"] = requested_capabilities + derived_capabilities
+        # Preserve warnings recorded before replacing Planner preferences.
         plan.pop("unsupported_requirements", None)
         return plan
 

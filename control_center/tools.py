@@ -8,13 +8,13 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .security import sanitize
+from .sandbox import SandboxUnavailable, run_in_sandbox
 
 
 MAX_FILE_BYTES = 512_000
@@ -199,6 +199,8 @@ class Toolbox:
             if handler is None:
                 raise ValueError("Unknown tool: {}".format(name))
             output, success, exit_code = handler(**args)
+        except SandboxUnavailable as exc:
+            output, success, exit_code = f"SandboxUnavailable: {exc}", False, None
         except Exception as exc:  # Keep a tool failure observable to the model.
             output, success, exit_code = "ERROR: {}".format(exc), False, None
         error_class = ""
@@ -206,6 +208,8 @@ class Toolbox:
             error_class = "not_applicable"
         if name == "run_command" and not success and "INTERACTIVE_INPUT_REQUIRED" in str(output):
             error_class = "interactive_input_required"
+        if not success and "SandboxUnavailable" in str(output):
+            error_class = "SandboxUnavailable"
         return ToolResult(
             name=name,
             output=_clip(str(output)),
@@ -229,9 +233,13 @@ class Toolbox:
             raise ValueError("Directory does not exist: {}".format(path))
         found: list[str] = []
         for current, dirs, files in os.walk(str(directory)):
-            dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRECTORIES)
+            dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRECTORIES
+                             and not (Path(current) / name).is_symlink()
+                             and self.safe_path(str((Path(current) / name).relative_to(self.workspace))).is_dir())
             for filename in sorted(files):
                 file_path = Path(current) / filename
+                if file_path.is_symlink():
+                    continue
                 found.append(str(file_path.relative_to(self.workspace)))
         return ("\n".join(found) if found else "Workspace is empty."), True, 0
 
@@ -286,7 +294,17 @@ class Toolbox:
         files: list[Path] = [root] if root.is_file() else []
         if root.is_dir():
             for current, dirs, names in os.walk(str(root)):
-                dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRECTORIES)
+                safe_dirs = []
+                for name in dirs:
+                    child = Path(current) / name
+                    if name in IGNORED_DIRECTORIES or child.is_symlink():
+                        continue
+                    try:
+                        self.safe_path(str(child.relative_to(self.workspace)))
+                    except ValueError:
+                        continue
+                    safe_dirs.append(name)
+                dirs[:] = sorted(safe_dirs)
                 files.extend(Path(current) / filename for filename in names)
         hits: list[str] = []
         for file_path in sorted(files):
@@ -329,9 +347,10 @@ class Toolbox:
             if len(stdin) > MAX_STDIN_CHARS:
                 raise ValueError("stdin exceeds the 16000 character limit.")
 
-        executable = Path(argv[0]).name.lower()
+        if Path(argv[0]).name != argv[0] or "\\" in argv[0]:
+            raise ValueError("Executable must be an allowlisted name, not a path.")
+        executable = argv[0].lower()
         command = argv[1:]
-        cwd = self.workspace
         normalized: list[str]
 
         if executable in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}:
@@ -345,7 +364,7 @@ class Toolbox:
                 if module == "py_compile":
                     if not module_args:
                         raise ValueError("py_compile requires workspace file paths.")
-                    normalized = ["-m", module] + [str(self.safe_path(item)) for item in module_args]
+                    normalized = ["-m", module] + [self.safe_path(item).relative_to(self.workspace).as_posix() for item in module_args]
                 elif module == "pytest":
                     paths = [item for item in module_args if not item.startswith("-")]
                     for item in paths:
@@ -361,21 +380,18 @@ class Toolbox:
                 script = self.safe_path(command[0])
                 if not script.is_file() or script.suffix.lower() != ".py":
                     raise ValueError("Python scripts must be .py files inside the workspace.")
-                normalized = [str(script)] + command[1:]
+                normalized = [script.relative_to(self.workspace).as_posix()] + command[1:]
         elif executable in {"git", "git.exe"}:
             if stdin is not None:
                 raise ValueError("stdin is only supported for Python commands.")
-            git_root, pathspec = self._git_scope()
+            self._git_scope()
             if command == ["status", "--short"]:
-                normalized = ["-C", str(git_root), "status", "--short", "--", pathspec]
+                normalized = ["status", "--short", "--untracked-files=all", "--", "."]
             elif command == ["diff"]:
-                normalized = [
-                    "-C", str(git_root), "diff", "--no-ext-diff", "--unified=3", "--", pathspec
-                ]
+                normalized = ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", "--", "."]
             else:
                 raise ValueError("Only git status --short and git diff for this workspace are allowed.")
             executable = "git"
-            cwd = git_root
         elif executable in {"ruff", "ruff.exe"} and command == ["check", "."]:
             if stdin is not None:
                 raise ValueError("stdin is only supported for Python commands.")
@@ -384,22 +400,9 @@ class Toolbox:
         else:
             raise ValueError("Command blocked. Allowed commands are workspace Python, Ruff check, and scoped Git status/diff.")
 
-        run_options: dict[str, Any] = {
-            "cwd": str(cwd), "capture_output": True, "text": True,
-            "encoding": "utf-8", "errors": "replace", "timeout": timeout_seconds,
-            "shell": False,
-        }
-        if stdin is None:
-            # A background worker has no human terminal. Closing stdin makes an
-            # accidental input() fail immediately instead of consuming the
-            # orchestration deadline.
-            run_options["stdin"] = subprocess.DEVNULL
-        else:
-            run_options["input"] = stdin
-        result = subprocess.run(
-            [sys.executable, *normalized] if executable.startswith("python") or executable == "py" else [executable, *normalized],
-            **run_options,
-        )
+        sandbox_executable = ("python" if executable.startswith("python") or executable.startswith("py")
+                              else executable)
+        result = run_in_sandbox(self.workspace, [sandbox_executable, *normalized], timeout_seconds, stdin)
         output = (result.stdout or "") + (result.stderr or "")
         if stdin is None and result.returncode != 0 and "EOFError" in output:
             output = (
@@ -417,7 +420,7 @@ class Toolbox:
         while index < len(args):
             item = args[index]
             if item == "-s" and index + 1 < len(args):
-                normalized.extend([item, str(self.safe_path(args[index + 1]))])
+                normalized.extend([item, self.safe_path(args[index + 1]).relative_to(self.workspace).as_posix()])
                 index += 2
             elif item == "-p" and index + 1 < len(args):
                 if Path(args[index + 1]).name != args[index + 1]:
@@ -432,71 +435,41 @@ class Toolbox:
         return normalized
 
     def _git_scope(self) -> tuple[Path, str]:
-        try:
-            top_level = subprocess.run(
-                ["git", "-C", str(self.workspace), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=5, shell=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ValueError("Could not inspect Git repository: {}".format(exc)) from exc
-        if top_level.returncode != 0:
+        # A parent repository is outside the assigned workspace. Only a Git
+        # repository rooted in this workspace may be inspected.
+        if not (self.workspace / ".git").is_dir():
             raise ValueError("The workspace is not inside a Git repository.")
-        git_root = Path(top_level.stdout.strip()).resolve()
-        try:
-            pathspec = self.workspace.relative_to(git_root).as_posix() or "."
-        except ValueError as exc:
-            raise ValueError("Could not scope Git operations to the workspace.") from exc
-        return git_root, pathspec
+        return self.workspace, "."
 
     def tool_git_diff(self) -> tuple[str, bool, int | None]:
         try:
-            git_root, repo_path = self._git_scope()
+            self._git_scope()
         except ValueError:
             return "The workspace is not inside a Git repository.", False, None
-
-        pieces: list[str] = []
+        pieces = []
         for args in (
-            ["diff", "--no-ext-diff", "--unified=3", "--", repo_path],
-            ["diff", "--cached", "--no-ext-diff", "--unified=3", "--", repo_path],
+            ["status", "--short", "--untracked-files=all", "--", "."],
+            ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", "--", "."],
+            ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--unified=3", "--", "."],
         ):
-            result = subprocess.run(
-                ["git", "-C", str(git_root), *args],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                shell=False,
-            )
-            if result.returncode not in {0, 1}:
-                raise ValueError((result.stderr or "git diff failed").strip())
-            if result.stdout.strip():
+            result = run_in_sandbox(self.workspace, ["git", *args], 30)
+            if result.returncode != 0:
+                raise ValueError((result.stderr or "git inspection failed").strip())
+            if args[0] == "status":
+                pieces.append("Git status:\n" + (result.stdout.strip() or "clean") + "\n")
+                for status_line in result.stdout.splitlines():
+                    if status_line.startswith("?? "):
+                        relative = status_line[3:].strip()
+                        try:
+                            target = self.safe_path(relative)
+                            if target.is_file() and target.stat().st_size <= MAX_FILE_BYTES:
+                                content = target.read_text(encoding="utf-8").splitlines(keepends=True)
+                                pieces.append("".join(difflib.unified_diff([], content, fromfile="/dev/null", tofile=relative)))
+                        except (ValueError, OSError, UnicodeDecodeError):
+                            continue
+            elif result.stdout.strip():
                 pieces.append(result.stdout)
-
-        status = subprocess.run(
-            ["git", "-C", str(git_root), "status", "--short", "--untracked-files=all", "--", repo_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            shell=False,
-        )
-        if status.returncode != 0:
-            raise ValueError((status.stderr or "git status failed").strip())
-        pieces.insert(0, "Git status:\n" + (status.stdout.strip() or "clean") + "\n")
-        for status_line in status.stdout.splitlines():
-            if status_line.startswith("?? "):
-                relative = status_line[3:].strip()
-                try:
-                    target = (git_root / relative).resolve()
-                    target.relative_to(self.workspace)
-                    if target.is_file() and target.stat().st_size <= MAX_FILE_BYTES:
-                        content = target.read_text(encoding="utf-8").splitlines(keepends=True)
-                        pieces.append("".join(difflib.unified_diff([], content, fromfile="/dev/null", tofile=relative)))
-                except (ValueError, OSError, UnicodeDecodeError):
-                    continue
-        return (_clip("\n".join(pieces) if pieces else "No changes under {}.".format(repo_path)), True, 0)
+        return _clip("\n".join(pieces)), True, 0
 
 
 def argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:

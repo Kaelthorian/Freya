@@ -21,6 +21,8 @@ from .integration_proof import STRUCTURAL_CRITERIA, criterion_key
 from .runtime_resources import (
     RuntimeResourceCatalog, UnknownTool, UnsupportedResourceRequirement,
 )
+from .skills import SkillCompatibilityError
+from .plan_scope import PlannerScopeError, reconcile_plan_scope, semantic_plan_snapshot
 
 
 PLAN_SCHEMA_VERSION = 1
@@ -1488,7 +1490,7 @@ class Planner:
             "Never invent capability, tool, or Skill IDs. Put concrete semantic requirements in semantic_needs. "
             "required_tools may be omitted when required_capabilities identify the needed actions; "
             "Freya resolves their registered tool transports. If tools are selected without capabilities, "
-            "Freya derives the capabilities registered for those tools. Prefer precise capabilities "
+            "Freya derives only capabilities justified by specific semantic operations. Prefer precise capabilities "
             "for the smallest policy surface. A selected tool never grants permission. "
             "Report an unmet need in unsupported_requirements instead of inventing a resource. "
             "An available resource is not permission: capability policy still authorizes each action. "
@@ -1602,7 +1604,8 @@ class Planner:
             "unique explicitly declared alias; never invent capability, tool, or Skill IDs. Prefer "
             "precise required_capabilities; required_tools may be omitted because Freya resolves "
             "their registered transports. When tools are selected without capabilities, Freya derives "
-            "the compatible registered capabilities. Do not duplicate the registry relationship by hand. "
+            "only a capability justified by a specific semantic operation. Do not duplicate the registry relationship by hand. "
+            "Creating a web artifact does not imply deployment, publication, hosting, or external execution. "
             "A selected tool never grants permission. If a "
             "need has no matching catalog resource, report it in unsupported_requirements. "
             "Capabilities are requirements, not permission grants; runtime policy remains authoritative. "
@@ -1665,8 +1668,15 @@ class Planner:
                 compiler_started_at = compiler_timestamp()
                 compiler_started = time.monotonic()
                 value = json.loads(semantic) if isinstance(semantic, str) else semantic
+                snapshot = semantic_plan_snapshot(value)
+                self.metrics["planner_semantic_plan"] = snapshot
+                self.metrics.setdefault("planner_semantic_plan_attempts", []).append(snapshot)
+                value, scope_adjustments = reconcile_plan_scope(spec, value)
+                self.metrics["scope_adjustments"] = scope_adjustments
                 value = resource_catalog.validate_semantic_plan(value)
+                resource_resolutions = list(resource_catalog.resource_resolutions)
                 plan = compile_semantic_plan(value, spec, resource_catalog=resource_catalog)
+                self.metrics["resource_resolutions"] = resource_resolutions
                 plan = _normalize_python_console_calculator(plan, spec)
                 objective = spec["objective"].casefold()
                 if ("python" in objective and any(word in objective for word in
@@ -1713,18 +1723,28 @@ class Planner:
                             link["supports_global_criteria"] = list(dict.fromkeys([
                                 *link["supports_global_criteria"], *behavior_globals]))
                 compiled = validate_plan(plan)
+                preferred_skill_warnings = resource_catalog.preferred_skill_warnings_for_tasks(
+                    compiled["tasks"])
+                self.metrics["preferred_skill_warnings"] = preferred_skill_warnings
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Success",
                     attempt_number=attempt + 1, plan=compiled,
                 )
+                record["preferred_skill_warnings"] = preferred_skill_warnings
+                record["scope_adjustments"] = scope_adjustments
+                record["resource_resolutions"] = resource_resolutions
+                record["planner_semantic_plan"] = snapshot
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 return compiled
-            except UnsupportedResourceRequirement as exc:
+            except (UnsupportedResourceRequirement, SkillCompatibilityError, PlannerScopeError) as exc:
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Failed",
                     attempt_number=attempt + 1, error=exc,
                 )
+                record["planner_semantic_plan"] = self.metrics.get("planner_semantic_plan", {})
+                record["scope_adjustments"] = self.metrics.get("scope_adjustments", [])
+                record["resource_resolutions"] = self.metrics.get("resource_resolutions", [])
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 raise

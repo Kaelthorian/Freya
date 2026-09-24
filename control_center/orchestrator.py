@@ -103,6 +103,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         """Resume the same orchestration with answers to its pending questions."""
         with self.lock:
             run = self.store.record_clarification_answers(oid, answers)
+            if run.pop("_clarification_replayed", False):
+                return run
             self.store.add_orchestration_event(oid, {
                 "event_type": "task_analysis.clarification_received",
                 "status": "Analyzing", "spec_version": run["task_spec"]["version"],
@@ -140,15 +142,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "agent_id": analyst_agent["id"] if analyst_agent else None,
             "message": "Task Analyst is updating the canonical user intent.",
         })
-        spec = analyzer.analyze_spec(run["prompt"], analyst_agent, previous, answers)
-        for diagnostic_event in getattr(analyzer, "diagnostic_events", []) or []:
-            self.store.add_orchestration_event(oid, {
-                **diagnostic_event,
-                "agent_id": analyst_agent.get("id") if analyst_agent else None,
-                "agent_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
-                "actor_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
-                "actor_role": analyst_agent.get("role") if analyst_agent else "Task Analyst",
-            })
+        try:
+            spec = analyzer.analyze_spec(run["prompt"], analyst_agent, previous, answers)
+        finally:
+            for diagnostic_event in getattr(analyzer, "diagnostic_events", []) or []:
+                self.store.add_orchestration_event(oid, {
+                    **diagnostic_event,
+                    "agent_id": analyst_agent.get("id") if analyst_agent else None,
+                    "agent_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
+                    "actor_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
+                    "actor_role": analyst_agent.get("role") if analyst_agent else "Task Analyst",
+                })
         spec = validate_task_spec(spec)
         if spec["status"] == "ANALYZING":
             raise ValueError("Task Analyst did not resolve the analysis state.")
@@ -473,11 +477,21 @@ class Orchestrator(IntegrationOrchestrationMixin):
             })
             raise
         agent = created["agent"]
+        for omission in created.get("skill_omissions", []):
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.agent_factory.skill_omitted", "status": "Warning",
+                "task_id": planned_task_id, "agent_id": agent["id"],
+                "skill_id": omission["skill_id"], "reason": omission["reason"],
+                "missing_capabilities": omission["missing_capabilities"],
+                "message": "A preferred Skill was omitted because its required capabilities are unavailable.",
+            })
         event = {
             "event_type": "freya.agent_created", "status": "Running",
             "task_id": planned_task_id, "plan_task_id": planned_task_id,
             "agent_id": agent["id"], "role": created["role"],
             "skill_ids": created["skill_ids"],
+            "planner_preferred_skills": list(task.get("preferred_skills", [])),
+            "resolved_skills": created["skill_ids"],
             "required_capabilities": created["required_capabilities"],
             "effective_tools": created["effective_tools"],
             "attempt": attempt, "factory_version": created["factory_version"],
@@ -678,8 +692,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan_compiler.started", "timestamp": compiler["started_at"],
                 "status": "Running", "message": "Plan Compiler started runtime preparation.",
+                "planner_semantic_plan": compiler.get("planner_semantic_plan", {}),
                 **common,
             })
+            for adjustment in compiler.get("scope_adjustments", []):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.scope_adjusted", "status": "Warning",
+                    "phase": "plan_compiler", "actor_type": "runtime",
+                    "task_key": adjustment.get("task_key", ""),
+                    "scope_action": adjustment.get("action", ""),
+                    "reason": adjustment.get("reason", ""),
+                    "category": adjustment.get("category", ""),
+                    "message": "Planner work outside the canonical Task Spec was omitted.",
+                })
             succeeded = compiler.get("status") == "Success"
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan_compiler.completed" if succeeded
@@ -690,6 +715,10 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 else "Plan Compiler could not prepare the runtime plan.",
                 **common,
                 **({"error": compiler["error"]} if compiler.get("error") else {}),
+                **({"preferred_skill_warnings": compiler["preferred_skill_warnings"]}
+                   if compiler.get("preferred_skill_warnings") else {}),
+                **({"resource_resolutions": compiler["resource_resolutions"]}
+                   if compiler.get("resource_resolutions") else {}),
             })
 
     def _fail_planning(self, oid: str, exc: Exception,
@@ -1780,7 +1809,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         except Exception as exc:
             with self.lock:
                 current = self.store.get_orchestration(oid)
-                if current.get("task_spec") != locals().get("spec"):
+                expected_spec = locals().get("spec", run.get("task_spec"))
+                if current.get("task_spec") != expected_spec:
                     return
             self._fail_planning(oid, exc, planning_metrics)
             return

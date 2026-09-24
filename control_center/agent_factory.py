@@ -14,9 +14,9 @@ from .capabilities import CAPABILITIES, CAPABILITY_REGISTRY, effective_tools_for
 from .config import normalize_agent
 from .task_analyst import canonical_task_kind
 from .policy import validate_policy
+from .skills import CORE_SKILL_ID, SkillConfigurationError, validate_skill_tools
 from .runtime_resources import (
-    RuntimeResourceCatalog, ToolCapabilityMismatch, UnknownTool,
-    UnsupportedResourceRequirement,
+    RuntimeResourceCatalog, ToolCapabilityMismatch, UnknownCapability, UnknownSkill, UnknownTool,
 )
 
 
@@ -30,11 +30,6 @@ def _slug(value: Any) -> str:
 
 def _tokens(value: Any) -> set[str]:
     return {item for item in re.findall(r"[a-z0-9_+-]{3,}", str(value or "").casefold())}
-
-
-def _skill_required(skill: dict[str, Any]) -> set[str]:
-    return {str(item) for item in skill.get("required_capabilities", [])
-            if isinstance(item, str)}
 
 
 class AgentFactory:
@@ -88,7 +83,6 @@ class AgentFactory:
 
     @staticmethod
     def orchestration_role(task: dict[str, Any]) -> str:
-        preferred = {_slug(item) for item in task.get("preferred_skills", [])}
         text = " ".join(
             str(task.get(key) or "") for key in ("objective", "description", "task_type")
         ).casefold()
@@ -99,7 +93,7 @@ class AgentFactory:
         explicit_review = bool(re.search(r"\b(?:code audit|code auditor|code review|audit the code|review the code)\b", text))
         if (task_kind == "review" or explicit_review) and "code_change" not in task_kind:
             return "auditor"
-        if (task_kind == "testing" and interactive) or (interactive and "interactive-testing" in preferred):
+        if task_kind == "testing" and interactive:
             return "qa"
         return "worker"
 
@@ -114,209 +108,16 @@ class AgentFactory:
         )
 
     def select_skills(self, task: dict[str, Any], skills: Iterable[dict[str, Any]],
-                      *, variant: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
-        """Select the smallest useful Skill set without changing policy.
-
-        ``max_skills`` remains a safety ceiling.  It is deliberately not used
-        as a target: ordinary implementation tasks receive one primary Skill,
-        and only a clearly distinct, task-required specialty may be added.
-        """
-        available = [
-            item for item in skills
-            if isinstance(item, dict) and item.get("enabled") is True
-            and isinstance(item.get("id"), str)
-        ]
-        available.sort(key=lambda item: (
-            str(item.get("id")).casefold(), str(item.get("name") or "").casefold()
-        ))
-        by_id = {str(item["id"]).casefold(): item for item in available}
-        by_alias: dict[str, dict[str, Any]] = {}
-        for item in available:
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            aliases = metadata.get("aliases", [])
-            if isinstance(aliases, list):
-                for alias in aliases:
-                    if isinstance(alias, str) and alias.strip():
-                        by_alias.setdefault(alias.strip().casefold(), item)
-
-        required = {str(item) for item in task.get("required_capabilities", [])}
-        selected: list[tuple[dict[str, Any], int]] = []
-        selected_ids: set[str] = set()
-        warnings: list[str] = []
-
-        def add(skill: dict[str, Any], priority: int) -> None:
-            skill_id = str(skill["id"])
-            if skill_id not in selected_ids and len(selected) < self.max_skills:
-                selected_ids.add(skill_id)
-                selected.append((skill, priority))
-
-        preferred = [
-            str(item).strip() for item in task.get("preferred_skills", [])
-            if str(item).strip()
-        ]
-        preferred_records: list[tuple[str, dict[str, Any] | None]] = []
-        for requested in preferred:
-            skill = by_id.get(requested.casefold())
-            if skill is None:
-                skill = by_alias.get(requested.casefold())
-            if skill is None:
-                raise UnsupportedResourceRequirement(
-                    "skill", requested,
-                    reason="The Agent Factory accepts only registered Skill IDs or declared aliases.",
-                )
-            preferred_records.append((requested, skill))
-
-        task_text = " ".join([
-            str(task.get("objective") or ""),
-            str(task.get("description") or ""),
-            str(task.get("task_type") or ""),
-            " ".join(preferred),
-        ])
-        intent_text = " ".join([
-            str(task.get("objective") or ""),
-            str(task.get("description") or ""),
-            str(task.get("task_type") or ""),
-        ])
-        role = self.orchestration_role(task)
-        task_kind = self.task_kind(task)
-        characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
-        single_case_verification = bool(characteristics.get("single_case_verification"))
-        interactive = bool(characteristics.get("interactive") or characteristics.get("requires_user_input"))
-        interactive = interactive or bool(re.search(r"(?<!non-)\b(?:interactive|input|qa|quality assurance)\b", task_text, re.I))
-        recovery_text = " ".join(str(task.get(key) or "") for key in (
-            "_recovery_reason", "_recovery_failure_class", "_recovery_cause",
-        )).casefold()
-        # A normal implementation may mention errors or fixes without being a
-        # debugging task.  Reserve the Skill for explicit diagnostic intent or
-        # an actual recovery attempt supplied by the orchestrator.
-        debug_requested = (
-            task_kind == "analysis"
-            or bool(re.search(
-                r"\b(?:debug(?:ging)?|diagnos(?:e|is|tic)?|root cause|bug|arregla(?:r)?|soluciona(?:r)?)\b",
-                intent_text, re.I,
-            ))
-            or any(str(task.get(key) or "").strip() for key in (
-                "_recovery_reason", "_recovery_failure_class", "_recovery_cause",
-            ))
-        )
-        python_requested = bool(re.search(r"\bpython\b|\.py\b|python-development", task_text, re.I))
-        python_requested = python_requested or bool(required & {
-            "execution.python_script", "execution.py_compile", "execution.pytest", "execution.unittest",
-        })
-        if role == "auditor":
-            canonical_ids = ["code-review"]
-        elif role == "qa":
-            canonical_ids = ([] if single_case_verification else
-                             ["interactive-testing", "software-testing"] if interactive
-                             else ["software-testing"])
-        elif task_kind == "analysis" or debug_requested:
-            canonical_ids = ["debugging"]
-        elif task_kind == "file_creation":
-            canonical_ids = ["simple-file-artifact"]
-        elif task_kind == "program_creation" and python_requested:
-            canonical_ids = ["python-development"]
-        elif task_kind == "code_change" and python_requested:
-            canonical_ids = ["python-development"]
-        elif task_kind == "testing":
-            canonical_ids = ["software-testing"]
-        else:
-            canonical_ids = []
-
-        primary: dict[str, Any] | None = None
-        for requested, candidate in preferred_records:
-            if (candidate is not None and candidate.get("source") == "user"
-                    and str(candidate["id"]) not in set(canonical_ids)):
-                missing = sorted(_skill_required(candidate) - required)
-                if missing:
-                    raise ValueError(
-                        f"Primary Skill '{candidate['id']}' is incompatible with the planned capability set: "
-                        + ", ".join(missing)
-                    )
-                break
-        for candidate_id in canonical_ids:
-            candidate = by_id.get(candidate_id)
-            if candidate is not None:
-                primary = candidate
-                break
-        if primary is None and preferred_records:
-            # A custom or explicitly requested Skill may be the only useful
-            # guidance for a non-canonical task.  Do not use this escape hatch
-            # for a trivial artifact/program when the canonical Skill exists.
-            for requested, candidate in preferred_records:
-                if candidate is None:
-                    continue
-                if task_kind in {"file_creation", "program_creation"} and str(candidate["id"]) in {
-                    "debugging", "interactive-testing", "software-testing", "code-review",
-                }:
-                    continue
-                primary = candidate
-                break
-        if primary is None:
-            for candidate_id in canonical_ids:
-                candidate = by_id.get(candidate_id)
-                if candidate is not None:
-                    primary = candidate
-                    break
-        if primary is not None:
-            missing = sorted(_skill_required(primary) - required)
-            if missing:
-                explicitly_requested = any(candidate is primary for _, candidate in preferred_records)
-                if explicitly_requested:
-                    raise ValueError(
-                        f"Primary Skill '{primary['id']}' is incompatible with the planned capability set: "
-                        + ", ".join(missing)
-                    )
-                warnings.append(
-                    f"Skill '{primary['id']}' was omitted because the plan lacks: "
-                    + ", ".join(missing)
-                )
-                primary = None
-            if primary is not None:
-                requested_priority = next(
-                    (1000 - index for index, (_, candidate) in enumerate(preferred_records)
-                     if candidate is primary),
-                    100,
-                )
-                add(primary, requested_priority)
-
-        # Do not fill the context with every compatible Skill.  An additional
-        # Skill is reserved for a genuinely separate explicit recovery or QA
-        # concern and is never selected for trivial implementation tasks.
-        if (not selected and task_kind not in {"file_creation", "program_creation"}
-                and not single_case_verification):
-            task_tokens = _tokens(task_text)
-            scored: list[tuple[int, str, dict[str, Any]]] = []
-            for skill in available:
-                if not _skill_required(skill) <= required:
-                    continue
-                metadata = " ".join([
-                    str(skill.get("name") or ""), str(skill.get("category") or ""),
-                    *[str(item) for item in skill.get("tags", [])],
-                ])
-                score = len(task_tokens & _tokens(metadata))
-                if score:
-                    scored.append((score, str(skill["id"]), skill))
-            scored.sort(key=lambda item: (-item[0], item[1]))
-            if variant and len(scored) > 1:
-                offset = variant % len(scored)
-                scored = scored[offset:] + scored[:offset]
-            if scored:
-                score, _, skill = scored[0]
-                add(skill, 100 + score)
-
-        for requested, candidate in preferred_records:
-            if candidate is None or str(candidate["id"]) in selected_ids:
-                continue
-            if task_kind in {"file_creation", "program_creation"}:
-                warnings.append(f"Preferred Skill '{candidate['id']}' was omitted because it is not needed for this task kind.")
-            elif len(selected) >= 1:
-                warnings.append(f"Preferred Skill '{candidate['id']}' was omitted to keep the worker context minimal.")
-
-        return (
-            [{"skill_id": skill["id"], "priority": priority}
-             for skill, priority in selected],
-            warnings,
-        )
+                      *, variant: int = 0) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+        """Assign the one active Skill. Planner preferences have no authority."""
+        core = next((item for item in skills if isinstance(item, dict)
+                     and item.get("id") == CORE_SKILL_ID and item.get("enabled") is True), None)
+        if core is None:
+            raise SkillConfigurationError("freya-core is unavailable")
+        validate_skill_tools(core)
+        warning = (["planner skill preference ignored; freya-core selected"]
+                   if task.get("preferred_skills") not in (None, [], [CORE_SKILL_ID]) else [])
+        return [{"skill_id": CORE_SKILL_ID, "priority": 100}], warning, []
 
     @staticmethod
     def _identity(task: dict[str, Any], role: str,
@@ -384,16 +185,15 @@ class AgentFactory:
             else self.store.list_skills(enabled=True)
         )
         catalog = RuntimeResourceCatalog.build(records)
-        normalized_skills = []
-        for requested in preferred_skills:
-            resolved = catalog.resolve("skill", requested)
-            if resolved is None:
-                raise UnsupportedResourceRequirement(
-                    "skill", requested,
-                    reason="The Agent Factory accepts only registered Skill IDs or unique declared aliases.",
-                )
-            if resolved not in normalized_skills:
-                normalized_skills.append(resolved)
+        catalog_skills = {item["id"]: item for item in catalog.skills}
+        for capability_id in required:
+            if catalog.resolve("capability", capability_id) is None:
+                raise UnknownCapability(capability_id)
+        normalized_skills = [CORE_SKILL_ID]
+        core = next((item for item in records if item.get("id") == CORE_SKILL_ID and item.get("enabled") is True), None)
+        if core is None:
+            raise SkillConfigurationError("freya-core is unavailable")
+        core_tools = validate_skill_tools(core)
         raw_tools = task.get("required_tools", [])
         if not isinstance(raw_tools, list) or any(not isinstance(item, str) for item in raw_tools):
             raise ValueError("required_tools must be a list of strings.")
@@ -426,12 +226,12 @@ class AgentFactory:
             )
         # Concrete tool schemas are still derived from the policy surface.
         # required_tools is a validated planning declaration, never authority.
-        tools = policy_tools
+        tools = core_tools
         skill_task = dict(task)
         skill_task["required_capabilities"] = list(required)
-        skill_task["preferred_skills"] = normalized_skills
+        skill_task["preferred_skills"] = preferred_skills
         skill_task["required_tools"] = normalized_tools
-        assignments, warnings = self.select_skills(
+        assignments, warnings, skill_omissions = self.select_skills(
             skill_task, records, variant=variant
         )
         name, role_label, identity = self._identity(task, role, attempt)
@@ -465,7 +265,7 @@ class AgentFactory:
             "description": identity["description"],
             "instructions": (
                 "Follow the Task Analyst operational brief and this plan step. "
-                "Use assigned Skills only when compatible with the capability policy."
+                "Use freya-core guidance and obey the capability policy for every action."
             ),
             "enabled": True,
             "tools": tools,
@@ -486,7 +286,7 @@ class AgentFactory:
             },
             "verification": {
                 "completion_criteria": list(task.get("success_criteria", [])),
-                "require_tool_evidence": bool(tools),
+                "require_tool_evidence": bool(policy_tools),
                 "stop_after_acceptance_evidence": bool(
                     characteristics.get("single_case_verification")
                 ),
@@ -496,9 +296,11 @@ class AgentFactory:
         return {
             "payload": payload,
             "warnings": warnings,
+            "skill_omissions": skill_omissions,
             "skill_ids": [item["skill_id"] for item in assignments],
             "required_capabilities": list(dict.fromkeys(required)),
-            "effective_tools": tools,
+            "effective_tools": policy_tools,
+            "declared_tools": tools,
             "role": role,
             "factory_version": self.version,
         }

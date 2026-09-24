@@ -42,7 +42,11 @@ Ollama and allowlisted tools → selected agent workspace.
   agent configuration. Autonomy records preferences only and never grants a
   capability.
 - Keep reusable Skills declarative. `skills.py` validates and resolves them;
-  required/recommended capabilities are diagnostics and never grants.
+  the temporary `freya-core` Skill declares registered tools directly and
+  never grants a capability. Every dynamic agent receives it.
+- Execute agent Python, tests, Ruff and Git only in an ephemeral Docker copy of
+  the assigned workspace. Never fall back to host execution or copy command
+  writes back. Missing Docker/image must fail as `SandboxUnavailable`.
 - Treat Git inspection as workspace-applicable only: non-Git task workspaces
   must not advertise `git_diff` or inject Git Inspection guidance.
 - Stop workers that repeat successful read-only actions without workspace

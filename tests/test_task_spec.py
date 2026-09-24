@@ -15,7 +15,7 @@ from control_center.planner import PlanGenerationError, Planner, semantic_plan_r
 from control_center.runtime_resources import RuntimeResourceCatalog, UnsupportedResourceRequirement
 from control_center.storage import Store
 from control_center.task_spec import (
-    TASK_SPEC_RESPONSE_FORMAT, TaskSpecAnalyst, deterministic_task_spec,
+    TASK_SPEC_RESPONSE_FORMAT, TaskSpecAnalyst, TaskSpecError, deterministic_task_spec,
     render_task_spec, revise_ready_task_spec, validate_task_spec,
 )
 
@@ -39,6 +39,120 @@ class CountingPlanner(Planner):
 
 
 class TaskSpecTests(unittest.TestCase):
+    def test_question_ids_are_runtime_owned_and_not_renumbered_by_validation(self):
+        first = deterministic_task_spec("haz una calculadora")
+        self.assertEqual([item["id"] for item in first["clarification_questions"]],
+                         ["CQ-1", "CQ-2"])
+        self.assertEqual(validate_task_spec(first)["clarification_questions"],
+                         first["clarification_questions"])
+        second = deterministic_task_spec("haz una calculadora", first,
+                                         {"CQ-1": "Web"})
+        self.assertEqual([item["id"] for item in second["clarification_questions"]], ["CQ-2"])
+        self.assertEqual(second["clarification_history"][0]["question_id"], "CQ-1")
+
+    def test_reserved_question_field_is_rejected_by_validator(self):
+        spec = deterministic_task_spec("haz una calculadora")
+        spec["clarification_questions"][0]["field"] = "user_decisions"
+        with self.assertRaises(TaskSpecError) as caught:
+            validate_task_spec(spec)
+        self.assertEqual(caught.exception.error_type, "invalid_question_field")
+
+    def test_no_is_a_resolved_answer_and_paraphrase_same_field_is_deduplicated(self):
+        prompt = "crea una calculadora web que sume"
+        baseline = deterministic_task_spec(prompt)
+        calls = []
+        def request(method, url, payload, timeout):
+            calls.append(payload)
+            candidate = _analyst_response(baseline)
+            candidate["status"] = "NEEDS_CLARIFICATION"
+            candidate["clarification_questions"] = [{
+                "question": "¿Debe funcionar sin conexión?" if len(calls) == 1
+                            else "¿Quieres uso offline?",
+                "reason": "Define un requisito del producto.",
+                "field": "offline_mode", "required": True,
+            }]
+            return {"message": {"content": json.dumps(candidate)}}
+        analyst = TaskSpecAnalyst(request=request)
+        agent = {"config": {"model": "test-model", "endpoint": "http://127.0.0.1:11434"}}
+        pending = analyst.analyze_spec(prompt, agent)
+        self.assertEqual(pending["clarification_questions"][0]["id"], "CQ-1")
+        ready = analyst.analyze_spec(prompt, agent, pending, {"CQ-1": "No"})
+        self.assertEqual(ready["status"], "READY_FOR_PLANNING")
+        self.assertEqual(ready["user_decisions"]["offline_mode"], "No")
+        self.assertEqual(len(ready["clarification_history"]), 1)
+        self.assertEqual(ready["clarification_history"][0]["answer"], "No")
+        types = [item["event_type"] for item in analyst.diagnostic_events]
+        self.assertIn("task_analysis.clarification_resolved", types)
+        self.assertIn("task_analysis.clarification_deduplicated", types)
+
+    def test_model_question_with_container_field_is_discarded(self):
+        prompt = "crea una calculadora web que sume"
+        candidate = _analyst_response(deterministic_task_spec(prompt))
+        candidate["status"] = "NEEDS_CLARIFICATION"
+        candidate["clarification_questions"] = [{"question": "¿Algo más?", "reason": "Detalles.",
+                                                 "field": "user_decisions", "required": True}]
+        analyst = TaskSpecAnalyst(request=lambda *args, **kwargs: {"message": {"content": json.dumps(candidate)}})
+        result = analyst.analyze_spec(prompt, {"config": {"model": "test-model"}})
+        self.assertEqual(result["status"], "READY_FOR_PLANNING")
+        self.assertEqual(result["clarification_questions"], [])
+        self.assertEqual(analyst.metrics["model_calls"], 1)
+        self.assertFalse(analyst.metrics["fallback_used"])
+        self.assertTrue(any(item["event_type"] == "task_analysis.clarification_rejected"
+                            for item in analyst.diagnostic_events))
+
+    def test_uncertain_answer_does_not_resolve_material_question(self):
+        prompt = "haz una calculadora"
+        analyst = TaskSpecAnalyst(offline=True)
+        first = analyst.analyze_spec(prompt)
+        answer = {first["clarification_questions"][0]["id"]: "No sé",
+                  first["clarification_questions"][1]["id"]: "sumar"}
+        second = analyst.analyze_spec(prompt, previous=first, answers=answer)
+        self.assertEqual(second["status"], "NEEDS_CLARIFICATION")
+        self.assertEqual([item["id"] for item in second["clarification_questions"]], ["CQ-1"])
+        self.assertEqual(second["clarification_history"][0]["question_id"], "CQ-2")
+        self.assertNotIn("interface", second["user_decisions"])
+
+    def test_reported_extra_features_loop_resolves_no_once(self):
+        prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
+        basis = deterministic_task_spec("crea una calculadora web que sume")
+        previous = validate_task_spec({**basis, "source_prompt": prompt, "version": 2,
+            "status": "NEEDS_CLARIFICATION", "user_decisions": {"platform": "Web"},
+            "clarification_history": [{"question_id": "CQ-1", "field": "platform",
+                                      "question": "¿Web, desktop o consola?", "answer": "Web"}],
+            "clarification_questions": [{"id": "CQ-2", "field": "additional_features",
+                 "question": "Do you want any additional features?",
+                 "reason": "Possible extras.", "required": True}]})
+        candidate = _analyst_response(basis)
+        candidate.update(status="NEEDS_CLARIFICATION", clarification_questions=[
+            {"field": "additional_features", "question": "Would you like any extra functionality?",
+             "reason": "Possible extras.", "required": True},
+            {"field": "operations", "question": "Which operations?",
+             "reason": "Core behavior.", "required": True}])
+        analyst = TaskSpecAnalyst(request=lambda *args, **kwargs: {
+            "message": {"content": json.dumps(candidate)}})
+        ready = analyst.analyze_spec(prompt, {"config": {"model": "test-model"}},
+                                     previous, {"CQ-2": "No"})
+        self.assertEqual(ready["status"], "READY_FOR_PLANNING")
+        self.assertEqual(ready["clarification_questions"], [])
+        self.assertEqual(ready["user_decisions"], {"platform": "Web", "additional_features": "No"})
+        self.assertEqual([item["question_id"] for item in ready["clarification_history"]],
+                         ["CQ-1", "CQ-2"])
+        self.assertEqual(analyst.metrics["model_calls"], 1)
+        self.assertFalse(analyst.metrics["fallback_used"])
+        self.assertFalse(analyst.metrics["repair_attempted"])
+        self.assertIn("task_analysis.clarification_deduplicated",
+                      [item["event_type"] for item in analyst.diagnostic_events])
+
+    def test_platform_then_material_operations_get_distinct_ids(self):
+        prompt = "haz una calculadora"
+        first = deterministic_task_spec(prompt)
+        first["clarification_questions"] = [first["clarification_questions"][0]]
+        first = validate_task_spec(first)
+        second = deterministic_task_spec(prompt, first, {"CQ-1": "Web"})
+        self.assertEqual(second["clarification_questions"][0]["field"], "operations")
+        self.assertEqual(second["clarification_questions"][0]["id"], "CQ-2")
+        self.assertEqual(second["clarification_history"][0]["question_id"], "CQ-1")
+
     def test_clear_request_is_ready_without_questions(self):
         spec = deterministic_task_spec("crea una calculadora usando Python, de consola, que solo sume")
         self.assertEqual(spec["status"], "READY_FOR_PLANNING")
@@ -569,6 +683,138 @@ class TaskSpecTests(unittest.TestCase):
 
 
 class ClarificationIntegrationTests(unittest.TestCase):
+    def test_model_calculator_web_answer_discards_extra_features_and_plans_once(self):
+        prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
+        ready_basis = deterministic_task_spec(
+            "crea una calculadora web que pueda sumar restar multiplicar y dividir")
+        calls = []
+        def request(method, url, payload, timeout):
+            calls.append(payload)
+            candidate = _analyst_response(ready_basis)
+            candidate["status"] = "NEEDS_CLARIFICATION"
+            candidate["clarification_questions"] = [
+                {"question": "¿Consola, escritorio o Web?", "reason": "La interfaz cambia el producto.",
+                 "field": "interface", "required": True},
+                {"question": "¿Quieres funcionalidades adicionales?",
+                 "reason": "Posibles funciones extras.", "field": "additional_features", "required": True},
+            ]
+            return {"message": {"content": json.dumps(candidate)}}
+        with TemporaryDirectory(dir=".") as folder:
+            store = Store(Path(folder) / "state.sqlite3")
+            store.create_agent(normalize_agent({"name": "Analyst", "config": {
+                "orchestration_role": "task_analyst", "model": "test-model"}}))
+            planner = CountingPlanner()
+            analyst = TaskSpecAnalyst(request=request)
+            orchestrator = Orchestrator(store, None, planner=planner, task_analyst=analyst)
+            orchestrator._run_graph = lambda *args: None
+            run = store.create_orchestration(prompt)
+            orchestrator._run(run["id"])
+            pending = store.get_orchestration(run["id"])
+            self.assertEqual(pending["status"], "NeedsClarification")
+            self.assertEqual([q["field"] for q in pending["task_spec"]["clarification_questions"]],
+                             ["interface"])
+            self.assertEqual(pending["task_spec"]["clarification_questions"][0]["id"], "CQ-1")
+            store.record_clarification_answers(run["id"], {"CQ-1": "Web"})
+            orchestrator._run(run["id"], {"CQ-1": "Web"})
+            final = store.get_orchestration(run["id"])
+            self.assertEqual(final["task_spec"]["status"], "READY_FOR_PLANNING")
+            self.assertEqual(final["task_spec"]["user_decisions"]["interface"], "Web")
+            self.assertEqual(len(final["task_spec"]["clarification_history"]), 1)
+            self.assertEqual(final["task_spec"]["clarification_history"][0]["question_id"], "CQ-1")
+            self.assertEqual(len(planner.calls), 1)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(analyst.metrics["model_calls"], 1)
+            self.assertFalse(analyst.metrics["fallback_used"])
+            self.assertFalse(analyst.metrics["repair_attempted"])
+            self.assertIn("task_analysis.clarification_deduplicated",
+                          [event["event_type"] for event in final["events"]])
+
+    def test_legitimate_second_question_gets_cq2_and_old_answer_replay_is_idempotent(self):
+        prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
+        basis = deterministic_task_spec("crea una calculadora web que sume")
+        calls = []
+        def request(method, url, payload, timeout):
+            calls.append(payload)
+            candidate = _analyst_response(basis)
+            if len(calls) == 1:
+                candidate.update(status="NEEDS_CLARIFICATION", clarification_questions=[
+                    {"question": "¿Qué interfaz?", "reason": "Define el producto.",
+                     "field": "interface", "required": True}])
+            elif len(calls) == 2:
+                candidate.update(status="NEEDS_CLARIFICATION", clarification_questions=[
+                    {"question": "¿Se necesita precisión decimal especial?",
+                     "reason": "Define el cálculo requerido.", "field": "precision_mode", "required": True}])
+            return {"message": {"content": json.dumps(candidate)}}
+        with TemporaryDirectory(dir=".") as folder:
+            store = Store(Path(folder) / "state.sqlite3")
+            store.create_agent(normalize_agent({"name": "Analyst", "config": {
+                "orchestration_role": "task_analyst", "model": "test-model"}}))
+            planner = CountingPlanner()
+            orchestrator = Orchestrator(store, None, planner=planner,
+                                        task_analyst=TaskSpecAnalyst(request=request))
+            orchestrator._run_graph = lambda *args: None
+            run = store.create_orchestration(prompt)
+            orchestrator._run(run["id"])
+            first = store.get_orchestration(run["id"])
+            self.assertEqual(first["task_spec"]["clarification_questions"][0]["id"], "CQ-1")
+            recorded = store.record_clarification_answers(run["id"], {"CQ-1": "Web"})
+            self.assertFalse(recorded["_clarification_replayed"])
+            self.assertTrue(store.record_clarification_answers(run["id"],
+                                                               {"CQ-1": "Web"})["_clarification_replayed"])
+            orchestrator._run(run["id"], {"CQ-1": "Web"})
+            second = store.get_orchestration(run["id"])
+            self.assertEqual(second["status"], "NeedsClarification")
+            self.assertEqual(second["task_spec"]["clarification_questions"][0]["id"], "CQ-2")
+            self.assertTrue(store.record_clarification_answers(run["id"],
+                                                               {"CQ-1": "Web"})["_clarification_replayed"])
+            self.assertEqual(len(second["clarification_answers"]), 1)
+            with self.assertRaises(ValueError):
+                store.record_clarification_answers(run["id"], {"CQ-1": "different"})
+            store.record_clarification_answers(run["id"], {"CQ-2": "No"})
+            orchestrator._run(run["id"], {"CQ-2": "No"})
+            final = store.get_orchestration(run["id"])
+            self.assertEqual(final["task_spec"]["status"], "READY_FOR_PLANNING")
+            self.assertEqual([x["question_id"] for x in final["task_spec"]["clarification_history"]],
+                             ["CQ-1", "CQ-2"])
+            self.assertEqual(final["task_spec"]["user_decisions"]["precision_mode"], "No")
+            self.assertEqual(len(planner.calls), 1)
+
+    def test_clarification_cycle_fails_after_three_rounds_with_event(self):
+        prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
+        basis = deterministic_task_spec("crea una calculadora web que sume")
+        fields = ["interface", "precision_mode", "data_mode", "deployment_region"]
+        def request(method, url, payload, timeout):
+            previous = json.loads(payload["messages"][1]["content"])["previous_task_spec"]
+            submitted = json.loads(payload["messages"][1]["content"])["answers_to_pending_questions"]
+            index = previous["version"] - 1 + bool(submitted)
+            candidate = _analyst_response(basis)
+            candidate.update(status="NEEDS_CLARIFICATION", clarification_questions=[
+                {"question": "Indica " + fields[index], "reason": "Decisión requerida.",
+                 "field": fields[index], "required": True}])
+            return {"message": {"content": json.dumps(candidate)}}
+        with TemporaryDirectory(dir=".") as folder:
+            store = Store(Path(folder) / "state.sqlite3")
+            store.create_agent(normalize_agent({"name": "Analyst", "config": {
+                "orchestration_role": "task_analyst", "model": "test-model"}}))
+            planner = CountingPlanner()
+            orchestrator = Orchestrator(store, None, planner=planner,
+                                        task_analyst=TaskSpecAnalyst(request=request))
+            run = store.create_orchestration(prompt)
+            orchestrator._run(run["id"])
+            for answer in ("Web", "No", "Local"):
+                current = store.get_orchestration(run["id"])
+                question = current["task_spec"]["clarification_questions"][0]
+                store.record_clarification_answers(run["id"], {question["id"]: answer})
+                orchestrator._run(run["id"], {question["id"]: answer})
+            final = store.get_orchestration(run["id"])
+            self.assertEqual(final["status"], "Failed")
+            self.assertIsNone(final["plan"])
+            self.assertEqual(len(planner.calls), 0)
+            cycle = next(json.loads(event["payload_json"]) for event in final["events"]
+                         if event["event_type"] == "task_analysis.clarification_cycle_detected")
+            self.assertEqual(cycle["rounds"], 3)
+            self.assertEqual(cycle["pending_fields"], ["deployment_region"])
+
     def test_resource_catalog_and_unknown_id_are_logged_without_repair(self):
         with TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.sqlite3")

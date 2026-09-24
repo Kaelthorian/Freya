@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS skills (
     procedures_json TEXT NOT NULL DEFAULT '[]',
     recommended_capabilities_json TEXT NOT NULL DEFAULT '[]',
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    tools_json TEXT NOT NULL DEFAULT '[]',
     tags_json TEXT NOT NULL DEFAULT '[]',
     source TEXT NOT NULL DEFAULT 'user',
     metadata_json TEXT NOT NULL DEFAULT '{}',

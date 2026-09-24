@@ -22,7 +22,7 @@ from .recovery import allowed_replan_scope, validate_replan_revision
 from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
 from .integration_storage import IntegrationStoreMixin, migrate_integration_schema
 from .agent_context import build_agent_context, build_effective_agent
-from .skills import BUILTIN_SKILLS, MAX_SKILLS_IMPORT, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary
+from .skills import BUILTIN_SKILLS, CORE_SKILL_ID, CORE_TOOLS, SkillConfigurationError, MAX_SKILLS_IMPORT, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary, validate_skill_tools
 from .security import sanitize
 from .tools import argument_summary
 
@@ -40,7 +40,7 @@ EXECUTION_FIELDS = {
 METRIC_FIELDS = {"model_calls", "tool_calls", "prompt_tokens", "generated_tokens", "total_tokens"}
 SKILL_DEFINITION_FIELDS = (
     "id", "name", "description", "category", "version", "instructions", "procedures",
-    "recommended_capabilities", "required_capabilities", "tags", "source", "metadata", "enabled",
+    "recommended_capabilities", "required_capabilities", "tools", "tags", "source", "metadata", "enabled",
 )
 TASK_SELECT = """
 SELECT t.*, e.id AS execution_id, e.status, e.started_at, e.finished_at,
@@ -122,6 +122,7 @@ class Store(IntegrationStoreMixin):
                 ("procedures_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("recommended_capabilities_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("required_capabilities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("tools_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("source", "TEXT NOT NULL DEFAULT 'user'"),
                 ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -143,6 +144,16 @@ class Store(IntegrationStoreMixin):
                   int(tool.get("dangerous", False))) for tool in TOOL_CATALOG],
             )
             self._seed_builtin_skills(connection)
+            core = connection.execute("SELECT tools_json,enabled,deleted_at FROM skills WHERE id=?", (CORE_SKILL_ID,)).fetchone()
+            if core is None:
+                raise RuntimeError("freya-core was not installed")
+            declared = validate_skill_tools({"id": CORE_SKILL_ID, "tools": _load(core["tools_json"])})
+            if set(declared) != set(CORE_TOOLS) or not core["enabled"] or core["deleted_at"]:
+                raise SkillConfigurationError("freya-core must be enabled with all registered tools")
+            # Preserve historical rows and snapshots, but remove every other Skill
+            # from the active catalog during the single-Skill configuration.
+            connection.execute("UPDATE skills SET enabled=0,deleted_at=COALESCE(deleted_at,?) WHERE id<>?",
+                               (utcnow(), CORE_SKILL_ID))
             for row in connection.execute("SELECT * FROM skills"):
                 legacy = self._skill(row)
                 snapshot = {key: legacy[key] for key in SKILL_DEFINITION_FIELDS}
@@ -159,11 +170,11 @@ class Store(IntegrationStoreMixin):
             skill = normalize_skill(raw)
             connection.execute(
                 "INSERT OR IGNORE INTO skills(id,name,description,category,version,instructions,procedures_json,"
-                "recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "recommended_capabilities_json,required_capabilities_json,tools_json,tags_json,source,metadata_json,enabled,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"],
                  _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]),
-                 _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]),
+                 _dump(skill["required_capabilities"]), _dump(skill["tools"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]),
                 int(skill["enabled"]), now, now),
             )
             connection.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial builtin version"))
@@ -211,12 +222,12 @@ class Store(IntegrationStoreMixin):
         assigned = []
         for row_skill in connection.execute(
             "SELECT s.id,s.name,s.description,s.category,s.version,s.instructions,s.procedures_json,"
-            "s.recommended_capabilities_json,s.required_capabilities_json,s.tags_json,s.source,s.metadata_json,"
+            "s.recommended_capabilities_json,s.required_capabilities_json,s.tools_json,s.tags_json,s.source,s.metadata_json,"
             "s.enabled,a.priority FROM skills s JOIN agent_skills a ON a.skill_id=s.id "
             "WHERE a.agent_id=? ORDER BY a.priority DESC,s.id", (agent_id,),
         ):
             skill = dict(row_skill)
-            for field in ("instructions", "procedures", "recommended_capabilities", "required_capabilities", "tags", "metadata"):
+            for field in ("instructions", "procedures", "recommended_capabilities", "required_capabilities", "tools", "tags", "metadata"):
                 encoded = skill.pop(field if field == "instructions" else field + "_json", None)
                 if field == "instructions":
                     skill[field] = _load(encoded) if isinstance(encoded, str) and encoded.startswith(("[", "\"")) else (encoded or "")
@@ -480,29 +491,42 @@ class Store(IntegrationStoreMixin):
         """Save answers separately from approvals and atomically resume analysis."""
         if not isinstance(answers, dict) or not answers:
             raise ValueError("Clarification answers must be a nonempty object.")
+        clean_answers = {}
+        for qid, answer in answers.items():
+            if not isinstance(qid, str) or not isinstance(answer, str) or not answer.strip() or len(answer) > 4000:
+                raise ValueError("Clarification answer must be nonempty bounded text.")
+            clean_answers[qid] = sanitize(answer.strip())
         now = utcnow()
+        replayed = False
         with self._connection(write=True) as c:
             row = c.execute("SELECT status,task_spec_json FROM orchestration_runs WHERE id=?",
                             (oid,)).fetchone()
             if row is None:
                 raise KeyError(oid)
-            if row["status"] != "NeedsClarification":
+            old = c.execute("SELECT spec_version,question_id,answer FROM orchestration_clarification_answers WHERE orchestration_id=?",
+                            (oid,)).fetchall()
+            versions = {item["spec_version"] for item in old}
+            replayed = any({item["question_id"]: item["answer"] for item in old
+                            if item["spec_version"] == version} == clean_answers
+                           for version in versions)
+            if not replayed and row["status"] != "NeedsClarification":
                 raise ValueError("Orchestration is not waiting for clarification.")
-            spec = _load(row["task_spec_json"])
-            questions = {item["id"]: item for item in spec["clarification_questions"]}
-            if set(answers) - set(questions):
-                raise ValueError("Unknown clarification question.")
-            if any(item["required"] and not str(answers.get(qid) or "").strip()
-                   for qid, item in questions.items()):
-                raise ValueError("Every required clarification question needs an answer.")
-            for qid, answer in answers.items():
-                if not isinstance(answer, str) or not answer.strip() or len(answer) > 4000:
-                    raise ValueError("Clarification answer must be nonempty bounded text.")
-                c.execute("INSERT INTO orchestration_clarification_answers(orchestration_id,spec_version,question_id,answer,created_at) VALUES(?,?,?,?,?)",
-                          (oid, spec["version"], qid, sanitize(answer.strip()), now))
-            c.execute("UPDATE orchestration_runs SET status='Analyzing',updated_at=? WHERE id=? AND status='NeedsClarification'",
-                      (now, oid))
-        return self.get_orchestration(oid)
+            if not replayed:
+                spec = _load(row["task_spec_json"])
+                questions = {item["id"]: item for item in spec["clarification_questions"]}
+                if set(clean_answers) - set(questions):
+                    raise ValueError("Unknown clarification question.")
+                if any(item["required"] and not clean_answers.get(qid)
+                       for qid, item in questions.items()):
+                    raise ValueError("Every required clarification question needs an answer.")
+                for qid, answer in clean_answers.items():
+                    c.execute("INSERT INTO orchestration_clarification_answers(orchestration_id,spec_version,question_id,answer,created_at) VALUES(?,?,?,?,?)",
+                              (oid, spec["version"], qid, answer, now))
+                c.execute("UPDATE orchestration_runs SET status='Analyzing',updated_at=? WHERE id=? AND status='NeedsClarification'",
+                          (now, oid))
+        run = self.get_orchestration(oid)
+        run["_clarification_replayed"] = replayed
+        return run
 
     def get_orchestration(self, oid: str) -> dict:
         with self._connection() as c:
@@ -570,7 +594,7 @@ class Store(IntegrationStoreMixin):
         if row is None:
             raise KeyError("skill")
         item = dict(row)
-        for field in ("procedures", "recommended_capabilities", "required_capabilities", "tags", "metadata"):
+        for field in ("procedures", "recommended_capabilities", "required_capabilities", "tools", "tags", "metadata"):
             item[field] = _load(item.pop(field + "_json", None)) or ([] if field != "metadata" else {})
         raw_instructions = item.get("instructions", "")
         if isinstance(raw_instructions, str) and raw_instructions.startswith(("[", "\"")):
@@ -590,6 +614,9 @@ class Store(IntegrationStoreMixin):
     def list_skills(self, *, query: str = "", category: str = "", enabled: bool | None = None,
                     source: str = "", include_deleted: bool = False) -> list[dict[str, Any]]:
         where, params = [], []
+        if not include_deleted:
+            where.append("s.id=?")
+            params.append(CORE_SKILL_ID)
         if query:
             where.append("(s.name LIKE ? OR s.id LIKE ? OR s.description LIKE ? OR s.category LIKE ? OR s.tags_json LIKE ?)")
             pattern = "%" + str(query).strip() + "%"
@@ -621,6 +648,8 @@ class Store(IntegrationStoreMixin):
             return self._skill(row)
 
     def create_skill(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data.get("id") != CORE_SKILL_ID:
+            raise ValueError("Only freya-core is available in the single-Skill configuration")
         skill = normalize_skill(data)
         now = utcnow()
         with self._connection(write=True) as c:
@@ -629,8 +658,8 @@ class Store(IntegrationStoreMixin):
             if c.execute("SELECT 1 FROM skills WHERE lower(name)=lower(?)", (skill["name"],)).fetchone() is not None:
                 raise ValueError("Skill name already exists: " + skill["name"])
             c.execute(
-                "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
+                "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tools_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tools"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
             )
             c.execute("INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial version"))
             c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill["id"],skill["version"],now,"skill.created","Skill created",_dump({"id":skill["id"],"version":skill["version"]})))
@@ -639,6 +668,7 @@ class Store(IntegrationStoreMixin):
 
     def import_skills(self, data: list[dict[str, Any]]) -> dict[str, Any]:
         """Validate and atomically create a batch of independent Skills."""
+        raise ValueError("Skill imports are disabled in the single-Skill configuration")
         if not isinstance(data, list):
             raise ValueError("skills must be a JSON array")
         if not data:
@@ -679,8 +709,8 @@ class Store(IntegrationStoreMixin):
                     if skill["id"] in skipped:
                         continue
                     c.execute(
-                        "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
+                        "INSERT INTO skills(id,name,description,category,version,instructions,procedures_json,recommended_capabilities_json,required_capabilities_json,tools_json,tags_json,source,metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (skill["id"], skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tools"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, now),
                     )
                     c.execute(
                         "INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)",
@@ -706,6 +736,8 @@ class Store(IntegrationStoreMixin):
             incoming.pop("version", None)
             incoming["id"] = skill_id
             candidate = normalize_skill(incoming, current)
+            if skill_id == CORE_SKILL_ID and (set(candidate["tools"]) != set(CORE_TOOLS) or not candidate["enabled"]):
+                raise SkillConfigurationError("freya-core must remain enabled with all registered tools")
             comparable = tuple(key for key in SKILL_DEFINITION_FIELDS if key != "version")
             if all(candidate[key] == current[key] for key in comparable):
                 return self._skill(c.execute("SELECT s.*,COUNT(a.agent_id) AS assigned_agents,GROUP_CONCAT(a.agent_id) AS assigned_agent_ids FROM skills s LEFT JOIN agent_skills a ON a.skill_id=s.id WHERE s.id=? GROUP BY s.id", (skill_id,)).fetchone())
@@ -721,8 +753,8 @@ class Store(IntegrationStoreMixin):
             if c.execute("SELECT 1 FROM skill_versions WHERE skill_id=? AND version=?", (skill_id, skill["version"])).fetchone():
                 raise RuntimeError("Next skill version already exists")
             c.execute(
-                "UPDATE skills SET name=?,description=?,category=?,version=?,instructions=?,procedures_json=?,recommended_capabilities_json=?,required_capabilities_json=?,tags_json=?,source=?,metadata_json=?,enabled=?,updated_at=? WHERE id=?",
-                (skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, skill_id),
+                "UPDATE skills SET name=?,description=?,category=?,version=?,instructions=?,procedures_json=?,recommended_capabilities_json=?,required_capabilities_json=?,tools_json=?,tags_json=?,source=?,metadata_json=?,enabled=?,updated_at=? WHERE id=?",
+                (skill["name"], skill["description"], skill["category"], skill["version"], _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]), _dump(skill["required_capabilities"]), _dump(skill["tools"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]), int(skill["enabled"]), now, skill_id),
             )
             c.execute("INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill_id, skill["version"], _dump(skill), now, "Updated definition"))
             c.execute("INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)", (skill_id,skill["version"],now,"skill.updated","Skill updated",_dump({"id":skill_id,"version":skill["version"]})))
@@ -730,6 +762,8 @@ class Store(IntegrationStoreMixin):
             return self._skill(updated)
 
     def delete_skill(self, skill_id: str) -> dict[str, Any]:
+        if skill_id == CORE_SKILL_ID:
+            raise SkillConfigurationError("freya-core cannot be archived")
         with self._connection(write=True) as c:
             if c.execute("SELECT 1 FROM skills WHERE id=?", (skill_id,)).fetchone() is None:
                 raise KeyError(skill_id)

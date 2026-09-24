@@ -12,12 +12,13 @@ from control_center.integration import GlobalVerifier
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
 from control_center.runtime_resources import (
-    ToolCapabilityMismatch, UnsupportedResourceRequirement,
+    ToolCapabilityMismatch, UnknownSkill, UnsupportedResourceRequirement,
 )
 from control_center.recovery import RecoveryController
 from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.task_analyst import TaskAnalyst
+from control_center.task_spec import TaskSpecAnalyst
 from control_center.worker import run_task
 
 
@@ -135,7 +136,7 @@ class AgentFactoryTests(unittest.TestCase):
             required_capabilities=["filesystem.create", "filesystem.read"],
             preferred_skills=[],
         ))
-        self.assertIn("simple-file-artifact", created["skill_ids"])
+        self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertIn("read_file", created["agent"]["tools"])
         self.assertIn("write_file", created["agent"]["tools"])
 
@@ -156,7 +157,7 @@ class AgentFactoryTests(unittest.TestCase):
                 "interactive-testing", "debugging",
             ],
         ))
-        self.assertEqual(created["skill_ids"], ["python-development"])
+        self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertEqual(created["agent"]["config"]["orchestration_role"], "worker")
 
     def test_hello_world_python_flow_uses_minimal_agent_and_real_evidence(self):
@@ -174,7 +175,7 @@ class AgentFactoryTests(unittest.TestCase):
             success_criteria=["The program outputs 'Hello World' when executed"],
         ))
         agent = built["agent"]
-        self.assertEqual(built["skill_ids"], ["python-development"])
+        self.assertEqual(built["skill_ids"], ["freya-core"])
         self.assertEqual(agent["tools"], ["read_file", "write_file", "run_command"])
 
         def answer(content="Finished.", calls=None):
@@ -225,7 +226,7 @@ class AgentFactoryTests(unittest.TestCase):
             required_capabilities=["filesystem.create", "filesystem.read"],
             preferred_skills=["simple-file-artifact", "python-development", "debugging", "interactive-testing"],
         ))
-        self.assertEqual(built["skill_ids"], ["simple-file-artifact"])
+        self.assertEqual(built["skill_ids"], ["freya-core"])
         self.assertEqual(built["agent"]["tools"], ["read_file", "write_file"])
         responses = iter([
             {"message": {"role": "assistant", "content": "", "tool_calls": [{
@@ -263,7 +264,7 @@ class AgentFactoryTests(unittest.TestCase):
                 "debugging", "interactive-testing",
             ],
         ))
-        self.assertEqual(created["skill_ids"], ["simple-file-artifact"])
+        self.assertEqual(created["skill_ids"], ["freya-core"])
 
     def test_recovery_workspace_state_derives_safe_read_without_overwrite(self):
         created = self.create(planned_task(
@@ -288,59 +289,67 @@ class AgentFactoryTests(unittest.TestCase):
             preferred_skills=["simple-file-artifact", "debugging"],
             _recovery_reason="The previous attempt did not produce the required artifact.",
         ))
-        self.assertEqual(created["skill_ids"], ["debugging"])
+        self.assertEqual(created["skill_ids"], ["freya-core"])
 
     def test_exact_preferred_skill_is_assigned_when_compatible(self):
         agent = self.create(planned_task())["agent"]
         skill = next(item for item in agent["skills"]
-                     if item["id"] == "python-development")
+                     if item["id"] == "freya-core")
         self.assertTrue(skill["operational"])
 
-    def test_unknown_preferred_skill_is_rejected(self):
-        with self.assertRaises(UnsupportedResourceRequirement) as caught:
-            self.create(planned_task(preferred_skills=["does-not-exist"]))
-        self.assertEqual(caught.exception.resource_type, "skill")
-        self.assertEqual(caught.exception.unknown_resource_id, "does-not-exist")
+    def test_create_only_python_preference_is_omitted_and_agent_is_created(self):
+        created = self.create(planned_task(
+            id="task-1", objective="Create calculator.py",
+            description="Create the calculator web implementation.",
+            task_kind="program_creation",
+            required_capabilities=["filesystem.create"],
+            preferred_skills=["python-development"],
+        ))
+        self.assertEqual(created["skill_ids"], ["freya-core"])
+        self.assertEqual(created["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(self.active_modes(created["agent"]), {"filesystem.create": "allow"})
+        self.assertEqual(created["skill_omissions"], [])
+        self.assertIn("planner skill preference ignored", created["warnings"][0])
 
-    def test_skill_requirement_never_expands_task_capabilities(self):
-        skill = self.store.create_skill({
-            "id": "write-guidance",
-            "name": "Write Guidance",
-            "category": "Engineering",
-            "description": "Guidance that requires modification.",
-            "instructions": ["Modify only when authorized."],
-            "procedures": [],
-            "recommended_capabilities": [],
-            "required_capabilities": ["filesystem.modify"],
-            "tags": ["write"],
-            "source": "user",
-            "enabled": True,
-        })
-        with self.assertRaisesRegex(ValueError, "Primary Skill.*filesystem.modify"):
-            self.create(planned_task(
-                preferred_skills=[skill["id"]],
-                required_capabilities=["filesystem.read"],
-            ))
+    def test_create_and_read_task_can_use_python_preference(self):
+        created = self.create(planned_task(
+            objective="Create calculator.py", task_kind="program_creation",
+            required_capabilities=["filesystem.create", "filesystem.read"],
+            preferred_skills=["python-development"],
+        ))
+        self.assertEqual(created["skill_ids"], ["freya-core"])
+        self.assertEqual(created["skill_omissions"], [])
+        self.assertEqual(set(self.active_modes(created["agent"])),
+                         {"filesystem.create", "filesystem.read"})
 
-    def test_incompatible_selected_skill_is_rejected_without_expanding_policy(self):
-        skill = self.store.create_skill({
-            "id": "requires-modify-after-unknown",
-            "name": "Requires Modify After Unknown",
-            "category": "Engineering",
-            "description": "Guidance that requires modification.",
-            "instructions": ["Modify only when authorized."],
-            "procedures": [],
-            "recommended_capabilities": [],
-            "required_capabilities": ["filesystem.modify"],
-            "tags": ["write"],
-            "source": "user",
-            "enabled": True,
-        })
-        with self.assertRaisesRegex(ValueError, "Primary Skill.*filesystem.modify"):
-            self.create(planned_task(
-                preferred_skills=[skill["id"]],
-                required_capabilities=["filesystem.read"],
-            ))
+    def test_core_skill_tools_do_not_grant_authority(self):
+        created = self.create(planned_task(
+            objective="Read the file", required_capabilities=["filesystem.read"],
+            preferred_skills=["python-development"],
+        ))
+        self.assertEqual(created["skill_ids"], ["freya-core"])
+        self.assertIn("run_command", created["declared_tools"])
+        self.assertNotIn("execution.python_script", self.active_modes(created["agent"]))
+        self.assertNotIn("run_command", created["effective_tools"])
+
+    def test_unknown_preferred_skill_is_ignored(self):
+        created = self.create(planned_task(preferred_skills=["does-not-exist"]))
+        self.assertEqual(created["skill_ids"], ["freya-core"])
+        self.assertIn("planner skill preference ignored", created["warnings"][0])
+
+    def test_other_skills_cannot_be_registered(self):
+        with self.assertRaisesRegex(ValueError, "Only freya-core"):
+            self.store.create_skill({"id": "write-guidance", "name": "Write Guidance"})
+        self.assertEqual([item["id"] for item in self.store.list_skills()], ["freya-core"])
+
+    def test_core_skill_never_expands_task_capabilities(self):
+        created = self.create(planned_task(
+            preferred_skills=["legacy-incompatible-skill"],
+            required_capabilities=["filesystem.read"],
+        ))
+        self.assertEqual(created["skill_ids"], ["freya-core"])
+        self.assertEqual(created["required_capabilities"], ["filesystem.read"])
+        self.assertEqual(self.active_modes(created["agent"]), {"filesystem.read": "allow"})
 
     def test_selected_tool_cannot_bypass_the_capability_policy(self):
         with self.assertRaises(ToolCapabilityMismatch) as caught:
@@ -378,7 +387,7 @@ class AgentFactoryTests(unittest.TestCase):
                                  "single_case_verification": True},
         ))
         self.assertEqual(created["role"], "qa")
-        self.assertEqual(created["skill_ids"], [])
+        self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertEqual(created["effective_tools"], ["read_file", "run_command"])
         self.assertTrue(created["agent"]["config"]["verification"]["stop_after_acceptance_evidence"])
 
@@ -519,7 +528,7 @@ class AgentFactoryTests(unittest.TestCase):
         created = next(item for item in events if item["event_type"] == "freya.agent_created")
         created_payload = json.loads(created["payload_json"])
         self.assertEqual(created_payload["role"], "worker")
-        self.assertIn("python-development", created_payload["skill_ids"])
+        self.assertIn("freya-core", created_payload["skill_ids"])
         self.assertIn("freya.dynamic_agent.archived", [item["event_type"] for item in events])
 
     def test_retry_same_agent_reuses_exact_agent_id(self):
@@ -556,6 +565,50 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertIn("freya.agent_policy.validated", event_types)
         self.assertIn("freya.dynamic_agent.archived", event_types)
         self.assertEqual(self.store.list_agents(), [])
+
+    def test_calculator_golden_path_omits_preferred_skill_and_reaches_runtime(self):
+        prompt = "Crea una calculadora web que sume, reste, multiplique y divida"
+        semantic = {"summary": "Create a web calculator.", "success_criteria": [],
+                    "unsupported_requirements": [], "tasks": [{
+            "key": "implement", "objective": "Create calculator.py",
+            "description": "Create the calculator web implementation.",
+            "depends_on": [], "semantic_needs": ["Create calculator.py."],
+            "required_capabilities": ["filesystem.create"],
+            "required_tools": ["write_file"],
+            "preferred_skills": ["python-development"],
+            "success_criteria": ["calculator.py exists."],
+        }]}
+        runtime = ImmediateRuntime(self.store)
+        planner = Planner(lambda request, context: json.dumps(semantic))
+        orchestrator = Orchestrator(
+            self.store, runtime, planner=planner,
+            task_analyst=TaskSpecAnalyst(offline=True),
+        )
+        submitted = []
+        def run_graph(oid, run, deadline, brief):
+            task = run["plan"]["tasks"][0]
+            created = orchestrator._create_dynamic_agent(oid, task, 1)
+            submitted.append(runtime.submit(created["agent"]["id"], brief))
+        orchestrator._run_graph = run_graph
+        run = self.store.create_orchestration(prompt)
+        orchestrator._run(run["id"])
+        final = self.store.get_orchestration(run["id"])
+        event_types = [event["event_type"] for event in final["events"]]
+        self.assertEqual(final["task_spec"]["status"], "READY_FOR_PLANNING")
+        self.assertIsNotNone(final["plan"])
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]["status"], "Success")
+        self.assertNotIn("freya.agent_factory.failed", event_types)
+        self.assertNotIn("freya.agent_factory.skill_omitted", event_types)
+        created = next(json.loads(event["payload_json"]) for event in final["events"]
+                       if event["event_type"] == "freya.agent_created")
+        self.assertEqual(created["planner_preferred_skills"], ["freya-core"])
+        self.assertEqual(created["resolved_skills"], ["freya-core"])
+        self.assertEqual(created["required_capabilities"], ["filesystem.create"])
+        compiler = next(json.loads(event["payload_json"]) for event in final["events"]
+                        if event["event_type"] == "freya.plan_compiler.completed")
+        self.assertIn("planner skill preference ignored",
+                      compiler["preferred_skill_warnings"][0]["message"])
 
     def test_successful_agent_archival_does_not_inherit_global_verifier_failure(self):
         final = self.run_orchestration(["accepted"],

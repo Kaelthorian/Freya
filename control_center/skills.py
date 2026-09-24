@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .capabilities import CAPABILITY_REGISTRY, effective_tools_for_policy, tool_for_capability
+from .tools import Toolbox
 
 
 SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
@@ -28,95 +29,64 @@ MAX_METADATA_DEPTH = 4
 MAX_CONTEXT_CHARS = 64000
 
 
-BUILTIN_SKILLS: tuple[dict[str, Any], ...] = (
-    {
-        "id": "simple-file-artifact", "name": "Simple File Artifact", "category": "Artifact Creation",
-        "version": 1,
-        "description": "Create and verify one small local file without unnecessary project scaffolding.",
-        "instructions": [
-            "Create only the requested artifact in the selected workspace.",
-            "Inspect before modifying an existing artifact during recovery.",
-            "Read the artifact after creation and stop when objective evidence is sufficient.",
-            "Never repeat an identical policy-denied write and do not add tests or audits unless requested.",
-        ],
-        "procedures": [{
-            "name": "Create and Verify Artifact",
-            "steps": [
-                "Inspect the target only when needed to distinguish a new file from an existing artifact.",
-                "Create the requested file with the exact requested content.",
-                "Read it back and compare the content with the objective.",
-                "Report the read-back evidence and finish without creating extra files.",
-            ],
-        }],
-        "recommended_capabilities": ["filesystem.read", "filesystem.create"],
-        "required_capabilities": ["filesystem.read", "filesystem.create"],
-        "tags": ["file", "artifact", "local", "creation", "readback", "simple"],
-        "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "python-development", "name": "Python Development", "category": "Software Development",
-        "version": 1, "description": "Develop, debug and validate Python software.",
-        "instructions": ["Follow existing project conventions.", "Prefer small reviewable changes.", "Validate syntax and relevant tests when available."],
-        "procedures": [{"name": "Implement Change", "description": "A practical sequence for a Python change.", "steps": ["Inspect relevant existing files.", "Identify affected code.", "Implement the minimal change.", "Validate syntax.", "Run relevant tests when available.", "Inspect the resulting diff."]}],
-        "recommended_capabilities": ["filesystem.read", "filesystem.search", "filesystem.create", "filesystem.modify", "filesystem.overwrite", "execution.python_script", "execution.pytest", "execution.py_compile", "git.diff"],
-        "required_capabilities": ["filesystem.read"], "tags": ["python", "development", "backend", "debugging"], "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "code-review", "name": "Code Review", "category": "Software Quality", "version": 1,
-        "description": "Review changes for correctness, risks and maintainability.",
-        "instructions": ["Ground findings in the current code and diff.", "Prioritize concrete correctness and security issues."],
-        "procedures": [{"name": "Review Change", "steps": ["Inspect the relevant diff.", "Trace affected callers and data flow.", "Check edge cases and error handling.", "Report findings with evidence."]}],
-        "recommended_capabilities": ["filesystem.read", "filesystem.search", "git.diff"], "required_capabilities": ["filesystem.read"],
-        "tags": ["review", "quality", "security"], "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "software-testing", "name": "Software Testing", "category": "Software Quality", "version": 1,
-        "description": "Design, run and interpret focused software tests.",
-        "instructions": ["Prefer focused tests that verify observable behavior.", "Explain unavailable test infrastructure instead of fabricating results."],
-        "procedures": [{"name": "Validate Change", "steps": ["Locate relevant tests.", "Add or adapt focused coverage when appropriate.", "Run the available test command.", "Inspect failures and report evidence."]}],
-        "recommended_capabilities": ["filesystem.read", "filesystem.create", "filesystem.modify", "execution.pytest", "execution.unittest", "execution.py_compile"],
-        "required_capabilities": ["filesystem.read"], "tags": ["testing", "pytest", "unittest", "verification"], "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "interactive-testing", "name": "Interactive Program Testing", "category": "Software Quality", "version": 1,
-        "description": "Exercise command-line programs with bounded controlled input and verify observable output.",
-        "instructions": [
-            "Use run_command stdin for programs that call input; never wait for a human terminal.",
-            "Test representative and edge-case inputs, then cite exit status and observed output.",
-            "Do not modify the implementation while acting as QA; report failures to Freya.",
-        ],
-        "procedures": [{
-            "name": "Test Interactive CLI", "description": "Validate an interactive Python program without a live terminal.",
-            "steps": [
-                "Inspect the implementation to determine its input sequence.",
-                "Prepare bounded newline-delimited stdin for a representative case.",
-                "Run the workspace Python script with controlled stdin and a short timeout.",
-                "Compare the exit status and output with the expected logical result.",
-                "Repeat only with a distinct edge case when it adds useful evidence.",
-                "Report the exact command, input case, exit status and observed output.",
-            ],
-        }],
-        "recommended_capabilities": ["filesystem.read", "filesystem.search", "execution.python_script"],
-        "required_capabilities": ["filesystem.read", "execution.python_script"],
-        "tags": ["qa", "interactive", "stdin", "cli", "testing"], "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "debugging", "name": "Debugging", "category": "Engineering", "version": 1,
-        "description": "Find root causes and apply evidence-based fixes.",
-        "instructions": ["Start from observable symptoms and reproduce when possible.", "Separate confirmed causes from hypotheses."],
-        "procedures": [{"name": "Debug Failure", "steps": ["Inspect the error and surrounding implementation.", "Reproduce the failure when possible.", "Locate the root cause.", "Apply a focused fix.", "Run relevant verification."]}],
-        "recommended_capabilities": ["filesystem.read", "filesystem.search", "filesystem.modify", "execution.python_script", "execution.pytest"],
-        "required_capabilities": ["filesystem.read"], "tags": ["debugging", "diagnostics", "errors"], "source": "builtin", "enabled": True,
-    },
-    {
-        "id": "git-inspection", "name": "Git Inspection", "category": "Engineering", "version": 1,
-        "description": "Inspect repository state and review the resulting changes.",
-        "instructions": ["Use Git as evidence about the current workspace state.", "Keep repository inspection read-only."],
-        "procedures": [{"name": "Inspect Repository", "steps": ["Inspect repository status.", "Review the relevant diff.", "Summarize tracked changes and limitations."]}],
-        "recommended_capabilities": ["git.status", "git.diff"], "required_capabilities": ["git.diff"],
-        "tags": ["git", "diff", "repository"], "source": "builtin", "enabled": True,
-    },
-)
+class SkillCompatibilityError(ValueError):
+    """A Skill definition cannot be checked against task authority."""
+
+    error_type = "InvalidSkillDefinition"
+
+    def __init__(self, skill_id: str, field: str, detail: str):
+        self.skill_id = skill_id
+        self.field = field
+        super().__init__(f"Skill '{skill_id}' has invalid {field}: {detail}")
+
+
+def skill_compatibility(skill: dict[str, Any], task_capabilities: Iterable[str]) -> dict[str, Any]:
+    """Check Skill prerequisites without changing task capabilities or policy."""
+    if not isinstance(skill, dict) or not isinstance(skill.get("id"), str):
+        raise SkillCompatibilityError("(unknown)", "id", "a Skill ID is required")
+    skill_id = skill["id"]
+    for field in ("required_capabilities", "recommended_capabilities"):
+        values = skill.get(field, [])
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise SkillCompatibilityError(skill_id, field, "expected a list of capability IDs")
+        unknown = sorted(set(values) - set(CAPABILITY_REGISTRY))
+        if unknown:
+            raise SkillCompatibilityError(skill_id, field, "unknown capability " + ", ".join(unknown))
+    missing = sorted(set(skill.get("required_capabilities", [])) - set(task_capabilities))
+    return {"compatible": not missing, "missing_required_capabilities": missing}
+
+
+CORE_SKILL_ID = "freya-core"
+CORE_TOOLS = ("edit_file", "git_diff", "list_files", "read_file", "run_command", "search_code", "write_file")
+BUILTIN_SKILLS: tuple[dict[str, Any], ...] = ({
+    "id": CORE_SKILL_ID, "name": "Freya Core", "category": "General",
+    "version": 1,
+    "description": "Workspace programming, file work, analysis, QA, testing, debugging and review.",
+    "instructions": [
+        "Use only tools exposed by Policy for this task and stay in the assigned workspace.",
+        "Use run_command to observe or test; persist changes with write_file or edit_file.",
+        "Verify requested results with observable workspace evidence.",
+    ],
+    "procedures": [], "tools": list(CORE_TOOLS),
+    "required_capabilities": [], "recommended_capabilities": [],
+    "tags": ["programming", "testing", "qa", "debugging", "review", "analysis"],
+    "source": "builtin", "enabled": True,
+},)
+
+
+class SkillConfigurationError(ValueError):
+    """A Skill declares a tool absent from the actual worker registry."""
+
+
+def validate_skill_tools(skill: dict[str, Any]) -> list[str]:
+    tools = skill.get("tools", [])
+    if not isinstance(tools, list) or any(not isinstance(item, str) for item in tools):
+        raise SkillConfigurationError(f"{skill.get('id', 'Skill')}.tools must be a list of tool IDs")
+    registered = {item["id"] for item in Toolbox.tool_catalog()}
+    for tool in tools:
+        if tool not in registered:
+            raise SkillConfigurationError(f"{skill.get('id', 'Skill')} references unknown tool '{tool}'")
+    return list(dict.fromkeys(tools))
 
 
 def _text(value: Any, field: str, maximum: int, *, required: bool = False) -> str:
@@ -201,7 +171,7 @@ def normalize_skill(data: dict[str, Any], existing: dict[str, Any] | None = None
     if not isinstance(data, dict):
         raise ValueError("Skill must be an object")
     allowed = {"id", "name", "description", "category", "version", "instructions", "procedures",
-               "recommended_capabilities", "required_capabilities", "tags", "enabled", "source", "metadata",
+               "recommended_capabilities", "required_capabilities", "tools", "tags", "enabled", "source", "metadata",
                "created_at", "updated_at"}
     unknown = set(data) - allowed
     if unknown:
@@ -209,7 +179,7 @@ def normalize_skill(data: dict[str, Any], existing: dict[str, Any] | None = None
     baseline = existing or {}
     result = {key: copy.deepcopy(baseline.get(key, default)) for key, default in {
         "id": "", "name": "", "description": "", "category": "General", "version": 1,
-        "instructions": [], "procedures": [], "recommended_capabilities": [], "required_capabilities": [],
+        "instructions": [], "procedures": [], "recommended_capabilities": [], "required_capabilities": [], "tools": [],
         "tags": [], "enabled": True, "source": "user", "metadata": {},
     }.items()}
     result.update(data)
@@ -229,6 +199,7 @@ def normalize_skill(data: dict[str, Any], existing: dict[str, Any] | None = None
     result["procedures"] = _procedures(result["procedures"])
     result["recommended_capabilities"] = _capability_list(result["recommended_capabilities"], "recommended_capabilities")
     result["required_capabilities"] = _capability_list(result["required_capabilities"], "required_capabilities")
+    result["tools"] = validate_skill_tools(result)
     result["tags"] = _string_list(result["tags"], "tags", MAX_TAGS, 80)
     if not isinstance(result["enabled"], bool):
         raise ValueError("enabled must be boolean")
@@ -261,7 +232,7 @@ def skill_snapshot(skill: dict[str, Any]) -> dict[str, Any]:
     return {key: copy.deepcopy(skill.get(key, default)) for key, default in {
         "id": "", "name": "", "description": "", "category": "General", "version": 1,
         "instructions": [], "procedures": [], "required_capabilities": [],
-        "recommended_capabilities": [], "tags": [], "priority": 0,
+        "recommended_capabilities": [], "tools": [], "tags": [], "priority": 0,
         "operational": False, "missing_required_capabilities": [], "missing_required_tools": [],
         "missing_recommended_capabilities": [], "missing_recommended_tools": [], "required_tools": [], "active": True,
     }.items()}
@@ -352,8 +323,10 @@ def resolve_agent_skills(agent: dict[str, Any], assigned_skills: Iterable[dict[s
                          if _policy_mode(policy, cap) == "allow" and (tool_for_capability(cap) or cap) not in available]
         missing_recommended_tools = [tool_for_capability(cap) or cap for cap in skill["recommended_capabilities"]
                                      if _policy_mode(policy, cap) == "allow" and (tool_for_capability(cap) or cap) not in available]
-        required_tools = list(dict.fromkeys(tool_for_capability(cap) for cap in skill["required_capabilities"]
-                                            if tool_for_capability(cap)))
+        required_tools = list(skill["tools"])
+        if skill["id"] == CORE_SKILL_ID:
+            missing = []
+            missing_tools = []
         item = {**skill, "priority": priority, "operational": bool(skill["enabled"] and not missing and not missing_tools),
                 "missing_required_capabilities": missing, "missing_required_tools": missing_tools,
                 "missing_recommended_capabilities": missing_recommended, "missing_recommended_tools": missing_recommended_tools,

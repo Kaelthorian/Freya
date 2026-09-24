@@ -8,7 +8,9 @@ from pathlib import Path
 from control_center.agent_context import build_agent_context, build_effective_agent
 from control_center.api import Application
 from control_center.config import normalize_agent
-from control_center.skills import MAX_CONTEXT_CHARS, normalize_skill, resolve_agent_skills, skill_summary, skills_context
+from control_center.skills import (MAX_CONTEXT_CHARS, SkillCompatibilityError,
+                                   normalize_skill, resolve_agent_skills, skill_compatibility,
+                                   skill_summary, skills_context)
 from control_center.storage import Store
 from control_center.orchestrator import Orchestrator
 
@@ -26,6 +28,19 @@ def skill_payload(skill_id="demo-skill", **changes):
 
 
 class SkillRegistryTests(unittest.TestCase):
+    def test_shared_skill_compatibility_uses_required_not_recommended_capabilities(self):
+        skill = skill_payload(recommended_capabilities=["execution.python_script"])
+        self.assertEqual(skill_compatibility(skill, ["filesystem.read"]), {
+            "compatible": True, "missing_required_capabilities": [],
+        })
+        self.assertEqual(skill_compatibility(skill, ["filesystem.create"]), {
+            "compatible": False, "missing_required_capabilities": ["filesystem.read"],
+        })
+        invalid = skill_payload(required_capabilities=["filesystem.unknown"])
+        with self.assertRaises(SkillCompatibilityError) as caught:
+            skill_compatibility(invalid, [])
+        self.assertEqual(caught.exception.error_type, "InvalidSkillDefinition")
+
     def test_simple_file_artifact_is_builtin_and_least_privilege(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.sqlite3")

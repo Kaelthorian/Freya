@@ -41,6 +41,15 @@ REQUIREMENT_SOURCE_ALIASES = {"inferred": RequirementSource.ASSUMED.value}
 MAX_ITEMS = 30
 MAX_TEXT = 4000
 MAX_REPAIR_INPUT_CHARS = 12000
+MAX_CLARIFICATION_ROUNDS = 3
+QUESTION_FIELD_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+RESERVED_QUESTION_FIELDS = frozenset({
+    "schema_version", "version", "status", "source_prompt", "objective",
+    "user_intent", "deliverables", "requirements", "constraints",
+    "user_decisions", "assumptions", "validation_expectations", "context",
+    "clarification_questions", "clarification_history", "revision_changes",
+    "readiness_reason",
+})
 
 
 def _source_entry_schema() -> dict[str, Any]:
@@ -119,6 +128,13 @@ class TaskSpecError(ValueError):
         }
 
 
+class ClarificationCycleError(TaskSpecError):
+    def __init__(self):
+        super().__init__("Clarification limit reached with material questions unresolved.",
+                         path="clarification_questions", expected="at most three clarification rounds",
+                         error_type="clarification_cycle_detected")
+
+
 def _received_summary(value: Any) -> Any:
     if isinstance(value, str):
         return sanitize(value)[:160]
@@ -152,6 +168,71 @@ def _list(value: Any, name: str) -> list[Any]:
                             expected=f"list with at most {MAX_ITEMS} items", received=value,
                             error_type="type_or_length_mismatch")
     return value
+
+
+def _question_field(value: Any, path: str) -> str:
+    field = _text(value, path)
+    if not QUESTION_FIELD_PATTERN.fullmatch(field) or field in RESERVED_QUESTION_FIELDS:
+        raise TaskSpecError("Clarification field must be a semantic leaf key.", path=path,
+                            expected="non-reserved snake_case leaf key", received=field,
+                            error_type="invalid_question_field")
+    return field
+
+
+def _question_fingerprint(value: str) -> str:
+    return " ".join(re.findall(r"\w+", value.casefold(), flags=re.UNICODE))
+
+
+def _optional_question(question: dict[str, Any]) -> bool:
+    if question.get("required") is False:
+        return True
+    field = str(question.get("field") or "").casefold()
+    if any(token in field for token in ("additional", "extra", "optional", "bonus")) or field == "enhancements":
+        return True
+    wording = f"{question.get('question', '')} {question.get('reason', '')}".casefold()
+    return bool(re.search(r"\b(?:additional|extra|optional|adicionales|extras|opcionales)\b", wording)
+                or re.search(r"\b(?:agregar|añadir|add|include)\b.{0,40}\b(?:funcionalidad|feature)\b", wording))
+
+
+def _next_question_id(previous: dict[str, Any]) -> int:
+    ids = [item.get("id", "") for item in previous.get("clarification_questions", [])]
+    ids += [item.get("question_id", "") for item in previous.get("clarification_history", [])]
+    numbers = [int(match.group(1)) for value in ids
+               if (match := re.fullmatch(r"CQ-(\d+)", str(value)))]
+    return max(numbers, default=0) + 1
+
+
+def _assign_question_ids(previous: dict[str, Any], questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    old = {item["field"]: item for item in previous["clarification_questions"]}
+    next_id = _next_question_id(previous)
+    assigned = []
+    for question in questions:
+        field = _question_field(question.get("field"), "clarification_questions.field")
+        prior = old.get(field)
+        assigned.append({**question, "id": prior["id"] if prior else f"CQ-{next_id}"})
+        if prior is None:
+            next_id += 1
+    return assigned
+
+
+def _apply_clarification_answers(previous: dict[str, Any], answers: dict[str, str]
+                                 ) -> tuple[list[dict[str, str]], dict[str, str]]:
+    history = list(previous["clarification_history"])
+    decisions = dict(previous["user_decisions"])
+    recorded = {item["question_id"] for item in history}
+    for question in previous["clarification_questions"]:
+        answer = str(answers.get(question["id"]) or "").strip()
+        if not answer or question["id"] in recorded:
+            continue
+        # An expression of uncertainty is audit evidence, not a semantic decision.
+        if _question_fingerprint(answer) in {"no se", "no sé", "decidilo vos", "lo vemos despues",
+                                             "lo vemos después"}:
+            continue
+        history.append({"question_id": question["id"], "field": question["field"],
+                        "question": question["question"], "answer": answer})
+        decisions[question["field"]] = answer
+        recorded.add(question["id"])
+    return history, decisions
 
 
 def _entries(value: Any, name: str, *, source: bool = False) -> list[dict[str, str]]:
@@ -296,11 +377,21 @@ def validate_task_spec(value: Any) -> dict[str, Any]:
             raise TaskSpecError("Clarification question required must be boolean.",
                                 path=f"clarification_questions[{index - 1}].required",
                                 expected="boolean", received=required, error_type="type_mismatch")
-        questions.append({"id": f"CQ-{index}",
+        question_id = _text(item.get("id"), f"clarification_questions[{index - 1}].id")
+        if not re.fullmatch(r"CQ-[1-9]\d*", question_id):
+            raise TaskSpecError("Clarification ID must be runtime-owned.",
+                                path=f"clarification_questions[{index - 1}].id",
+                                expected="CQ-<positive integer>", received=question_id,
+                                error_type="invalid_question_id")
+        questions.append({"id": question_id,
                           "question": _text(item.get("question"), f"clarification_questions[{index - 1}].question"),
                           "reason": _text(item.get("reason"), f"clarification_questions[{index - 1}].reason"),
-                          "field": _text(item.get("field"), f"clarification_questions[{index - 1}].field"),
+                          "field": _question_field(item.get("field"), f"clarification_questions[{index - 1}].field"),
                           "required": required})
+    if len({item["id"] for item in questions}) != len(questions) or len({item["field"] for item in questions}) != len(questions):
+        raise TaskSpecError("Pending clarification questions must have unique IDs and fields.",
+                            path="clarification_questions", expected="unique IDs and fields",
+                            error_type="duplicate_question")
     changes = []
     for item in _list(value.get("revision_changes", []), "revision_changes"):
         if not isinstance(item, dict):
@@ -322,6 +413,11 @@ def validate_task_spec(value: Any) -> dict[str, Any]:
         index = len(history)
         history.append({key: _text(item.get(key), f"clarification_history[{index}].{key}")
                         for key in ("question_id", "field", "question", "answer")})
+        _question_field(history[-1]["field"], f"clarification_history[{index}].field")
+    if len({item["question_id"] for item in history}) != len(history):
+        raise TaskSpecError("Clarification history must contain one answer per question.",
+                            path="clarification_history", expected="unique question IDs",
+                            error_type="duplicate_answer")
     if status == TaskSpecStatus.NEEDS_CLARIFICATION.value and not questions:
         raise TaskSpecError("A pending Task Spec needs at least one clarification question.",
                             path="clarification_questions", expected="non-empty list",
@@ -373,15 +469,8 @@ def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
                             answers: dict[str, str] | None = None) -> dict[str, Any]:
     """Conservative local fallback; never turns vague input into invented work."""
     previous = validate_task_spec(previous) if previous else initial_task_spec(prompt)
-    history = list(previous["clarification_history"])
-    decisions = dict(previous["user_decisions"])
     answers = answers or {}
-    for question in previous["clarification_questions"]:
-        answer = str(answers.get(question["id"]) or "").strip()
-        if answer:
-            history.append({"question_id": question["id"], "field": question["field"],
-                            "question": question["question"], "answer": answer})
-            decisions[question["field"]] = answer
+    history, decisions = _apply_clarification_answers(previous, answers)
     combined = " ".join([prompt, *[item["answer"] for item in history]])
     lower = combined.casefold()
     calculator = bool(re.search(r"\b(?:calculadora|calculator)\b", lower))
@@ -428,7 +517,7 @@ def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
     elif not re.search(r"\b(?:crea|crear|haz|hacer|monta|revisa|automatiza|build|create|review|fix|implement)\b", lower):
         questions.append({"question": "¿Qué resultado concreto necesitas que produzca Freya?",
                           "reason": "No se identifica un objetivo verificable.",
-                          "field": "objective", "required": True})
+                          "field": "desired_outcome", "required": True})
     elif re.search(r"\b(?:app|aplicaci[oó]n)\b", lower) and len(lower.split()) < 7:
         questions.append({"question": "¿Qué función principal debe cumplir la aplicación?",
                           "reason": "La función principal no está especificada.",
@@ -463,6 +552,7 @@ def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
                 "source": RequirementSource.ASSUMED.value if field == "language" and default_python
                 else RequirementSource.CLARIFIED.value if answers else RequirementSource.EXPLICIT.value,
             })
+    questions = _assign_question_ids(previous, questions)
     return validate_task_spec({**previous, "version": previous["version"] + (1 if answers else 0),
         "status": status, "objective": objective, "user_intent": prompt,
         "deliverables": deliverables, "requirements": requirements, "constraints": constraints,
@@ -529,6 +619,39 @@ class TaskSpecAnalyst:
             "phase": "task_analysis", "actor_type": "task_analyst",
             "message": message, **fields,
         }))
+
+    def _record_clarification_lifecycle(self, previous: dict[str, Any], result: dict[str, Any],
+                                        repeated_fields: list[str],
+                                        repeated_ids: list[str], rejected_fields: list[str] | None = None) -> None:
+        prior_ids = {item["question_id"] for item in previous["clarification_history"]}
+        newly_resolved = [item for item in result["clarification_history"]
+                          if item["question_id"] not in prior_ids]
+        if newly_resolved:
+            self._event("task_analysis.clarification_resolved", "Success",
+                        "Clarification answers resolved semantic fields.",
+                        question_ids=[item["question_id"] for item in newly_resolved],
+                        resolved_fields=[item["field"] for item in newly_resolved])
+        if repeated_fields:
+            self._event("task_analysis.clarification_deduplicated", "Success",
+                        "Repeated clarification questions were discarded.",
+                        repeated_fields=list(dict.fromkeys(repeated_fields)),
+                        repeated_question_ids=list(dict.fromkeys(repeated_ids)))
+        if rejected_fields:
+            self._event("task_analysis.clarification_rejected", "Warning",
+                        "Non-material or invalid clarification fields were discarded.",
+                        rejected_fields=list(dict.fromkeys(rejected_fields)))
+        rounds = result["version"] - 1
+        if (rounds >= MAX_CLARIFICATION_ROUNDS and
+                (result["clarification_questions"] or repeated_fields or rejected_fields)):
+            self._event("task_analysis.clarification_cycle_detected",
+                        "Failed" if result["clarification_questions"] else "Success",
+                        "Clarification round limit reached.", rounds=rounds,
+                        resolved_fields=list(result["user_decisions"]),
+                        pending_fields=[item["field"] for item in result["clarification_questions"]],
+                        repeated_fields=list(dict.fromkeys(repeated_fields)),
+                        repeated_question_ids=list(dict.fromkeys(repeated_ids)))
+            if result["clarification_questions"]:
+                raise ClarificationCycleError()
 
     @staticmethod
     def _contract_error(exc: Exception, raw: str,
@@ -610,6 +733,7 @@ class TaskSpecAnalyst:
         if self.offline or not agent:
             started = time.monotonic()
             result = deterministic_task_spec(prompt, previous, answers)
+            self._record_clarification_lifecycle(previous, result, [], [])
             self.metrics.update(mode="deterministic", model_calls=0,
                                 duration_seconds=round(time.monotonic() - started, 4))
             return result
@@ -697,40 +821,83 @@ class TaskSpecAnalyst:
                 raise TaskSpecError("Task Analyst returned a field outside its output schema.",
                                     path=field, expected="one of the Task Analyst schema fields",
                                     received="present", error_type="unexpected_field")
-            history = list(previous["clarification_history"])
-            decisions = dict(previous["user_decisions"])
-            for question in previous["clarification_questions"]:
-                answer = str(answers.get(question["id"]) or "").strip()
-                if answer:
-                    history.append({"question_id": question["id"], "field": question["field"],
-                                    "question": question["question"], "answer": answer})
-                    decisions[question["field"]] = answer
-            model_decisions = candidate.get("user_decisions", {})
-            if isinstance(model_decisions, dict):
-                model_decisions = {**model_decisions, **decisions}
+            proposed_status = _text(candidate.get("status"), "status")
+            if proposed_status not in TASK_ANALYST_OUTPUT_STATUSES:
+                raise TaskSpecError("Task Analyst must decide ready or clarification.", path="status",
+                                    expected="NEEDS_CLARIFICATION or READY_FOR_PLANNING",
+                                    received=proposed_status, error_type="invalid_state")
+            floor = deterministic_task_spec(prompt, previous, answers)
+            history, decisions = _apply_clarification_answers(previous, answers)
+            proposed = candidate.get("clarification_questions", [])
+            if not isinstance(proposed, list):
+                raise TaskSpecError("Clarification questions must be a list.",
+                                    path="clarification_questions", expected="list", received=proposed,
+                                    error_type="type_mismatch")
+            resolved_fields = set(decisions) | {item["field"] for item in history}
+            if re.search(r"\b(?:calculadora|calculator)\b", prompt, flags=re.I):
+                if "platform" in resolved_fields:
+                    resolved_fields.add("interface")
+                if "interface" in resolved_fields:
+                    resolved_fields.add("platform")
+                # The deterministic calculator floor only reaches READY after
+                # resolving its interface and operations, including safe defaults.
+                if floor["status"] == TaskSpecStatus.READY_FOR_PLANNING.value:
+                    resolved_fields.update({"platform", "interface", "operations", "language"})
+            seen_fields: set[str] = set()
+            seen_questions: set[str] = set()
+            historical_questions = {_question_fingerprint(item["question"]) for item in history}
+            pending = []
+            repeated_fields = []
+            repeated_ids = []
+            rejected_fields = []
+            for question in [*floor["clarification_questions"], *proposed]:
+                if not isinstance(question, dict):
+                    raise TaskSpecError("Clarification question must be an object.",
+                                        path="clarification_questions", expected="object", received=question,
+                                        error_type="type_mismatch")
+                try:
+                    field = _question_field(question.get("field"), "clarification_questions.field")
+                except TaskSpecError:
+                    rejected_fields.append(str(question.get("field") or "")[:64])
+                    continue
+                fingerprint = _question_fingerprint(str(question.get("question") or ""))
+                if (field in resolved_fields or field in seen_fields or
+                        fingerprint in historical_questions or fingerprint in seen_questions):
+                    repeated_fields.append(field)
+                    repeated_ids.extend(item["question_id"] for item in history if item["field"] == field)
+                    continue
+                if _optional_question(question):
+                    rejected_fields.append(field)
+                    continue
+                prior = next((item for item in previous["clarification_questions"]
+                              if item["field"] == field and field not in resolved_fields), None)
+                pending.append(prior or question)
+                seen_fields.add(field)
+                seen_questions.add(fingerprint)
+            pending = _assign_question_ids(previous, pending)
             candidate.update({
                 "source_prompt": prompt,
                 "schema_version": TASK_SPEC_SCHEMA_VERSION,
                 "version": previous["version"] + (1 if answers else 0),
                 "clarification_history": history,
-                "user_decisions": model_decisions,
+                "user_decisions": decisions,
+                "clarification_questions": pending,
+                "status": (TaskSpecStatus.NEEDS_CLARIFICATION.value if pending
+                           else TaskSpecStatus.READY_FOR_PLANNING.value),
             })
+            if not pending and (proposed_status == TaskSpecStatus.NEEDS_CLARIFICATION.value
+                                or candidate.get("readiness_reason", "") == ""):
+                candidate["readiness_reason"] = floor["readiness_reason"]
+            if (not pending and floor["status"] == TaskSpecStatus.READY_FOR_PLANNING.value
+                    and proposed_status == TaskSpecStatus.NEEDS_CLARIFICATION.value):
+                for field in ("deliverables", "requirements"):
+                    if not candidate.get(field):
+                        candidate[field] = floor[field]
             result = validate_task_spec(candidate)
-            if result["status"] == TaskSpecStatus.ANALYZING.value:
-                raise TaskSpecError(
-                    "Task Analyst must decide ready or clarification.", path="status",
-                    expected="NEEDS_CLARIFICATION or READY_FOR_PLANNING",
-                    received=result["status"], error_type="invalid_state",
-                )
-            floor = deterministic_task_spec(prompt, previous, answers)
-            if (floor["status"] == TaskSpecStatus.NEEDS_CLARIFICATION.value
-                    and result["status"] == TaskSpecStatus.READY_FOR_PLANNING.value):
-                result = validate_task_spec({
-                    **result, "status": TaskSpecStatus.NEEDS_CLARIFICATION.value,
-                    "clarification_questions": floor["clarification_questions"],
-                    "readiness_reason": floor["readiness_reason"],
-                })
+            if floor["status"] == TaskSpecStatus.NEEDS_CLARIFICATION.value:
                 self.metrics["semantic_gate"] = "material_ambiguity"
+            self._record_clarification_lifecycle(previous, result,
+                                                  repeated_fields, repeated_ids, rejected_fields)
             return result, changes
 
         def note_normalization(stage: str, changes: list[str]) -> None:
@@ -764,6 +931,8 @@ class TaskSpecAnalyst:
             raw = call(json.dumps(payload, ensure_ascii=False))
             try:
                 result, changes = parse_and_validate(raw)
+            except ClarificationCycleError:
+                raise
             except (ValueError, KeyError, TypeError) as exc:
                 initial_error = record_invalid("initial", exc, raw)
                 self.metrics["repair_attempted"] = True
@@ -778,6 +947,8 @@ class TaskSpecAnalyst:
                 raw = call(self._repair_content(original, payload, initial_error), repair=True)
                 try:
                     result, changes = parse_and_validate(raw)
+                except ClarificationCycleError:
+                    raise
                 except (ValueError, KeyError, TypeError) as repair_exc:
                     repair_error = record_invalid("repair", repair_exc, raw)
                     self.metrics["fallback_used"] = True
@@ -805,7 +976,11 @@ class TaskSpecAnalyst:
             else:
                 self.metrics["mode"] = "llm"
                 note_normalization("initial", changes)
+            if self.metrics["fallback_used"]:
+                self._record_clarification_lifecycle(previous, result, [], [])
             return result
+        except ClarificationCycleError:
+            raise
         except Exception as exc:
             self.metrics["mode"] = "deterministic_fallback"
             self.metrics["fallback_used"] = True
@@ -817,7 +992,9 @@ class TaskSpecAnalyst:
                 "Task Analyst used the deterministic fallback after model processing failed.",
                 reason=reason, model_calls=self.metrics["model_calls"], fallback_used=True,
             )
-            return deterministic_task_spec(prompt, previous, answers)
+            result = deterministic_task_spec(prompt, previous, answers)
+            self._record_clarification_lifecycle(previous, result, [], [])
+            return result
         finally:
             self.metrics["duration_seconds"] = round(time.monotonic() - started, 4)
             self.metrics["total_tokens"] = self.metrics.get("prompt_tokens", 0) + self.metrics.get("generated_tokens", 0)

@@ -15,13 +15,10 @@ Agent configuration also accepts JSON blocks `identity`, `behavior`,
 Agent responses include `context_preview`, a read-only context rendering with
 no secret values.
 
-Skills are reusable declarative knowledge. A Skill is not a Tool, Capability, or
-Permission: its instructions and procedures guide the model, while
-`required_capabilities` and `recommended_capabilities` are diagnostics only.
-Required capabilities must be allowed by the agent policy for a Skill to be
-operational. Assigned Skills use `{ "id": "python-development", "priority":
-100 }`; priority orders context and never overrides policy. Tasks store
-immutable Skill snapshots, including version and procedures.
+The active Skill catalog contains only `freya-core`, assigned automatically to
+every dynamic agent. Its `tools` list declares all seven registered worker
+tools; it grants no permission. Capability Policy filters the effective
+surface and evaluates every invocation. Tasks store immutable Skill snapshots.
 
 ## Freya orchestration
 
@@ -34,7 +31,13 @@ When the Analyst needs a high-impact answer, the run has status
 `POST /api/orchestrations/{id}/clarifications` and body
 `{"answers":{"CQ-1":"Python de consola"}}`. This resumes the same run;
 it creates neither an approval nor a new orchestration. The route rejects
-unknown IDs, missing required answers and runs that are not waiting.
+unknown IDs, missing required answers and new answers on runs that are not
+waiting. An exact replay of a recorded submission is idempotent. Question IDs
+are runtime assigned and monotonic within the run: an unresolved question
+keeps its ID, while a new semantic question gets the next ID. Answered or
+optional model questions are removed before the next spec is saved. At most
+three answer rounds are accepted; a remaining material ambiguity fails the run
+with `task_analysis.clarification_cycle_detected` instead of asking again.
 `task_spec`, `task_spec_revisions` and `clarification_answers` are returned
 by the run detail API. While a ready run is still `Planning` and has no saved
 plan, `POST /api/orchestrations/{id}/revise-spec` accepts
@@ -140,10 +143,23 @@ Production runs pass through `Queued`, `Analyzing`, optional
 `Integrating`. `task_analysis.started`, `task_analysis.updated`,
 `task_analysis.clarification_required`,
 `task_analysis.clarification_received` and `task_analysis.ready` expose
-the Analyst's decisions. A pending clarification creates no plan or worker.
+the Analyst's decisions. `task_analysis.clarification_resolved`,
+`task_analysis.clarification_deduplicated`,
+`task_analysis.clarification_rejected` and
+`task_analysis.clarification_cycle_detected` explain answer reduction and the
+round limit when applicable. A pending clarification creates no plan or worker.
 A ready Task Spec is rendered deterministically for Planner and workers.
 Planner model output uses semantic task keys; the Plan Compiler generates
-all internal task/criterion IDs and validates dependency references.
+all internal task/criterion IDs and validates dependency references. Before
+resource validation, Freya removes optional external actions and deployment
+criteria that explicit/clarified Task Spec intent does not support. It rewires
+dependencies and rejects a removal that would lose a Task Spec validation
+criterion. The bounded sanitized pre-resolution task view is available as
+`planning_metrics.planner_semantic_plan` and on
+`freya.plan_compiler.started`; `freya.plan.scope_adjusted` records omissions.
+An unneeded `run_command` proposal is removed, while a specific semantic
+operation can derive one capability for Policy. Ambiguous required commands
+still fail with `ToolCapabilityMismatch`.
 
 A new plan uses schema version 1 with `criterion_links`:
 the plan's `success_criteria` remain authoritative if the model omits global link
@@ -188,8 +204,8 @@ Planner repair call.
 ```
 
 `required_capabilities` are validated registry IDs that describe likely task
-needs; they do not grant permission. `preferred_skills` are non-binding semantic
-hints and may name a Skill that is not currently installed. The Analyst also
+needs; they do not grant permission. Planner `preferred_skills` values are
+ignored and normalized to `freya-core`, including unknown old IDs. The Analyst also
 records a canonical internal `task_kind`; the Planner uses it to derive safe
 verification needs. A write normally adds `filesystem.read` for read-back, and
 a Python program adds `execution.python_script`; `filesystem.overwrite` is not
@@ -203,20 +219,19 @@ creation. Normalized task metadata also retains `task_kind` and available
 boolean `task_characteristics` hints for AgentFactory selection.
 For every ready plan task, Freya creates a validated ephemeral agent. Its complete
 policy allows only the declared requirements (`ask` for dangerous capabilities)
-and denies the rest; its Tool list is the deduplicated projection of that policy.
-The factory selects a minimal primary Skill and at most one additional
-task-justified specialty; eight is only a safety ceiling. Skills never add
-capability authority. An explicitly requested incompatible primary preferred
-Skill makes construction fail for replanning; irrelevant or incompatible
-optional Skills are omitted. Generic file creation uses the builtin
-`simple-file-artifact` Skill, whose required and recommended capabilities are
-only `filesystem.create` and `filesystem.read`.
+and denies the rest. The factory assigns `freya-core` and reads its declared
+tools directly. The agent's effective Tool list remains the policy projection;
+the Skill never adds capability authority. Unknown tool IDs and incompatible
+tool/capability pairs remain errors.
 
 After planning, `freya.agent_factory.started` precedes construction.
-`freya.agent_created` identifies the generated agent, role, assigned Skill IDs,
+`freya.agent_created` identifies the generated agent, role, Planner preferred
+Skills, assigned Skill IDs,
 attempt and factory version; `freya.agent_policy.validated` records required
 capabilities and effective Tools. `freya.agent_factory.failed` records a bounded
-construction error. The generated candidate then passes through
+construction error. The compiler's completion event can include an ignored
+Planner Skill preference warning before the graph is
+created. The generated candidate then passes through
 `freya.agent_selection.started`; `freya.agent_selected` records the planned task
 ID, generated agent ID, score, classification and selector version, while
 `freya.agent_selection.failed` records validation failure. The
@@ -351,10 +366,10 @@ integration adapters are loopback-only and tool-free.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| GET / POST | `/api/skills` | list/filter or create reusable Skills |
-| POST | `/api/skills/import` | atomically import one or many Skills from a JSON array |
-| GET / PATCH / DELETE | `/api/skills/{id}` | inspect, edit, or delete/disable a Skill |
-| POST | `/api/skills/{id}/duplicate` | create a user copy with a new stable ID |
+| GET / POST | `/api/skills` | list `freya-core`; creation of other Skills is disabled |
+| POST | `/api/skills/import` | rejected during the single-Skill configuration |
+| GET / PATCH / DELETE | `/api/skills/{id}` | inspect or edit `freya-core`; deletion of it is rejected |
+| POST | `/api/skills/{id}/duplicate` | rejected during the single-Skill configuration |
 | GET | `/api/agents/{id}/skills` | resolved Skill compatibility summaries |
 | GET | `/api/approvals?status=pending&task_id=` | list durable approval requests |
 | GET | `/api/approvals/{id}` | read one sanitized approval request |
@@ -390,9 +405,10 @@ when `path` is omitted. It returns the resolved current path, parent, write-acce
 to 500 immediate subdirectories, and a `truncated` flag. Saving the agent is the
 authoritative validation step.
 
-Skill creation accepts `id`, `name`, `description`, `category`, positive
-`version`, list-valued `instructions`, structured `procedures`, capability
-metadata, `tags`, `source` (`builtin` or `user`), `metadata`, and `enabled`.
+The `freya-core` definition includes `tools` alongside `id`, `name`,
+`description`, `category`, positive `version`, instructions, procedures,
+capability metadata, tags, source, metadata and enabled state. Startup validates
+its seven tool IDs; other Skill creation and import are disabled.
 IDs are lowercase stable identifiers. Procedures are recommended operating
 guidance and are adapted or omitted when a step needs a tool/capability not in
 the worker's effective toolbox. The worker sees no `recommended_capabilities`,
@@ -404,6 +420,8 @@ the worker's effective toolbox. The worker sees no `recommended_capabilities`,
 commands. Input is capped at 16,000 characters and is redacted to a character
 count in logs. Omitting it closes child stdin; a Python `input()` therefore
 fails immediately with `interactive_input_required` instead of hanging. A
+command runs only inside a disposable Docker copy of the workspace; Docker
+failure returns `error_class=SandboxUnavailable` with no host fallback. A
 successful command can add a `command_execution` item to
 `verification.evidence` when its bounded output directly supports a quoted
 output, exit-code, or JSON completion criterion. The Planner adds
@@ -474,6 +492,6 @@ for that inspection, never `filesystem.overwrite`.
 
 Skills support `GET /api/skills/{id}/versions` and `GET /api/skills/{id}/versions/{version}` for immutable history. `DELETE /api/skills/{id}` archives a skill and records an audit event; archived skills are excluded from `/api/skills` unless `include_deleted=true` is requested.
 
-`POST /api/skills/import` accepts { "skills": [ ... ] } (optionally with a version field), validates every definition with the same registry schema, rejects conflicting duplicate IDs or case-insensitive names, skips identical existing definitions, and commits the full batch atomically. The frontend exports a single definition as a JSON object and bulk exports as { "version": 1, "skills": [ ... ] }.
+`POST /api/skills/import` currently rejects imports. The frontend can export the visible `freya-core` definition; older archived definitions remain available only through historical queries.
 
 `PATCH /api/skills/{id}` ignores a client-supplied version and assigns the next version when versioned definition fields change. A no-op PATCH preserves the current version and emits no `skill.updated` event. Historical snapshots cannot be overwritten.

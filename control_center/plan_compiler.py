@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .planner import MAX_PLAN_TASKS, PlanValidationError, validate_plan
+from .plan_scope import reconcile_plan_scope
 from .runtime_resources import RuntimeResourceCatalog
 from .task_spec import validate_task_spec
 
@@ -20,6 +21,8 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
     if spec["status"] != "READY_FOR_PLANNING":
         raise PlanValidationError("Planning requires a ready Task Spec.")
     resource_catalog = resource_catalog or RuntimeResourceCatalog.build()
+    value, scope_adjustments = reconcile_plan_scope(spec, value)
+    resource_catalog.scope_adjustments = scope_adjustments
     value = resource_catalog.validate_semantic_plan(value, allow_aliases=False)
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
         raise PlanValidationError("Semantic plan must contain tasks.")
@@ -106,6 +109,9 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
                 "supports_global_criteria": [f"GC-{index}" for index, global_item in
                                              enumerate(global_criteria, 1) if global_item == criterion],
             })
+    for warning in resource_catalog.preferred_skill_warnings_for_tasks(tasks):
+        if warning not in resource_catalog.preferred_skill_warnings:
+            resource_catalog.preferred_skill_warnings.append(warning)
     return validate_plan({"goal": spec["objective"],
                           "summary": str(value.get("summary") or spec["objective"]).strip(),
                           "complexity": "simple" if len(tasks) == 1 else "multi_step",

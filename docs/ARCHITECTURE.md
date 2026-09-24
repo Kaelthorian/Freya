@@ -82,13 +82,10 @@ grounded response to present**, but it cannot change correctness. These
 orchestration-level components are tool-free and consume only bounded,
 sanitized evidence.
 
-Skills remain declarative guidance: they never grant capabilities. A primary
-preferred Skill that is incompatible with the task policy rejects construction
-so the task can be replanned; optional incompatible Skills are omitted. Generic
-file creation selects the builtin `simple-file-artifact` Skill, whose required
-capabilities are only `filesystem.create` and `filesystem.read`. Recovery retries
-pass bounded reason/cause evidence into factory selection; only that genuine
-recovery state or explicit diagnostic intent selects `debugging`.
+Skills remain declarative guidance and never grant capabilities. During the
+single-Skill configuration, `freya-core` is the only active Skill and is
+assigned to every dynamic role. Planner Skill preferences are ignored with a
+warning. Policy determines the actual tool surface and evaluates each action.
 
 The worker uses `control_center/transport.py`, which disables proxies and redirects so an
 authorization value cannot be forwarded to another destination.
@@ -171,13 +168,20 @@ exists while clarification is pending. The Task Spec and its revisions are
 persisted before planning; responses are stored separately from approvals.
 Events include `task_analysis.started`, `task_analysis.updated`,
 `task_analysis.clarification_required`,
-`task_analysis.clarification_received`, and `task_analysis.ready`.
+`task_analysis.clarification_received`, and `task_analysis.ready`. The
+clarification reducer records an answer once in history and `user_decisions`,
+filters answered or repeated questions by semantic field and normalized text,
+and rejects optional questions and Task Spec container fields. An exact answer
+submission replay is idempotent. After three answered rounds, unresolved
+material questions fail with `task_analysis.clarification_cycle_detected`;
+resolved questions proceed to planning.
 The Planner emits `freya.planning.started` and `freya.plan.created`.
 Workers receive only a deterministic rendering of the Task Spec plus their
 compiled task step. The planner may add controlled Python QA for an interactive
 calculator; a simple task need not create an auditor.
 Agent construction emits `freya.agent_factory.started`, `freya.agent_created`
-and `freya.agent_policy.validated`; construction errors emit
+and `freya.agent_policy.validated`. Planner Skill preferences are ignored;
+`freya-core` is assigned directly. Construction errors emit
 `freya.agent_factory.failed`. Lifecycle cleanup emits
 one `freya.dynamic_agent.archived` event per archived agent. Its `status=Success`
 describes successful cleanup; `orchestration_status` retains the final run state.
@@ -232,14 +236,15 @@ Cancellation serializes with planning and delegation.
 
 `task_spec.py` validates Task Spec schema version 1 and sequential revisions.
 Each requirement, deliverable and constraint has an `explicit`, `clarified`
-or `assumed` source. Questions have a generated ID, question, reason, field
+or `assumed` source. Questions have a runtime-assigned monotonic ID, question, reason, semantic leaf field
 and required flag. The Analyst asks only about material ambiguity without a
 safe default; internal engineering decisions stay with Planner and workers.
 `TaskSpecStatus` and `RequirementSource` define the canonical status and source
 enums. The Ollama response schema and prompt use those same values. A declared
 `inferred` compatibility alias normalizes to `assumed`; casing and whitespace,
 null list/map containers, omitted optional collections and runtime clarification
-IDs are normalized deterministically before validation. These transformations
+IDs are assigned after question reduction, before validation. Existing IDs are
+preserved by validation; it never renumbers them. These transformations
 do not supply missing user intent. The model returns intent fields only;
 source prompt, schema/revision metadata, clarification history and revision
 changes remain runtime-owned. Unknown fields and invalid cross-field readiness
@@ -264,30 +269,53 @@ capabilities, worker tools, preferred Skills and local checks. Before each
 planning call, `orchestrator.py` creates a `RuntimeResourceCatalog` from the
 capability registry, the schemas exposed by `Toolbox`, and enabled Skill
 definitions in SQLite. The catalog includes semantic summaries and a stable
-content hash; it excludes Skill instructions and procedures. Ollama receives
+content hash; Skill summaries include required and recommended capabilities,
+but exclude instructions and procedures. Ollama receives
 dynamic resource enums plus those summaries. The capability registry describes
 operations such as bounded stdin, captured output and exit status for
 `execution.python_script`; it does not describe per-agent policy.
 
-Immediately after JSON parsing, resource validation accepts exact IDs or one
+After JSON parsing, `plan_scope.py` compares the semantic proposal with explicit
+or clarified Task Spec intent. An optional external-only task or model-created
+deployment criterion is removed before resource resolution; dependent tasks
+inherit its prerequisites. Mixed artifact/external tasks and removal that
+would leave a Task Spec validation expectation uncovered fail as
+`PlannerScopeError`. A web artifact request alone does not authorize deployment,
+publication, hosting, upload or remote actions. Explicitly requested external
+work remains in the plan and still needs supported resources and Policy.
+The bounded, sanitized `planner_semantic_plan` snapshot records proposed task
+keys, objectives, needs, resources, Skills and dependencies before resolution.
+
+Resource validation then accepts exact IDs or one
 unambiguous alias explicitly declared by a registry. Unknown or ambiguous
-capabilities, tools and Skills fail before `plan_compiler.py` runs. Tool IDs
+capabilities and tools fail before `plan_compiler.py` runs. Planner Skill
+preferences are replaced with `freya-core` before ID validation. Tool IDs
 are checked against the global `Toolbox` schema catalog, even when Planner
 context or an injected catalog contains other IDs; an unknown tool emits
-`UnknownTool`. If a task selects tools without declaring
-capabilities, the resolver derives the capabilities registered for those
-tools. If both fields are present, every selected tool must support at least
-one declared capability; an incompatible pair raises `ToolCapabilityMismatch`
-and does not trigger model repair. `plan_compiler.py` rechecks references,
+`UnknownTool`. A selected tool alone never supplies a capability. A specific
+operation in task objective/semantic needs can derive exactly one compatible
+capability, such as executing a Python script or running pytest. An unneeded
+`run_command` proposal is removed without adding execution authority. An
+ambiguous required command with incompatible declared capabilities raises
+`ToolCapabilityMismatch`; when no capabilities were declared, unclear
+inference raises `AmbiguousToolCapability`. A mismatch does not trigger
+model repair. `plan_compiler.py` rechecks references,
 assigns task and criterion IDs, resolves dependencies, rejects cycles and
 produces durable plan schema version 1. Capability-only plans derive their
 tool transports from the capability registry. Additive resource metadata
 remains compatible with legacy version 1 plans. The Agent Factory repeats
 tool/capability compatibility checks as a second boundary.
 
+`preferred_skills` values from Planner are ignored, including old or unknown
+Skill IDs. The resolver records an ignored-preference warning and AgentFactory
+assigns `freya-core` without a Skill-capability prerequisite. Startup validates
+every declared `freya-core.tools` ID against `Toolbox`; unknown IDs fail with
+`SkillConfigurationError`. No Skill adds a capability to task policy.
+
 Tools remain concrete worker operations; capabilities remain declarative action
-requirements; Skills remain knowledge and instructions. Agent tools continue
-to derive from capability policy, and every operation still passes through the
+requirements; Skills remain knowledge and instructions. `freya-core` declares
+the complete tool set, and capability policy filters the effective worker
+schemas. Every operation still passes through the
 worker's fail-closed policy engine. Selecting a resource does not authorize it.
 Derived capabilities are requirements only; the generated task policy and
 worker policy checks remain the authority for each concrete action.
@@ -427,7 +455,7 @@ recovery actions and sixteen total recovery/replanning model calls per orchestra
 The orchestration wall-clock deadline is rechecked after every recovery call. Stable
 fingerprints stop repeated equivalent
 failures. Same-agent retry revalidates and reuses the exact dynamic agent ID.
-Different-agent retry creates a new dynamic identity/Skill variant, excludes
+Different-agent retry creates a new dynamic identity, excludes
 every prior agent ID, and derives the same capability ceiling from the unchanged
 plan task; recovery inspection may derive only the safe `filesystem.read`
 prerequisite and never `filesystem.overwrite`. There is no silent same-agent
@@ -555,10 +583,9 @@ memory.
 
 Normal Freya orchestration does not depend on a preconfigured pool of Programmer,
 QA Tester or Code Auditor agents. `AgentFactory` creates one candidate per ready
-task, selects a minimal primary Skill (with at most one additional
-task-justified specialty), records warnings for unknown or irrelevant preferred
-Skills, and never turns Skill requirements into capability grants. Eight is only
-a safety ceiling. Manual agents remain available for direct task submission and
+task, assigns `freya-core`, ignores Planner Skill preferences with a warning,
+and never turns its tool declarations into capability grants. Manual agents
+remain available for direct task submission and
 compatibility tests.
 `AgentSelector.select_agent(task, agents, context=None)` is local,
 deterministic and model-free. It deep-copies its inputs, resolves each agent's
@@ -663,10 +690,9 @@ or alternates the same two read-only actions for three cycles, it emits
 step budget is not treated as a fix. Writes and process execution are never
 automatically retried.
 
-Git inspection is applicability-aware. A task workspace outside a Git checkout
-does not advertise `git_diff`, and the assigned Git Inspection Skill is removed
-from the prompt-visible skill context while the immutable assignment remains in
-the task snapshot. A direct non-applicable request returns a failed result with
+Git inspection is applicability-aware. Only a checkout rooted in the assigned
+workspace advertises `git_diff`; a parent checkout is outside its boundary.
+A direct non-applicable request returns a failed result with
 `error_class=not_applicable` rather than a misleading success.
 
 Text-mode models may emit JSON actions instead of native tool calls. When a
@@ -687,9 +713,12 @@ prevents later actions from relying on invented tool results.
   directory; task submission checks it again.
 - Tool dispatch is allowlisted. `run_command` uses argv with `shell=False` and
   accepts only workspace Python/tests, Ruff, and scoped read-only Git commands.
-- `execute` is a trust grant, not an OS sandbox. A Python file run inside the
-  workspace has the Windows user's process privileges and may access host
-  resources. Use disposable inputs and trusted local models.
+- `run_command` and `git_diff` execute only in a disposable Docker copy of the
+  workspace. The container has no network or Docker socket, a read-only root,
+  no host HOME/USERPROFILE or inherited credentials, and memory, CPU, PID and
+  time limits. It mounts only the copy; results are never copied back. Docker
+  or image failure is `SandboxUnavailable`, without host fallback. Persistent
+  edits use Policy-checked filesystem tools.
 - Secrets are environment references named `ACC_SECRET_...`. The worker reads
   the selected value for the Ollama Authorization header, registers it for
   redaction, then removes credential-like variables before tool subprocesses.
@@ -716,19 +745,18 @@ local user or hostile executable code.
 
 ## Reusable skills
 
-`control_center/skills.py` is the single registry and validation layer for
-declarative Skills. A Skill contains specialty knowledge, instructions,
-adaptable procedures, tags, a stable ID and a positive version.
-`resolve_agent_skills` orders assigned Skills by per-agent priority, marks each
-Skill operational only when every required capability is allowed and its concrete tool is available; diagnostics distinguish missing capability from missing tool/runtime support and expose recommended-capability warnings. Skills never grant capabilities or execute
-tools. Workers receive compact active Skill context; the dynamic AgentFactory
-selects a minimal primary Skill and filters irrelevant preferred Skills. The
+`control_center/skills.py` defines `freya-core` with all seven registered tools.
+`storage.py` archives prior active Skills on startup but keeps their historical
+versions. New Skill imports are disabled during this temporary configuration.
+`resolve_agent_skills` renders the assigned Skill without requiring a matching
+capability. Its tools remain declarations only; Policy determines effective
+schemas and checks each operation. The
 worker renderer exposes purpose, relevant instructions/procedures and only
 required capabilities that exist in the effective toolbox; recommended and
 missing-recommended fields remain internal diagnostics. Procedures that require
 unavailable tools or capabilities are omitted/adapted, and the rendered
 context has a 64,000-character budget. Each task stores an immutable copy of
-every resolved Skill, including its version.
+the resolved Skill, including its version.
 
 The orchestrator sends only bounded Skill summaries to the loopback Ollama
 planner; full instructions and procedures remain outside planning context.

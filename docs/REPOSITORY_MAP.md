@@ -15,9 +15,10 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── activity.py           persisted orchestration timeline, phase durations and performance read model
 │   ├── task_analyst.py       legacy version-3 rewrite compatibility
 │   ├── planner.py            semantic strategy and legacy plan schema compatibility
+│   ├── plan_scope.py         semantic scope guard and bounded pre-resolution plan snapshot
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
 │   ├── plan_compiler.py      resource derivation, deterministic IDs, semantic dependencies and DAG validation
-│   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
+│   ├── agent_factory.py      dynamic agents, freya-core assignment, task policy and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── evaluator.py          criterion evidence checks, decision schema and tool-free Ollama adapter
@@ -29,13 +30,14 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop, action fingerprints, verification ledger and per-agent policy
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
+│   ├── sandbox.py            disposable workspace copy and restricted Docker execution
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
 │   ├── capabilities.py       capability registry and tool-to-action resolver
 │   ├── policy.py             policy schema, legacy migration and engine
-│   ├── skills.py             reusable Skill registry, minimal-context rendering and validation/resolution
+│   ├── skills.py             freya-core definition, tool validation and context rendering
 │   ├── agent_context.py      structured agent defaults, effective config and policy/tool-aware worker context
 │   ├── presets.py            manual/legacy Programmer, Task Analyst, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
@@ -46,6 +48,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
 ├── tests/                    API, storage, runtime, activity, transport, policy, Skill and tool tests
+├── sandbox/Dockerfile        local Python, pytest, Ruff and Git sandbox image
 ├── data/
 │   ├── agents/              versioned, importable pipeline-agent definitions
 │   └── (runtime files)      ignored databases, logs, locks and workspaces
@@ -67,11 +70,17 @@ selects them.
    `orchestrator.py` asks `task_spec.py` to derive a canonical Task Spec.
    High-impact gaps persist `NeedsClarification` questions and pause the
    same run; `POST /orchestrations/{id}/clarifications` stores answers and
-   resumes analysis. Before planning, `orchestrator.py` builds a fresh
+   resumes analysis. `task_spec.py` reduces proposed questions against answered
+   fields and deterministic material gaps, assigns durable question IDs, and
+   bounds clarification to three answered rounds. `storage.py` preserves
+   versioned answers and accepts exact submission replays. Before planning,
+   `orchestrator.py` builds a fresh
    `RuntimeResourceCatalog` from `capabilities.py`, `Toolbox` schemas and the
    enabled Skill registry in SQLite. `planner.py` receives compact descriptions
    and dynamic closed enums for those resources; exact IDs and declared unique
-   aliases are validated before `plan_compiler.py` assigns internal IDs and
+   aliases are validated after `plan_scope.py` removes unrequested external
+   work and invented external criteria. It preserves authoritative Task Spec
+   checks and rewires dependencies. `plan_compiler.py` then assigns internal IDs and
    builds the durable plan and DAG. Planner decides
    whether QA or audit is needed. The legacy `task_analyst.py` contract is
    retained for injected compatibility adapters.
@@ -84,12 +93,23 @@ selects them.
    when that one command supplies evidence for every planned criterion.
    For each ready task,
    `agent_factory.py` creates one validated ephemeral agent whose complete policy
-   comes only from `required_capabilities`, whose Tools are derived from that
-   policy, and whose Skills come from the enabled registry without granting
-   authority. The resource resolver checks tool IDs against the global Toolbox
-   catalog and derives compatible capabilities when the Planner supplies tools
-   without capabilities. Incompatible explicit pairs raise
-   `ToolCapabilityMismatch`; the policy engine still decides each action.
+   comes only from `required_capabilities`. Every dynamic agent receives
+   `freya-core`; its seven declared tools are checked against `Toolbox` at
+   startup. Planner Skill preferences are ignored with a warning. Tool
+   availability never grants a capability: Policy limits the worker schemas
+   and evaluates each invocation.
+   The resource resolver checks tool IDs against the global Toolbox
+   catalog. Tool proposals cannot create authority by themselves: a specific
+   semantic operation must justify any inferred capability. Unneeded
+   `run_command` is removed; an ambiguous required command fails with
+   `ToolCapabilityMismatch`. The policy engine still
+   decides each action.
+   `tools.py` resolves filesystem paths inside the assigned workspace. For
+   Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
+   allowlisted command to `sandbox.py`; Docker receives only a disposable
+   workspace copy. `run_command` changes are discarded. Persistent edits use
+   `write_file` or `edit_file` through Policy. A missing Docker daemon/image
+   produces `SandboxUnavailable`.
    `agent_selector.py` then validates and classifies that generated
    candidate before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
@@ -142,12 +162,12 @@ selects them.
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
-| Tool implementation, dynamic tool prompt or controlled stdin | `tools.py`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_control_runtime.py`, `tests/test_agent_context.py` |
+| Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
-| Planner resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |
+| Planner scope, resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `plan_scope.py`, `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_plan_scope.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
-| Reusable Skills, minimal assignment or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_factory.py`, `agent_context.py`, `tests/test_skills.py`, `tests/test_agent_factory.py`, `tests/test_agent_context.py` |
+| Universal Skill definition, startup tool validation or automatic assignment | `skills.py`, `storage.py`, `runtime_resources.py`, `agent_factory.py`, `agent_context.py`, `tests/test_core_sandbox.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
 | Canonical Task Analyst contract, normalization or repair | `task_spec.py`, `orchestrator.py`, `storage.py`, `tests/test_task_spec.py` |
 | Legacy prompt rewrite or task kinds | `task_analyst.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py`, `tests/test_planner.py` |
@@ -155,7 +175,7 @@ selects them.
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
 | Recovery workspace context or safe retry capabilities | `orchestrator.py`, `recovery.py`, `agent_factory.py`, `agent_selector.py`, `tests/test_agent_factory.py`, `tests/test_recovery.py` |
 | Terminal failure diagnosis, no-progress causes or merged orchestration logs | `recovery.py`, `orchestrator.py`, `storage.py` (normalized actor/workspace traces), `worker.py`, `__main__.py`, `frontend/views.js`, `frontend/components.js`, `tests/test_recovery.py`, `tests/test_control_storage.py`, `tests/test_control_runtime.py` |
-| Dynamic agent construction, Skill compatibility, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `skills.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py`, `tests/test_skills.py` |
+| Dynamic agent construction, freya-core assignment, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `skills.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py`, `tests/test_core_sandbox.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |
