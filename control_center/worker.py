@@ -144,9 +144,18 @@ def _command_evidence_criteria(criteria: list[str], argv: list[str], result: Too
         lowered = criterion.casefold()
         quoted = re.findall(r"[\"'“”]([^\"'“”]+)[\"'“”]", criterion)
         output_assertion = bool(re.search(r"\b(output|outputs|stdout|print|prints|imprime|salida|produce|produces)\b", lowered))
-        exit_assertion = bool(re.search(r"\b(exit|return|status|c[oó]digo)\b.*\b(?:0|zero|cero|success|successful|successful(?:ly)?)\b", lowered))
+        exit_assertion = bool(re.search(
+            r"\b(?:exit(?:s|ed)?|return|status|c[oó]digo)\b.*\b(?:0|zero|cero|success|successful|successfully)\b",
+            lowered,
+        ))
         json_assertion = "json" in lowered and bool(output)
-        matches_output = bool(quoted) and all(item.casefold() in normalized_output for item in quoted)
+        def output_contains(expected: str) -> bool:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", expected.strip()):
+                pattern = r"(?<![\w.])" + re.escape(expected.strip()) + r"(?![\w.])"
+                return re.search(pattern, normalized_output) is not None
+            return expected.casefold() in normalized_output
+
+        matches_output = bool(quoted) and all(output_contains(item) for item in quoted)
         valid_json = False
         if json_assertion:
             try:
@@ -154,7 +163,37 @@ def _command_evidence_criteria(criteria: list[str], argv: list[str], result: Too
                 valid_json = True
             except (TypeError, ValueError):
                 valid_json = False
-        if (output_assertion and matches_output) or (exit_assertion and result.exit_code == 0) or valid_json:
+        checks: list[bool] = []
+        if output_assertion:
+            checks.append(matches_output)
+        if exit_assertion:
+            checks.append(result.exit_code == 0)
+        if json_assertion:
+            checks.append(valid_json)
+        if checks and all(checks):
+            supported.append(criterion)
+    return supported
+
+
+def _readback_evidence_criteria(criteria: list[str], path: str, output: str,
+                                expected: str | None) -> list[str]:
+    """Support only explicit file-presence criteria with matching read-back."""
+    if expected is not None and output != expected:
+        return []
+    filename = Path(path).name.casefold()
+    supported: list[str] = []
+    for raw in criteria:
+        criterion = str(raw or "").strip()
+        lowered = criterion.casefold()
+        mentions_file = filename and filename in lowered
+        exists_assertion = bool(re.search(
+            r"\b(?:exist|exists|present|created|saved|creado|guardado)\b", lowered,
+        ))
+        readable_assertion = bool(re.search(
+            r"\b(?:read|readable|read-back|read back|can be read|leer|legible)\b", lowered,
+        ))
+        negated = bool(re.search(r"\b(?:not|no|never|without|doesn't|isn't|sin)\b", lowered))
+        if mentions_file and exists_assertion and readable_assertion and not negated:
             supported.append(criterion)
     return supported
 
@@ -883,6 +922,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             } for item in criteria):
                                 verification_state["passed"] = True
                                 verification_state["unavailable"] = False
+                                if verification["stop_after_acceptance_evidence"]:
+                                    success = True
+                                    auto_completed = True
+                                    final = json.dumps({
+                                        "summary": "Completed from the bounded command evidence for every acceptance criterion.",
+                                        "actions": [], "artifacts": [], "verification": {}, "limitations": [],
+                                    })
+                                    publish("event", event={
+                                        "event_type": "task.auto_completed", "level": "info",
+                                        "status": "Success",
+                                        "reason": "The single-case QA task stopped after one successful command satisfied every configured acceptance criterion.",
+                                    })
                     if result.success and name in WRITE_TOOLS and result.error_class != "already_satisfied":
                         publish_workspace_diff(name, safe_args, existing_before)
                         telemetry["workspace_changes"] += 1
@@ -934,7 +985,26 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         path = safe_args.get("path")
                         if isinstance(path, str) and path in modified_paths:
                             expected = modified_paths[path]
-                            observed_files[path] = (expected is None or result.output == expected, result.output)
+                            matches = expected is None or result.output == expected
+                            observed_files[path] = (matches, result.output)
+                            criteria = [str(item).strip() for item in verification.get("completion_criteria", [])
+                                        if str(item).strip()]
+                            supported = _readback_evidence_criteria(criteria, path, result.output, expected)
+                            if verification["enabled"] and criteria and all(item in supported for item in criteria):
+                                verification_state["attempted"] = True
+                                verification_state["passed"] = True
+                                verification_state["unavailable"] = False
+                                success = True
+                                auto_completed = True
+                                final = json.dumps({
+                                    "summary": "Completed from the created artifact and matching read-back evidence.",
+                                    "actions": [], "artifacts": [], "verification": {}, "limitations": [],
+                                })
+                                publish("event", event={
+                                    "event_type": "task.auto_completed", "level": "info",
+                                    "status": "Success",
+                                    "reason": "The artifact was read back successfully and the evidence directly satisfied every configured file-presence criterion.",
+                                })
                     if not result.success:
                         successful_validation_streak = 0
                         repeated_success_count = 0

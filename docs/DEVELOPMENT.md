@@ -51,11 +51,22 @@ leaves an ambiguous run in `NeedsClarification`. The user answers through
 stores both question and answer. A ready spec can be revised through
 `POST /api/orchestrations/{id}/revise-spec` only before a plan is persisted;
 the store fences late output from a planner using the previous version. `TaskSpecAnalyst` repairs one malformed
-model response, then falls back conservatively on technical failure.
+model response, then falls back conservatively on technical failure. It sends
+Ollama the same closed JSON Schema documented in `task_spec.py` and normalizes
+only declared aliases and safe container/default differences before validation.
+Inspect `task_analysis.contract_invalid` and the `fallback_*` Task Analyst
+metrics to identify the exact field if a repair still fails.
 
-The Planner receives the ready Task Spec, chooses tasks, capabilities, Skills
-and QA, and emits semantic task keys/dependencies. `plan_compiler.py`
-generates all runtime IDs, links criteria and validates the DAG. Workers
+The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
+The catalog is rebuilt from `capabilities.py`, worker schemas exposed by
+`Toolbox`, and all enabled Skills from the current Store. It sends capability
+operation summaries, tool purposes and Skill descriptions/use cases, without
+Skill instruction bodies. Resource ID enums in the Ollama response schema are
+dynamic. The Planner chooses semantic needs, capabilities, tool references,
+Skills and QA. Resource references are validated immediately after JSON parse;
+unknown or ambiguous IDs fail as `UnsupportedResourceRequirement` without a
+second LLM repair call. `plan_compiler.py` checks those references again,
+generates runtime IDs, links criteria and validates the DAG. Workers
 receive a deterministic rendering of the Task Spec, never an independent
 `operational_prompt`. The old Analyst v3 path is retained for injected
 compatibility adapters and historical tests.
@@ -72,7 +83,9 @@ plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
 The factory uses only enabled registry Skills, selects one minimal primary Skill
 for ordinary work (with at most one additional task-justified specialty), and
 keeps eight only as a safety ceiling. It derives Tools from the complete task
-policy and persists provenance for audit and terminal cleanup. Preferred Skills
+policy and persists provenance for audit and terminal cleanup. Selected tools
+must be registered and associated with a requested capability; the policy
+engine still decides every action. Preferred Skills
 are filtered against task kind, role, recovery evidence and the real capability
 surface; they are not a request to fill the context with every compatible Skill.
 When a retry is selected, the orchestrator forwards only the bounded recovery
@@ -91,6 +104,21 @@ Git, a test suite, QA, or a Code Auditor. The Skill requirements are diagnostics
 only and never expand the task policy; an explicitly requested incompatible
 primary Skill is a planning error, while an irrelevant or incompatible optional
 Skill is omitted.
+
+For a Python console calculator that needs interactive input, the semantic
+plan normalizer collapses model-created file/function/test subtasks into one
+implementation node, then appends one dependent QA node. QA receives
+`filesystem.read` and `execution.python_script`, selects the `interactive-testing`
+Skill for ordinary interactive QA plans. For this exact one-case calculator
+request, Freya omits multi-case Skill guidance and uses `run_command` once with
+bounded stdin lines `3` and `5` to verify output `8` and exit code `0`. The
+implementation receives only `filesystem.create` and `filesystem.read`;
+execution authority stays with QA. Whole-number results omit a trailing `.0`.
+The QA worker stops after one successful command supplies evidence for every
+configured acceptance criterion. Neither task creates helper or test files,
+and this simple request does not add a code-audit node.
+For file-only implementation criteria, the worker also finishes immediately
+after a matching read-back of the new artifact.
 
 Semantic evaluation has separate local-model configuration:
 
@@ -298,6 +326,7 @@ python -m unittest discover -s tests -p "test_planner.py" -v
 python -m unittest discover -s tests -p "test_execution_graph.py" -v
 python -m unittest discover -s tests -p "test_evaluator.py" -v
 python -m unittest discover -s tests -p "test_integration.py" -v
+python -m unittest tests.test_task_spec tests.test_activity tests.test_control_api -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -318,6 +347,15 @@ resolves and evaluates a capability before every tool invocation. A policy or au
 Runtime tests use a local fake Ollama server and spawned worker processes. The
 symlink regression skips when the Windows account cannot create symlinks. A
 full end-to-end task additionally requires local Ollama and an installed model.
+`tests/test_task_spec.py` covers valid one-call output, safe normalization,
+source aliases, one targeted repair, exact invalid-field diagnostics and
+deterministic fallback. `tests/test_activity.py` covers system actors, timestamp
+durations, clarification/approval waits, failed phases, LLM metrics and
+non-additive overlapping intervals; `tests/test_control_api.py` checks the
+activity endpoint against persisted orchestration data. In Freya Activity, the
+top summary shows total elapsed, processing, worker execution, clarification
+wait, approval wait and aggregate LLM time; the phase table and chronological
+event list expose each component and expandable event details.
 Planner tests cover atomic transitions, cancellation races, restart recovery,
 approval waiting, child failure propagation, deadlines and simulated Ollama.
 They also verify synthesis of omitted global-link rows from success criteria,

@@ -12,9 +12,11 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── task_spec.py          canonical intent, clarification questions, revisions and deterministic rendering
+│   ├── activity.py           persisted orchestration timeline, phase durations and performance read model
 │   ├── task_analyst.py       legacy version-3 rewrite compatibility
 │   ├── planner.py            semantic strategy and legacy plan schema compatibility
-│   ├── plan_compiler.py      deterministic task/criterion IDs, semantic dependencies and DAG validation
+│   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
+│   ├── plan_compiler.py      resource derivation, deterministic IDs, semantic dependencies and DAG validation
 │   ├── agent_factory.py      dynamic least-privilege agents, Skill compatibility and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
@@ -43,7 +45,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── views.js              dashboard and detail views
 │   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
-├── tests/                    API, storage, runtime, transport, policy, Skill and tool tests
+├── tests/                    API, storage, runtime, activity, transport, policy, Skill and tool tests
 ├── data/
 │   ├── agents/              versioned, importable pipeline-agent definitions
 │   └── (runtime files)      ignored databases, logs, locks and workspaces
@@ -65,18 +67,30 @@ selects them.
    `orchestrator.py` asks `task_spec.py` to derive a canonical Task Spec.
    High-impact gaps persist `NeedsClarification` questions and pause the
    same run; `POST /orchestrations/{id}/clarifications` stores answers and
-   resumes analysis. A ready Task Spec is rendered deterministically and
-   passed to `planner.py`, whose semantic task output is compiled by
-   `plan_compiler.py` into the existing durable plan and DAG. Planner decides
+   resumes analysis. Before planning, `orchestrator.py` builds a fresh
+   `RuntimeResourceCatalog` from `capabilities.py`, `Toolbox` schemas and the
+   enabled Skill registry in SQLite. `planner.py` receives compact descriptions
+   and dynamic closed enums for those resources; exact IDs and declared unique
+   aliases are validated before `plan_compiler.py` assigns internal IDs and
+   builds the durable plan and DAG. Planner decides
    whether QA or audit is needed. The legacy `task_analyst.py` contract is
    retained for injected compatibility adapters.
    `execution_graph.py` releases ready tasks in plan order. Low-risk generic file
-   and Python artifact requests remain one task; the Planner derives read-back
-   and Python execution needs without adding audit/QA. For each ready task,
+   and Python artifact requests remain one task. A Python console calculator
+   that requires interactive input is normalized to one implementation node
+   with file read/create access and one dependent QA node that alone receives
+   Python execution. QA runs the exact bounded stdin case `3` and `5` once.
+   File-only implementation stops on a matching read-back; single-case QA stops
+   when that one command supplies evidence for every planned criterion.
+   For each ready task,
    `agent_factory.py` creates one validated ephemeral agent whose complete policy
    comes only from `required_capabilities`, whose Tools are derived from that
    policy, and whose Skills come from the enabled registry without granting
-   authority. `agent_selector.py` then validates and classifies that generated
+   authority. The resource resolver checks tool IDs against the global Toolbox
+   catalog and derives compatible capabilities when the Planner supplies tools
+   without capabilities. Incompatible explicit pairs raise
+   `ToolCapabilityMismatch`; the policy engine still decides each action.
+   `agent_selector.py` then validates and classifies that generated
    candidate before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.
    A non-accepted evaluation enters bounded recovery; retries are reselected and
@@ -124,16 +138,19 @@ selects them.
 | Change | Entry points and validation |
 | --- | --- |
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
+| Freya Activity timeline or performance calculation | `control_center/activity.py`, `storage.py`, `api.py`, `frontend/views.js`, `frontend/app.js`, `frontend/styles.css`, `tests/test_activity.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt or controlled stdin | `tools.py`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_control_runtime.py`, `tests/test_agent_context.py` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
+| Planner resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Reusable Skills, minimal assignment or compatibility | `skills.py`, `storage.py`, `api.py`, `agent_factory.py`, `agent_context.py`, `tests/test_skills.py`, `tests/test_agent_factory.py`, `tests/test_agent_context.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |
-| Prompt rewrite, task kinds or Analyst repair | `task_analyst.py`, `orchestrator.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py`, `tests/test_planner.py` |
+| Canonical Task Analyst contract, normalization or repair | `task_spec.py`, `orchestrator.py`, `storage.py`, `tests/test_task_spec.py` |
+| Legacy prompt rewrite or task kinds | `task_analyst.py`, `planner.py`, `config.py`, `frontend/dialogs.js`, `tests/test_task_analyst.py`, `tests/test_planner.py` |
 | Pipeline agent presets or QA routing | `presets.py`, `skills.py`, `api.py`, `planner.py`, `tests/test_agent_presets.py`, `tests/test_control_api.py` |
 | Semantic recovery, retries or plan revisions | `recovery.py`, `orchestrator.py`, `execution_graph.py`, `agent_selector.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_recovery.py` |
 | Recovery workspace context or safe retry capabilities | `orchestrator.py`, `recovery.py`, `agent_factory.py`, `agent_selector.py`, `tests/test_agent_factory.py`, `tests/test_recovery.py` |

@@ -11,7 +11,6 @@ from uuid import uuid4
 from .agent_context import build_effective_agent, capability_summary
 from .agent_factory import AgentFactory
 from .agent_selector import AgentSelector
-from .capabilities import capability_catalog
 from .execution_graph import ExecutionGraph
 from .integration import GlobalVerifier, IntegrationReplanner, ResultIntegrator
 from .integration_orchestrator import IntegrationOrchestrationMixin
@@ -23,6 +22,7 @@ from .recovery import (FAILURE_ANALYSIS_VERSION, RECOVERY_VERSION,
 from .security import sanitize
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
+from .runtime_resources import planner_resource_context
 from .skills import skill_summary
 from .task_analyst import (TaskAnalyst, reconciled_deterministic_task_analysis,
                             select_task_analyst)
@@ -141,6 +141,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "message": "Task Analyst is updating the canonical user intent.",
         })
         spec = analyzer.analyze_spec(run["prompt"], analyst_agent, previous, answers)
+        for diagnostic_event in getattr(analyzer, "diagnostic_events", []) or []:
+            self.store.add_orchestration_event(oid, {
+                **diagnostic_event,
+                "agent_id": analyst_agent.get("id") if analyst_agent else None,
+                "agent_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
+                "actor_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
+                "actor_role": analyst_agent.get("role") if analyst_agent else "Task Analyst",
+            })
         spec = validate_task_spec(spec)
         if spec["status"] == "ANALYZING":
             raise ValueError("Task Analyst did not resolve the analysis state.")
@@ -370,18 +378,30 @@ class Orchestrator(IntegrationOrchestrationMixin):
         return candidates
 
     def _planning_context(self, agents=None) -> dict:
-        # Deliberately compact: no Skill procedures, logs, task output, policy
-        # secrets, model transcripts, or preconfigured-agent availability cross
-        # the planning boundary.
-        skills = []
-        if self.store is not None:
-            skills = [{key: item.get(key) for key in ("id", "name", "category", "tags")}
-                      for item in self.store.list_skills(enabled=True)[:200]]
-        return {
-            "capabilities": [{key: item[key] for key in ("id", "category", "description")}
-                             for item in capability_catalog()],
-            "skills": skills,
+        # Include semantic summaries only. Full Skill instructions and
+        # procedures, policy, task history, logs, and model transcripts stay out.
+        skills = self.store.list_skills(enabled=True) if self.store is not None else None
+        return planner_resource_context(skills)
+
+    def _record_planning_resources(self, oid: str, context: dict) -> dict:
+        summary = {
+            "resource_catalog_version": context.get("resource_catalog_version", ""),
+            "available_capability_ids": sorted(
+                item["id"] for item in context.get("capabilities", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)),
+            "available_tool_ids": sorted(
+                item["id"] for item in context.get("tools", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)),
+            "available_skill_ids": sorted(
+                item["id"] for item in context.get("skills", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)),
         }
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.planning.resources", "status": "Planning",
+            **summary,
+            "message": "Freya supplied the current runtime resource catalog to the Planner.",
+        })
+        return summary
 
     def _decision(self, prompt, agents, results):
         candidates = self._agent_candidates(agents)
@@ -638,6 +658,40 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "stable_ids": stable_ids,
         })
 
+    def _record_plan_compiler_activity(self, oid: str, planning_metrics: dict) -> None:
+        attempts = planning_metrics.get("semantic_compiler_attempts")
+        if not isinstance(attempts, list):
+            single = planning_metrics.get("semantic_compiler")
+            attempts = [single] if isinstance(single, dict) else []
+        if not attempts:
+            return
+        for compiler in attempts:
+            if not isinstance(compiler, dict) or not compiler.get("started_at"):
+                continue
+            common = {
+                "phase": "plan_compiler", "actor_type": "runtime",
+                "attempt": compiler.get("attempt"),
+                "task_ids": compiler.get("task_ids", []),
+                "global_criteria": compiler.get("global_criteria"),
+                "duration_seconds": compiler.get("duration_seconds"),
+            }
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.plan_compiler.started", "timestamp": compiler["started_at"],
+                "status": "Running", "message": "Plan Compiler started runtime preparation.",
+                **common,
+            })
+            succeeded = compiler.get("status") == "Success"
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.plan_compiler.completed" if succeeded
+                else "freya.plan_compiler.failed",
+                "timestamp": compiler.get("completed_at"),
+                "status": "Success" if succeeded else "Failed",
+                "message": "Plan Compiler completed runtime preparation." if succeeded
+                else "Plan Compiler could not prepare the runtime plan.",
+                **common,
+                **({"error": compiler["error"]} if compiler.get("error") else {}),
+            })
+
     def _fail_planning(self, oid: str, exc: Exception,
                        planning_metrics: dict | None = None) -> None:
         with self.lock:
@@ -649,9 +703,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
             )
             if failed is None:
                 return
+            failure = {}
+            if hasattr(exc, "resource_type"):
+                failure = {
+                    "resource_type": getattr(exc, "resource_type", ""),
+                    "error_type": getattr(exc, "error_type", type(exc).__name__),
+                    "unknown_resource_id": getattr(exc, "unknown_resource_id", ""),
+                    "semantic_need": getattr(exc, "semantic_need", ""),
+                }
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.planning.failed", "status": "Failed", "message": message,
-                "planning_metrics": metrics,
+                "planning_metrics": metrics, **failure,
             })
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.failed", "status": "Failed", "message": message,
@@ -1698,16 +1760,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         "message": "Planner is creating work from the canonical Task Spec.",
                     })
             context = self._planning_context()
+            resource_summary = self._record_planning_resources(oid, context)
             operational_prompt = render_task_spec(spec)
             with self.planner_lock:
                 try:
                     plan = self.planner.create_plan_for_spec(spec, context)
                 finally:
                     planning_metrics = dict(self.planner.metrics)
+                    self._record_plan_compiler_activity(oid, planning_metrics)
             planning_metrics["task_analysis"] = {
                 key: value for key, value in analysis_metrics.items()
                 if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
                            "total_tokens", "duration_seconds"}}
+            planning_metrics.update(resource_summary)
             if len(plan["tasks"]) > int(self.config["max_delegated_tasks"]):
                 raise ValueError(
                     f"Plan contains {len(plan['tasks'])} tasks but max_delegated_tasks is "
@@ -1737,6 +1802,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "task_ids": [task["id"] for task in plan["tasks"]],
                     "plan_schema_version": PLAN_SCHEMA_VERSION,
                     "planning_metrics": planning_metrics,
+                    "selected_capabilities": sorted({
+                        capability for task in plan["tasks"]
+                        for capability in task.get("required_capabilities", [])}),
+                    "selected_skills": sorted({
+                        skill for task in plan["tasks"]
+                        for skill in task.get("preferred_skills", [])}),
+                    "selected_tools": sorted({
+                        tool for task in plan["tasks"]
+                        for tool in task.get("required_tools", [])}),
+                    "resource_catalog_version": resource_summary.get("resource_catalog_version"),
                 })
                 self._workspace_for_run(planned)
                 graph = ExecutionGraph(plan)
@@ -1785,6 +1860,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if self.store.get_orchestration(oid)["status"] != "Planning":
                     return
             context = self._planning_context()
+            resource_summary = self._record_planning_resources(oid, context)
             analysis = self._require_ready_analysis(oid, analysis)
             context["task_analysis"] = analysis
             operational_prompt = str(analysis.get("operational_prompt") or "").strip()
@@ -1800,6 +1876,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
                            "total_tokens", "duration_seconds"}
             }
+            planning_metrics.update(resource_summary)
             if len(plan["tasks"]) > int(self.config["max_delegated_tasks"]):
                 raise ValueError(
                     f"Plan contains {len(plan['tasks'])} tasks but max_delegated_tasks is "
@@ -1825,6 +1902,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "task_ids": [task["id"] for task in plan["tasks"]],
                     "plan_schema_version": PLAN_SCHEMA_VERSION,
                     "planning_metrics": planning_metrics,
+                    "selected_capabilities": sorted({
+                        capability for task in plan["tasks"]
+                        for capability in task.get("required_capabilities", [])}),
+                    "selected_skills": sorted({
+                        skill for task in plan["tasks"]
+                        for skill in task.get("preferred_skills", [])}),
+                    "selected_tools": sorted({
+                        tool for task in plan["tasks"]
+                        for tool in task.get("required_tools", [])}),
+                    "resource_catalog_version": resource_summary.get("resource_catalog_version"),
                 })
                 self._workspace_for_run(planned)
                 graph = ExecutionGraph(plan)
@@ -1870,6 +1957,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             operational_prompt = str(analysis.get("operational_prompt") or "").strip()
             agents = self.store.list_agents()
             context = self._planning_context(agents)
+            resource_summary = self._record_planning_resources(oid, context)
             context["task_analysis"] = analysis
             with self.planner_lock:
                 try:
@@ -1881,6 +1969,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if key in {"mode", "model_calls", "prompt_tokens", "generated_tokens",
                            "total_tokens", "duration_seconds"}
             }
+            planning_metrics.update(resource_summary)
         except Exception as exc:
             self._fail_planning(oid, exc, planning_metrics)
             return
@@ -1900,6 +1989,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "task_ids": [task["id"] for task in plan["tasks"]],
                 "plan_schema_version": PLAN_SCHEMA_VERSION,
                 "planning_metrics": planning_metrics,
+                "selected_capabilities": sorted({
+                    capability for task in plan["tasks"]
+                    for capability in task.get("required_capabilities", [])}),
+                "selected_skills": sorted({
+                    skill for task in plan["tasks"]
+                    for skill in task.get("preferred_skills", [])}),
+                "selected_tools": sorted({
+                    tool for task in plan["tasks"]
+                    for tool in task.get("required_tools", [])}),
+                "resource_catalog_version": resource_summary.get("resource_catalog_version"),
             })
             running = self.store.transition_orchestration(oid, ("Planned",), "Running")
             if running is None:

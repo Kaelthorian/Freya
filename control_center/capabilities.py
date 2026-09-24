@@ -19,27 +19,31 @@ class Capability:
     dangerous: bool = False
     tool: str = ""
     actions: tuple[str, ...] = ()
+    operations: tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["actions"] = list(self.actions)
+        value["operations"] = list(self.operations)
+        value["aliases"] = list(self.aliases)
         return value
 
 
 CAPABILITIES: tuple[Capability, ...] = (
-    Capability("filesystem.list", "filesystem", "List files in the workspace", tool="list_files", actions=("path",)),
-    Capability("filesystem.read", "filesystem", "Read a file in the workspace", tool="read_file", actions=("path",)),
-    Capability("filesystem.search", "filesystem", "Search text in the workspace", tool="search_code", actions=("path", "query")),
-    Capability("filesystem.create", "filesystem", "Create a new file", tool="write_file", actions=("path", "content", "extension", "size_bytes")),
-    Capability("filesystem.modify", "filesystem", "Modify an existing file", tool="edit_file", actions=("path", "old", "new", "extension", "size_bytes")),
-    Capability("filesystem.overwrite", "filesystem", "Overwrite an existing file", tool="write_file", actions=("path", "content", "extension", "size_bytes")),
-    Capability("git.status", "git", "Inspect scoped Git status", dangerous=False, tool="run_command", actions=("argv",)),
-    Capability("git.diff", "git", "Inspect scoped Git differences", dangerous=False, tool="git_diff", actions=("workspace",)),
-    Capability("execution.python_script", "execution", "Run a workspace Python script", dangerous=True, tool="run_command", actions=("argv",)),
-    Capability("execution.pytest", "execution", "Run pytest in the workspace", dangerous=True, tool="run_command", actions=("argv",)),
-    Capability("execution.unittest", "execution", "Run unittest discovery", dangerous=True, tool="run_command", actions=("argv",)),
-    Capability("execution.py_compile", "execution", "Compile workspace Python files", dangerous=True, tool="run_command", actions=("argv",)),
-    Capability("execution.ruff", "execution", "Run Ruff checks", dangerous=True, tool="run_command", actions=("argv",)),
+    Capability("filesystem.list", "filesystem", "List files in the task workspace", tool="list_files", actions=("path",), operations=("List workspace files and directories.",)),
+    Capability("filesystem.read", "filesystem", "Read UTF-8 text files from the task workspace", tool="read_file", actions=("path",), operations=("Read a workspace-relative text file.", "Inspect generated source and output files.")),
+    Capability("filesystem.search", "filesystem", "Search text files in the task workspace", tool="search_code", actions=("path", "query"), operations=("Search workspace files by text or regular expression.",)),
+    Capability("filesystem.create", "filesystem", "Create a new file in the task workspace", tool="write_file", actions=("path", "content", "extension", "size_bytes"), operations=("Create a workspace-relative file that does not already exist.",)),
+    Capability("filesystem.modify", "filesystem", "Replace a specific part of an existing workspace file", tool="edit_file", actions=("path", "old", "new", "extension", "size_bytes"), operations=("Replace one exact, unique text fragment in an existing file.",)),
+    Capability("filesystem.overwrite", "filesystem", "Replace the complete contents of an existing workspace file", tool="write_file", actions=("path", "content", "extension", "size_bytes"), operations=("Overwrite an existing workspace-relative file.",)),
+    Capability("git.status", "git", "Inspect scoped Git status", dangerous=False, tool="run_command", actions=("argv",), operations=("Run the allowlisted read-only git status --short command in a Git workspace.",)),
+    Capability("git.diff", "git", "Inspect scoped Git differences", dangerous=False, tool="git_diff", actions=("workspace",), operations=("Read staged, unstaged, and new-file diffs inside the selected workspace.",)),
+    Capability("execution.python_script", "execution", "Run a Python script in the task workspace with bounded input and captured output", dangerous=True, tool="run_command", actions=("argv",), operations=("Execute a Python script from the workspace.", "Provide bounded controlled stdin as newline-delimited input to programs that call input().", "Capture stdout, stderr, and the process exit code."), aliases=("run_python_script", "execute_python_script")),
+    Capability("execution.pytest", "execution", "Run pytest against the task workspace", dangerous=True, tool="run_command", actions=("argv",), operations=("Run the allowlisted pytest module command and capture its result.",), aliases=("run_pytest",)),
+    Capability("execution.unittest", "execution", "Run unittest discovery against the task workspace", dangerous=True, tool="run_command", actions=("argv",), operations=("Run the allowlisted unittest discovery command and capture its result.",), aliases=("run_unittest",)),
+    Capability("execution.py_compile", "execution", "Compile Python files in the task workspace", dangerous=True, tool="run_command", actions=("argv",), operations=("Run Python bytecode compilation for workspace files.",)),
+    Capability("execution.ruff", "execution", "Run Ruff checks against the task workspace", dangerous=True, tool="run_command", actions=("argv",), operations=("Run the allowlisted ruff check command and capture its result.",)),
 )
 CAPABILITY_REGISTRY = {item.id: item for item in CAPABILITIES}
 

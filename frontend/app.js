@@ -213,6 +213,7 @@ document.addEventListener('click', async event => {
     if (action === 'chart') { state.chart = value; return render(); }
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
+    if (action === 'show-freya-activity') { state.freyaRunId = id; return render(); }
     if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} Agent ${e.agent_name || e.agent_id || '—'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
     if (action === 'copy-task-logs') { event.preventDefault(); const filter = orchestrationId ? `orchestration_id=${encodeURIComponent(orchestrationId)}` : `task_id=${encodeURIComponent(id)}`; const events = await api(`/logs?${filter}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
     if (action === 'copy-task-details') { const task = await api(`/tasks/${encodeURIComponent(id)}`); await navigator.clipboard.writeText(serialize(task)); toast('Task details copied to the clipboard.'); return; }

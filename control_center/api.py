@@ -143,6 +143,8 @@ class Application:
             return self.store.metrics(agent_id=query.get("agent_id") or None)
         if parts == ["orchestrations"]:
             return self.store.list_orchestrations(self._limit(query))
+        if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "activity":
+            return self.store.orchestration_activity(parts[1])
         if len(parts) == 2 and parts[0] == "orchestrations":
             return self.store.get_orchestration(parts[1])
         if len(parts) == 3 and parts[0] == "orchestrations" and parts[2] == "plan":

@@ -50,6 +50,10 @@ class ToolResult:
 class Toolbox:
     """Tools whose read and write paths are confined to a task workspace."""
 
+    # Aliases are declarations in the concrete tool registry. They are kept
+    # separate from model-facing JSON schemas and never grant a capability.
+    TOOL_ALIASES = {"run_command": ("run_workspace_command",)}
+
     def __init__(
         self,
         project_root: Path,
@@ -74,20 +78,25 @@ class Toolbox:
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
+        return self.schema_catalog()
+
+    @classmethod
+    def schema_catalog(cls) -> list[dict[str, Any]]:
+        """Return the schemas used by workers without creating a workspace."""
         return [
-            self._schema(
+            cls._schema(
                 "list_files",
                 "List files available in the task workspace.",
                 {"path": {"type": "string", "description": "Optional relative directory (default: workspace root)."}},
                 [],
             ),
-            self._schema(
+            cls._schema(
                 "read_file",
                 "Read a UTF-8 text file from the task workspace.",
                 {"path": {"type": "string", "description": "Workspace-relative file path."}},
                 ["path"],
             ),
-            self._schema(
+            cls._schema(
                 "write_file",
                 "Create or overwrite a UTF-8 text file in the task workspace.",
                 {
@@ -96,7 +105,7 @@ class Toolbox:
                 },
                 ["path", "content"],
             ),
-            self._schema(
+            cls._schema(
                 "edit_file",
                 "Replace one exact, unique text fragment in a workspace file.",
                 {
@@ -106,7 +115,7 @@ class Toolbox:
                 },
                 ["path", "old", "new"],
             ),
-            self._schema(
+            cls._schema(
                 "search_code",
                 "Search workspace text files for a literal string or regular expression.",
                 {
@@ -116,7 +125,7 @@ class Toolbox:
                 },
                 ["query"],
             ),
-            self._schema(
+            cls._schema(
                 "run_command",
                 "Run a restricted Python test/script, Ruff check, or read-only Git status/diff command. No shell is used. Interactive Python scripts require bounded stdin.",
                 {
@@ -126,13 +135,41 @@ class Toolbox:
                 },
                 ["argv"],
             ),
-            self._schema(
+            cls._schema(
                 "git_diff",
                 "Show staged, unstaged, and new-file changes under the task workspace.",
                 {},
                 [],
             ),
         ]
+
+    @classmethod
+    def tool_catalog(cls) -> list[dict[str, Any]]:
+        """Summarize actual worker tools from the schemas they expose."""
+        from .capabilities import CAPABILITIES
+
+        capabilities_by_tool: dict[str, list[str]] = {}
+        for capability in CAPABILITIES:
+            capabilities_by_tool.setdefault(capability.tool, []).append(capability.id)
+        result = []
+        for schema in cls.schema_catalog():
+            function = schema["function"]
+            properties = function.get("parameters", {}).get("properties", {})
+            operations = [function["description"]]
+            for name, definition in properties.items():
+                description = definition.get("description") if isinstance(definition, dict) else None
+                operations.append(
+                    f"Accepts {name}" + (f": {description}" if isinstance(description, str) and description else ".")
+                )
+            tool_id = function["name"]
+            result.append({
+                "id": tool_id,
+                "description": function["description"],
+                "operations": operations,
+                "capabilities": sorted(capabilities_by_tool.get(tool_id, [])),
+                "aliases": list(cls.TOOL_ALIASES.get(tool_id, ())),
+            })
+        return result
 
     @staticmethod
     def _schema(

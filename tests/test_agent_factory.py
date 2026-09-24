@@ -11,6 +11,9 @@ from control_center.evaluator import Evaluator
 from control_center.integration import GlobalVerifier
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
+from control_center.runtime_resources import (
+    ToolCapabilityMismatch, UnsupportedResourceRequirement,
+)
 from control_center.recovery import RecoveryController
 from control_center.runtime import Runtime
 from control_center.storage import Store
@@ -293,13 +296,11 @@ class AgentFactoryTests(unittest.TestCase):
                      if item["id"] == "python-development")
         self.assertTrue(skill["operational"])
 
-    def test_unknown_preferred_skill_warns_and_uses_relevant_fallback(self):
-        created = self.create(planned_task(
-            preferred_skills=["does-not-exist"],
-            objective="Inspect Python backend code",
-        ))
-        self.assertIn("not registered", " ".join(created["warnings"]))
-        self.assertIn("python-development", created["skill_ids"])
+    def test_unknown_preferred_skill_is_rejected(self):
+        with self.assertRaises(UnsupportedResourceRequirement) as caught:
+            self.create(planned_task(preferred_skills=["does-not-exist"]))
+        self.assertEqual(caught.exception.resource_type, "skill")
+        self.assertEqual(caught.exception.unknown_resource_id, "does-not-exist")
 
     def test_skill_requirement_never_expands_task_capabilities(self):
         skill = self.store.create_skill({
@@ -321,7 +322,7 @@ class AgentFactoryTests(unittest.TestCase):
                 required_capabilities=["filesystem.read"],
             ))
 
-    def test_incompatible_first_selected_skill_rejects_after_unknown_hint(self):
+    def test_incompatible_selected_skill_is_rejected_without_expanding_policy(self):
         skill = self.store.create_skill({
             "id": "requires-modify-after-unknown",
             "name": "Requires Modify After Unknown",
@@ -337,9 +338,18 @@ class AgentFactoryTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "Primary Skill.*filesystem.modify"):
             self.create(planned_task(
-                preferred_skills=["missing-skill", skill["id"]],
+                preferred_skills=[skill["id"]],
                 required_capabilities=["filesystem.read"],
             ))
+
+    def test_selected_tool_cannot_bypass_the_capability_policy(self):
+        with self.assertRaises(ToolCapabilityMismatch) as caught:
+            self.create(planned_task(
+                required_capabilities=["filesystem.read"],
+                required_tools=["write_file"],
+            ))
+        self.assertEqual(caught.exception.error_type, "ToolCapabilityMismatch")
+        self.assertEqual(caught.exception.tool_id, "write_file")
 
     def test_qa_task_is_dynamic_and_has_no_write_surface(self):
         created = self.create(planned_task(
@@ -356,6 +366,21 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertNotIn("write_file", agent["tools"])
         self.assertNotIn("edit_file", agent["tools"])
         self.assertEqual(self.active_modes(agent)["execution.python_script"], "ask")
+
+    def test_single_case_qa_does_not_attach_multi_case_skill_guidance(self):
+        created = self.create(planned_task(
+            id="qa-single-case", task_kind="testing",
+            objective="Run the one requested interactive QA case",
+            description="Read once and run one bounded stdin case.",
+            required_capabilities=["filesystem.read", "execution.python_script"],
+            required_tools=["read_file", "run_command"], preferred_skills=[],
+            task_characteristics={"interactive": True, "requires_user_input": True,
+                                 "single_case_verification": True},
+        ))
+        self.assertEqual(created["role"], "qa")
+        self.assertEqual(created["skill_ids"], [])
+        self.assertEqual(created["effective_tools"], ["read_file", "run_command"])
+        self.assertTrue(created["agent"]["config"]["verification"]["stop_after_acceptance_evidence"])
 
     def test_code_auditor_is_independent_and_read_only(self):
         implementation = self.create(planned_task(

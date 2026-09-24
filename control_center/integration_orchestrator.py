@@ -231,16 +231,46 @@ class IntegrationOrchestrationMixin:
                               result: dict, deadline: float) -> bool:
         remaining = (int(self.config["max_integration_model_calls"])
                      - self._integration_model_calls_used(oid))
+        self.store.add_orchestration_event(oid, {
+            "event_type": "freya.final_response.started", "status": "Running",
+            "phase": "result_integrator", "actor_type": "result_integrator",
+            "integration_id": integration_id,
+            "message": "Result Integrator started the grounded final response.",
+        })
         with self.integration_lock:
-            response, metrics, fallback = self.result_integrator.compose(
-                prepared, result, max_model_calls=max(0, min(2, remaining)),
-            )
+            try:
+                response, metrics, fallback = self.result_integrator.compose(
+                    prepared, result, max_model_calls=max(0, min(2, remaining)),
+                )
+            except Exception as exc:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.final_response.failed", "status": "Failed",
+                    "phase": "result_integrator", "actor_type": "result_integrator",
+                    "integration_id": integration_id,
+                    "error": str(exc)[:1000],
+                    "message": "Result Integrator could not compose the final response.",
+                })
+                raise
         if self.clock() >= deadline:
+            self.store.add_orchestration_event(oid, {
+                "event_type": "freya.final_response.failed", "status": "Failed",
+                "phase": "result_integrator", "actor_type": "result_integrator",
+                "integration_id": integration_id,
+                "error": "Orchestration time limit reached during final response composition.",
+                "message": "Result Integrator exceeded the orchestration time limit.",
+            })
             self._timeout_integration(oid)
             return False
         completed = self.store.finalize_accepted_integration(oid, integration_id, response)
         if completed is None:
             if self.store.get_orchestration(oid)["status"] == "Integrating":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.final_response.failed", "status": "Failed",
+                    "phase": "result_integrator", "actor_type": "result_integrator",
+                    "integration_id": integration_id,
+                    "error": "The final response snapshot became stale before commit.",
+                    "message": "Result Integrator could not commit the final response.",
+                })
                 self._fail_integrating(
                     oid, "The final response snapshot became stale before commit.",
                 )

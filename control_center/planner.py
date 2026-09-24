@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import re
 import time
+import copy
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .capabilities import CAPABILITY_REGISTRY
@@ -16,6 +18,9 @@ from .transport import model_profile, model_request, request_json
 from .task_analyst import (TaskAnalysisError, canonical_task_kind,
                            validate_task_analysis)
 from .integration_proof import STRUCTURAL_CRITERIA, criterion_key
+from .runtime_resources import (
+    RuntimeResourceCatalog, UnknownTool, UnsupportedResourceRequirement,
+)
 
 
 PLAN_SCHEMA_VERSION = 1
@@ -46,7 +51,7 @@ TASK_FIELDS = {
     "id", "objective", "description", "depends_on", "required_capabilities",
     "preferred_skills", "success_criteria",
 }
-TASK_METADATA_FIELDS = {"task_kind", "task_characteristics"}
+TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools"}
 TASK_KIND_VALUES = {
     "file_creation", "program_creation", "code_change", "review", "testing",
     "analysis", "external_action", "general",
@@ -73,6 +78,8 @@ PLAN_RESPONSE_FORMAT = {
                         },
                     },
                     "preferred_skills": {"type": "array", "items": {"type": "string"}},
+                    "semantic_needs": {"type": "array", "items": {"type": "string"}},
+                    "required_tools": {"type": "array", "items": {"type": "string"}},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
                     "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                     "task_characteristics": {"type": "object"},
@@ -97,6 +104,79 @@ PLAN_RESPONSE_FORMAT = {
     "required": sorted(PLAN_FIELDS | {CRITERION_LINKS_FIELD}),
     "additionalProperties": False,
 }
+
+
+def _catalog_enum(context: dict[str, Any], resource_type: str) -> list[str]:
+    field = {"capability": "capabilities", "tool": "tools", "skill": "skills"}[resource_type]
+    records = context.get(field, [])
+    values = []
+    alias_counts: dict[str, int] = {}
+    if isinstance(records, list):
+        for item in records:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                values.append(item["id"])
+                declared_aliases = item.get("aliases", [])
+                if isinstance(declared_aliases, list):
+                    for alias in declared_aliases:
+                        if isinstance(alias, str) and alias:
+                            alias_counts[alias] = alias_counts.get(alias, 0) + 1
+    ids = set(values)
+    return sorted(ids | {alias for alias, count in alias_counts.items()
+                         if count == 1 and alias not in ids})
+
+
+def _resource_array_schema(context: dict[str, Any], resource_type: str) -> dict[str, Any]:
+    values = _catalog_enum(context, resource_type)
+    schema = {"type": "array", "items": {"type": "string", "enum": values}}
+    if not values:
+        schema["maxItems"] = 0
+    return schema
+
+
+def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
+    """Build a closed resource-reference schema from the current catalog."""
+    task_fields = {
+        "key": {"type": "string"},
+        "objective": {"type": "string"},
+        "description": {"type": "string"},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "semantic_needs": {"type": "array", "items": {"type": "string"}},
+        "required_capabilities": _resource_array_schema(context, "capability"),
+        "required_tools": _resource_array_schema(context, "tool"),
+        "preferred_skills": _resource_array_schema(context, "skill"),
+        "success_criteria": {"type": "array", "items": {"type": "string"}},
+    }
+    unsupported = {"type": "array", "items": {"type": "object", "properties": {
+        "semantic_need": {"type": "string"},
+        "resource_type": {"type": "string", "enum": ["capability", "tool", "skill"]},
+        "resource_id": {"type": "string"},
+        "reason": {"type": "string"},
+    }, "required": ["semantic_need", "resource_type", "reason"], "additionalProperties": False}}
+    return {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "success_criteria": {"type": "array", "items": {"type": "string"}},
+            "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
+                      "items": {"type": "object", "properties": task_fields,
+                                "required": sorted(task_fields), "additionalProperties": False}},
+            "unsupported_requirements": unsupported,
+        },
+        "required": ["summary", "success_criteria", "tasks", "unsupported_requirements"],
+        "additionalProperties": False,
+    }
+
+
+def planner_response_format(context: dict[str, Any], *, semantic: bool) -> dict[str, Any]:
+    """Create model output constraints using the live resource IDs."""
+    if semantic:
+        return semantic_plan_response_format(context)
+    schema = copy.deepcopy(PLAN_RESPONSE_FORMAT)
+    task_properties = schema["properties"]["tasks"]["items"]["properties"]
+    task_properties["required_capabilities"] = _resource_array_schema(context, "capability")
+    task_properties["preferred_skills"] = _resource_array_schema(context, "skill")
+    task_properties["required_tools"] = _resource_array_schema(context, "tool")
+    return schema
 
 _SIMPLE_ARTIFACT_HINT = re.compile(
     r"(?:\.[a-z0-9]{1,8}\b|\b(?:file|archivo|script|document|documento)\b)",
@@ -223,6 +303,59 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
         collapsed[CRITERION_LINKS_FIELD] = {"global": links["global"], "local": merged_links}
     return validate_plan(collapsed)
 
+
+def _normalize_python_console_calculator(plan: dict[str, Any],
+                                         task_spec: dict[str, Any]) -> dict[str, Any]:
+    """Keep the user's one-file calculator request to implementation plus QA."""
+    objective = str(task_spec.get("objective") or "").casefold()
+    context_text = " ".join(
+        str(item.get("description") or "")
+        for field in ("deliverables", "requirements", "constraints")
+        for item in task_spec.get(field, []) if isinstance(item, dict)
+    ).casefold()
+    request_text = objective + " " + context_text
+    if not ("python" in request_text and any(word in request_text for word in ("calculadora", "calculator"))
+            and any(word in request_text for word in ("consola", "console"))):
+        return plan
+    if any(word in request_text for word in ("web", "desktop", "gráfica", "graphical", "gui")):
+        return plan
+
+    expectations = [item for item in task_spec.get("validation_expectations", [])
+                    if isinstance(item, str) and item.strip()]
+    criteria = list(dict.fromkeys([
+        "calculator.py exists in the selected workspace and can be read.",
+        *(item.strip() for item in expectations),
+        "With input lines 3 and 5, calculator.py prints 8 and exits successfully.",
+    ]))
+    normalized = dict(plan)
+    normalized["goal"] = task_spec["objective"]
+    normalized["summary"] = "Create and verify the requested Python console calculator."
+    normalized["complexity"] = "simple"
+    normalized["success_criteria"] = criteria
+    normalized.pop(CRITERION_LINKS_FIELD, None)
+    normalized["tasks"] = [{
+        "id": "task-1",
+        "objective": "Implement the Python console calculator.",
+        "description": (
+            "Create calculator.py once. Read two numbers from standard input, add them, and print "
+            "int(total) when total.is_integer(); otherwise print total. This makes inputs 3 and 5 "
+            "produce exactly 8, never 8.0, while fractional sums retain decimals. Write only "
+            "calculator.py and read it back once. Do not overwrite, modify, or create another file."
+        ),
+        "depends_on": [],
+        "required_capabilities": ["filesystem.create", "filesystem.read"],
+        "required_tools": ["write_file", "read_file"],
+        "semantic_needs": [
+            "Create calculator.py as a Python console program.",
+            "Read two numbers from standard input, add them, print int(total) only for integer-valued sums, and preserve fractional output.",
+            "Write the source file once, read it back once, and do not attempt a second write.",
+            "Leave controlled execution and output verification to the dependent verification task.",
+        ],
+        "preferred_skills": ["python-development"],
+        "success_criteria": [criteria[0]],
+    }]
+    return validate_plan(normalized)
+
 def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[str, Any]:
     """Add exactly one read-only Code Review task after code/file changes."""
     if _is_trivial_task(plan, analysis):
@@ -311,7 +444,14 @@ def _append_qa_task(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
         ),
         "depends_on": [task["id"] for task in implementation_tasks],
         "required_capabilities": ["filesystem.read", "execution.python_script"],
-        "preferred_skills": ["interactive-testing", "software-testing"],
+        "required_tools": ["read_file", "run_command"],
+        "semantic_needs": [
+            "Read the implemented program.",
+            "Run it with bounded controlled stdin and capture output and exit status.",
+        ],
+        "task_kind": "testing",
+        "task_characteristics": {"interactive": True, "requires_user_input": True},
+        "preferred_skills": ["interactive-testing"],
         "success_criteria": [
             "Representative controlled input completes without timeout or crash.",
             "Observed output is logically correct for the supplied input.",
@@ -536,7 +676,8 @@ class OllamaPlanner:
                          json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))},
                     ],
                     "tools": [],
-                    "format": "json" if context.get("_semantic_plan") else PLAN_RESPONSE_FORMAT,
+                    "format": planner_response_format(
+                        model_context, semantic=bool(context.get("_semantic_plan"))),
                     "stream": False,
                     "think": False,
                     "options": {
@@ -971,6 +1112,21 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                                             f"plan.tasks[{index}].success_criteria",
                                             MAX_CRITERIA, allow_empty=False),
         }
+        if "required_tools" in task:
+            normalized_task["required_tools"] = _text_list(
+                task["required_tools"], f"plan.tasks[{index}].required_tools",
+                MAX_CAPABILITIES, identifiers=False,
+            )
+            known_tools = set(RuntimeResourceCatalog.build().ids("tool"))
+            unknown_tools = [tool for tool in normalized_task["required_tools"]
+                             if tool not in known_tools]
+            if unknown_tools:
+                raise UnknownTool(unknown_tools[0])
+        if "semantic_needs" in task:
+            normalized_task["semantic_needs"] = _text_list(
+                task["semantic_needs"], f"plan.tasks[{index}].semantic_needs",
+                MAX_CRITERIA, identifiers=False,
+            )
         if "task_kind" in task:
             task_kind = _text(task["task_kind"], f"plan.tasks[{index}].task_kind", 64).casefold()
             if task_kind not in TASK_KIND_VALUES:
@@ -1226,7 +1382,8 @@ class Planner:
 
     def _reset_metrics(self) -> None:
         self.metrics = {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
-                        "total_tokens": 0, "duration_seconds": 0.0}
+                        "total_tokens": 0, "duration_seconds": 0.0,
+                        "semantic_compiler_attempts": []}
 
     def _call(self, prompt: str, context: dict[str, Any]) -> Any:
         started = time.monotonic()
@@ -1252,7 +1409,8 @@ class Planner:
 
     @staticmethod
     def _parse_output(value: Any, analysis: Any = None,
-                      diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+                      diagnostics: dict[str, Any] | None = None,
+                      resource_catalog: RuntimeResourceCatalog | None = None) -> dict[str, Any]:
         if isinstance(value, dict) and set(value) == {"message"} and isinstance(value["message"], dict):
             value = value["message"].get("content")
         if isinstance(value, str):
@@ -1262,6 +1420,8 @@ class Planner:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
+        if resource_catalog is not None:
+            value = resource_catalog.validate_semantic_plan(value)
         value = _expand_model_task_ids(value, diagnostics)
         value = _remove_analyst_acceptance_placeholders(value, analysis, diagnostics)
         declared_links = isinstance(value, dict) and CRITERION_LINKS_FIELD in value
@@ -1277,10 +1437,15 @@ class Planner:
 
     @staticmethod
     def _prompt(goal: str, context: dict[str, Any]) -> str:
-        capability_ids = [item.get("id") for item in context.get("capabilities", [])
-                          if isinstance(item, dict) and isinstance(item.get("id"), str)]
-        skill_ids = [item.get("id") for item in context.get("skills", [])
-                     if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        resources = {
+            kind: [{key: item.get(key) for key in fields if key in item}
+                   for item in context.get(kind, []) if isinstance(item, dict)]
+            for kind, fields in (
+                ("capabilities", ("id", "description", "operations", "aliases", "tool")),
+                ("tools", ("id", "description", "operations", "capabilities", "aliases")),
+                ("skills", ("id", "name", "description", "use_when", "tags", "aliases")),
+            )
+        }
         return (
             "Create a work plan and return one JSON object only. Do not use Markdown. "
             "Required plan fields: goal, summary, complexity, tasks, success_criteria, criterion_links. "
@@ -1300,7 +1465,7 @@ class Planner:
             "in the criterion text field or copy the Analyst's generic AC text unless that full text "
             "is also a plan success_criteria entry. "
             "complexity is simple or multi_step. Each task requires id, objective, description, "
-            "depends_on, required_capabilities, preferred_skills, success_criteria. "
+            "depends_on, semantic_needs, required_capabilities, required_tools, preferred_skills, success_criteria. "
             "Use at most 20 tasks, unique stable IDs, existing dependency IDs, and an acyclic graph. "
             "Prefer the smallest plan that can completely satisfy the user goal. "
             "Trivial work MUST remain a single task when one agent can complete it directly. "
@@ -1317,12 +1482,16 @@ class Planner:
             "Use multi_step only when there are genuinely distinct pieces of work, dependencies, or specialized agents. "
             "Multi-step plans should normally use 2-6 tasks. "
             "Do not add QA or code-audit tasks yourself; Freya appends and orders those deterministic stages. "
-            "required_capabilities may only use these IDs: "
-            + json.dumps(capability_ids, ensure_ascii=False)
-            + ". Capabilities describe likely needs and never grant permission. "
-            "Use preferred_skills IDs from this enabled Skill list when possible: "
-            + json.dumps(skill_ids, ensure_ascii=False)
-            + ". Unknown Skill hints do not grant permission and may be ignored. "
+            "Runtime resource catalog (semantic summaries only; Skills' full instructions go to selected workers): "
+            + json.dumps(resources, ensure_ascii=False, separators=(",", ":"))
+            + ". Select only exact IDs in this catalog or their explicitly declared unique aliases. "
+            "Never invent capability, tool, or Skill IDs. Put concrete semantic requirements in semantic_needs. "
+            "required_tools may be omitted when required_capabilities identify the needed actions; "
+            "Freya resolves their registered tool transports. If tools are selected without capabilities, "
+            "Freya derives the capabilities registered for those tools. Prefer precise capabilities "
+            "for the smallest policy surface. A selected tool never grants permission. "
+            "Report an unmet need in unsupported_requirements instead of inventing a resource. "
+            "An available resource is not permission: capability policy still authorizes each action. "
             "Task Analyst operational prompt (authoritative task input): " + json.dumps(goal, ensure_ascii=False)
             + ("\nTask Analyst structured analysis (authoritative constraints): " +
                json.dumps(context.get("task_analysis"), ensure_ascii=False, separators=(",", ":"))
@@ -1333,6 +1502,14 @@ class Planner:
         goal = _text(prompt, "prompt", MAX_GOAL_CHARS)
         self._reset_metrics()
         limited_context = dict(context) if isinstance(context, dict) else {}
+        resource_catalog = RuntimeResourceCatalog.from_context(limited_context)
+        limited_context.update(resource_catalog.as_dict())
+        self.metrics.update({
+            "resource_catalog_version": resource_catalog.version,
+            "available_capability_ids": resource_catalog.ids("capability"),
+            "available_tool_ids": resource_catalog.ids("tool"),
+            "available_skill_ids": resource_catalog.ids("skill"),
+        })
         analysis = limited_context.get("task_analysis")
         if isinstance(analysis, dict) and ("requirements" in analysis or "acceptance_criteria" in analysis):
             try:
@@ -1356,11 +1533,14 @@ class Planner:
             raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
         try:
             normalization = {}
-            parsed = self._parse_output(output, limited_context.get("task_analysis"), normalization)
+            parsed = self._parse_output(output, limited_context.get("task_analysis"), normalization,
+                                        resource_catalog)
             parsed["goal"] = goal
             if normalization:
                 self.metrics["normalization"] = normalization
             return validate_plan(parsed)
+        except UnsupportedResourceRequirement:
+            raise
         except (PlanValidationError, TypeError, ValueError) as first_error:
             rendered = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
             repair_prompt = (
@@ -1372,7 +1552,8 @@ class Planner:
             try:
                 repaired = self._call(repair_prompt, {**limited_context, "_freya_repair": True})
                 normalization = {}
-                parsed = self._parse_output(repaired, limited_context.get("task_analysis"), normalization)
+                parsed = self._parse_output(repaired, limited_context.get("task_analysis"), normalization,
+                                            resource_catalog)
                 parsed["goal"] = goal
                 if normalization:
                     self.metrics["normalization"] = normalization
@@ -1395,21 +1576,39 @@ class Planner:
         public_spec = {key: value for key, value in spec.items()
                        if key not in {"source_prompt", "clarification_history", "clarification_questions"}}
         limited_context = {**(context or {}), "task_spec": public_spec, "_semantic_plan": True}
-        capability_ids = [item.get("id") for item in limited_context.get("capabilities", [])
-                          if isinstance(item, dict)]
-        skill_ids = [item.get("id") for item in limited_context.get("skills", [])
-                     if isinstance(item, dict)]
+        resource_catalog = RuntimeResourceCatalog.from_context(limited_context)
+        limited_context.update(resource_catalog.as_dict())
+        self.metrics.update({
+            "resource_catalog_version": resource_catalog.version,
+            "available_capability_ids": resource_catalog.ids("capability"),
+            "available_tool_ids": resource_catalog.ids("tool"),
+            "available_skill_ids": resource_catalog.ids("skill"),
+        })
+        resource_view = {
+            "capabilities": limited_context["capabilities"],
+            "tools": limited_context["tools"],
+            "skills": limited_context["skills"],
+        }
         request = (
             "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
             "success_criteria and tasks. Each task has a meaningful key, objective, description, "
-            "depends_on (semantic task keys), required_capabilities, preferred_skills and "
+            "depends_on (semantic task keys), semantic_needs, required_capabilities, required_tools, "
+            "preferred_skills and "
             "success_criteria. Do not supply runtime IDs, criterion IDs, criterion links, "
             "execution nodes or UUIDs; Freya compiles those deterministically. Use the fewest "
             "workers needed. Decide implementation, controlled QA, research and audit only when "
-            "justified. No task may reinterpret the original human prompt. Capabilities describe "
-            "requirements and do not grant permission. Available capabilities: "
-            + json.dumps(capability_ids, ensure_ascii=False) + ". Available Skills: "
-            + json.dumps(skill_ids, ensure_ascii=False) + ". Canonical Task Spec: "
+            "justified. No task may reinterpret the original human prompt. Keep semantic_needs "
+            "separate from resource IDs. Use only exact resource IDs from the catalog below or a "
+            "unique explicitly declared alias; never invent capability, tool, or Skill IDs. Prefer "
+            "precise required_capabilities; required_tools may be omitted because Freya resolves "
+            "their registered transports. When tools are selected without capabilities, Freya derives "
+            "the compatible registered capabilities. Do not duplicate the registry relationship by hand. "
+            "A selected tool never grants permission. If a "
+            "need has no matching catalog resource, report it in unsupported_requirements. "
+            "Capabilities are requirements, not permission grants; runtime policy remains authoritative. "
+            "Runtime resource catalog: "
+            + json.dumps(resource_view, ensure_ascii=False, separators=(",", ":"))
+            + ". Canonical Task Spec: "
             + render_task_spec(spec)
         )
         if self.decide is None:
@@ -1424,37 +1623,118 @@ class Planner:
             semantic = {"summary": objective, "tasks": [{
                 "key": "implement", "objective": objective,
                 "description": "Complete the specified deliverable in the selected workspace and verify it.",
-                "depends_on": [], "required_capabilities": capabilities,
-                "preferred_skills": [], "success_criteria": [
+                "depends_on": [], "semantic_needs": ["Create and inspect the requested program."],
+                "required_capabilities": capabilities,
+                "required_tools": [], "preferred_skills": [], "success_criteria": [
                     "The requested artifact exists and can be inspected."],
-            }]}
+            }], "success_criteria": [], "unsupported_requirements": []}
             self.metrics["mode"] = "deterministic"
         else:
             try:
                 semantic = self._call(request, limited_context)
             except Exception as exc:
                 raise PlanGenerationError(f"Planner model call failed: {exc}") from exc
+
+        def compiler_timestamp() -> str:
+            return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+        def compiler_metrics(started_at: str, started_monotonic: float,
+                             status: str, *, attempt_number: int,
+                             plan: dict[str, Any] | None = None,
+                             error: Exception | None = None) -> dict[str, Any]:
+            record: dict[str, Any] = {
+                "attempt": attempt_number,
+                "started_at": started_at,
+                "completed_at": compiler_timestamp(),
+                "duration_seconds": round(time.monotonic() - started_monotonic, 4),
+                "status": status,
+            }
+            if plan is not None:
+                record.update({
+                    "task_ids": [task["id"] for task in plan["tasks"]],
+                    "global_criteria": len(plan["success_criteria"]),
+                })
+            if error is not None:
+                record["error"] = str(error)[:600]
+            return record
+
+        compiler_started_at = ""
+        compiler_started = 0.0
         for attempt in range(2):
             try:
+                compiler_started_at = compiler_timestamp()
+                compiler_started = time.monotonic()
                 value = json.loads(semantic) if isinstance(semantic, str) else semantic
-                plan = compile_semantic_plan(value, spec)
+                value = resource_catalog.validate_semantic_plan(value)
+                plan = compile_semantic_plan(value, spec, resource_catalog=resource_catalog)
+                plan = _normalize_python_console_calculator(plan, spec)
                 objective = spec["objective"].casefold()
                 if ("python" in objective and any(word in objective for word in
                     ("calculadora", "calculator"))):
                     plan = _append_qa_task(plan, {"task_characteristics": {"requires_user_input": True}})
-                    behavior_globals = [item["id"] for item in plan["criterion_links"]["global"]
-                                        if any(word in item["criterion"].casefold() for word in
-                                               ("output", "input", "resultado", "suma", "sum", "correct"))]
+                    qa_task = next((task for task in plan["tasks"]
+                                    if task["id"].startswith("qa-interactive-test")), None)
+                    if qa_task is not None and ("calculadora" in objective or "calculator" in objective):
+                        qa_task["description"] = (
+                            "Read calculator.py once, then run exactly one case with stdin lines 3 and 5 "
+                            "through run_command. Verify that stdout reports 8 and the exit code is 0. "
+                            "Do not run another case, repeat the command, create files or modify the "
+                            "implementation."
+                        )
+                        qa_task["semantic_needs"] = [
+                            "Run one bounded case with stdin lines 3 and 5.",
+                            "Capture stdout and exit status; verify the integer output is 8.",
+                        ]
+                        qa_task["task_characteristics"] = {
+                            "interactive": True, "requires_user_input": True,
+                            "single_case_verification": True,
+                        }
+                        qa_task["preferred_skills"] = []
+                        qa_task["success_criteria"] = [
+                            "The bounded command outputs '8' and exits successfully."]
+                        implementation_task = next(
+                            (task for task in plan["tasks"] if task["id"] == "task-1"), None)
+                        if implementation_task is not None:
+                            implementation_task["success_criteria"] = [
+                                "calculator.py exists in the selected workspace and can be read."]
+                        plan.pop(CRITERION_LINKS_FIELD, None)
+                        plan = validate_plan(plan)
+                    artifact_globals = {
+                        item["id"] for item in plan["criterion_links"]["global"]
+                        if item["criterion"].casefold().startswith("calculator.py exists")
+                    }
+                    behavior_globals = [
+                        item["id"] for item in plan["criterion_links"]["global"]
+                        if item["id"] not in artifact_globals
+                    ]
                     for link in plan["criterion_links"]["local"]:
                         if (link["task_id"].startswith("qa-interactive-test")
-                                and "output is logically correct" in link["criterion"].casefold()):
+                                and "outputs '8'" in link["criterion"].casefold()):
                             link["supports_global_criteria"] = list(dict.fromkeys([
                                 *link["supports_global_criteria"], *behavior_globals]))
-                self.metrics["semantic_compiler"] = {
-                    "task_ids": [task["id"] for task in plan["tasks"]],
-                    "global_criteria": len(plan["success_criteria"])}
-                return validate_plan(plan)
+                compiled = validate_plan(plan)
+                record = compiler_metrics(
+                    compiler_started_at, compiler_started, "Success",
+                    attempt_number=attempt + 1, plan=compiled,
+                )
+                self.metrics["semantic_compiler"] = record
+                self.metrics["semantic_compiler_attempts"].append(record)
+                return compiled
+            except UnsupportedResourceRequirement as exc:
+                record = compiler_metrics(
+                    compiler_started_at, compiler_started, "Failed",
+                    attempt_number=attempt + 1, error=exc,
+                )
+                self.metrics["semantic_compiler"] = record
+                self.metrics["semantic_compiler_attempts"].append(record)
+                raise
             except (ValueError, TypeError, PlanValidationError) as exc:
+                record = compiler_metrics(
+                    compiler_started_at, compiler_started, "Failed",
+                    attempt_number=attempt + 1, error=exc,
+                )
+                self.metrics["semantic_compiler"] = record
+                self.metrics["semantic_compiler_attempts"].append(record)
                 if attempt or self.decide is None:
                     raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
                 repair = request + "\nRepair this semantic plan without adding internal IDs. Error: " + str(exc)

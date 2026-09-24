@@ -5,9 +5,20 @@ runtime. `frontend/` is its browser client and `tools.py` owns workspace-scoped
 filesystem, command and Git implementations.
 
 `task_spec.py` owns the production tool-free canonical intent contract,
-clarification questions, sequential revisions and deterministic rendering.
+clarification questions, sequential revisions and deterministic rendering. It
+defines the Task Analyst response schema, canonical status/source enums, safe
+pre-validation normalization and structured contract diagnostics. Runtime-only
+history and revision metadata are not model-authored.
 `task_analyst.py` retains the legacy version-3 compatibility contract.
-`plan_compiler.py` assigns execution IDs and checks semantic dependencies.
+`activity.py` builds the backend orchestration timeline and performance read
+model from persisted timestamps/events; phase durations can overlap and must not
+be summed into wall-clock totals. Keep actor identity independent of `agent_id`.
+`runtime_resources.py` builds the planning catalog from the global capability
+registry, global `Toolbox` schemas and enabled Store Skills. It resolves exact
+IDs/aliases, derives tool-compatible capabilities and reports typed resource
+mismatches; Skill instructions remain in worker snapshots. `plan_compiler.py`
+derives missing resource links, assigns execution IDs and checks semantic
+dependencies.
 `planner.py` owns the versioned orchestration-plan contract, deterministic
 criterion-ID normalization, `T-N` task-ID expansion with reference updates,
 and DAG validation. It fills omitted global-link
@@ -45,6 +56,19 @@ archival event reports archival `Success` separately from the run's final
   single decision point. Store effective policies in task snapshots.
 - Planner `required_capabilities` are declarative requirements. They must use
   the capability registry but must never mutate or bypass agent policy.
+- Rebuild the Runtime Resource Catalog for each planning request. Keep it
+  derived from the global capability and Toolbox registries plus enabled Skills;
+  context-provided tool IDs must not extend the global worker tool catalog.
+  Do not duplicate IDs in Planner prompts.
+  Validate capability, tool and Skill IDs, plus declared unique aliases,
+  immediately after parse and again at the compiler/factory boundary. Unknown
+  resource errors are fail-closed and do not trigger an LLM repair call.
+- Keep `semantic_needs`, `required_capabilities`, `required_tools` and
+  `preferred_skills` distinct. The resolver derives registered compatible
+  capabilities when tools are supplied without capabilities; when both are
+  supplied, reject incompatible pairs with `ToolCapabilityMismatch`. A tool
+  selection never grants access: the Agent Factory derives worker schemas from
+  the capability policy and every action still passes through `policy.py`.
 - Use `storage.py` conditional transitions for orchestration state. Save the
   plan with `Planning → Planned` atomically, never reactivate a terminal run,
   and keep cancellation serialized with task submission.
@@ -62,14 +86,25 @@ archival event reports archival `Success` separately from the run's final
 - A program_creation request without a named language uses an explicit Python
   3.10+ assumption. A code_change follows the existing project stack. Preserve
   explicit languages and keep unrelated missing-input blockers fail-closed.
-- Interactive plans append a dependent QA node with `interactive-testing`, then
-  the normal read-only Code Auditor. `run_command` accepts bounded stdin for
-  Python only and closes stdin otherwise so `input()` cannot consume the wall-clock deadline.
+- Interactive plans append a dependent QA node with the registered
+  `execution.python_script` capability. Ordinary interactive QA can select the
+  `interactive-testing` Skill; the single-case console calculator omits its
+  multi-case guidance. Keep Python execution on QA; implementation tasks receive
+  only the file capabilities they need. The calculator runs one QA case with
+  stdin lines `3` and `5`, produces integer output `8`, and creates no helper or
+  test files. Its worker stops after one successful command supplies evidence
+  for every configured acceptance criterion. More complex code changes may
+  still add a read-only audit. The concrete tool is `run_command`; it accepts
+  bounded stdin for Python only and closes stdin otherwise so `input()` cannot
+  consume the wall-clock deadline.
 - Keep context assembly in `agent_context.py`; do not add role-specific global
   prompts to the worker. Repeated non-recoverable tool failures must be
   bounded before consuming the task step budget.
 - `worker.py` must stop repeated successful read-only actions when no workspace
   progress is observed and bound consecutive denied/repeatedly blocked actions.
+  It may complete a single-file task after exact matching read-back supports all
+  file-presence criteria, or stop a single-case QA task after one controlled
+  command supports every configured output and exit-status criterion.
   For structured output, attempt one bounded format repair for prose and
   malformed JSON; emit a sanitized task.result_contract diagnostic when the
   original response needs repair or fallback. Keep that format diagnostic

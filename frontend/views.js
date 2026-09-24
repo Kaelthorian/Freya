@@ -21,6 +21,65 @@ function skillContextPreview(skill) {
 const FREYA_ACTIVE_STATUSES = new Set(['Queued', 'Planning', 'Planned', 'Running', 'Integrating', 'WaitingForApproval', 'Paused']);
 const FREYA_ORCHESTRATION_ACTIVE = new Set(['Queued', 'Analyzing', 'NeedsClarification', 'Planning', 'Planned', 'Running', 'Integrating']);
 
+function activityClock(value) {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '—' : parsed.toLocaleTimeString('en-US', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+
+function activityDetails(details = {}) {
+  const rows = Object.entries(details).filter(([, value]) => value !== null && value !== undefined && value !== '');
+  if (!rows.length) return '';
+  return '<dl class="freya-activity-details">' + rows.map(([key, value]) =>
+    '<dt>' + esc(key.replaceAll('_', ' ')) + '</dt><dd>' +
+    (typeof value === 'object' ? '<pre>' + esc(serialize(value)) + '</pre>' : '<span>' + esc(value) + '</span>') +
+    '</dd>').join('') + '</dl>';
+}
+
+function freyaActivityPanel(activity, run) {
+  if (!activity) return '';
+  const llm = activity.llm || {};
+  const stats = [
+    ['Total elapsed', activity.total_elapsed_seconds],
+    ['Freya processing', activity.processing_seconds],
+    ['Worker execution', activity.execution_seconds],
+    ['Waiting for clarification', activity.waiting_for_user_seconds],
+    ['Waiting for approvals', activity.waiting_for_approval_seconds],
+    ['LLM time', llm.duration_seconds],
+  ];
+  const phaseRows = (activity.phases || []).map(phase => {
+    const status = phase.fallback_used ? 'Success (fallback)' : phase.status;
+    const extra = { ...phase };
+    for (const key of ['name', 'label', 'actor_type', 'started_at', 'completed_at', 'duration_seconds', 'status']) delete extra[key];
+    return '<tr><td><strong>' + esc(phase.label || phase.name) + '</strong>' +
+      (phase.actor_name && phase.actor_name !== phase.label ? '<span class="table-sub">' + esc(phase.actor_name) + '</span>' : '') +
+      '</td><td class="mono nowrap">' + activityClock(phase.started_at) + '</td><td>' + badge(status || 'Running') +
+      '</td><td class="mono nowrap">' + duration(phase.duration_seconds) +
+      '</td><td>' + (Object.keys(extra).length ? '<details><summary>Details</summary>' + activityDetails(extra) + '</details>' : '') + '</td></tr>';
+  }).join('');
+  const eventRows = (activity.events || []).map((event, index) => '<article class="freya-activity-event ' +
+    (String(event.status || '').toLowerCase().includes('fail') ? 'error' : '') + '"><time class="mono">' +
+    activityClock(event.timestamp) + '</time><div class="freya-activity-event-body"><div class="freya-activity-event-heading"><strong>' +
+    esc(event.component || 'System') + '</strong><span>' + esc(event.event || event.event_type || 'event') + '</span>' +
+    badge(event.status || 'Info') + (event.duration_seconds != null ? '<span class="mono">' + duration(event.duration_seconds) + '</span>' : '') +
+    '</div>' + (event.message ? '<p>' + esc(uiText(event.message)) + '</p>' : '') +
+    ((event.error || Object.keys(event.details || {}).length) ? '<details data-detail="freya-event-' + esc(event.id || index) + '"><summary>Details</summary>' +
+      (event.error ? '<p class="event-error">' + esc(uiText(event.error)) + '</p>' : '') + activityDetails(event.details || {}) +
+      '</details>' : '') + '</div></article>').join('');
+  return '<section class="panel freya-orchestration-activity"><div class="freya-section-heading"><div><span class="eyebrow">ORCHESTRATION ACTIVITY</span><h2>' +
+    esc(taskTitle(run?.prompt || 'Freya run')) + '</h2><p>Chronological system and worker events. Durations come from persisted timestamps.</p></div><span>' +
+    badge(activity.status || run?.status || 'Running') + '</span></div>' +
+    '<div class="freya-performance-grid">' + stats.map(([label, seconds]) => '<div class="freya-performance-card"><span>' + esc(label) +
+      '</span><strong>' + duration(seconds) + '</strong></div>').join('') +
+    '<div class="freya-performance-card"><span>LLM calls · tokens</span><strong>' + number(llm.calls) + ' · ' + compact(llm.total_tokens) + '</strong></div></div>' +
+    '<p class="freya-duration-note">Processing excludes clarification and approval waits. Worker execution and LLM time are subsets of processing. Phase durations can overlap; do not add them to the elapsed total.</p>' +
+    '<div class="table-wrap"><table class="freya-phase-table"><thead><tr><th>PHASE</th><th>STARTED</th><th>STATUS</th><th>DURATION</th><th></th></tr></thead><tbody>' +
+    (phaseRows || '<tr><td colspan="5">No phase events recorded yet.</td></tr>') + '</tbody></table></div>' +
+    '<div class="freya-event-timeline">' + (eventRows || '<p class="muted">No activity events have been recorded yet.</p>') + '</div></section>';
+}
+
 function freyaHistoryEntry(kind, id, data, agent) {
   const existing = state.freyaHistory.find(item => item.kind === kind && item.id === id);
   if (existing) {
@@ -72,6 +131,7 @@ function freyaRunRow(item) {
   const startedAt = run.created_at, elapsed = active && startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : Number(run.duration_seconds) || 0;
   const failed = run.status === 'Failed', failure = failed ? taskTitle(uiText(run.error || run.response || 'Failure cause unavailable.'), 120) : '';
   const action = run.status === 'NeedsClarification' ? '<a class="text-link" href="#freya-clarification-' + esc(run.id) + '">Responder</a>' : active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<a class="text-link" href="#/logs?orchestration_id=' + encodeURIComponent(run.id || '') + '">' + (failed ? 'Diagnosis' : 'Logs') + ' ' + icon('arrow') + '</a>';
+  const activityAction = '<button type="button" class="text-link freya-view-activity" data-action="show-freya-activity" data-id="' + esc(run.id) + '">Activity</button>';
   return [
     '<tr>',
     '<td>' + badge(run.status || 'Pending') + '</td>',
@@ -81,7 +141,7 @@ function freyaRunRow(item) {
     '<td class="mono nowrap">' + duration(elapsed) + '</td>',
     '<td class="mono">—</td>',
     '<td class="mono">—</td>',
-    '<td>' + action + '</td>',
+    '<td><div class="freya-row-actions">' + action + activityAction + '</div></td>',
     '</tr>'
   ].join('');
 }
@@ -109,14 +169,26 @@ export async function freya() {
   const activeRun = (state.freyaRunId && activeRuns.find(run => run.id === state.freyaRunId)) || activeRuns[0];
   if (activeRun) freyaHistoryEntry('orchestration', activeRun.id, activeRun);
 
-  const taskHistory = state.freyaHistory.filter(item => item.kind === 'task');
-  const rows = (taskHistory.length ? taskHistory : state.freyaHistory).slice().sort((a, b) => {
+  const rows = state.freyaHistory.slice().sort((a, b) => {
     const activeA = a.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(a.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(a.run.status);
     const activeB = b.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(b.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(b.run.status);
     if (activeA !== activeB) return activeA ? -1 : 1;
     return freyaStartedAt(b) - freyaStartedAt(a);
   });
   const activeCount = rows.filter(item => item.kind === 'task' ? FREYA_ACTIVE_STATUSES.has(item.task.status) : FREYA_ORCHESTRATION_ACTIVE.has(item.run.status)).length;
+  const activityRuns = state.orchestrations.filter(run => run.id === state.freyaRunId ||
+    freyaIsInCurrentSession({ kind: 'orchestration', id: run.id, run })).sort((a, b) =>
+    new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+  const selectedRun = activityRuns.find(run => run.id === state.freyaRunId) || activityRuns[0] || null;
+  let activityPanel = '';
+  if (selectedRun) {
+    try {
+      const activity = await api('/orchestrations/' + encodeURIComponent(selectedRun.id) + '/activity');
+      activityPanel = freyaActivityPanel(activity, selectedRun);
+    } catch (error) {
+      activityPanel = '<section class="panel"><p class="event-error">Activity could not be loaded: ' + esc(error.message) + '</p></section>';
+    }
+  }
   const clarificationForms = state.orchestrations.filter(run => run.status === 'NeedsClarification' && run.task_spec?.clarification_questions?.length).map(run =>
     '<section class="panel" id="freya-clarification-' + esc(run.id) + '"><h2>Freya necesita aclarar</h2><p class="small muted">' + esc(taskTitle(run.prompt)) + '</p><form class="stack-form freya-clarification-form" data-run-id="' + esc(run.id) + '">' +
     run.task_spec.clarification_questions.map(question => '<label for="' + esc(run.id + '-' + question.id) + '">' + esc(question.question) + '</label><textarea id="' + esc(run.id + '-' + question.id) + '" name="' + esc(question.id) + '" rows="2" maxlength="4000" ' + (question.required ? 'required' : '') + '></textarea>').join('') +
@@ -125,7 +197,7 @@ export async function freya() {
   const label = activeCount ? activeCount + ' active · ' + rows.length + ' total' : rows.length ? rows.length + ' completed' : 'Idle';
   return heading('Freya', 'Tell Freya what you need and it will coordinate the available agents.', '', 'ORCHESTRATOR') +
     '<section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want...">' + esc(state.freyaDraft.prompt || '') + '</textarea><label for="freya-workspace">Workspace folder (existing files)</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="' + esc(state.freyaDraft.workspace_path || '') + '" placeholder="Select an existing folder, or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><p class="small muted workspace-help">A selected folder is used directly, so Freya can act on its existing files. Leave it empty to create an isolated workspace.</p><button class="button primary" type="submit">Ask Freya</button></form></section>' +
-    clarificationForms + '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>';
+    clarificationForms + '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>' + activityPanel;
 }
 export function dashboard() {
   const m = state.metrics || {}, h = state.health || {}, system = h.system || {};

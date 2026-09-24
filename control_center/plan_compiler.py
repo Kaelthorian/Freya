@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .planner import MAX_PLAN_TASKS, PlanValidationError, validate_plan
+from .runtime_resources import RuntimeResourceCatalog
 from .task_spec import validate_task_spec
 
 
@@ -12,11 +13,14 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")[:64]
 
 
-def compile_semantic_plan(value: Any, task_spec: dict[str, Any]) -> dict[str, Any]:
+def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
+                          resource_catalog=None) -> dict[str, Any]:
     """Assign every internal ID and link; model supplies only task meaning."""
     spec = validate_task_spec(task_spec)
     if spec["status"] != "READY_FOR_PLANNING":
         raise PlanValidationError("Planning requires a ready Task Spec.")
+    resource_catalog = resource_catalog or RuntimeResourceCatalog.build()
+    value = resource_catalog.validate_semantic_plan(value, allow_aliases=False)
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
         raise PlanValidationError("Semantic plan must contain tasks.")
     raw_tasks = value["tasks"]
@@ -49,10 +53,24 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any]) -> dict[str, An
         criteria = item.get("success_criteria") or []
         if not isinstance(criteria, list) or any(not isinstance(x, str) or not x.strip() for x in criteria):
             raise PlanValidationError("Semantic task checks must be text.")
+        capabilities = item.get("required_capabilities", [])
+        if not isinstance(capabilities, list) or any(not isinstance(x, str) for x in capabilities):
+            raise PlanValidationError("Semantic task required_capabilities must be a list of strings.")
+        required_tools = item.get("required_tools", [])
+        if not isinstance(required_tools, list) or any(not isinstance(x, str) for x in required_tools):
+            raise PlanValidationError("Semantic task required_tools must be a list of strings.")
+        if not required_tools:
+            required_tools = resource_catalog.tools_for_capabilities(capabilities)
+        semantic_needs = item.get("semantic_needs", [])
+        if not isinstance(semantic_needs, list) or any(not isinstance(x, str) or not x.strip()
+                                                        for x in semantic_needs):
+            raise PlanValidationError("Semantic task semantic_needs must be non-empty strings.")
         tasks.append({"id": f"task-{index}", "objective": str(item["objective"]).strip(),
                       "description": str(item.get("description") or item["objective"]).strip(),
                       "depends_on": resolved,
-                      "required_capabilities": item.get("required_capabilities", []),
+                      "required_capabilities": capabilities,
+                      "required_tools": required_tools,
+                      "semantic_needs": list(dict.fromkeys(semantic_needs)),
                       "preferred_skills": item.get("preferred_skills", []),
                       "success_criteria": list(dict.fromkeys(criteria)) or
                                           [f"The result of {item['objective']} is verified."]})

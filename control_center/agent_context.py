@@ -33,6 +33,7 @@ DEFAULT_AUTONOMY = {
 DEFAULT_VERIFICATION = {
     "enabled": True, "inspect_changes": True, "run_available_tests": True,
     "require_tool_evidence": True, "completion_criteria": [],
+    "stop_after_acceptance_evidence": False,
 }
 DEFAULT_OUTPUT = {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]}
 PLANNING_MODES = {"direct", "adaptive", "explicit"}
@@ -128,7 +129,8 @@ def normalize_verification(value: Any) -> dict[str, Any]:
         if unknown:
             raise ValueError("verification contains unknown fields: " + ", ".join(sorted(unknown)))
         result.update(value)
-    for key in ("enabled", "inspect_changes", "run_available_tests", "require_tool_evidence"):
+    for key in ("enabled", "inspect_changes", "run_available_tests", "require_tool_evidence",
+                "stop_after_acceptance_evidence"):
         if not isinstance(result[key], bool):
             raise ValueError(f"verification.{key} must be boolean")
     result["completion_criteria"] = _text_list(result.get("completion_criteria", []), "verification completion_criteria")
@@ -295,6 +297,7 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   ), "VERIFICATION",
                   f"Enabled: {verification['enabled']}", f"Inspect changes: {verification['inspect_changes']}",
                   f"Run available tests: {verification['run_available_tests']}", f"Require tool evidence: {verification['require_tool_evidence']}",
+                  f"Stop after acceptance evidence: {verification['stop_after_acceptance_evidence']}",
                   "Completion criteria: " + "; ".join(verification["completion_criteria"]) if verification["completion_criteria"] else "Completion criteria: None specified",
                   "OUTPUT CONTRACT",
                   f"Format: {output['format']}",

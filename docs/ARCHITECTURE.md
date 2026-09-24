@@ -20,9 +20,14 @@ policy denies every undeclared capability, dangerous requirements remain
 `control_center/execution_graph.py` delegates the bounded task through `Runtime`
 and requires
 `control_center/evaluator.py` to accept technical successes before integration.
-Low-risk file and Python artifact requests use a single dynamic implementation
-task; the Planner derives the minimum read-back and execution capabilities and
-does not add a code audit or recovery stage merely because a file was created.
+Low-risk file and non-interactive Python artifact requests use a single dynamic
+implementation task. The calculator console case uses one implementation
+task plus its dependent controlled-input QA task; it does not create test-file
+scaffolding or a code-audit task. The Planner derives the minimum read-back and
+file-creation capabilities for implementation, while Python execution is
+reserved for QA. QA runs the requested `3` and `5` input case once. The program
+prints whole-number sums without a trailing `.0`; QA reports its bounded input,
+output and exit status.
 Workers remain the only components allowed to invoke tools;
 Semantic non-acceptance enters bounded recovery in `control_center/recovery.py`
 before a node can fail or a validated effective-plan revision can replace its subgraph.
@@ -230,19 +235,86 @@ Each requirement, deliverable and constraint has an `explicit`, `clarified`
 or `assumed` source. Questions have a generated ID, question, reason, field
 and required flag. The Analyst asks only about material ambiguity without a
 safe default; internal engineering decisions stay with Planner and workers.
-A malformed model response gets one bounded repair attempt. If the model
-fails, conservative deterministic analysis keeps vague requests pending
-instead of inventing requirements. The legacy version-3
+`TaskSpecStatus` and `RequirementSource` define the canonical status and source
+enums. The Ollama response schema and prompt use those same values. A declared
+`inferred` compatibility alias normalizes to `assumed`; casing and whitespace,
+null list/map containers, omitted optional collections and runtime clarification
+IDs are normalized deterministically before validation. These transformations
+do not supply missing user intent. The model returns intent fields only;
+source prompt, schema/revision metadata, clarification history and revision
+changes remain runtime-owned. Unknown fields and invalid cross-field readiness
+combinations fail validation. One bounded repair receives the original candidate,
+the exact validation path/message and the expected schema; a still-invalid
+candidate uses the conservative deterministic fallback.
+
+Contract failures are recorded as sanitized `task_analysis.contract_invalid`
+events with the initial/repair stage, error type/path, expected and received
+values, validation message, bounded response excerpt and normalization flag.
+`task_analysis.normalization_succeeded`, `task_analysis.repair_started`,
+`task_analysis.repair_succeeded` and `task_analysis.fallback_used` expose the
+corresponding transitions. Task Analyst metrics include `model_calls`,
+`fallback_used`, `fallback_reason`, `initial_validation_error`,
+`repair_validation_error` and `repair_attempted`. A model response that passes
+after safe normalization completes after one call. The legacy version-3
 `task_analyst.py` contract remains for injected compatibility adapters.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec. Its model
-output describes semantic task keys, dependencies, required capabilities,
-preferred Skills and local checks. `plan_compiler.py` assigns task and
-criterion IDs, resolves dependencies, rejects unknown references and cycles,
-then produces the existing durable plan schema. The source human prompt is
-retained for audit and omitted from Planner context; a worker sees a
-deterministic rendering of the ready Task Spec. Capability Policy remains the
-only permission authority.
+output describes semantic task keys, dependencies, semantic needs, required
+capabilities, worker tools, preferred Skills and local checks. Before each
+planning call, `orchestrator.py` creates a `RuntimeResourceCatalog` from the
+capability registry, the schemas exposed by `Toolbox`, and enabled Skill
+definitions in SQLite. The catalog includes semantic summaries and a stable
+content hash; it excludes Skill instructions and procedures. Ollama receives
+dynamic resource enums plus those summaries. The capability registry describes
+operations such as bounded stdin, captured output and exit status for
+`execution.python_script`; it does not describe per-agent policy.
+
+Immediately after JSON parsing, resource validation accepts exact IDs or one
+unambiguous alias explicitly declared by a registry. Unknown or ambiguous
+capabilities, tools and Skills fail before `plan_compiler.py` runs. Tool IDs
+are checked against the global `Toolbox` schema catalog, even when Planner
+context or an injected catalog contains other IDs; an unknown tool emits
+`UnknownTool`. If a task selects tools without declaring
+capabilities, the resolver derives the capabilities registered for those
+tools. If both fields are present, every selected tool must support at least
+one declared capability; an incompatible pair raises `ToolCapabilityMismatch`
+and does not trigger model repair. `plan_compiler.py` rechecks references,
+assigns task and criterion IDs, resolves dependencies, rejects cycles and
+produces durable plan schema version 1. Capability-only plans derive their
+tool transports from the capability registry. Additive resource metadata
+remains compatible with legacy version 1 plans. The Agent Factory repeats
+tool/capability compatibility checks as a second boundary.
+
+Tools remain concrete worker operations; capabilities remain declarative action
+requirements; Skills remain knowledge and instructions. Agent tools continue
+to derive from capability policy, and every operation still passes through the
+worker's fail-closed policy engine. Selecting a resource does not authorize it.
+Derived capabilities are requirements only; the generated task policy and
+worker policy checks remain the authority for each concrete action.
+The source human prompt is retained for audit and omitted from Planner context;
+a worker sees a deterministic rendering of the ready Task Spec.
+
+## Activity and performance read model
+
+`control_center/activity.py` projects the existing persisted event stream into
+the `GET /api/orchestrations/{id}/activity` response; `storage.py` supplies the
+run, merged runtime/orchestration events, evaluations and integration metrics.
+The projection labels actors separately from agents, so Planner, Task Analyst,
+orchestration and other system events stay visible with a null `agent_id`.
+It derives Task Analyst, Planner, compiler, dynamic-agent, worker/QA, evaluator,
+graph, integration and final-response phase intervals from event timestamps and
+emits the original events in chronological order. `freya.plan_compiler.*`
+events expose compiler attempts, duration and terminal status. Result Integrator
+started, failed and created events bound final-response duration.
+
+`total_elapsed_seconds` is wall clock from orchestration creation through its
+terminal event (or current time while active). `processing_seconds` excludes
+the union of clarification and approval waits. `execution_seconds` is the union
+of worker intervals, less those waits; overlapping workers count once. `llm`
+aggregates recorded model-call durations, calls and tokens. Component phase
+durations may overlap or nest, and LLM time is included in processing, so phase
+and LLM durations are not additive totals. The read model is calculated from
+persisted timestamps and metrics rather than frontend input.
 
 ## Execution graph and scheduling
 
@@ -702,6 +774,15 @@ commands become verification evidence only when their exit/output directly
 supports configured completion criteria. Once the action ledger contains a
 created artifact and evidence for every configured criterion, an already-
 satisfied duplicate write can end the task without consuming more model steps.
+When every criterion is an explicit artifact-presence/readability requirement,
+the worker also ends after a matching read-back of the created file. This keeps
+simple file tasks from looping through duplicate writes and reads.
+For a task explicitly marked as single-case QA, the Agent Factory sets
+`verification.stop_after_acceptance_evidence`; the worker then ends after one
+successful controlled command supports every configured criterion. Output
+assertions and exit-status assertions in the same criterion must both pass, and
+quoted numeric output is matched as a complete number (`8.0` does not satisfy
+`8`).
 
 ## Feature scope
 

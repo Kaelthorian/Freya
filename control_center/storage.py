@@ -547,6 +547,18 @@ class Store(IntegrationStoreMixin):
             result["events"] = [dict(x) for x in c.execute("SELECT * FROM orchestration_events WHERE orchestration_id=? ORDER BY id", (oid,))]
             return result
 
+    def orchestration_activity(self, oid: str) -> dict[str, Any]:
+        """Return a read model over persisted runtime and orchestration events."""
+        from .activity import build_orchestration_activity
+
+        run = self.get_orchestration(oid)
+        events = self.list_events(orchestration_id=oid, limit=10000)
+        integrations = self.list_integrations(oid)
+        return build_orchestration_activity(
+            run, events, evaluations=run.get("evaluations") or [],
+            integrations=integrations,
+        )
+
     def list_orchestrations(self, limit=100):
         with self._connection() as c:
             bounded = max(1, min(int(limit), 1000))

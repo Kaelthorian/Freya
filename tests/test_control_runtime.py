@@ -15,7 +15,9 @@ from control_center.config import DEFAULT_CONFIG, normalize_agent
 from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.transport import TransportError, request_json
-from control_center.worker import PolicyToolbox, run_task
+from control_center.worker import (
+    PolicyToolbox, _command_evidence_criteria, _readback_evidence_criteria, run_task,
+)
 from control_center.tools import ToolResult
 
 
@@ -155,6 +157,75 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(any(item.get("check") == "filesystem:read_file:hello.py"
                             for item in evidence))
         self.assertTrue(any(item["tool"] == "run_command" for item in result["result"]["actions"]))
+
+    def test_file_creation_stops_after_matching_readback_evidence(self):
+        criterion = "calculator.py exists in the selected workspace and can be read."
+        content = "print('ready')\n"
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+            answer(calls=[("read_file", {"path": "calculator.py"})]),
+        ], tools=["write_file", "read_file"], config={
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {
+                "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": True, "completion_criteria": [criterion],
+            },
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(result["tool_calls"], 2)
+        self.assertTrue(result["verification"]["passed"])
+        self.assertTrue(any(item.get("check") == "filesystem:read_file:calculator.py"
+                            for item in result["verification"]["evidence"]))
+        self.assertTrue(any(event.get("event", {}).get("event_type") == "task.auto_completed"
+                            for event in self.events))
+
+    def test_single_case_qa_stops_after_exact_command_evidence(self):
+        (self.workspace / "calculator.py").write_text(
+            "first = float(input())\nsecond = float(input())\n"
+            "print(f'The sum is: {first + second:.0f}')\n",
+            encoding="utf-8",
+        )
+        criterion = "The bounded command outputs '8' and exits successfully."
+        result = self.run_worker([
+            answer(calls=[("run_command", {
+                "argv": ["python", "calculator.py"], "stdin": "3\n5",
+            })]),
+        ], tools=["run_command"], config={
+            "permissions": "execute",
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {
+                "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": True, "completion_criteria": [criterion],
+                "stop_after_acceptance_evidence": True,
+            },
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 1)
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertTrue(result["verification"]["passed"])
+        self.assertIn("The sum is: 8", result["verification"]["evidence"][0]["output"])
+        self.assertTrue(any(event.get("event", {}).get("event_type") == "task.auto_completed"
+                            for event in self.events))
+
+    def test_command_evidence_requires_exact_numeric_output_and_all_assertions(self):
+        criterion = "The bounded command outputs '8' and exits successfully."
+        argv = ["python", "calculator.py"]
+        self.assertEqual(_command_evidence_criteria(
+            [criterion], argv, ToolResult("run_command", "The sum is: 8.0", True, 0, exit_code=0),
+        ), [])
+        self.assertEqual(_command_evidence_criteria(
+            [criterion], argv, ToolResult("run_command", "The sum is: 8", True, 0, exit_code=0),
+        ), [criterion])
+        self.assertEqual(_command_evidence_criteria(
+            [criterion], argv, ToolResult("run_command", "The sum is: 8", True, 0, exit_code=1),
+        ), [])
+        self.assertEqual(_readback_evidence_criteria(
+            ["calculator.py exists and can be read."], "calculator.py", "source", "source",
+        ), ["calculator.py exists and can be read."])
+        self.assertEqual(_readback_evidence_criteria(
+            ["calculator.py does not exist and can be read."], "calculator.py", "source", "source",
+        ), [])
 
     def test_calculator_create_run_and_identical_write_finishes_from_evidence(self):
         content = "first = float(input())\nsecond = float(input())\nprint(f'The sum is: {first + second:.1f}')\n"

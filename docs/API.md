@@ -48,6 +48,15 @@ immutable and versioned.
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
 `planning_metrics`, selection snapshots, delegations, execution attempts,
 evaluations, recovery actions, plan revisions, and events needed to reconstruct it.
+`GET /api/orchestrations/{id}/activity` returns a backend-derived chronological
+timeline and performance read model. Its `events` include system actors even
+when `agent_id` is null; `phases` pair persisted start/end events and calculate
+duration from timestamps; `llm` aggregates recorded model calls and tokens.
+The summary includes total elapsed, processing, worker execution, clarification
+wait and approval wait seconds. Phase durations can overlap, LLM time is inside
+processing, and parallel worker execution is a union, so these values must not
+be added to produce wall-clock time. The endpoint does not accept client-computed
+metrics.
 `GET /api/orchestrations/{id}/plan` returns
 the plan and its version metadata directly. Existing agent and task routes
 remain compatible.
@@ -67,6 +76,10 @@ verification history ordered by round. Each item exposes `round`, `status`,
 responsible active task IDs, `plan_revision`, integration version, metrics and
 truncation/deterministic flags. The private bounded snapshot is not returned by
 the API. Historical pre-4.6 runs return `[]`.
+
+The activity projection is assembled from the persisted orchestration and
+runtime event timelines, evaluations and integration metrics. It does not add
+a second metrics table or treat a system actor as an agent.
 
 ```json
 [{

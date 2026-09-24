@@ -86,6 +86,28 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("hidden", json.dumps(detail))
         self.assertEqual(self.request("GET", "/api/agents")[1], [])
 
+    def test_orchestration_activity_endpoint_includes_system_actor_rows(self):
+        run = self.store.create_orchestration("Track system activity")
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "task_analysis.started", "status": "Analyzing",
+            "actor_type": "task_analyst", "message": "Analyst started.",
+        })
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "task_analysis.updated", "status": "Planning",
+            "actor_type": "task_analyst", "agent_id": None,
+            "metrics": {"model": "test-model", "model_calls": 1, "fallback_used": False},
+            "message": "Analyst completed.",
+        })
+        status, activity = self.request(
+            "GET", f"/api/orchestrations/{run['id']}/activity",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(activity["orchestration_id"], run["id"])
+        self.assertTrue(any(event["component"] == "Task Analyst"
+                            for event in activity["events"]))
+        self.assertTrue(any(phase["name"] == "task_analysis"
+                            for phase in activity["phases"]))
+
     def test_duplicate_agent_preserves_instructions_and_names_remain_unique(self):
         status, agent = self.request("POST", "/api/agents", {
             "name": "Original",

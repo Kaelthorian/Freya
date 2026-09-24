@@ -14,6 +14,10 @@ from .capabilities import CAPABILITIES, CAPABILITY_REGISTRY, effective_tools_for
 from .config import normalize_agent
 from .task_analyst import canonical_task_kind
 from .policy import validate_policy
+from .runtime_resources import (
+    RuntimeResourceCatalog, ToolCapabilityMismatch, UnknownTool,
+    UnsupportedResourceRequirement,
+)
 
 
 AGENT_FACTORY_VERSION = 1
@@ -126,11 +130,14 @@ class AgentFactory:
             str(item.get("id")).casefold(), str(item.get("name") or "").casefold()
         ))
         by_id = {str(item["id"]).casefold(): item for item in available}
-        by_normalized: dict[str, dict[str, Any]] = {}
+        by_alias: dict[str, dict[str, Any]] = {}
         for item in available:
-            for key in (_slug(item.get("id")), _slug(item.get("name"))):
-                if key:
-                    by_normalized.setdefault(key, item)
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            aliases = metadata.get("aliases", [])
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if isinstance(alias, str) and alias.strip():
+                        by_alias.setdefault(alias.strip().casefold(), item)
 
         required = {str(item) for item in task.get("required_capabilities", [])}
         selected: list[tuple[dict[str, Any], int]] = []
@@ -151,10 +158,11 @@ class AgentFactory:
         for requested in preferred:
             skill = by_id.get(requested.casefold())
             if skill is None:
-                skill = by_normalized.get(_slug(requested))
+                skill = by_alias.get(requested.casefold())
             if skill is None:
-                warnings.append(
-                    f"Preferred Skill '{requested}' is not registered and was ignored."
+                raise UnsupportedResourceRequirement(
+                    "skill", requested,
+                    reason="The Agent Factory accepts only registered Skill IDs or declared aliases.",
                 )
             preferred_records.append((requested, skill))
 
@@ -172,6 +180,7 @@ class AgentFactory:
         role = self.orchestration_role(task)
         task_kind = self.task_kind(task)
         characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
+        single_case_verification = bool(characteristics.get("single_case_verification"))
         interactive = bool(characteristics.get("interactive") or characteristics.get("requires_user_input"))
         interactive = interactive or bool(re.search(r"(?<!non-)\b(?:interactive|input|qa|quality assurance)\b", task_text, re.I))
         recovery_text = " ".join(str(task.get(key) or "") for key in (
@@ -197,7 +206,9 @@ class AgentFactory:
         if role == "auditor":
             canonical_ids = ["code-review"]
         elif role == "qa":
-            canonical_ids = ["interactive-testing", "software-testing"] if interactive else ["software-testing"]
+            canonical_ids = ([] if single_case_verification else
+                             ["interactive-testing", "software-testing"] if interactive
+                             else ["software-testing"])
         elif task_kind == "analysis" or debug_requested:
             canonical_ids = ["debugging"]
         elif task_kind == "file_creation":
@@ -271,7 +282,8 @@ class AgentFactory:
         # Do not fill the context with every compatible Skill.  An additional
         # Skill is reserved for a genuinely separate explicit recovery or QA
         # concern and is never selected for trivial implementation tasks.
-        if not selected and task_kind not in {"file_creation", "program_creation"}:
+        if (not selected and task_kind not in {"file_creation", "program_creation"}
+                and not single_case_verification):
             task_tokens = _tokens(task_text)
             scored: list[tuple[int, str, dict[str, Any]]] = []
             for skill in available:
@@ -351,16 +363,52 @@ class AgentFactory:
             raise ValueError("Planned task must be an object.")
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise ValueError("attempt must be a positive integer.")
-        required = list(task.get("required_capabilities", []))
+        required = task.get("required_capabilities", [])
         if (not isinstance(required, list)
                 or any(not isinstance(item, str) for item in required)):
             raise ValueError("required_capabilities must be a list of strings.")
+        required = list(required)
+        characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
+        preferred_skills = task.get("preferred_skills", [])
+        if (not isinstance(preferred_skills, list)
+                or any(not isinstance(item, str) for item in preferred_skills)):
+            raise ValueError("preferred_skills must be a list of strings.")
         recovery_state = task.get("_recovery_workspace_state")
         if recovery_state is not None and "filesystem.read" not in required:
             # Recovery inspection is a safe, task-derived prerequisite.  It is
             # deliberately narrower than write authority and still passes
             # through the generated policy and selector checks below.
             required.append("filesystem.read")
+        records = (
+            list(skills) if skills is not None
+            else self.store.list_skills(enabled=True)
+        )
+        catalog = RuntimeResourceCatalog.build(records)
+        normalized_skills = []
+        for requested in preferred_skills:
+            resolved = catalog.resolve("skill", requested)
+            if resolved is None:
+                raise UnsupportedResourceRequirement(
+                    "skill", requested,
+                    reason="The Agent Factory accepts only registered Skill IDs or unique declared aliases.",
+                )
+            if resolved not in normalized_skills:
+                normalized_skills.append(resolved)
+        raw_tools = task.get("required_tools", [])
+        if not isinstance(raw_tools, list) or any(not isinstance(item, str) for item in raw_tools):
+            raise ValueError("required_tools must be a list of strings.")
+        normalized_tools = []
+        for requested in raw_tools:
+            resolved = catalog.resolve("tool", requested)
+            if resolved is None:
+                raise UnknownTool(requested)
+            compatible = catalog.capabilities_for_tool(resolved)
+            if not set(required) & set(compatible):
+                raise ToolCapabilityMismatch(
+                    resolved, required, compatible_capabilities=compatible,
+                )
+            if resolved not in normalized_tools:
+                normalized_tools.append(resolved)
         role = self.orchestration_role(task)
         write_capabilities = {
             "filesystem.create", "filesystem.modify", "filesystem.overwrite",
@@ -368,13 +416,21 @@ class AgentFactory:
         if role in {"qa", "auditor"} and set(required) & write_capabilities:
             raise ValueError(f"Dynamic {role} agents cannot receive write capabilities.")
         policy = self.capability_policy(required)
-        tools = list(dict.fromkeys(effective_tools_for_policy(policy)))
-        records = (
-            list(skills) if skills is not None
-            else self.store.list_skills(enabled=True)
-        )
+        policy_tools = list(dict.fromkeys(effective_tools_for_policy(policy)))
+        unavailable_tools = sorted(set(normalized_tools) - set(policy_tools))
+        if unavailable_tools:
+            tool_id = unavailable_tools[0]
+            raise ToolCapabilityMismatch(
+                tool_id, required,
+                compatible_capabilities=catalog.capabilities_for_tool(tool_id),
+            )
+        # Concrete tool schemas are still derived from the policy surface.
+        # required_tools is a validated planning declaration, never authority.
+        tools = policy_tools
         skill_task = dict(task)
         skill_task["required_capabilities"] = list(required)
+        skill_task["preferred_skills"] = normalized_skills
+        skill_task["required_tools"] = normalized_tools
         assignments, warnings = self.select_skills(
             skill_task, records, variant=variant
         )
@@ -431,6 +487,9 @@ class AgentFactory:
             "verification": {
                 "completion_criteria": list(task.get("success_criteria", [])),
                 "require_tool_evidence": bool(tools),
+                "stop_after_acceptance_evidence": bool(
+                    characteristics.get("single_case_verification")
+                ),
             },
             "config": agent_config,
         }, allow_provenance=True)

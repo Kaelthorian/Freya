@@ -477,6 +477,39 @@ dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(3px); }
   .onboarding-strip { align-items: flex-start; flex-wrap: wrap; }
   .onboarding-strip .button { margin-left: 0; }
 }
+.freya-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
+.freya-view-activity { padding: 0; border: 0; background: transparent; color: var(--blue); font: inherit; font-size: 11px; cursor: pointer; }
+.freya-orchestration-activity { margin-top: 20px; }
+.freya-performance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 18px 0 12px; }
+.freya-performance-card { min-width: 0; display: grid; gap: 7px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised, var(--surface)); }
+.freya-performance-card span { color: var(--muted); font-size: 10px; }
+.freya-performance-card strong { overflow-wrap: anywhere; font-size: 16px; font-weight: 650; }
+.freya-duration-note { margin: 0 0 16px; color: var(--faint); font-size: 10px; line-height: 1.5; }
+.freya-phase-table { min-width: 680px; }
+.freya-phase-table details > summary, .freya-activity-details summary { color: var(--blue); cursor: pointer; font-size: 10px; }
+.freya-activity-details { display: grid; grid-template-columns: minmax(110px, .35fr) minmax(0, 1fr); gap: 7px 12px; margin: 10px 0; font-size: 10px; }
+.freya-activity-details dt { color: var(--muted); text-transform: capitalize; }
+.freya-activity-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.freya-activity-details pre { max-height: 280px; overflow: auto; white-space: pre-wrap; }
+.freya-event-timeline { display: grid; gap: 0; margin-top: 22px; }
+.freya-activity-event { position: relative; display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 12px; padding: 0 0 17px; }
+.freya-activity-event:not(:last-child)::after { position: absolute; top: 22px; bottom: 0; left: 39px; width: 1px; background: var(--border); content: ""; }
+.freya-activity-event > time { color: var(--faint); font-size: 10px; padding-top: 4px; }
+.freya-activity-event-body { min-width: 0; padding: 0 0 0 14px; border-left: 2px solid var(--border); }
+.freya-activity-event.error .freya-activity-event-body { border-left-color: var(--red); }
+.freya-activity-event-heading { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.freya-activity-event-heading strong { font-size: 11px; }
+.freya-activity-event-heading > span:nth-child(2) { color: var(--muted); font-size: 10px; }
+.freya-activity-event-body > p { margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.freya-activity-event-body details { margin-top: 8px; }
+.freya-activity-event-body details > summary { color: var(--blue); cursor: pointer; font-size: 10px; }
+@media (max-width: 760px) {
+  .freya-performance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .freya-activity-event { grid-template-columns: 64px minmax(0, 1fr); gap: 7px; }
+  .freya-activity-event:not(:last-child)::after { left: 31px; }
+  .freya-activity-details { grid-template-columns: 1fr; gap: 3px; }
+  .freya-activity-details dd { margin-bottom: 6px; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
