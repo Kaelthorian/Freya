@@ -43,6 +43,8 @@ class ToolResult:
     policy_reason: str = ""
     executed: bool = False
     error_class: str = ""
+    changed: bool | None = None
+    already_satisfied: bool = False
 
 
 class Toolbox:
