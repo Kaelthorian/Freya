@@ -58,13 +58,22 @@ def skill_compatibility(skill: dict[str, Any], task_capabilities: Iterable[str])
 
 CORE_SKILL_ID = "freya-core"
 CORE_TOOLS = ("edit_file", "git_diff", "list_files", "read_file", "run_command", "search_code", "write_file")
+CORE_WRITE_FILE_INSTRUCTIONS = (
+    "write_file creates files, not directories. Never create a directory by "
+    "calling write_file with empty content. To create nested files, call "
+    "write_file directly with the complete path. Parent directories are "
+    "created automatically.",
+    'Correct: write_file("calculator-project/index.html", content). Never '
+    'use write_file("calculator-project", "") before writing nested files.',
+)
 BUILTIN_SKILLS: tuple[dict[str, Any], ...] = ({
     "id": CORE_SKILL_ID, "name": "Freya Core", "category": "General",
-    "version": 1,
+    "version": 2,
     "description": "Workspace programming, file work, analysis, QA, testing, debugging and review.",
     "instructions": [
         "Use only tools exposed by Policy for this task and stay in the assigned workspace.",
         "Use run_command to observe or test; persist changes with write_file or edit_file.",
+        *CORE_WRITE_FILE_INSTRUCTIONS,
         "Verify requested results with observable workspace evidence.",
     ],
     "procedures": [], "tools": list(CORE_TOOLS),

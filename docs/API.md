@@ -408,7 +408,9 @@ authoritative validation step.
 The `freya-core` definition includes `tools` alongside `id`, `name`,
 `description`, `category`, positive `version`, instructions, procedures,
 capability metadata, tags, source, metadata and enabled state. Startup validates
-its seven tool IDs; other Skill creation and import are disabled.
+its seven tool IDs; other Skill creation and import are disabled. When startup
+finds that a stored `freya-core` lacks the required `write_file` guidance, it adds
+the instructions as a new version and keeps earlier snapshots unchanged.
 IDs are lowercase stable identifiers. Procedures are recommended operating
 guidance and are adapted or omitted when a step needs a tool/capability not in
 the worker's effective toolbox. The worker sees no `recommended_capabilities`,
@@ -419,9 +421,14 @@ the worker's effective toolbox. The worker sees no `recommended_capabilities`,
 `run_command` accepts optional `{ "stdin": "..." }` only for restricted Python
 commands. Input is capped at 16,000 characters and is redacted to a character
 count in logs. Omitting it closes child stdin; a Python `input()` therefore
-fails immediately with `interactive_input_required` instead of hanging. A
-command runs only inside a disposable Docker copy of the workspace; Docker
-failure returns `error_class=SandboxUnavailable` with no host fallback. A
+fails immediately with `interactive_input_required` instead of hanging. `write_file`
+creates a file even when `content` is empty, and creates missing parent directories
+automatically. If a parent path is already a file, it fails with
+`error_class=ParentPathIsFile` and names the blocking path. The worker stops the
+current tool-call batch at that error so the model can change strategy; another
+write under the same blocker is not executed. A command runs only inside a
+disposable Docker copy of the workspace; Docker failure returns
+`error_class=SandboxUnavailable` with no host fallback. A
 successful command can add a `command_execution` item to
 `verification.evidence` when its bounded output directly supports a quoted
 output, exit-code, or JSON completion criterion. The Planner adds

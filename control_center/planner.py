@@ -180,6 +180,24 @@ def planner_response_format(context: dict[str, Any], *, semantic: bool) -> dict[
     task_properties["required_tools"] = _resource_array_schema(context, "tool")
     return schema
 
+PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS = (
+    "SOURCE OF TRUTH: The canonical Task Spec is the source of truth for user intent. "
+    "Do not invent user preferences, user decisions, requirements, constraints, deliverables, "
+    "or external dependencies unless they are explicitly present in the Task Spec or are strictly "
+    "necessary implementation details.\n\n"
+    "MISSING INFORMATION: If a missing decision materially changes the requested product, "
+    "request clarification through the existing clarification mechanism before planning. If it is "
+    "only an implementation detail, choose a reasonable default, record it as an assumption in the "
+    "implementing task description, and continue with implementation. Do not create a task whose "
+    "purpose is to discover a user preference that is not present in the Task Spec.\n\n"
+    "WORKSPACE PREFERENCES: Never assume that user preferences are stored in workspace files. "
+    "Do not create tasks to discover a user preference, find a user selection, or read configuration "
+    "chosen by the user unless the Task Spec explicitly references that file or resource.\n\n"
+    "IMPLEMENTATION: Prefer the simplest implementation that satisfies the Task Spec. Do not "
+    "introduce frameworks, databases, services, libraries, or architectural components unless the "
+    "Task Spec requires them or they are reasonably necessary to implement the requested behavior."
+)
+
 _SIMPLE_ARTIFACT_HINT = re.compile(
     r"(?:\.[a-z0-9]{1,8}\b|\b(?:file|archivo|script|document|documento)\b)",
     re.IGNORECASE,
@@ -1449,6 +1467,7 @@ class Planner:
             )
         }
         return (
+            PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS + "\n\n"
             "Create a work plan and return one JSON object only. Do not use Markdown. "
             "Required plan fields: goal, summary, complexity, tasks, success_criteria, criterion_links. "
             "Freya assigns stable IDs to global and local criteria in criterion_links; "
@@ -1592,6 +1611,7 @@ class Planner:
             "skills": limited_context["skills"],
         }
         request = (
+            PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS + "\n\n"
             "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
             "success_criteria and tasks. Each task has a meaningful key, objective, description, "
             "depends_on (semantic task keys), semantic_needs, required_capabilities, required_tools, "

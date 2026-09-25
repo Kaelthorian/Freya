@@ -12,8 +12,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from control_center.config import DEFAULT_CONFIG, normalize_agent
+from control_center.evaluator import Evaluator
 from control_center.runtime import Runtime
 from control_center.storage import Store
+from control_center.task_spec import render_task_spec, validate_task_spec
 from control_center.transport import TransportError, request_json
 from control_center.worker import (
     PolicyToolbox, _command_evidence_criteria, _readback_evidence_criteria, run_task,
@@ -88,10 +90,13 @@ class WorkerTests(unittest.TestCase):
         self.workspace.mkdir()
         self.events = []
 
-    def run_worker(self, responses, *, config=None, tools=None, toolbox=None, token=""):
+    def run_worker(self, responses, *, config=None, tools=None, toolbox=None, token="",
+                   task_characteristics=None, prompt="Create hello.py"):
         config = {**DEFAULT_CONFIG, **(config or {})}
         task = {"config": config, "tools": tools if tools is not None else ["write_file", "read_file"],
-                "workspace": str(self.workspace), "prompt": "Create hello.py"}
+                "workspace": str(self.workspace), "prompt": prompt}
+        if task_characteristics is not None:
+            task["task_characteristics"] = dict(task_characteristics)
         replies = iter(responses)
         self.payloads = []
         def transport(method, url, body, **kwargs):
@@ -258,6 +263,54 @@ class WorkerTests(unittest.TestCase):
         diffs = [event["event"] for event in self.events
                  if event.get("event", {}).get("event_type") == "workspace.diff"]
         self.assertEqual(len(diffs), 1)
+
+    def test_parent_path_error_stops_sibling_writes_before_strategy_change(self):
+        result = self.run_worker([
+            answer(calls=[
+                ("write_file", {"path": "calculator-project", "content": ""}),
+                ("write_file", {"path": "calculator-project/index.html", "content": "old"}),
+                ("write_file", {"path": "calculator-project/style.css", "content": "body {}"}),
+            ]),
+            answer(calls=[
+                ("write_file", {"path": "site/index.html", "content": "<h1>Calculator</h1>"}),
+                ("write_file", {"path": "site/style.css", "content": "body {}"}),
+            ]),
+            answer("Created site with its HTML and CSS files."),
+        ], tools=["write_file"], config={
+            "verification": {"enabled": False, "inspect_changes": False, "run_available_tests": False,
+                            "require_tool_evidence": False, "completion_criteria": []},
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue((self.workspace / "calculator-project").is_file())
+        self.assertTrue((self.workspace / "site/index.html").is_file())
+        self.assertTrue((self.workspace / "site/style.css").is_file())
+        first_batch = next(message for message in self.payloads[1]["messages"]
+                           if message.get("role") == "assistant" and message.get("tool_calls"))
+        attempted_paths = [call["function"]["arguments"]["path"] for call in first_batch["tool_calls"]]
+        self.assertEqual(attempted_paths, ["calculator-project", "calculator-project/index.html"])
+        structural_errors = [event["event"] for event in self.events
+                             if event.get("event", {}).get("error_class") == "ParentPathIsFile"]
+        self.assertEqual(len(structural_errors), 1)
+
+    def test_parent_path_error_rejects_repeated_child_write_without_execution(self):
+        result = self.run_worker([
+            answer(calls=[
+                ("write_file", {"path": "project", "content": ""}),
+                ("write_file", {"path": "project/index.html", "content": "<h1>Hi</h1>"}),
+            ]),
+            answer(calls=[("write_file", {"path": "project/style.css", "content": "body {}"})]),
+        ], tools=["write_file"], config={
+            "verification": {"enabled": False, "inspect_changes": False, "run_available_tests": False,
+                            "require_tool_evidence": False, "completion_criteria": []},
+        })
+        self.assertEqual(result["status"], "Failed")
+        self.assertIn("ParentPathIsFile", result["error"])
+        self.assertEqual(result["tool_calls"], 2)
+        finished = [event["event"] for event in self.events
+                    if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual(len(finished), 2)
+        self.assertEqual(finished[-1]["error_class"], "ParentPathIsFile")
+        self.assertFalse((self.workspace / "project/style.css").exists())
 
     def test_changed_arguments_after_policy_denial_allow_a_new_strategy(self):
         existing = self.workspace / "existing.py"
@@ -476,14 +529,282 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(contract_event["output"]["fallback_normalization_used"])
         self.assertTrue(contract_event["output"]["normalized_result_valid"])
         self.assertFalse(contract_event["output"]["repair_succeeded"])
-    def test_fallback_disabled_tool_is_a_visible_error_without_mutation(self):
-        result = self.run_worker([answer('{"action":"write_file","path":"blocked.txt","content":"bad"}'),
-                                  answer('{"action":"finish","message":"Could not write"}')], tools=["read_file"])
-        self.assertEqual(result["status"], "Success")
+
+    def test_textual_registered_tool_call_executes_once_before_final_result(self):
+        contract = {
+            "summary": "Created output.txt.",
+            "actions": [{"tool": "fabricated_tool"}],
+            "artifacts": [{"path": "fabricated.txt"}],
+            "verification": {}, "limitations": [],
+        }
+        tool_call = json.dumps({
+            "name": "write_file",
+            "arguments": {"path": "output.txt", "content": "real write"},
+        })
+        result = self.run_worker([
+            answer(tool_call),
+            answer(json.dumps(contract)),
+        ], tools=["write_file"], task_characteristics={"requires_filesystem_write": True},
+            config={
+                "output": {"format": "structured",
+                           "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+                "verification": {"enabled": False, "inspect_changes": False,
+                                 "run_available_tests": False, "require_tool_evidence": False,
+                                 "completion_criteria": []},
+            })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertEqual((self.workspace / "output.txt").read_text(), "real write")
+        self.assertEqual([item["tool"] for item in result["result"]["actions"]], ["write_file"])
+        self.assertEqual([item["path"] for item in result["result"]["artifacts"]], ["output.txt"])
+        self.assertEqual(result["workspace_changes"], 1)
+        finished = [event["event"] for event in self.events
+                    if event.get("event", {}).get("event_type") == "step.finished"]
+        self.assertEqual([event["tool"] for event in finished], ["write_file"])
+        event_types = [item.get("event", {}).get("event_type") for item in self.events]
+        self.assertLess(event_types.index("step.finished"),
+                        event_types.index("task.result_contract"))
+
+    def test_textual_unregistered_tool_is_not_executed_or_reported_as_success(self):
+        tool_call = json.dumps({
+            "name": "write_file",
+            "arguments": {"path": "blocked.txt", "content": "bad"},
+        })
+        result = self.run_worker([answer(tool_call)], tools=["read_file"],
+                                 task_characteristics={"requires_filesystem_write": True},
+                                 config={"verification": {"enabled": False, "inspect_changes": False,
+                                                          "run_available_tests": False,
+                                                          "require_tool_evidence": False,
+                                                          "completion_criteria": []}})
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertEqual(result["tool_calls"], 0)
+        self.assertEqual(result["workspace_changes"], 0)
         self.assertFalse((self.workspace / "blocked.txt").exists())
-        errors = [e for e in self.events if e.get("event", {}).get("status") == "Failed"]
-        self.assertEqual(errors[0]["event"]["tool"], "write_file")
-        self.assertIn("disabled", errors[0]["event"]["error"])
+        self.assertFalse(any(item.get("event", {}).get("event_type") == "step.finished"
+                             for item in self.events))
+
+    def test_textual_tool_call_requires_object_arguments(self):
+        malformed_call = json.dumps({
+            "name": "write_file",
+            "arguments": json.dumps({"path": "bad.txt", "content": "bad"}),
+        })
+        result = self.run_worker(
+            [answer(malformed_call)],
+            tools=["write_file"],
+            task_characteristics={"requires_filesystem_write": True},
+            config={"verification": {"enabled": False, "inspect_changes": False,
+                                     "run_available_tests": False, "require_tool_evidence": False,
+                                     "completion_criteria": []}},
+        )
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertEqual(result["tool_calls"], 0)
+        self.assertFalse((self.workspace / "bad.txt").exists())
+
+    def test_final_success_claim_without_runtime_write_fails_and_discards_claimed_ledger(self):
+        claimed = {
+            "summary": "Created claimed.txt.",
+            "actions": [{
+                "name": "write_file",
+                "arguments": {"path": "claimed.txt", "content": "invented"},
+                "success": True,
+            }],
+            "artifacts": [{"path": "claimed.txt"}],
+            "verification": {"passed": True}, "limitations": [],
+        }
+        result = self.run_worker([answer(json.dumps(claimed))],
+                                 task_characteristics={"requires_filesystem_write": True},
+                                 config={
+                                     "output": {"format": "structured",
+                                                "include": ["summary", "actions", "artifacts",
+                                                            "verification", "limitations"]},
+                                     "verification": {"enabled": False, "inspect_changes": False,
+                                                      "run_available_tests": False,
+                                                      "require_tool_evidence": False,
+                                                      "completion_criteria": []},
+                                 })
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertEqual(result["task_execution_successful"], False)
+        self.assertEqual(result["workspace_changes"], 0)
+        self.assertEqual(result["result"]["actions"], [])
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertIn("ExpectedWorkspaceMutationNotObserved", result["result"]["limitations"][0])
+        contract_event = next(item["event"] for item in self.events
+                              if item.get("event", {}).get("event_type") == "task.result_contract")
+        self.assertTrue(contract_event["output"]["result_contract_valid"])
+        self.assertFalse(contract_event["output"]["task_execution_successful"])
+
+    def test_successful_format_repair_cannot_fabricate_a_missing_write(self):
+        repaired_claim = {
+            "summary": "Created repaired.txt.",
+            "actions": [{"tool": "write_file", "success": True}],
+            "artifacts": [{"path": "repaired.txt"}],
+            "verification": {}, "limitations": [],
+        }
+        result = self.run_worker([
+            answer("The file was created successfully."),
+            answer(json.dumps(repaired_claim)),
+        ], task_characteristics={"requires_filesystem_write": True},
+            config={
+                "max_model_calls": 2,
+                "output": {"format": "structured",
+                           "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+                "verification": {"enabled": False, "inspect_changes": False,
+                                 "run_available_tests": False, "require_tool_evidence": False,
+                                 "completion_criteria": []},
+            })
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertEqual(result["result"]["actions"], [])
+        self.assertEqual(result["result"]["artifacts"], [])
+        contract_event = next(item["event"] for item in self.events
+                              if item.get("event", {}).get("event_type") == "task.result_contract")
+        self.assertTrue(contract_event["output"]["repair_succeeded"])
+        self.assertFalse(contract_event["output"]["fallback_normalization_used"])
+        self.assertFalse(contract_event["output"]["task_execution_successful"])
+
+    def test_format_normalization_does_not_turn_missing_write_into_success(self):
+        result = self.run_worker([
+            answer("The file was created successfully."),
+            answer("This repair is still not valid JSON."),
+        ], task_characteristics={"requires_filesystem_write": True},
+            config={
+                "max_model_calls": 2,
+                "output": {"format": "structured",
+                           "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+                "verification": {"enabled": False, "inspect_changes": False,
+                                 "run_available_tests": False, "require_tool_evidence": False,
+                                 "completion_criteria": []},
+            })
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertEqual(result["result"]["actions"], [])
+        self.assertEqual(result["result"]["artifacts"], [])
+        contract_event = next(item["event"] for item in self.events
+                              if item.get("event", {}).get("event_type") == "task.result_contract")
+        self.assertFalse(contract_event["output"]["model_response_valid"])
+        self.assertTrue(contract_event["output"]["repair_attempted"])
+        self.assertFalse(contract_event["output"]["repair_succeeded"])
+        self.assertTrue(contract_event["output"]["fallback_normalization_used"])
+        self.assertTrue(contract_event["output"]["result_contract_valid"])
+        self.assertTrue(contract_event["output"]["normalized_result_valid"])
+        self.assertFalse(contract_event["output"]["task_execution_successful"])
+
+    def test_read_only_task_succeeds_without_workspace_changes(self):
+        result = self.run_worker([answer("Read-only analysis completed.")], tools=["read_file"],
+                                 task_characteristics={"requires_filesystem_write": False},
+                                 config={"verification": {"enabled": False, "inspect_changes": False,
+                                                          "run_available_tests": False,
+                                                          "require_tool_evidence": False,
+                                                          "completion_criteria": []}})
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["task_execution_successful"])
+        self.assertEqual(result["workspace_changes"], 0)
+
+    def test_web_calculator_worker_to_evaluator_uses_real_write_and_readback(self):
+        source_prompt = (
+            "Create a web calculator supporting addition, subtraction, multiplication, and division."
+        )
+        criterion = "calculator/index.html exists and can be read."
+        spec = validate_task_spec({
+            "status": "READY_FOR_PLANNING",
+            "source_prompt": source_prompt,
+            "objective": "Create a web calculator with four arithmetic operations.",
+            "user_intent": source_prompt,
+            "deliverables": [{"description": "A usable web calculator.", "source": "explicit"}],
+            "requirements": [
+                {"description": "Support addition.", "source": "explicit"},
+                {"description": "Support subtraction.", "source": "explicit"},
+                {"description": "Support multiplication.", "source": "explicit"},
+                {"description": "Support division.", "source": "explicit"},
+            ],
+            "constraints": [],
+            "user_decisions": {},
+            "assumptions": [{
+                "description": "Use plain HTML, CSS, and JavaScript.",
+                "reason": "The browser platform is sufficient for the requested calculator.",
+            }],
+            "validation_expectations": [criterion],
+            "context": {},
+            "clarification_questions": [],
+            "readiness_reason": "The requested interface and operations are specified.",
+        })
+        planned_task = {
+            "id": "calculator",
+            "objective": spec["objective"],
+            "description": "Implement the requested web calculator.",
+            "success_criteria": [criterion],
+            "required_capabilities": ["filesystem.create"],
+        }
+        html = """<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Calculator</title>
+<label>First number <input id="left" type="number"></label>
+<select id="operation">
+<option value="add">Addition</option><option value="subtract">Subtraction</option>
+<option value="multiply">Multiplication</option><option value="divide">Division</option>
+</select>
+<label>Second number <input id="right" type="number"></label>
+<button id="calculate">Calculate</button><output id="result"></output>
+<script>
+document.querySelector("#calculate").addEventListener("click", () => {
+  const left = Number(document.querySelector("#left").value);
+  const right = Number(document.querySelector("#right").value);
+  const operation = document.querySelector("#operation").value;
+  const result = operation === "add" ? left + right
+    : operation === "subtract" ? left - right
+    : operation === "multiply" ? left * right
+    : right === 0 ? "Cannot divide by zero" : left / right;
+  document.querySelector("#result").textContent = String(result);
+});
+</script></html>"""
+        write_call = json.dumps({
+            "name": "write_file",
+            "arguments": {"path": "calculator/index.html", "content": html},
+        })
+        read_call = json.dumps({
+            "name": "read_file",
+            "arguments": {"path": "calculator/index.html"},
+        })
+        result = self.run_worker([
+            answer(write_call),
+            answer(read_call),
+        ], tools=["write_file", "read_file"],
+            task_characteristics={"requires_filesystem_write": True},
+            prompt=render_task_spec(spec),
+            config={
+                "output": {"format": "structured",
+                           "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+                "verification": {
+                    "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                    "require_tool_evidence": True, "completion_criteria": [criterion],
+                },
+            })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertEqual(result["workspace_changes"], 1)
+        written = self.workspace / "calculator" / "index.html"
+        written_contents = written.read_text()
+        self.assertEqual(written_contents, html)
+        for expression in ("left + right", "left - right", "left * right", "left / right"):
+            self.assertIn(expression, written_contents)
+        self.assertEqual([item["path"] for item in result["result"]["artifacts"]],
+                         ["calculator/index.html"])
+        self.assertEqual(result["result"]["verification"]["evidence"][0]["check"],
+                         "filesystem:read_file:calculator/index.html")
+
+        evaluation = Evaluator(offline=True).evaluate(
+            planned_task=planned_task,
+            runtime_task=result,
+            execution_node={"selected_agent_id": "calculator-worker",
+                            "runtime_task_id": "calculator-runtime", "attempt": 1},
+        )
+        self.assertEqual(evaluation["status"], "accepted")
+        self.assertEqual(evaluation["criteria"][0]["status"], "satisfied")
+        self.assertIn("filesystem:read_file:calculator/index.html",
+                      evaluation["criteria"][0]["evidence"])
 
     def test_prose_wrapped_json_action_is_executed(self):
         wrapped = ('I will inspect the workspace and then create the requested file.\n'
@@ -494,6 +815,7 @@ class WorkerTests(unittest.TestCase):
         finished = [event["event"] for event in self.events
                     if event.get("event", {}).get("event_type") == "step.finished"]
         self.assertEqual(finished[0]["tool"], "write_file")
+
     def test_concatenated_json_actions_execute_only_after_real_observations(self):
         batched = ('{"name":"write_file","arguments":{"path":"verified.txt","content":"OK"}}\n'
                    '{"name":"read_file","arguments":{"path":"verified.txt"}}\n'

@@ -45,6 +45,20 @@ class ToolResult:
     error_class: str = ""
     changed: bool | None = None
     already_satisfied: bool = False
+    blocking_path: str = ""
+
+
+class ParentPathIsFile(Exception):
+    """A file already occupies a parent path required by a nested write."""
+
+    def __init__(self, blocking_path: str, requested_path: str) -> None:
+        self.blocking_path = blocking_path
+        self.requested_path = requested_path
+        super().__init__(
+            "parent path {!r} is a file and blocks creation of {!r}.".format(
+                blocking_path, requested_path,
+            )
+        )
 
 
 class Toolbox:
@@ -98,7 +112,9 @@ class Toolbox:
             ),
             cls._schema(
                 "write_file",
-                "Create or overwrite a UTF-8 text file in the task workspace.",
+                "Create or overwrite a UTF-8 text file in the task workspace; "
+                "this tool never creates directories, and parent directories "
+                "are created automatically.",
                 {
                     "path": {"type": "string", "description": "Workspace-relative file path."},
                     "content": {"type": "string", "description": "Complete file contents."},
@@ -194,16 +210,20 @@ class Toolbox:
     def invoke(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         start = time.perf_counter()
         args = arguments or {}
+        blocking_path = ""
         try:
             handler = getattr(self, "tool_" + name, None)
             if handler is None:
                 raise ValueError("Unknown tool: {}".format(name))
             output, success, exit_code = handler(**args)
+        except ParentPathIsFile as exc:
+            output, success, exit_code = "ParentPathIsFile: {}".format(exc), False, None
+            blocking_path = exc.blocking_path
         except SandboxUnavailable as exc:
             output, success, exit_code = f"SandboxUnavailable: {exc}", False, None
         except Exception as exc:  # Keep a tool failure observable to the model.
             output, success, exit_code = "ERROR: {}".format(exc), False, None
-        error_class = ""
+        error_class = "ParentPathIsFile" if blocking_path else ""
         if name == "git_diff" and not success and "not inside a Git repository" in str(output):
             error_class = "not_applicable"
         if name == "run_command" and not success and "INTERACTIVE_INPUT_REQUIRED" in str(output):
@@ -217,6 +237,7 @@ class Toolbox:
             duration_seconds=time.perf_counter() - start,
             exit_code=exit_code,
             error_class=error_class,
+            blocking_path=blocking_path,
         )
 
     def git_repository_available(self) -> bool:
@@ -252,11 +273,35 @@ class Toolbox:
         return target.read_text(encoding="utf-8"), True, 0
 
     def tool_write_file(self, path: str, content: str) -> tuple[str, bool, int | None]:
+        if isinstance(path, str) and path.strip():
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                lexical_target = Path(os.path.abspath(self.workspace / candidate))
+                if lexical_target == self.workspace or self.workspace in lexical_target.parents:
+                    for parent in lexical_target.parents:
+                        if parent == self.workspace:
+                            break
+                        try:
+                            resolved_parent = parent.resolve()
+                        except OSError:
+                            continue
+                        if (resolved_parent.is_file()
+                                and self.workspace in resolved_parent.parents):
+                            blocking_path = parent.relative_to(self.workspace).as_posix()
+                            requested_path = lexical_target.relative_to(self.workspace).as_posix()
+                            raise ParentPathIsFile(blocking_path, requested_path)
         target = self.safe_path(path)
         if not isinstance(content, str):
             raise ValueError("content must be a string.")
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
             raise ValueError("File exceeds the 1 MB write limit.")
+        for parent in target.parents:
+            if parent == self.workspace:
+                break
+            if parent.is_file():
+                blocking_path = parent.relative_to(self.workspace).as_posix()
+                requested_path = target.relative_to(self.workspace).as_posix()
+                raise ParentPathIsFile(blocking_path, requested_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="")
         return "Wrote {} ({} bytes).".format(path, target.stat().st_size), True, 0

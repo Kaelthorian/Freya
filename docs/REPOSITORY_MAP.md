@@ -108,8 +108,10 @@ selects them.
    Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
    allowlisted command to `sandbox.py`; Docker receives only a disposable
    workspace copy. `run_command` changes are discarded. Persistent edits use
-   `write_file` or `edit_file` through Policy. A missing Docker daemon/image
-   produces `SandboxUnavailable`.
+   `write_file` or `edit_file` through Policy. `write_file` creates parent
+   directories for nested file paths and reports `ParentPathIsFile` when a file
+   blocks one; the worker stops that call batch so it can change strategy. A
+   missing Docker daemon/image produces `SandboxUnavailable`.
    `agent_selector.py` then validates and classifies that generated
    candidate before delegation. A technical Runtime success
    enters `evaluating`; `evaluator.py` must accept it before dependencies unlock.

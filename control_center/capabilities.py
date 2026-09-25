@@ -107,7 +107,18 @@ class CapabilityResolver:
                 candidate = Path(path)
                 if candidate.is_absolute() or ".." in candidate.parts:
                     raise ValueError("Path is outside the task workspace")
-                target = (self.workspace / candidate).resolve()
+                lexical_target = self.workspace / candidate
+                for parent in lexical_target.parents:
+                    if parent == self.workspace:
+                        break
+                    try:
+                        resolved_parent = parent.resolve()
+                    except OSError:
+                        continue
+                    if (resolved_parent.is_file()
+                            and self.workspace in resolved_parent.parents):
+                        return "filesystem.create"
+                target = lexical_target.resolve()
                 if target != self.workspace and self.workspace not in target.parents:
                     raise ValueError("Path is outside the task workspace")
                 return "filesystem.overwrite" if target.exists() else "filesystem.create"

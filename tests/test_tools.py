@@ -36,6 +36,43 @@ class ToolboxTests(unittest.TestCase):
         self.assertTrue(edited.success)
         self.assertEqual((self.workspace / "src/calc.py").read_text(encoding="utf-8"), "VALUE = 2\n")
 
+    def test_write_file_creates_parent_directories_for_nested_files(self) -> None:
+        result = self.toolbox.invoke("write_file", {"path": "project/index.html", "content": "<h1>Hi</h1>"})
+        self.assertTrue(result.success, result.output)
+        self.assertTrue((self.workspace / "project").is_dir())
+        self.assertEqual((self.workspace / "project/index.html").read_text(encoding="utf-8"), "<h1>Hi</h1>")
+
+    def test_empty_write_creates_an_empty_file_not_a_directory(self) -> None:
+        result = self.toolbox.invoke("write_file", {"path": "calculator-project", "content": ""})
+        self.assertTrue(result.success, result.output)
+        self.assertTrue((self.workspace / "calculator-project").is_file())
+        self.assertFalse((self.workspace / "calculator-project").is_dir())
+        self.assertEqual((self.workspace / "calculator-project").read_bytes(), b"")
+
+    def test_file_parent_returns_typed_parent_path_error(self) -> None:
+        self.toolbox.invoke("write_file", {"path": "project", "content": ""})
+        result = self.toolbox.invoke("write_file", {"path": "project/index.html", "content": "<h1>Hi</h1>"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_class, "ParentPathIsFile")
+        self.assertEqual(result.blocking_path, "project")
+        self.assertIn("project", result.output)
+        self.assertIn("blocks creation", result.output)
+        self.assertTrue((self.workspace / "project").is_file())
+
+    def test_project_files_create_all_parent_directories_implicitly(self) -> None:
+        files = {
+            "calculator-project/index.html": "<script src=app.js></script>",
+            "calculator-project/css/site.css": "body { color: black; }",
+            "calculator-project/js/app.js": "console.log('ready');",
+        }
+        for path, content in files.items():
+            result = self.toolbox.invoke("write_file", {"path": path, "content": content})
+            self.assertTrue(result.success, result.output)
+        for path, content in files.items():
+            self.assertEqual((self.workspace / path).read_text(encoding="utf-8"), content)
+        self.assertTrue((self.workspace / "calculator-project/css").is_dir())
+        self.assertTrue((self.workspace / "calculator-project/js").is_dir())
+
     def test_edit_refuses_ambiguous_match(self) -> None:
         self.toolbox.invoke("write_file", {"path": "same.py", "content": "x = 1\nx = 1\n"})
         result = self.toolbox.invoke("edit_file", {"path": "same.py", "old": "x = 1", "new": "x = 2"})

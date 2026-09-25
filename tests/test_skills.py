@@ -8,9 +8,10 @@ from pathlib import Path
 from control_center.agent_context import build_agent_context, build_effective_agent
 from control_center.api import Application
 from control_center.config import normalize_agent
-from control_center.skills import (MAX_CONTEXT_CHARS, SkillCompatibilityError,
-                                   normalize_skill, resolve_agent_skills, skill_compatibility,
-                                   skill_summary, skills_context)
+from control_center.skills import (BUILTIN_SKILLS, CORE_WRITE_FILE_INSTRUCTIONS,
+                                   MAX_CONTEXT_CHARS, SkillCompatibilityError, normalize_skill,
+                                   resolve_agent_skills, skill_compatibility, skill_summary,
+                                   skills_context)
 from control_center.storage import Store
 from control_center.orchestrator import Orchestrator
 
@@ -28,6 +29,32 @@ def skill_payload(skill_id="demo-skill", **changes):
 
 
 class SkillRegistryTests(unittest.TestCase):
+    def test_freya_core_explains_write_file_creates_files_not_directories(self):
+        skill = next(item for item in BUILTIN_SKILLS if item["id"] == "freya-core")
+        instructions = "\n".join(skill["instructions"])
+        self.assertIn("write_file creates files, not directories", instructions)
+        self.assertIn("Never create a directory by calling write_file with empty content", instructions)
+        self.assertIn("Parent directories are created automatically", instructions)
+        self.assertIn('write_file("calculator-project/index.html", content)', instructions)
+
+    def test_existing_core_skill_gets_write_file_rule_as_a_new_immutable_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = Store(path)
+            current = store.get_skill("freya-core")
+            old_instructions = [instruction for instruction in current["instructions"]
+                                if instruction not in CORE_WRITE_FILE_INSTRUCTIONS]
+            edited = store.update_skill("freya-core", {**current, "instructions": old_instructions})
+            old_version = edited["version"]
+
+            migrated = Store(path).get_skill("freya-core")
+            self.assertEqual(migrated["version"], old_version + 1)
+            self.assertEqual(
+                migrated["instructions"], [*old_instructions, *CORE_WRITE_FILE_INSTRUCTIONS],
+            )
+            history = Store(path).skill_version("freya-core", old_version)
+            self.assertEqual(history["snapshot"]["instructions"], old_instructions)
+
     def test_shared_skill_compatibility_uses_required_not_recommended_capabilities(self):
         skill = skill_payload(recommended_capabilities=["execution.python_script"])
         self.assertEqual(skill_compatibility(skill, ["filesystem.read"]), {

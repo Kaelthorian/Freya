@@ -471,6 +471,68 @@ class TaskSpecTests(unittest.TestCase):
         self.assertEqual(len(plan["tasks"]), 2)
         self.assertEqual(plan["tasks"][1]["id"], "qa-interactive-test")
 
+    def test_web_calculator_without_framework_uses_default_without_preference_task(self):
+        prompt = "Create a web calculator supporting addition, subtraction, multiplication, and division."
+        spec = deterministic_task_spec(
+            "Create a web calculator that can add, subtract, multiply, and divide.")
+        spec.update({
+            "objective": "Create a web calculator.",
+            "user_intent": prompt,
+            "deliverables": [{"description": "A web calculator.", "source": "explicit"}],
+            "requirements": [
+                {"description": "Support addition.", "source": "explicit"},
+                {"description": "Support subtraction.", "source": "explicit"},
+                {"description": "Support multiplication.", "source": "explicit"},
+                {"description": "Support division.", "source": "explicit"},
+            ],
+            "validation_expectations": [
+                "The calculator supports addition.",
+                "The calculator supports subtraction.",
+                "The calculator supports multiplication.",
+                "The calculator supports division.",
+            ],
+        })
+        spec = validate_task_spec(spec)
+        captured = {}
+        semantic = {
+            "summary": "Implement the requested web calculator.",
+            "success_criteria": list(spec["validation_expectations"]),
+            "unsupported_requirements": [],
+            "tasks": [{
+                "key": "implement_calculator",
+                "objective": "Implement the web calculator.",
+                "description": (
+                    "Assumption: use plain HTML, CSS, and JavaScript. "
+                    "Create the calculator UI and implement all four requested operations."),
+                "depends_on": [],
+                "semantic_needs": ["Create a web calculator artifact."],
+                "required_capabilities": ["filesystem.create"],
+                "required_tools": ["write_file"],
+                "preferred_skills": [],
+                "success_criteria": list(spec["validation_expectations"]),
+            }],
+        }
+
+        def decide(planner_prompt, context):
+            captured["prompt"] = planner_prompt
+            captured["context"] = context
+            return semantic
+
+        result = Planner(decide).create_plan_for_spec(spec)
+        self.assertEqual(len(result["tasks"]), 1)
+        implementation = result["tasks"][0]
+        self.assertIn("Assumption: use plain HTML, CSS, and JavaScript.",
+                      implementation["description"])
+        task_text = " ".join((implementation["objective"], implementation["description"])).casefold()
+        self.assertNotRegex(task_text, r"user.?preference|framework selection|user selection|discover.*framework")
+        self.assertEqual(implementation["depends_on"], [])
+        planner_prompt = captured["prompt"].casefold()
+        self.assertIn("canonical task spec is the source of truth for user intent", planner_prompt)
+        self.assertIn("do not create a task whose purpose is to discover a user preference", planner_prompt)
+        self.assertIn("never assume that user preferences are stored in workspace files", planner_prompt)
+        self.assertIn("prefer the simplest implementation that satisfies the task spec", planner_prompt)
+        self.assertEqual(captured["context"]["task_spec"]["assumptions"], [])
+
     def test_calculator_plan_uses_registered_resources_and_descriptions(self):
         spec = deterministic_task_spec(
             "crea una calculadora que pueda sumar 2 numeros y devolver el resultado en python; consola")

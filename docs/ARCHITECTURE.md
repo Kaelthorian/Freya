@@ -695,6 +695,14 @@ workspace advertises `git_diff`; a parent checkout is outside its boundary.
 A direct non-applicable request returns a failed result with
 `error_class=not_applicable` rather than a misleading success.
 
+`write_file` always writes a file, including for empty content, and creates
+missing parent directories. Before writing, `tools.py` checks every existing
+parent; a file in that chain returns `error_class=ParentPathIsFile` with the
+blocking workspace-relative path. The worker treats this as non-retryable,
+returns only the processed portion of a batched tool-call message, and waits for
+the model to change strategy before another action. A later nested write under
+the recorded blocker stops without a tool call or another failed-write charge.
+
 Text-mode models may emit JSON actions instead of native tool calls. When a
 model concatenates several action objects, the worker executes only the first,
 returns its actual observation to the model and waits for a new action. This
@@ -733,7 +741,8 @@ to one concrete action. `PolicyToolbox` checks an in-scope `write_file` target
 for exact UTF-8 byte equality before policy classification. A match returns an
 `already_satisfied` no-op with `changed=false`, no overwrite capability, and no
 workspace mutation; different bytes remain `filesystem.overwrite` and use normal
-policy. `run_command`
+policy. Parent directories are created automatically; a file occupying a parent
+path is returned as `ParentPathIsFile` before filesystem mutation. `run_command`
 maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
 actions. `policy.py` validates the per-agent JSON policy and returns explicit
 `allow`, `deny`, or `approval_required` decisions. Allow and ask rules are the only source used to derive the model-visible tool list; stale legacy tool selections cannot expose a capability. Deny and approval results never invoke the underlying tool. Filesystem rules support paths, extensions and max_bytes for every filesystem action. Agents with
@@ -747,7 +756,9 @@ local user or hostile executable code.
 
 `control_center/skills.py` defines `freya-core` with all seven registered tools.
 `storage.py` archives prior active Skills on startup but keeps their historical
-versions. New Skill imports are disabled during this temporary configuration.
+versions. It also adds the required `write_file` guidance to existing core
+definitions as a new immutable version, preserving their previous instructions.
+New Skill imports are disabled during this temporary configuration.
 `resolve_agent_skills` renders the assigned Skill without requiring a matching
 capability. Its tools remain declarations only; Policy determines effective
 schemas and checks each operation. The

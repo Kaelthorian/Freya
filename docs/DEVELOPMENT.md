@@ -234,6 +234,14 @@ and may derive read-only inspection, but never overwrite authority. A
 deterministic missing-file result is terminal for semantic recovery; selecting
 another agent does not make an absent artifact appear.
 
+`write_file` creates files only; empty content creates an empty file, not a
+directory. It creates missing parent directories when given a nested path. If
+an existing parent is a file, the result is `ParentPathIsFile` and identifies
+that path. This error is not retried: the worker stops sibling calls in the
+current batch so the model can change strategy, and it rejects a later child
+write under the same blocker without another filesystem attempt. The Skill also
+spells out this rule and the complete-path pattern.
+
 `write_file` compares exact UTF-8 bytes before overwrite policy. Identical
 content returns `already_satisfied=true` and `changed=false`, emits no workspace
 diff and does not count as workspace progress. The action ledger records this

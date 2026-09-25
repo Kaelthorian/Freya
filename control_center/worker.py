@@ -17,7 +17,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
-from control_center.tools import IGNORED_DIRECTORIES, MAX_WRITE_BYTES, Toolbox, ToolResult, argument_summary
+from control_center.tools import (IGNORED_DIRECTORIES, MAX_WRITE_BYTES, ParentPathIsFile,
+                                  Toolbox, ToolResult, argument_summary)
 from control_center.transport import model_profile, model_request, request_json
 from control_center.security import register_secret, sanitize, strip_thinking as strip_private_content
 from control_center.capabilities import CapabilityResolver, effective_tools_for_policy
@@ -43,7 +44,7 @@ NON_RETRYABLE_ERROR_CLASSES = {
     "policy_denied", "repeated_policy_denied", "blocked_action_cycle",
     "unknown_tool", "tool_unavailable", "invalid_request", "approval_denied",
     "not_applicable", "path_forbidden", "destructive_action_denied",
-    "repeated_action_blocked",
+    "repeated_action_blocked", "ParentPathIsFile",
 }
 BLOCKED_MODEL_ERROR_CLASSES = NON_RETRYABLE_ERROR_CLASSES | {"autonomy_denied"}
 BASE_PROMPT = """You are an autonomous worker operating inside Freya.
@@ -56,6 +57,9 @@ the requested result to Freya.
 
 Tool usage rules:
 - If an action repeatedly fails with identical arguments, change strategy instead of repeating it.
+- A ParentPathIsFile write error means a file blocks the requested nested path.
+  Stop writes under that blocker; change strategy immediately or report the
+  limitation.
 - The operational brief is already present in the task context. Do not invent or
   read a prerequisite brief file unless the current task explicitly names it.
 - A missing-file read is a missing input, not a permission grant. Do not repeat
@@ -79,7 +83,8 @@ def render_available_tools(schemas: list[dict[str, Any]]) -> str:
     descriptions = {
         "list_files": "List files in the task workspace.",
         "read_file": "Read one known UTF-8 file in the task workspace.",
-        "write_file": "Create the requested UTF-8 file with complete contents.",
+        "write_file": ("Create the requested UTF-8 file with complete contents; "
+                       "parent directories are created automatically."),
         "edit_file": "Apply one exact replacement in a workspace file.",
         "search_code": "Search workspace text when a search is necessary.",
         "git_diff": "Inspect Git changes when the workspace is a Git repository.",
@@ -224,20 +229,34 @@ def clean(value: Any, token: str = "") -> Any:
     return value
 
 
-def fallback_action(content: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Read only the first JSON action from text-mode model output.
+def _task_requires_workspace_mutation(task: dict[str, Any], effective: dict[str, Any]) -> bool:
+    candidates = [task.get("task_characteristics")]
+    config = task.get("config") if isinstance(task.get("config"), dict) else {}
+    candidates.append(config.get("task_characteristics"))
+    for characteristics in candidates:
+        if (isinstance(characteristics, dict)
+                and isinstance(characteristics.get("requires_filesystem_write"), bool)):
+            return characteristics["requires_filesystem_write"]
+    provenance = config.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("generated_by_freya") is not True:
+        return False
+    # Factory-generated policies are task-scoped, so an enabled write tool
+    # indicates that this delegated plan step requires a workspace mutation.
+    return bool(set(effective.get("tools") or []) & WRITE_TOOLS)
 
-    Some Ollama models emit several newline-separated action objects in one
-    answer. Executing all of them would trust invented observations, so the
-    runtime executes the first action and asks the model again with the real
-    tool result. Models also sometimes preface a valid action with prose; in
-    that case only a recognized tool object is extracted.
+
+def fallback_action(content: str, registered_tools: set[str]) -> tuple[dict[str, Any] | None, str | None]:
+    """Extract one textual tool call only when it matches a registered tool.
+
+    Some models emit a tool-call-shaped JSON object instead of a native call.
+    Unknown JSON remains final text; it is never treated as a tool request.
     """
     value = content.strip()
     if value.startswith("```"):
         value = value[3:].lstrip()
         if value.lower().startswith("json"):
             value = value[4:].lstrip()
+    registered = set(registered_tools)
 
     def decode(raw: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
         try:
@@ -251,25 +270,44 @@ def fallback_action(content: str) -> tuple[dict[str, Any] | None, str | None]:
             return None, None, None
         if name == "finish":
             return None, strip_thinking(str(action.get("message", ""))), name
+        if name not in registered:
+            return None, None, name
         if "name" in action:
-            arguments = action.get("arguments", {})
+            arguments = action.get("arguments")
+            if not isinstance(arguments, dict):
+                return None, None, name
         else:
-            arguments = {key: value for key, value in action.items() if key != "action"}
+            arguments = {key: item for key, item in action.items() if key != "action"}
         return {"function": {"name": name, "arguments": arguments}}, None, name
 
     call, finish, name = decode(value)
     if call is not None or finish is not None:
         return call, finish
 
-    # A model may explain what it is about to do and then emit the JSON action.
-    # Scan only for known tools so arbitrary JSON mentioned in prose is never
-    # dispatched. The first recognized object is the only one executed.
-    known_tools = READ_TOOLS | WRITE_TOOLS | EXEC_TOOLS
+    # Do not reinterpret nested objects in a structured final result as calls.
+    # A prose-wrapped response may contain one top-level JSON tool object.
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(value)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return None, None
+
     for match in re.finditer(r"\x7b", value):
-        call, _finish, name = decode(value[match.start():])
-        if call is not None and name in known_tools:
+        candidate = value[match.start():]
+        call, finish, name = decode(candidate)
+        if call is not None and name in registered:
             return call, None
+        if finish is not None:
+            return None, finish
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return None, None
     return None, None
+
 
 class PolicyToolbox(Toolbox):
     """Additional per-agent restrictions layered on the existing tools."""
@@ -683,10 +721,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     }
     runtime_actions: list[dict[str, Any]] = []
     runtime_artifacts: list[dict[str, Any]] = []
+    workspace_mutation_required = _task_requires_workspace_mutation(task, effective)
     command_evidence: list[dict[str, Any]] = []
     policy_denials: dict[str, int] = {}
     repeated_denial_feedback: dict[str, int] = {}
     failure_history: dict[str, int] = {}
+    blocked_write_parents: set[str] = set()
     blocked_action_count = 0
     successful_validation_streak = 0
     last_success_signature = ""
@@ -694,6 +734,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     auto_completed = False
     action_history: list[str] = []
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
+    mutation_failure = ""
     try:
         while True:
             remaining = guard()
@@ -752,7 +793,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             legacy = False
             if not calls:
                 content = message["content"].strip()
-                fallback_call, fallback_finish = fallback_action(content)
+                fallback_call, fallback_finish = fallback_action(content, set(visible_tool_names))
                 if fallback_call is not None:
                     calls = [fallback_call]
                     legacy = True
@@ -769,11 +810,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             if not legacy:
                 message["tool_calls"] = calls
             messages.append(message)
+            processed_calls: list[dict[str, Any]] = []
             for call in calls:
                 guard()
                 if metrics["steps"] >= config.get("max_steps", 20):
                     raise TaskStopped("Maximum steps reached.")
-                metrics["steps"] += 1
                 function = call.get("function", {}) if isinstance(call, dict) else {}
                 name = str(function.get("name", "unknown")) if isinstance(function, dict) else "unknown"
                 args: dict[str, Any] = {}
@@ -782,6 +823,25 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     args = _parse_tool_arguments(function.get("arguments", {}))
                 except (ValueError, TypeError, AttributeError) as exc:
                     argument_error = "Invalid tool arguments: " + str(exc)
+                if name == "write_file" and not argument_error and isinstance(args.get("path"), str):
+                    candidate = Path(args["path"])
+                    relative_target = None
+                    if not candidate.is_absolute():
+                        lexical_target = Path(os.path.abspath(box.workspace / candidate))
+                        if (lexical_target == box.workspace
+                                or box.workspace in lexical_target.parents):
+                            relative_target = lexical_target.relative_to(box.workspace)
+                    if relative_target is not None:
+                        target_parts = tuple(os.path.normcase(part) for part in relative_target.parts)
+                        for blocker in blocked_write_parents:
+                            blocker_parts = tuple(os.path.normcase(part) for part in Path(blocker).parts)
+                            if (len(target_parts) > len(blocker_parts)
+                                    and target_parts[:len(blocker_parts)] == blocker_parts):
+                                raise ParentPathIsFile(
+                                    Path(blocker).as_posix(), relative_target.as_posix(),
+                                )
+                processed_calls.append(call)
+                metrics["steps"] += 1
                 step_id = uuid.uuid4().hex
                 attempts = 1 + (config.get("retries", 0) if name in READ_TOOLS else 0)
                 for attempt in range(1, attempts + 1):
@@ -1005,6 +1065,14 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                     "status": "Success",
                                     "reason": "The artifact was read back successfully and the evidence directly satisfied every configured file-presence criterion.",
                                 })
+                    if result.error_class == "ParentPathIsFile":
+                        if result.blocking_path:
+                            blocked_write_parents.add(result.blocking_path)
+                        if not legacy:
+                            # Keep the recorded assistant call batch aligned with the
+                            # tool results: later calls were not executed so the model
+                            # can change strategy before any sibling write is attempted.
+                            message["tool_calls"] = processed_calls
                     if not result.success:
                         successful_validation_streak = 0
                         repeated_success_count = 0
@@ -1130,10 +1198,42 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         break
                 messages.append({"role": "user", "content": "Tool {} (success={}):\n{}".format(name, result.success, result.output)}
                                 if legacy else {"role": "tool", "tool_name": name, "content": result.output})
+                if result.error_class == "ParentPathIsFile":
+                    break
                 if auto_completed:
                     break
             if auto_completed:
                 break
+        if success and workspace_mutation_required:
+            changed_write_actions = sum(
+                1 for action in runtime_actions
+                if action.get("tool") in WRITE_TOOLS
+                and action.get("success") is True
+                and action.get("changed") is True
+            )
+            mutation_observed = bool(
+                changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
+            )
+            if not mutation_observed:
+                mutation_failure = (
+                    "ExpectedWorkspaceMutationNotObserved: this task requires a workspace "
+                    "mutation, but no successful write action or resulting artifact was recorded."
+                )
+                error = mutation_failure
+                success = False
+                telemetry["failure_class"] = "ExpectedWorkspaceMutationNotObserved"
+                telemetry["stop_reason"] = mutation_failure
+                publish("event", event={
+                    "event_type": "task.execution_contract", "level": "error", "status": "Failed",
+                    "reason": "A workspace-mutating task ended without runtime mutation evidence.",
+                    "error_class": "ExpectedWorkspaceMutationNotObserved",
+                    "output": {
+                        "task_execution_successful": False,
+                        "successful_write_actions": changed_write_actions,
+                        "workspace_changes": telemetry["workspace_changes"],
+                        "artifact_count": len(runtime_artifacts),
+                    },
+                })
         if success and verification_state["requested"]:
             publish("event", event={"event_type": "verification.started", "level": "info", "status": "Running",
                                      "reason": "Run configured verification checks with tool evidence."})
@@ -1395,11 +1495,15 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         "actions": [], "artifacts": [], "verification": [], "limitations": [],
                     }
                     normalized_contract_valid = True
-                result_output["actions"] = list(result_output.get("actions") or []) + runtime_actions
-                result_output["artifacts"] = list(result_output.get("artifacts") or []) + runtime_artifacts
+                result_output["actions"] = list(runtime_actions)
+                result_output["artifacts"] = list(runtime_artifacts)
                 if workspace_diffs:
                     result_output["workspace_diffs"] = workspace_diffs
                 result_output["verification"] = verification_state
+                if mutation_failure:
+                    result_output["summary"] = "Task failed because the required workspace mutation was not observed."
+                    if mutation_failure not in result_output["limitations"]:
+                        result_output["limitations"].append(mutation_failure)
                 if verification_state.get("skipped_with_reason"):
                     result_output["limitations"].append(verification_state["skipped_with_reason"].strip())
             else:
@@ -1411,7 +1515,9 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 "repair_attempted": repair_attempted,
                 "repair_succeeded": repaired is not None and repair_attempted,
                 "fallback_normalization_used": repaired is None,
+                "result_contract_valid": normalized_contract_valid,
                 "normalized_result_valid": normalized_contract_valid,
+                "task_execution_successful": success,
                 "validation_error": validation_error,
                 "repair_error": repair_error,
             }
@@ -1430,8 +1536,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 ),
                 "output": contract_diagnostics,
             })
+    elif mutation_failure:
+        result_output = mutation_failure
     update()
-    return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "result": result_output,
+    return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "task_execution_successful": success, "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,
                   "duration_seconds": round(time.monotonic() - started, 3)}, token))
 

@@ -22,7 +22,10 @@ from .recovery import allowed_replan_scope, validate_replan_revision
 from .execution_graph import NODE_STATES, TERMINAL_NODE_STATES, graph_summary
 from .integration_storage import IntegrationStoreMixin, migrate_integration_schema
 from .agent_context import build_agent_context, build_effective_agent
-from .skills import BUILTIN_SKILLS, CORE_SKILL_ID, CORE_TOOLS, SkillConfigurationError, MAX_SKILLS_IMPORT, normalize_skill, normalize_skill_assignments, resolve_agent_skills, skill_snapshot, skill_summary, validate_skill_tools
+from .skills import (BUILTIN_SKILLS, CORE_SKILL_ID, CORE_TOOLS, CORE_WRITE_FILE_INSTRUCTIONS,
+                     SkillConfigurationError, MAX_SKILLS_IMPORT, normalize_skill,
+                     normalize_skill_assignments, resolve_agent_skills, skill_snapshot,
+                     skill_summary, validate_skill_tools)
 from .security import sanitize
 from .tools import argument_summary
 
@@ -164,11 +167,11 @@ class Store(IntegrationStoreMixin):
 
     @staticmethod
     def _seed_builtin_skills(connection: sqlite3.Connection) -> None:
-        """Keep a small editable starter catalogue in new and old databases."""
+        """Seed builtins and add required freya-core guidance without losing history."""
         now = utcnow()
         for raw in BUILTIN_SKILLS:
             skill = normalize_skill(raw)
-            connection.execute(
+            inserted = connection.execute(
                 "INSERT OR IGNORE INTO skills(id,name,description,category,version,instructions,procedures_json,"
                 "recommended_capabilities_json,required_capabilities_json,tools_json,tags_json,source,metadata_json,enabled,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -176,8 +179,52 @@ class Store(IntegrationStoreMixin):
                  _dump(skill["instructions"]), _dump(skill["procedures"]), _dump(skill["recommended_capabilities"]),
                  _dump(skill["required_capabilities"]), _dump(skill["tools"]), _dump(skill["tags"]), skill["source"], _dump(skill["metadata"]),
                 int(skill["enabled"]), now, now),
+            ).rowcount == 1
+            row = connection.execute("SELECT * FROM skills WHERE id=?", (skill["id"],)).fetchone()
+            current = Store._skill(row)
+            current_snapshot = {key: current[key] for key in SKILL_DEFINITION_FIELDS}
+            historical = connection.execute(
+                "SELECT snapshot_json FROM skill_versions WHERE skill_id=? AND version=?",
+                (current["id"], current["version"]),
+            ).fetchone()
+            if historical is None:
+                connection.execute(
+                    "INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)",
+                    (current["id"], current["version"], _dump(current_snapshot), now,
+                     "Initial builtin version" if inserted else "Migrated current definition"),
+                )
+            elif _load(historical["snapshot_json"]) != current_snapshot:
+                raise RuntimeError("Current Skill definition conflicts with its immutable history")
+
+            if skill["id"] != CORE_SKILL_ID:
+                continue
+            missing_instructions = [instruction for instruction in CORE_WRITE_FILE_INSTRUCTIONS
+                                    if instruction not in current["instructions"]]
+            if not missing_instructions:
+                continue
+            next_version = connection.execute(
+                "SELECT COALESCE(MAX(version),0) FROM skill_versions WHERE skill_id=?",
+                (current["id"],),
+            ).fetchone()[0] + 1
+            updated = {**current, "version": next_version,
+                       "instructions": [*current["instructions"], *missing_instructions]}
+            updated_snapshot = {key: updated[key] for key in SKILL_DEFINITION_FIELDS}
+            now = utcnow()
+            connection.execute(
+                "UPDATE skills SET version=?,instructions=?,updated_at=? WHERE id=?",
+                (next_version, _dump(updated["instructions"]), now, current["id"]),
             )
-            connection.execute("INSERT OR IGNORE INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)", (skill["id"], skill["version"], _dump(skill), now, "Initial builtin version"))
+            connection.execute(
+                "INSERT INTO skill_versions(skill_id,version,snapshot_json,created_at,reason) VALUES(?,?,?,?,?)",
+                (current["id"], next_version, _dump(updated_snapshot), now,
+                 "Added required write_file parent-path guidance"),
+            )
+            connection.execute(
+                "INSERT INTO skill_events(skill_id,version,timestamp,event_type,summary,payload_json) VALUES(?,?,?,?,?,?)",
+                (current["id"], next_version, now, "skill.updated",
+                 "Required write_file guidance added",
+                 _dump({"id": current["id"], "version": next_version})),
+            )
 
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
