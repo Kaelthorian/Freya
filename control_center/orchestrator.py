@@ -26,6 +26,8 @@ from .runtime_resources import planner_resource_context
 from .skills import skill_summary
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 from .task_spec import TaskSpecAnalyst, render_task_spec, validate_task_spec
+from .cross_task import owned_path_key
+from .cross_task import CrossTaskIntentMatcher
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -44,7 +46,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                  global_verifier: GlobalVerifier | None = None,
                  integration_replanner: IntegrationReplanner | None = None,
                  result_integrator: ResultIntegrator | None = None,
-                 agent_factory: AgentFactory | None = None):
+                 agent_factory: AgentFactory | None = None,
+                 cross_task_intent_matcher: CrossTaskIntentMatcher | None = None):
         self.store, self.runtime = store, runtime
         self.decide = decide
         self.planner = planner or Planner()
@@ -62,6 +65,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self.integration_replanner = integration_replanner or IntegrationReplanner()
         self.result_integrator = result_integrator or ResultIntegrator()
         self.agent_factory = agent_factory or AgentFactory(store)
+        self.cross_task_intent_matcher = cross_task_intent_matcher or CrossTaskIntentMatcher()
         self.lock = threading.RLock()
         self._orchestration_workspaces: dict[str, str] = {}
         self.planner_lock = threading.Lock()
@@ -351,6 +355,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             )
             if cancelled is None:
                 return self.store.get_orchestration(oid)
+            self.store.cancel_cross_task_modification_requests(oid, "Cancelled by user.")
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.cancelled", "status": "Cancelled",
                 "message": "Freya orchestration cancelled by user.",
@@ -377,6 +382,39 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     })
             self._archive_dynamic_agents(oid)
             return self.store.get_orchestration(oid)
+
+    def resolve_cross_task_approval(self, approval_id: str, resolution: str) -> dict[str, Any]:
+        """Resolve the existing durable approval row for a cross-task request."""
+        with self.lock:
+            request = self.store.get_cross_task_modification_request_by_approval(approval_id)
+            if request is None:
+                raise KeyError(approval_id)
+            run = self.store.get_orchestration(request["orchestration_id"])
+            if run["status"] not in ORCHESTRATION_ACTIVE_STATUSES:
+                raise ValueError("Cannot resolve a cross-task request after its orchestration ended.")
+            if resolution != "denied":
+                plan = run.get("effective_plan") or run.get("plan") or {}
+                owner = next((item for item in plan.get("tasks", [])
+                              if item.get("id") == request.get("target_owner_plan_task_id")), None)
+                if owner is None:
+                    raise ValueError("The owning task is not present in the current plan.")
+                self._cross_task_change_task(plan, owner, request)
+                if self._cross_task_cycle_would_form(plan, request):
+                    raise ValueError("The cross-task request would create a dependency cycle.")
+            resolved = self.store.resolve_cross_task_modification_approval(approval_id, resolution)
+            request = resolved["request"]
+            event_type = {
+                "approved_once": "cross_task_modification.approved_once",
+                "approved_file_intent": "cross_task_modification.approved_intent",
+                "denied": "cross_task_modification.denied",
+            }[resolution]
+            self._cross_task_event(
+                request["orchestration_id"], event_type, request,
+                status=request["status"], approval_source=request["approval_source"],
+                grant_id=request.get("grant_id"), human_resolution=resolution,
+                message="The operator resolved the cross-task modification request.",
+            )
+            return resolved
 
     @staticmethod
     def _agent_candidates(agents):
@@ -442,8 +480,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
     def _selection_context(self, run: dict) -> dict:
         workloads: dict[str, int] = {}
         active_runtime_task_ids: set[str] = set()
+        suspended_cross_task_ids = {
+            item.get("requester_runtime_task_id")
+            for item in self.store.list_cross_task_modification_requests(run.get("id", ""))
+        } if run.get("id") else set()
         for task in self.store.list_tasks(limit=10000):
             if task.get("status") in ACTIVE_DELEGATED_TASK_STATUSES:
+                if task.get("id") in suspended_cross_task_ids:
+                    continue
                 agent_id = task.get("agent_id")
                 if isinstance(agent_id, str):
                     workloads[agent_id] = workloads.get(agent_id, 0) + 1
@@ -461,7 +505,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     continue
                 reserved = (node.get("state") == "ready" and node.get("selection_id"))
                 missing_runtime = (
-                    node.get("state") in {"running", "waiting_for_approval", "evaluating"}
+                    node.get("state") in {"running", "evaluating"}
                     and node.get("runtime_task_id") not in active_runtime_task_ids
                 )
                 if reserved or missing_runtime:
@@ -708,7 +752,21 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "task_ids": compiler.get("task_ids", []),
                 "global_criteria": compiler.get("global_criteria"),
                 "duration_seconds": compiler.get("duration_seconds"),
+                "semantic_plan_schema_version": compiler.get("semantic_plan_schema_version"),
+                "compiled_plan_schema_version": compiler.get("compiled_plan_schema_version"),
             }
+            semantic_plan = compiler.get("planner_semantic_plan")
+            if isinstance(semantic_plan, dict) and semantic_plan.get("tasks"):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.planner.semantic_plan_proposed",
+                    "phase": "planner",
+                    "actor_type": "model" if compiler.get("semantic_plan_source") == "planner_model"
+                    else "runtime",
+                    "semantic_plan_source": compiler.get("semantic_plan_source", "unknown"),
+                    "semantic_plan_schema_version": compiler.get("semantic_plan_schema_version"),
+                    "semantic_plan": semantic_plan,
+                    "message": "Planner supplied task meaning and semantic operations.",
+                })
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan_compiler.started", "timestamp": compiler["started_at"],
                 "status": "Running", "message": "Plan Compiler started runtime preparation.",
@@ -740,6 +798,29 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 **({"resource_resolutions": compiler["resource_resolutions"]}
                    if compiler.get("resource_resolutions") else {}),
             })
+            if succeeded and compiler.get("resource_resolutions"):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.resources_resolved",
+                    "phase": "plan_compiler", "actor_type": "runtime",
+                    "resource_resolutions": compiler["resource_resolutions"],
+                    "resource_catalog_version": planning_metrics.get("resource_catalog_version"),
+                    "message": "Runtime catalog derived tools and capabilities from semantic operations.",
+                })
+            if succeeded and compiler.get("ownership_resolutions"):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.ownership_resolved",
+                    "phase": "plan_compiler", "actor_type": "runtime",
+                    "ownership_resolutions": compiler["ownership_resolutions"],
+                    "message": "Plan Compiler normalized and validated task-owned paths.",
+                })
+            if succeeded and compiler.get("compiled_runtime_plan"):
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.plan.compiled",
+                    "phase": "plan_compiler", "actor_type": "runtime",
+                    "compiled_plan_schema_version": compiler.get("compiled_plan_schema_version"),
+                    "compiled_runtime_plan": compiler["compiled_runtime_plan"],
+                    "message": "Plan Compiler produced the validated runtime contract.",
+                })
 
     def _fail_planning(self, oid: str, exc: Exception,
                        planning_metrics: dict | None = None) -> None:
@@ -771,8 +852,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
 
     def _fail_running(self, oid: str, message: str) -> None:
         with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Running":
+                return
+            self._cancel_active_children(oid)
             failed = self.store.transition_orchestration(oid, ("Running",), "Failed", error=message)
             if failed is not None:
+                self.store.cancel_cross_task_modification_requests(
+                    oid, "The orchestration entered a terminal failure.",
+                )
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.failed", "status": "Failed", "message": message,
                 })
@@ -809,6 +896,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if run["status"] != "Running":
                 return
             self._cancel_active_children(oid)
+            self.store.cancel_cross_task_modification_requests(
+                oid, "The orchestration reached its wall-clock deadline.",
+            )
             persisted = self.store.get_execution_graph(oid)
             if run.get("plan") and persisted["nodes"]:
                 graph = ExecutionGraph(run.get("effective_plan") or run["plan"], persisted["nodes"])
@@ -915,6 +1005,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     agents = [self.store.get_agent(required_agent_id)]
                 else:
                     factory_task = dict(task)
+                    plan_snapshot = current_run.get("effective_plan") or current_run.get("plan") or {}
+                    factory_task["_write_owners"] = {
+                        owned_path_key(path): owner["id"]
+                        for owner in plan_snapshot.get("tasks", [])
+                        for path in owner.get("owned_paths", [])
+                    }
                     if recovery_workspace_state:
                         factory_task["_recovery_workspace_state"] = recovery_workspace_state
                     if recovery_reason:
@@ -1372,6 +1468,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "id_allocation": revision.get("id_allocation", {}),
                     "task_id": task_id, "recovery_id": recovery_id,
                     "plan_revision_id": revision_id, "revision": saved["revision"],
+                    "resource_resolutions": revision.get("resource_resolutions", []),
                     "message": "Freya committed a validated effective-plan revision.",
                 })
         except Exception as exc:
@@ -1451,6 +1548,503 @@ class Orchestrator(IntegrationOrchestrationMixin):
 
         self._archive_dynamic_agents(oid)
 
+    def _cross_task_event(self, oid: str, event_type: str, request: dict[str, Any],
+                          *, status: str | None = None, **extra: Any) -> None:
+        payload = {
+            "event_type": event_type, "status": status or request.get("status", "Pending"),
+            "request_id": request.get("id"), "approval_id": request.get("approval_id"),
+            "requester_plan_task_id": request.get("requester_plan_task_id"),
+            "requester_runtime_task_id": request.get("requester_runtime_task_id"),
+            "target_owner_plan_task_id": request.get("target_owner_plan_task_id"),
+            "target_path": request.get("target_path"),
+            "requested_operation": request.get("requested_operation"),
+            "requested_change": request.get("requested_change"),
+            "reason": request.get("reason"), "needed_for": request.get("needed_for"),
+            "blocking": request.get("blocking"),
+            "approval_source": request.get("approval_source", ""),
+            "grant_id": request.get("grant_id"),
+        }
+        payload.update(extra)
+        payload.setdefault("message", event_type.replace(".", " "))
+        self.store.add_orchestration_event(oid, sanitize(payload))
+
+    @staticmethod
+    def _cross_task_reaches(edges: dict[str, set[str]], start: str, target: str) -> bool:
+        pending = [start]
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == target:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            pending.extend(edges.get(current, set()) - visited)
+        return False
+
+    def _cross_task_cycle_would_form(self, plan: dict[str, Any], request: dict[str, Any]) -> bool:
+        requester = str(request.get("requester_plan_task_id") or "")
+        owner = str(request.get("target_owner_plan_task_id") or "")
+        if not requester or not owner or requester == owner:
+            return True
+        edges: dict[str, set[str]] = {}
+        for task in plan.get("tasks", []):
+            task_id = str(task.get("id") or "")
+            edges[task_id] = set(task.get("depends_on", []))
+        for existing in self.store.list_cross_task_modification_requests(
+                request["orchestration_id"]):
+            if (existing.get("id") == request.get("id") or not existing.get("blocking")
+                    or existing.get("status") in {"completed", "denied", "blocked", "cycle_detected", "cancelled"}):
+                continue
+            source = str(existing.get("requester_plan_task_id") or "")
+            target = str(existing.get("target_owner_plan_task_id") or "")
+            if source and target:
+                edges.setdefault(source, set()).add(target)
+        # A requester waits on its owner, so owner -> requester closes a cycle.
+        return self._cross_task_reaches(edges, owner, requester)
+
+    def _resolve_pending_cross_task_intents(self, oid: str) -> None:
+        """Match reusable grants outside the orchestration lock; uncertainty asks a human."""
+        run = self.store.get_orchestration(oid)
+        if run["status"] != "Running":
+            return
+        plan = run.get("effective_plan") or run.get("plan") or {}
+        planned = {str(item.get("id")): item for item in plan.get("tasks", [])}
+        for request in self.store.list_cross_task_modification_requests(oid, ["pending"]):
+            self._cross_task_event(oid, "cross_task_modification.requested", request,
+                                   status="Pending", approval_id=request.get("approval_id"))
+            owner = planned.get(request.get("target_owner_plan_task_id"))
+            owned = {owned_path_key(path) for path in (owner or {}).get("owned_paths", [])}
+            cycle = owner is not None and self._cross_task_cycle_would_form(plan, request)
+            in_owner_scope = owner is not None and owned_path_key(request.get("target_path")) in owned
+            owner_can_write = False
+            if in_owner_scope:
+                try:
+                    self._cross_task_change_task(plan, owner, request)
+                    owner_can_write = True
+                except (KeyError, TypeError, ValueError):
+                    owner_can_write = False
+            if not in_owner_scope or not owner_can_write or cycle:
+                reason = ("cross_task_dependency_cycle" if cycle else
+                          "The owning plan task lacks declared read and write capabilities for this file."
+                          if in_owner_scope else "The request does not match a plan-owned file.")
+                blocked = self.store.block_cross_task_modification_request(
+                    request["id"], status="cycle_detected" if cycle else "blocked", reason=reason,
+                    expected_statuses=["pending"],
+                )
+                if blocked:
+                    self._cross_task_event(
+                        oid, "cross_task_modification.cycle_detected" if cycle
+                        else "cross_task_modification.blocked", blocked,
+                        status=blocked["status"], message=reason,
+                    )
+                continue
+            snapshot = {key: owner.get(key) for key in (
+                "id", "objective", "description", "depends_on", "required_capabilities",
+                "required_tools", "semantic_needs", "preferred_skills", "success_criteria",
+                "owned_paths", "task_kind", "task_characteristics",
+            ) if key in owner}
+            self.store.update_cross_task_modification_request(
+                request["id"], expected_statuses=["pending"], status="pending",
+                owner_task_snapshot=snapshot,
+            )
+            grants = self.store.find_cross_task_intent_grants(request)
+            if not grants:
+                awaiting = self.store.update_cross_task_modification_request(
+                    request["id"], expected_statuses=["pending"], status="awaiting_human",
+                    approval_source="no_reusable_match",
+                    intent_match={"same_intent": None, "reason": "No reusable grant exists in this scope.",
+                                  "confidence": 0.0, "method": "no_grant"},
+                )
+                if awaiting:
+                    self._cross_task_event(
+                        oid, "cross_task_modification.awaiting_human", awaiting,
+                        status="WaitingForApproval",
+                        message="No reusable same-purpose grant matched; operator approval is required.",
+                    )
+                continue
+            last_match: dict[str, Any] = {
+                "same_intent": False, "reason": "No grant matched the new purpose.",
+                "confidence": 0.0, "method": "reusable_grant_miss",
+            }
+            auto_approved = None
+            for grant in grants:
+                try:
+                    match = self.cross_task_intent_matcher.match(
+                        grant.get("approved_intent") or {}, request,
+                    )
+                    match = {**match, "grant_id": grant["id"]}
+                except Exception as exc:
+                    match = {
+                        "same_intent": False,
+                        "reason": "Intent matcher unavailable; request remains with the human.",
+                        "confidence": 0.0, "method": "unavailable",
+                        "matcher_error": sanitize(str(exc))[:300], "grant_id": grant["id"],
+                    }
+                last_match = match
+                self._cross_task_event(
+                    oid, "cross_task_modification.intent_match", request,
+                    status="Running", grant_id=grant["id"], intent_match=match,
+                    message="Freya recorded the deterministic or semantic reusable-intent comparison.",
+                )
+                if match.get("same_intent") is True and float(match.get("confidence", 0)) >= 0.90:
+                    auto_approved = self.store.auto_approve_cross_task_modification_request(
+                        request["id"], grant_id=grant["id"], intent_match=match,
+                    )
+                    if auto_approved:
+                        break
+            if auto_approved:
+                self._cross_task_event(
+                    oid, "cross_task_modification.auto_approved", auto_approved,
+                    status="Approved", approval_source="automatic_reuse",
+                    grant_id=auto_approved.get("grant_id"), intent_match=last_match,
+                    message="An existing same-scope human grant matched the approved intent.",
+                )
+            else:
+                awaiting = self.store.update_cross_task_modification_request(
+                    request["id"], expected_statuses=["pending"], status="awaiting_human",
+                    approval_source="reusable_match_uncertain", intent_match=last_match,
+                )
+                if awaiting:
+                    self._cross_task_event(
+                        oid, "cross_task_modification.awaiting_human", awaiting,
+                        status="WaitingForApproval", intent_match=last_match,
+                        message="Intent match was different or uncertain; operator approval is required.",
+                    )
+
+    @staticmethod
+    def _cross_task_change_task(plan: dict[str, Any], owner: dict[str, Any],
+                                request: dict[str, Any]) -> dict[str, Any]:
+        """Build an exact-file child task using only the owner's declared access."""
+        target_path = str(request.get("target_path") or "")
+        target_key = owned_path_key(target_path)
+        owner_paths = {owned_path_key(item) for item in owner.get("owned_paths", [])}
+        if target_key not in owner_paths:
+            raise ValueError("The requested file is outside the owning task's declared scope.")
+        owner_capabilities = owner.get("required_capabilities", [])
+        if not isinstance(owner_capabilities, list):
+            raise ValueError("The owning task has an invalid capability declaration.")
+        operation = str(request.get("requested_operation") or "")
+        requested_capability = "filesystem." + operation
+        if (operation not in {"create", "modify", "overwrite"}
+                or requested_capability not in owner_capabilities):
+            raise ValueError("The owning task must already declare the requested filesystem write capability.")
+        if "filesystem.read" not in owner_capabilities:
+            raise ValueError("The owning task must already declare filesystem.read.")
+        write_capabilities = [requested_capability]
+        requester = str(request.get("requester_plan_task_id") or "requester")
+        change = str(request.get("requested_change") or "").strip()
+        reason = str(request.get("reason") or "").strip()
+        needed_for = str(request.get("needed_for") or "").strip()
+        owners = {
+            owned_path_key(path): str(task.get("id") or "")
+            for task in plan.get("tasks", []) if isinstance(task, dict)
+            for path in task.get("owned_paths", [])
+        }
+        return {
+            # Keep the original owner plan-task identity in agent provenance so
+            # Worker enforces the same declared owner at the filesystem gate.
+            "id": str(owner["id"]),
+            "objective": f"Apply the approved change to {target_path}: {change}",
+            "description": (
+                f"A requesting plan task ({requester}) needs a scoped change to this owner task's file. "
+                f"Requested change: {change}\nReason: {reason}\nNeeded for: {needed_for}\n"
+                f"Modify only {target_path}. Preserve the existing project conventions. Read the file back "
+                "after the edit. Do not run commands, touch other files, or expand this request."
+            ),
+            "depends_on": [],
+            "required_capabilities": ["filesystem.read", *write_capabilities],
+            "required_tools": [],
+            "semantic_needs": ["Apply and read back the explicitly approved change to the exact owned file."],
+            "owned_paths": [target_path],
+            "preferred_skills": list(owner.get("preferred_skills", [])),
+            "success_criteria": [
+                f"The approved requested change is applied to {target_path}.",
+                f"The updated {target_path} is read back successfully after the edit.",
+            ],
+            "task_kind": "code_change",
+            "task_characteristics": {},
+            "_write_owners": owners,
+        }
+
+    def _resume_cross_task_requester(self, oid: str, request: dict[str, Any],
+                                     outcome: str, explanation: str) -> bool:
+        """Start a fresh normal graph attempt after the owner handoff resolves."""
+        with self.lock:
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
+                return False
+            plan = run.get("effective_plan") or run.get("plan") or {}
+            graph_record = self.store.get_execution_graph(oid)
+            graph = ExecutionGraph(plan, graph_record["nodes"])
+            task_id = str(request.get("requester_plan_task_id") or "")
+            try:
+                node = graph.node(task_id)
+            except KeyError:
+                return False
+            if node["state"] != "waiting_for_approval":
+                return False
+            if outcome == "completed":
+                instruction = (
+                    "The file owner applied and independently verified the approved change. Re-read the file "
+                    "if needed, continue the original task, and do not repeat the coordinated edit."
+                )
+            else:
+                instruction = (
+                    "The coordinated edit did not proceed: " + sanitize(explanation)[:1000] +
+                    " Choose another permitted approach or report the remaining blocker. Do not retry the "
+                    "same cross-task write unchanged."
+                )
+            prompt = (
+                "CROSS-TASK FILE COORDINATION RESULT\n"
+                f"Target file: {request.get('target_path', '')}\n"
+                f"Owner task: {request.get('target_owner_plan_task_id', '')}\n"
+                f"Outcome: {outcome}\n{instruction}"
+            )
+            graph.resume_cross_task_wait(task_id, prompt, utcnow())
+            self.store.save_execution_graph(oid, graph.serialize())
+            self._cross_task_event(
+                oid, "cross_task_modification.requester_resumed", request,
+                status="Running", outcome=outcome,
+                message="The requester will continue in a fresh normal execution attempt.",
+            )
+            return True
+
+    def _dispatch_cross_task_owner_change(self, oid: str, request: dict[str, Any],
+                                          deadline: float, operational_prompt: str) -> None:
+        run = self.store.get_orchestration(oid)
+        if run["status"] != "Running":
+            return
+        plan = run.get("effective_plan") or run.get("plan") or {}
+        owner = next((item for item in plan.get("tasks", [])
+                      if item.get("id") == request.get("target_owner_plan_task_id")), None)
+        if owner is not None and self._cross_task_cycle_would_form(plan, request):
+            reason = "The effective plan now creates a cross-task dependency cycle."
+            blocked = self.store.block_cross_task_modification_request(
+                request["id"], status="cycle_detected", reason=reason,
+                expected_statuses=["owner_selecting"],
+            )
+            if blocked:
+                self._cross_task_event(oid, "cross_task_modification.cycle_detected", blocked,
+                                       status="cycle_detected", message=reason)
+                self._resume_cross_task_requester(oid, blocked, "cycle_detected", reason)
+            return
+        if owner is None:
+            reason = "The owning plan task is no longer present in the effective plan."
+            blocked = self.store.block_cross_task_modification_request(
+                request["id"], status="blocked", reason=reason,
+                expected_statuses=["owner_selecting"],
+            )
+            if blocked:
+                self._cross_task_event(oid, "cross_task_modification.blocked", blocked,
+                                       status="blocked", message=reason)
+                self._resume_cross_task_requester(oid, blocked, "blocked", reason)
+            return
+        runtime_task = None
+        try:
+            task = self._cross_task_change_task(plan, owner, request)
+            created = self._create_dynamic_agent(oid, task, 1)
+            context = self._selection_context(run)
+            selection = self.selector.select_agent(task, [created["agent"]], context)
+            selection = dict(selection)
+            selection["task_id"] = task["id"]
+            selection["attempt"] = 1
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] != "Running":
+                    self._archive_dynamic_agents(oid)
+                    return
+                selection_id = self.store.save_agent_selection(oid, selection)
+                selected_agent_id = selection.get("selected_agent_id")
+                if selection_id is None or not selected_agent_id:
+                    reason = self._selection_failure_message(selection, [created["agent"]])
+                    blocked = self.store.block_cross_task_modification_request(
+                        request["id"], status="blocked", reason=reason,
+                        expected_statuses=["owner_selecting"],
+                    )
+                    if blocked:
+                        self._cross_task_event(oid, "cross_task_modification.blocked", blocked,
+                                               status="blocked", message=reason)
+                    self._resume_cross_task_requester(oid, request, "blocked", reason)
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "freya.agent_selected", "status": "Running",
+                    "task_id": task["id"], "agent_id": selected_agent_id,
+                    "selection_id": selection_id, "score": selection.get("score"),
+                    "selector_version": selection.get("selector_version"),
+                    "message": "AgentSelector validated the owner-scoped change agent.",
+                    "cross_task_request_id": request["id"],
+                })
+            if self.clock() >= deadline:
+                self._timeout(oid)
+                return
+            prompt = self._execution_prompt(
+                operational_prompt,
+                task,
+                "Perform only the approved, exact-file change recorded by Freya. "
+                "The approval covers this request; it does not grant capabilities or broader file access. "
+                f"Coordination request ID: {request['id']}.",
+            )
+            with self.lock:
+                if self.store.get_orchestration(oid)["status"] != "Running":
+                    self._archive_dynamic_agents(oid)
+                    return
+                runtime_task = self.runtime.submit(
+                    selected_agent_id, prompt, self._workspace_for_run(run),
+                )
+                delegation_id = self.store.add_delegation(
+                    oid, selected_agent_id, prompt, runtime_task["id"],
+                )
+                if delegation_id is None:
+                    self.runtime.cancel(runtime_task["id"])
+                    return
+                dispatched = self.store.update_cross_task_modification_request(
+                    request["id"], expected_statuses=["owner_selecting"],
+                    status="owner_running", owner_runtime_task_id=runtime_task["id"],
+                    owner_agent_id=selected_agent_id,
+                )
+                if dispatched is None:
+                    self.runtime.cancel(runtime_task["id"])
+                    return
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "cross_task_modification.dispatched",
+                    "status": runtime_task["status"],
+                    "request_id": request["id"], "owner_runtime_task_id": runtime_task["id"],
+                    "owner_agent_id": selected_agent_id,
+                    "delegation_id": delegation_id,
+                    "message": "Freya dispatched an ephemeral agent using only the owner's declared file capabilities.",
+                })
+        except Exception as exc:
+            if runtime_task is not None:
+                try:
+                    self.runtime.cancel(runtime_task["id"])
+                except (KeyError, ValueError):
+                    pass
+            reason = "Owner-scoped change agent could not be dispatched: " + sanitize(str(exc))[:800]
+            blocked = self.store.block_cross_task_modification_request(
+                request["id"], status="blocked", reason=reason,
+                expected_statuses=["owner_selecting"],
+            )
+            if blocked:
+                self._cross_task_event(oid, "cross_task_modification.blocked", blocked,
+                                       status="blocked", message=reason)
+                self._resume_cross_task_requester(oid, blocked, "blocked", reason)
+
+    def _evaluate_cross_task_owner_change(self, oid: str, request: dict[str, Any],
+                                          deadline: float) -> None:
+        run = self.store.get_orchestration(oid)
+        if run["status"] != "Running":
+            return
+        plan = run.get("effective_plan") or run.get("plan") or {}
+        owner = next((item for item in plan.get("tasks", [])
+                      if item.get("id") == request.get("target_owner_plan_task_id")), None)
+        if owner is None:
+            outcome = {"status": "rejected", "summary": "The owner task is missing from the effective plan."}
+        else:
+            try:
+                planned = self._cross_task_change_task(plan, owner, request)
+                runtime_task = self.store.get_task(request["owner_runtime_task_id"])
+                execution_node = {
+                    "selected_agent_id": request.get("owner_agent_id"),
+                    "runtime_task_id": request.get("owner_runtime_task_id"),
+                    "attempt": 1,
+                }
+                with self.evaluator_lock:
+                    outcome = self.evaluator.evaluate(
+                        planned_task=planned, runtime_task=runtime_task,
+                        execution_node=execution_node,
+                        context={"cross_task_request_id": request["id"],
+                                 "target_path": request["target_path"],
+                                 "approved_intent": {key: request.get(key) for key in
+                                     ("requested_change", "reason", "needed_for")}},
+                    )
+            except Exception as exc:
+                outcome = technical_failure_evaluation(
+                    "Cross-task owner evaluation failed: " + sanitize(str(exc))[:800],
+                    [f"The approved requested change is applied to {request.get('target_path', '')}.",
+                     f"The updated {request.get('target_path', '')} is read back successfully after the edit."],
+                )
+        if self.clock() >= deadline:
+            self._timeout(oid)
+            return
+        accepted = outcome.get("status") == "accepted"
+        status = "completed" if accepted else "blocked"
+        reason = str(outcome.get("summary") or "The owner change did not pass independent evaluation.")
+        updated = self.store.update_cross_task_modification_request(
+            request["id"], expected_statuses=["owner_evaluating"], status=status,
+            owner_evaluation=outcome,
+            **({"approval_source": request.get("approval_source", "")} if accepted else {}),
+        )
+        if updated:
+            self._cross_task_event(
+                oid, "cross_task_modification.completed" if accepted
+                else "cross_task_modification.evaluation_rejected", updated,
+                status=status, owner_evaluation=outcome,
+                message=reason,
+            )
+            self._resume_cross_task_requester(oid, updated, status, reason)
+
+    def _advance_cross_task_requests(self, oid: str, deadline: float,
+                                     operational_prompt: str) -> None:
+        """Advance one durable handoff state per graph iteration."""
+        run = self.store.get_orchestration(oid)
+        if run["status"] != "Running":
+            return
+        requests = self.store.list_cross_task_modification_requests(oid)
+        for request in requests:
+            status = request.get("status")
+            if status in {"approved_once", "approved_intent", "auto_approved"}:
+                graph_nodes = self.store.get_execution_graph(oid)["nodes"]
+                owner_node = next((item for item in graph_nodes
+                                   if item.get("plan_task_id") == request.get("target_owner_plan_task_id")), None)
+                if owner_node is not None and owner_node.get("state") not in {
+                        "success", "failed", "blocked", "cancelled", "skipped", "superseded"}:
+                    # Let the original owner finish before its scoped change
+                    # agent runs, so later owner writes cannot overwrite it.
+                    continue
+                with self.lock:
+                    claimed = self.store.update_cross_task_modification_request(
+                        request["id"], expected_statuses=[status], status="owner_selecting",
+                    )
+                if claimed:
+                    self._dispatch_cross_task_owner_change(
+                        oid, claimed, deadline, operational_prompt,
+                    )
+                    return
+            elif status == "owner_running":
+                try:
+                    task = self.store.get_task(request["owner_runtime_task_id"])
+                except (KeyError, TypeError):
+                    task = None
+                if task and task["status"] in {"Success", "Failed", "Cancelled"}:
+                    if task["status"] == "Success":
+                        with self.lock:
+                            evaluating = self.store.update_cross_task_modification_request(
+                                request["id"], expected_statuses=["owner_running"],
+                                status="owner_evaluating",
+                            )
+                        if evaluating:
+                            self._evaluate_cross_task_owner_change(oid, evaluating, deadline)
+                    else:
+                        reason = "The owner change task ended with status " + task["status"] + ". " + str(task.get("error") or "")
+                        blocked = self.store.block_cross_task_modification_request(
+                            request["id"], status="blocked", reason=sanitize(reason)[:1000],
+                            expected_statuses=["owner_running"],
+                        )
+                        if blocked:
+                            self._cross_task_event(oid, "cross_task_modification.owner_failed", blocked,
+                                                   status="blocked", message=sanitize(reason)[:1000])
+                            self._resume_cross_task_requester(oid, blocked, "blocked", reason)
+                    return
+            elif status == "owner_evaluating":
+                self._evaluate_cross_task_owner_change(oid, request, deadline)
+                return
+            elif status in {"denied", "blocked", "cycle_detected"}:
+                self._resume_cross_task_requester(
+                    oid, request, status,
+                    request.get("human_resolution") or status.replace("_", " "),
+                )
+                return
+
     def _run_graph(self, oid: str, running: dict, deadline: float,
                    operational_prompt: str = "") -> None:
         operational_prompt = (
@@ -1463,6 +2057,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if self.clock() >= deadline:
                 self._timeout(oid)
                 return
+
+            self._resolve_pending_cross_task_intents(oid)
+            self._advance_cross_task_requests(oid, deadline, operational_prompt)
 
             selection_target = None
             evaluation_target = None
@@ -1604,12 +2201,26 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     return
                 graph = ExecutionGraph(plan, self.store.get_execution_graph(oid)["nodes"])
                 active_nodes = graph.active_nodes()
-                slots = max(0, int(self.config["max_parallel_tasks"]) - len(active_nodes))
-                active_agents = {node.get("selected_agent_id") for node in active_nodes}
-                active_agents.update(
-                    task.get("agent_id") for task in self.store.list_tasks(limit=10000)
-                    if task.get("status") in ACTIVE_DELEGATED_TASK_STATUSES
-                )
+                cross_waiter_ids = {
+                    item.get("requester_runtime_task_id")
+                    for item in self.store.list_cross_task_modification_requests(oid)
+                }
+                active_node_ids = {
+                    node.get("runtime_task_id") for node in active_nodes
+                    if node.get("state") in {"running", "evaluating"}
+                }
+                active_runtime = [item for item in self.store.list_tasks(limit=10000)
+                                  if item.get("status") in ACTIVE_DELEGATED_TASK_STATUSES
+                                  and item.get("id") not in cross_waiter_ids]
+                active_runtime_ids = {item.get("id") for item in active_runtime}
+                slots = max(0, int(self.config["max_parallel_tasks"])
+                            - len(active_node_ids | active_runtime_ids))
+                active_agents = {
+                    node.get("selected_agent_id") for node in active_nodes
+                    if node.get("state") in {"running", "evaluating"}
+                }
+                active_agents.update(item.get("agent_id") for item in active_runtime
+                                     if item.get("agent_id"))
                 for task in graph.ready_tasks():
                     if slots <= 0:
                         break

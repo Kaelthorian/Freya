@@ -134,6 +134,7 @@ class AgentFactoryTests(unittest.TestCase):
             objective="Create hola_mundo.txt with hola mundo",
             description="Create one local text file and verify its contents.",
             required_capabilities=["filesystem.create", "filesystem.read"],
+            owned_paths=["hola_mundo.txt"],
             preferred_skills=[],
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
@@ -152,6 +153,7 @@ class AgentFactoryTests(unittest.TestCase):
             required_capabilities=[
                 "filesystem.create", "filesystem.read", "execution.python_script",
             ],
+            owned_paths=["hello.py"],
             preferred_skills=[
                 "python-development", "simple-file-artifact",
                 "interactive-testing", "debugging",
@@ -169,6 +171,7 @@ class AgentFactoryTests(unittest.TestCase):
             required_capabilities=[
                 "filesystem.create", "filesystem.read", "execution.python_script",
             ],
+            owned_paths=["hello.py"],
             preferred_skills=[
                 "python-development", "simple-file-artifact", "interactive-testing", "debugging",
             ],
@@ -224,6 +227,7 @@ class AgentFactoryTests(unittest.TestCase):
             description="Create one text artifact and verify its contents by reading it back.",
             task_kind="file_creation",
             required_capabilities=["filesystem.create", "filesystem.read"],
+            owned_paths=["hola.txt"],
             preferred_skills=["simple-file-artifact", "python-development", "debugging", "interactive-testing"],
         ))
         self.assertEqual(built["skill_ids"], ["freya-core"])
@@ -266,7 +270,7 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
 
-    def test_recovery_workspace_state_derives_safe_read_without_overwrite(self):
+    def test_recovery_workspace_state_does_not_add_capabilities(self):
         created = self.create(planned_task(
             required_capabilities=["filesystem.create", "execution.python_script"],
             _recovery_workspace_state={
@@ -274,12 +278,11 @@ class AgentFactoryTests(unittest.TestCase):
                 "verification": {"attempted": False},
             },
         ))
-        agent = created["agent"]
-        self.assertIn("read_file", agent["tools"])
-        self.assertIn("filesystem.read", created["required_capabilities"])
+        self.assertNotIn("read_file", created["effective_tools"])
+        self.assertNotIn("filesystem.read", created["required_capabilities"])
         self.assertNotIn("filesystem.overwrite", created["required_capabilities"])
-        self.assertEqual(self.active_modes(agent)["filesystem.read"], "allow")
-        self.assertEqual(self.active_modes(agent).get("filesystem.overwrite"), None)
+        self.assertEqual(self.active_modes(created["agent"])["filesystem.read"], "deny")
+        self.assertEqual(self.active_modes(created["agent"]).get("filesystem.overwrite"), "deny")
 
     def test_recovery_state_selects_debugging_without_debug_words_in_objective(self):
         created = self.create(planned_task(
@@ -303,6 +306,7 @@ class AgentFactoryTests(unittest.TestCase):
             description="Create the calculator web implementation.",
             task_kind="program_creation",
             required_capabilities=["filesystem.create"],
+            owned_paths=["calculator.py"],
             preferred_skills=["python-development"],
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
@@ -315,6 +319,7 @@ class AgentFactoryTests(unittest.TestCase):
         created = self.create(planned_task(
             objective="Create calculator.py", task_kind="program_creation",
             required_capabilities=["filesystem.create", "filesystem.read"],
+            owned_paths=["calculator.py"],
             preferred_skills=["python-development"],
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
@@ -359,6 +364,38 @@ class AgentFactoryTests(unittest.TestCase):
             ))
         self.assertEqual(caught.exception.error_type, "ToolCapabilityMismatch")
         self.assertEqual(caught.exception.tool_id, "write_file")
+
+    def test_factory_rejects_compiled_resources_that_disagree_with_operations(self):
+        with self.assertRaisesRegex(ValueError, "do not match its semantic operations"):
+            self.create(planned_task(
+                required_capabilities=["filesystem.modify", "execution.python_script"],
+                required_tools=["edit_file", "run_command"],
+                semantic_operations=["modify_file"],
+                owned_paths=["calculator.py"],
+            ))
+
+    def test_factory_accepts_only_the_catalog_mapping_for_modify_file(self):
+        created = self.create(planned_task(
+            required_capabilities=["filesystem.modify"],
+            required_tools=["edit_file"],
+            semantic_operations=["modify_file"],
+            owned_paths=["calculator.py"],
+        ))
+        self.assertEqual(created["required_capabilities"], ["filesystem.modify"])
+        self.assertEqual(created["effective_tools"], ["edit_file"])
+        self.assertNotIn("execution.python_script", self.active_modes(created["agent"]))
+        self.assertNotIn("run_command", created["effective_tools"])
+
+    def test_factory_uses_compiled_task_kind_instead_of_reclassifying_task_text(self):
+        created = self.create(planned_task(
+            objective="Review and update calculator.py",
+            task_kind="code_change",
+            semantic_operations=["modify_file"],
+            required_capabilities=["filesystem.modify"],
+            required_tools=["edit_file"],
+            owned_paths=["calculator.py"],
+        ))
+        self.assertEqual(created["role"], "worker")
 
     def test_qa_task_is_dynamic_and_has_no_write_surface(self):
         created = self.create(planned_task(
@@ -574,6 +611,7 @@ class AgentFactoryTests(unittest.TestCase):
             "description": "Create the calculator web implementation.",
             "depends_on": [], "semantic_needs": ["Create calculator.py."],
             "required_capabilities": ["filesystem.create"],
+            "owned_paths": ["calculator.py"],
             "required_tools": ["write_file"],
             "preferred_skills": ["python-development"],
             "success_criteria": ["calculator.py exists."],

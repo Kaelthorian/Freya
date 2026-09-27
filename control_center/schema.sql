@@ -112,6 +112,56 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 CREATE INDEX IF NOT EXISTS idx_approvals_status_created ON approval_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_task ON approval_requests(task_id);
 
+CREATE TABLE IF NOT EXISTS cross_task_modification_requests (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    requester_plan_task_id TEXT NOT NULL,
+    requester_runtime_task_id TEXT NOT NULL REFERENCES tasks(id),
+    requester_agent_id TEXT NOT NULL REFERENCES agents(id),
+    target_owner_plan_task_id TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    normalized_target_path TEXT NOT NULL,
+    requested_operation TEXT NOT NULL,
+    requested_change TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    needed_for TEXT NOT NULL,
+    blocking INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    approval_id TEXT NOT NULL UNIQUE REFERENCES approval_requests(id),
+    approval_source TEXT NOT NULL DEFAULT '',
+    grant_id TEXT,
+    intent_match_json TEXT NOT NULL DEFAULT '{}',
+    owner_runtime_task_id TEXT REFERENCES tasks(id),
+    owner_agent_id TEXT REFERENCES agents(id),
+    owner_evaluation_json TEXT NOT NULL DEFAULT '{}',
+    human_resolution TEXT NOT NULL DEFAULT '',
+    owner_task_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cross_task_requests_run_status
+    ON cross_task_modification_requests(orchestration_id,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_cross_task_requests_approval
+    ON cross_task_modification_requests(approval_id);
+
+CREATE TABLE IF NOT EXISTS cross_task_intent_grants (
+    id TEXT PRIMARY KEY,
+    orchestration_id TEXT NOT NULL REFERENCES orchestration_runs(id),
+    requester_plan_task_id TEXT NOT NULL,
+    owner_plan_task_id TEXT NOT NULL,
+    normalized_target_path TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    approved_intent_json TEXT NOT NULL,
+    approver TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    source_request_json TEXT NOT NULL,
+    human_resolution TEXT NOT NULL,
+    source_approval_id TEXT NOT NULL REFERENCES approval_requests(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_task_grants_scope
+    ON cross_task_intent_grants(orchestration_id,requester_plan_task_id,owner_plan_task_id,
+                                normalized_target_path,operation);
+
 CREATE INDEX IF NOT EXISTS idx_executions_status ON task_executions(status);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON log_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_agent_id ON log_events(agent_id, id);

@@ -19,13 +19,16 @@ from .task_analyst import (TaskAnalysisError, canonical_task_kind,
                            validate_task_analysis)
 from .integration_proof import STRUCTURAL_CRITERIA, criterion_key
 from .runtime_resources import (
-    RuntimeResourceCatalog, UnknownTool, UnsupportedResourceRequirement,
+    RuntimeResourceCatalog, SEMANTIC_OPERATION_CAPABILITIES, UnknownTool,
+    UnsupportedResourceRequirement,
 )
 from .skills import SkillCompatibilityError
 from .plan_scope import PlannerScopeError, reconcile_plan_scope, semantic_plan_snapshot
+from .cross_task import (CrossTaskRequestError, normalize_owned_paths, owned_path_key)
 
 
-PLAN_SCHEMA_VERSION = 1
+SEMANTIC_PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 4
 MAX_PLAN_TASKS = 20
 # User prompts are accepted without an application-level character limit.
 # The model/provider context window and HTTP transport remain the practical
@@ -53,7 +56,8 @@ TASK_FIELDS = {
     "id", "objective", "description", "depends_on", "required_capabilities",
     "preferred_skills", "success_criteria",
 }
-TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools"}
+TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools",
+                        "semantic_operations", "owned_paths"}
 TASK_KIND_VALUES = {
     "file_creation", "program_creation", "code_change", "review", "testing",
     "analysis", "external_action", "general",
@@ -83,10 +87,11 @@ PLAN_RESPONSE_FORMAT = {
                     "semantic_needs": {"type": "array", "items": {"type": "string"}},
                     "required_tools": {"type": "array", "items": {"type": "string"}},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
+                    "owned_paths": {"type": "array", "items": {"type": "string"}},
                     "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                     "task_characteristics": {"type": "object"},
                 },
-                "required": sorted(TASK_FIELDS),
+                "required": sorted(TASK_FIELDS | {"owned_paths"}),
                 "additionalProperties": False,
             },
         },
@@ -136,24 +141,27 @@ def _resource_array_schema(context: dict[str, Any], resource_type: str) -> dict[
 
 
 def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
-    """Build a closed resource-reference schema from the current catalog."""
+    """Build a closed semantic-operation schema without runtime authority fields."""
+    operation_records = context.get("semantic_operations", [])
+    operation_ids = sorted({item["id"] for item in operation_records
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)})
+    if not operation_ids:
+        operation_ids = sorted(SEMANTIC_OPERATION_CAPABILITIES)
     task_fields = {
         "key": {"type": "string"},
+        "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
         "objective": {"type": "string"},
         "description": {"type": "string"},
         "depends_on": {"type": "array", "items": {"type": "string"}},
         "semantic_needs": {"type": "array", "items": {"type": "string"}},
-        "required_capabilities": _resource_array_schema(context, "capability"),
-        "required_tools": _resource_array_schema(context, "tool"),
-        "preferred_skills": _resource_array_schema(context, "skill"),
+        "operations": {"type": "array", "items": {"type": "string", "enum": operation_ids}},
         "success_criteria": {"type": "array", "items": {"type": "string"}},
+        "owned_paths": {"type": "array", "items": {"type": "string"}},
     }
     unsupported = {"type": "array", "items": {"type": "object", "properties": {
         "semantic_need": {"type": "string"},
-        "resource_type": {"type": "string", "enum": ["capability", "tool", "skill"]},
-        "resource_id": {"type": "string"},
         "reason": {"type": "string"},
-    }, "required": ["semantic_need", "resource_type", "reason"], "additionalProperties": False}}
+    }, "required": ["semantic_need", "reason"], "additionalProperties": False}}
     return {
         "type": "object",
         "properties": {
@@ -161,7 +169,7 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
                       "items": {"type": "object", "properties": task_fields,
-                                "required": sorted(task_fields), "additionalProperties": False}},
+            "required": sorted(task_fields), "additionalProperties": False}},
             "unsupported_requirements": unsupported,
         },
         "required": ["summary", "success_criteria", "tasks", "unsupported_requirements"],
@@ -279,6 +287,13 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 break
         return result
 
+    try:
+        owned_paths = normalize_owned_paths(
+            [path for task in tasks for path in task.get("owned_paths", [])]
+        )
+    except CrossTaskRequestError as exc:
+        raise PlanValidationError(f"Collapsed task owned_paths are invalid: {exc}") from exc
+
     objective = str(plan.get("goal") or tasks[0]["objective"]).strip()
     if len(objective) > MAX_OBJECTIVE_CHARS:
         objective = str(tasks[0]["objective"]).strip()[:MAX_OBJECTIVE_CHARS]
@@ -302,6 +317,7 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
             [criterion for task in tasks for criterion in task.get("success_criteria", [])],
             MAX_CRITERIA,
         ),
+        "owned_paths": owned_paths,
     }
     collapsed = dict(plan)
     collapsed["complexity"] = "simple"
@@ -325,7 +341,8 @@ def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_python_console_calculator(plan: dict[str, Any],
-                                         task_spec: dict[str, Any]) -> dict[str, Any]:
+                                         task_spec: dict[str, Any],
+                                         resource_catalog: RuntimeResourceCatalog | None = None) -> dict[str, Any]:
     """Keep the user's one-file calculator request to implementation plus QA."""
     objective = str(task_spec.get("objective") or "").casefold()
     context_text = " ".join(
@@ -353,8 +370,10 @@ def _normalize_python_console_calculator(plan: dict[str, Any],
     normalized["complexity"] = "simple"
     normalized["success_criteria"] = criteria
     normalized.pop(CRITERION_LINKS_FIELD, None)
-    normalized["tasks"] = [{
+    from .plan_compiler import compile_semantic_task_resources
+    normalized["tasks"] = [compile_semantic_task_resources({
         "id": "task-1",
+        "task_kind": "program_creation",
         "objective": "Implement the Python console calculator.",
         "description": (
             "Create calculator.py once. Read two numbers from standard input, add them, and print "
@@ -363,31 +382,31 @@ def _normalize_python_console_calculator(plan: dict[str, Any],
             "calculator.py and read it back once. Do not overwrite, modify, or create another file."
         ),
         "depends_on": [],
-        "required_capabilities": ["filesystem.create", "filesystem.read"],
-        "required_tools": ["write_file", "read_file"],
+        "operations": ["create_file", "read_file"],
+        "owned_paths": ["calculator.py"],
         "semantic_needs": [
             "Create calculator.py as a Python console program.",
             "Read two numbers from standard input, add them, print int(total) only for integer-valued sums, and preserve fractional output.",
             "Write the source file once, read it back once, and do not attempt a second write.",
             "Leave controlled execution and output verification to the dependent verification task.",
         ],
-        "preferred_skills": ["python-development"],
         "success_criteria": [criteria[0]],
-    }]
+    }, resource_catalog)]
     return validate_plan(normalized)
 
-def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[str, Any]:
+def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None,
+                            resource_catalog: RuntimeResourceCatalog | None = None) -> dict[str, Any]:
     """Add exactly one read-only Code Review task after code/file changes."""
     if _is_trivial_task(plan, analysis):
         return plan
     tasks = plan.get("tasks", [])
     if not isinstance(tasks, list) or len(tasks) >= MAX_PLAN_TASKS:
         return plan
-    capabilities = {
-        str(capability) for task in tasks
-        for capability in task.get("required_capabilities", [])
+    operations = {
+        str(operation) for task in tasks
+        for operation in task.get("semantic_operations", [])
     }
-    if not capabilities.intersection({"filesystem.create", "filesystem.modify", "filesystem.overwrite"}):
+    if not operations.intersection({"create_file", "modify_file", "overwrite_file"}):
         return plan
     if any(_is_code_audit_task(task) for task in tasks):
         return plan
@@ -399,8 +418,10 @@ def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[
         suffix += 1
     audited = dict(plan)
     audited["complexity"] = "multi_step"
-    audited["tasks"] = [*tasks, {
+    from .plan_compiler import compile_semantic_task_resources
+    audited["tasks"] = [*tasks, compile_semantic_task_resources({
         "id": audit_id,
+        "task_kind": "review",
         "objective": "Audit the code produced for the user's request",
         "description": (
             "Perform a read-only code audit after implementation. Inspect the current workspace, "
@@ -408,17 +429,17 @@ def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None) -> dict[
             "or execute commands. Report confirmed findings and hypotheses separately."
         ),
         "depends_on": [task["id"] for task in tasks],
-        "required_capabilities": ["filesystem.read"],
-        "preferred_skills": ["code-review"],
+        "operations": ["read_file"],
         "success_criteria": [
             "The changed code is inspected with the Code Review skill.",
             "Findings include severity, evidence and file references, or clearly state that no findings were detected.",
         ],
-    }]
+    }, resource_catalog)]
     return validate_plan(audited)
 
 
-def _append_qa_task(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
+def _append_qa_task(plan: dict[str, Any], analysis: Any,
+                    resource_catalog: RuntimeResourceCatalog | None = None) -> dict[str, Any]:
     """Insert one independent QA node when observable input must be tested."""
     if not isinstance(analysis, dict):
         return plan
@@ -452,7 +473,8 @@ def _append_qa_task(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
     while qa_id in ids:
         qa_id = f"qa-interactive-test-{suffix}"
         suffix += 1
-    qa = {
+    from .plan_compiler import compile_semantic_task_resources
+    qa = compile_semantic_task_resources({
         "id": qa_id,
         "objective": "QA-test the interactive behavior with controlled input",
         "description": (
@@ -463,21 +485,19 @@ def _append_qa_task(plan: dict[str, Any], analysis: Any) -> dict[str, Any]:
             "runtime, report the exact unsupported boundary instead of waiting or inventing success."
         ),
         "depends_on": [task["id"] for task in implementation_tasks],
-        "required_capabilities": ["filesystem.read", "execution.python_script"],
-        "required_tools": ["read_file", "run_command"],
+        "operations": ["read_file", "run_python_script"],
         "semantic_needs": [
             "Read the implemented program.",
             "Run it with bounded controlled stdin and capture output and exit status.",
         ],
         "task_kind": "testing",
         "task_characteristics": {"interactive": True, "requires_user_input": True},
-        "preferred_skills": ["interactive-testing"],
         "success_criteria": [
             "Representative controlled input completes without timeout or crash.",
             "Observed output is logically correct for the supplied input.",
             "The QA report cites the command, bounded stdin case, exit status and observed output.",
         ],
-    }
+    }, resource_catalog)
     updated = dict(plan)
     updated["complexity"] = "multi_step"
     # If the Planner model already emitted an audit node, normalize it behind
@@ -1098,6 +1118,27 @@ def _normalize_criterion_links(raw: Any, criteria: list[str], tasks: list[dict[s
     return {"global": normalized_global, "local": validated_local}
 
 
+def _inferred_owned_paths(objective: str, task_kind: str,
+                          capabilities: list[str]) -> list[str]:
+    """Recover concrete names already present in intent for deterministic plans."""
+    if not set(capabilities) & {"filesystem.create", "filesystem.modify", "filesystem.overwrite"}:
+        return []
+    matches = re.findall(
+        r"(?<![\w])(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10}(?![\w])",
+        objective,
+    )
+    if matches:
+        try:
+            return normalize_owned_paths(list(dict.fromkeys(matches)))
+        except CrossTaskRequestError:
+            return []
+    if task_kind == "program_creation":
+        return ["main.py"]
+    if task_kind == "file_creation":
+        return ["output.txt"]
+    return []
+
+
 def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                    repair_model_criteria: bool = False) -> dict[str, Any]:
     """Return a stable representation while enforcing field types and bounds."""
@@ -1142,11 +1183,30 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                              if tool not in known_tools]
             if unknown_tools:
                 raise UnknownTool(unknown_tools[0])
+        if "semantic_operations" in task:
+            operations = _text_list(
+                task["semantic_operations"], f"plan.tasks[{index}].semantic_operations",
+                MAX_CAPABILITIES, identifiers=False,
+            )
+            unknown_operations = [operation for operation in operations
+                                  if operation not in SEMANTIC_OPERATION_CAPABILITIES]
+            if unknown_operations:
+                raise PlanValidationError(
+                    f"Unknown semantic operation: {unknown_operations[0]}."
+                )
+            normalized_task["semantic_operations"] = operations
         if "semantic_needs" in task:
             normalized_task["semantic_needs"] = _text_list(
                 task["semantic_needs"], f"plan.tasks[{index}].semantic_needs",
                 MAX_CRITERIA, identifiers=False,
             )
+        if "owned_paths" in task:
+            try:
+                normalized_task["owned_paths"] = normalize_owned_paths(task["owned_paths"])
+            except CrossTaskRequestError as exc:
+                raise PlanValidationError(
+                    f"plan.tasks[{index}].owned_paths is invalid: {exc}"
+                ) from exc
         if "task_kind" in task:
             task_kind = _text(task["task_kind"], f"plan.tasks[{index}].task_kind", 64).casefold()
             if task_kind not in TASK_KIND_VALUES:
@@ -1193,6 +1253,16 @@ def validate_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
     ids = [task["id"] for task in plan["tasks"]]
     if len(ids) != len(set(ids)):
         raise PlanValidationError("Task IDs must be unique after normalization.")
+    ownership: dict[str, str] = {}
+    for task in plan["tasks"]:
+        for path in task.get("owned_paths", []):
+            key = owned_path_key(path)
+            previous = ownership.get(key)
+            if previous and previous != task["id"]:
+                raise PlanValidationError(
+                    f"Conflicting write ownership for {path}: {previous} and {task['id']}."
+                )
+            ownership[key] = task["id"]
     known = set(ids)
     graph: dict[str, list[str]] = {}
     for task in plan["tasks"]:
@@ -1440,8 +1510,6 @@ class Planner:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
                 raise PlanValidationError("Planner output is not valid JSON.") from exc
-        if resource_catalog is not None:
-            value = resource_catalog.validate_semantic_plan(value)
         value = _expand_model_task_ids(value, diagnostics)
         value = _remove_analyst_acceptance_placeholders(value, analysis, diagnostics)
         declared_links = isinstance(value, dict) and CRITERION_LINKS_FIELD in value
@@ -1486,7 +1554,7 @@ class Planner:
             "in the criterion text field or copy the Analyst's generic AC text unless that full text "
             "is also a plan success_criteria entry. "
             "complexity is simple or multi_step. Each task requires id, objective, description, "
-            "depends_on, semantic_needs, required_capabilities, required_tools, preferred_skills, success_criteria. "
+        "depends_on, semantic_needs, required_capabilities, required_tools, preferred_skills, success_criteria, owned_paths. "
             "Use at most 20 tasks, unique stable IDs, existing dependency IDs, and an acyclic graph. "
             "Prefer the smallest plan that can completely satisfy the user goal. "
             "Trivial work MUST remain a single task when one agent can complete it directly. "
@@ -1520,6 +1588,13 @@ class Planner:
         )
 
     def create_plan(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build a legacy concrete-resource plan for compatibility callers.
+
+        The built-in Task Spec path must use ``create_plan_for_spec`` so that
+        Planner emits semantic operations and the Plan Compiler owns resource
+        resolution. This method remains for injected pre-Semantic-Plan adapters
+        and historical callers during migration.
+        """
         goal = _text(prompt, "prompt", MAX_GOAL_CHARS)
         self._reset_metrics()
         limited_context = dict(context) if isinstance(context, dict) else {}
@@ -1596,40 +1671,42 @@ class Planner:
         self._reset_metrics()
         public_spec = {key: value for key, value in spec.items()
                        if key not in {"source_prompt", "clarification_history", "clarification_questions"}}
-        limited_context = {**(context or {}), "task_spec": public_spec, "_semantic_plan": True}
-        resource_catalog = RuntimeResourceCatalog.from_context(limited_context)
-        limited_context.update(resource_catalog.as_dict())
-        self.metrics.update({
+        catalog_context = {**(context or {}), "task_spec": public_spec}
+        resource_catalog = RuntimeResourceCatalog.from_context(catalog_context)
+        limited_context = {
+            "task_spec": public_spec,
+            "_semantic_plan": True,
             "resource_catalog_version": resource_catalog.version,
-            "available_capability_ids": resource_catalog.ids("capability"),
-            "available_tool_ids": resource_catalog.ids("tool"),
-            "available_skill_ids": resource_catalog.ids("skill"),
-        })
-        resource_view = {
-            "capabilities": limited_context["capabilities"],
-            "tools": limited_context["tools"],
-            "skills": limited_context["skills"],
+            "semantic_operations": resource_catalog.semantic_operations,
         }
+        self.metrics.update({
+            "semantic_plan_schema_version": SEMANTIC_PLAN_SCHEMA_VERSION,
+            "compiled_plan_schema_version": PLAN_SCHEMA_VERSION,
+            "resource_catalog_version": resource_catalog.version,
+            "available_semantic_operation_ids": sorted(
+                item["id"] for item in resource_catalog.semantic_operations),
+        })
+        resource_view = {"semantic_operations": resource_catalog.semantic_operations}
         request = (
             PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS + "\n\n"
             "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
-            "success_criteria and tasks. Each task has a meaningful key, objective, description, "
-            "depends_on (semantic task keys), semantic_needs, required_capabilities, required_tools, "
-            "preferred_skills and "
-            "success_criteria. Do not supply runtime IDs, criterion IDs, criterion links, "
+            "success_criteria and tasks. Each task has a meaningful key, task_kind, objective, description, "
+            "depends_on (semantic task keys), semantic_needs, operations, success_criteria and owned_paths. "
+            "task_kind must be one of " + json.dumps(sorted(TASK_KIND_VALUES)) + ". "
+            "For a write task, choose a precise, "
+            "workspace-relative exact file path; do not use broad patterns. Do not supply runtime IDs, "
+            "criterion IDs, criterion links, "
             "execution nodes or UUIDs; Freya compiles those deterministically. Use the fewest "
             "workers needed. Decide implementation, controlled QA, research and audit only when "
-            "justified. No task may reinterpret the original human prompt. Keep semantic_needs "
-            "separate from resource IDs. Use only exact resource IDs from the catalog below or a "
-            "unique explicitly declared alias; never invent capability, tool, or Skill IDs. Prefer "
-            "precise required_capabilities; required_tools may be omitted because Freya resolves "
-            "their registered transports. When tools are selected without capabilities, Freya derives "
-            "only a capability justified by a specific semantic operation. Do not duplicate the registry relationship by hand. "
+            "justified. No task may reinterpret the original human prompt. Operations are semantic "
+            "work descriptions, not tool or permission IDs. Select only operation IDs from the catalog; "
+            "do not return required_capabilities, required_tools, Skills, agent IDs, or tool IDs. "
+            "Freya deterministically maps operations to runtime resources. Keep semantic_needs "
+            "as explanations and include every concrete operation needed by the task. "
             "Creating a web artifact does not imply deployment, publication, hosting, or external execution. "
-            "A selected tool never grants permission. If a "
-            "need has no matching catalog resource, report it in unsupported_requirements. "
-            "Capabilities are requirements, not permission grants; runtime policy remains authoritative. "
-            "Runtime resource catalog: "
+            "If a requested semantic operation is not represented, describe it in unsupported_requirements "
+            "using only semantic_need and reason. Runtime policy remains authoritative. "
+            "Semantic operation catalog: "
             + json.dumps(resource_view, ensure_ascii=False, separators=(",", ":"))
             + ". Canonical Task Spec: "
             + render_task_spec(spec)
@@ -1640,15 +1717,21 @@ class Planner:
             objective = spec["objective"]
             lower = objective.casefold()
             programming = any(word in lower for word in ("calculadora", "calculator", "programa", "script"))
-            capabilities = ["filesystem.create", "filesystem.read"] if programming else ["filesystem.read"]
+            operations = ["create_file", "read_file"] if programming else ["read_file"]
+            owned_paths = _inferred_owned_paths(
+                objective, "program_creation" if programming else "file_creation",
+                ["filesystem.create"] if programming else [],
+            )
             if programming and "python" in lower:
-                capabilities.append("execution.python_script")
+                operations.append("run_python_script")
             semantic = {"summary": objective, "tasks": [{
                 "key": "implement", "objective": objective,
+                "task_kind": "program_creation" if programming else "general",
                 "description": "Complete the specified deliverable in the selected workspace and verify it.",
                 "depends_on": [], "semantic_needs": ["Create and inspect the requested program."],
-                "required_capabilities": capabilities,
-                "required_tools": [], "preferred_skills": [], "success_criteria": [
+                "operations": operations,
+                "owned_paths": owned_paths,
+                "success_criteria": [
                     "The requested artifact exists and can be inspected."],
             }], "success_criteria": [], "unsupported_requirements": []}
             self.metrics["mode"] = "deterministic"
@@ -1694,14 +1777,14 @@ class Planner:
                 value, scope_adjustments = reconcile_plan_scope(spec, value)
                 self.metrics["scope_adjustments"] = scope_adjustments
                 value = resource_catalog.validate_semantic_plan(value)
-                resource_resolutions = list(resource_catalog.resource_resolutions)
+                planner_resource_resolutions = list(resource_catalog.resource_resolutions)
                 plan = compile_semantic_plan(value, spec, resource_catalog=resource_catalog)
-                self.metrics["resource_resolutions"] = resource_resolutions
-                plan = _normalize_python_console_calculator(plan, spec)
+                plan = _normalize_python_console_calculator(plan, spec, resource_catalog)
                 objective = spec["objective"].casefold()
                 if ("python" in objective and any(word in objective for word in
                     ("calculadora", "calculator"))):
-                    plan = _append_qa_task(plan, {"task_characteristics": {"requires_user_input": True}})
+                    plan = _append_qa_task(
+                        plan, {"task_characteristics": {"requires_user_input": True}}, resource_catalog)
                     qa_task = next((task for task in plan["tasks"]
                                     if task["id"].startswith("qa-interactive-test")), None)
                     if qa_task is not None and ("calculadora" in objective or "calculator" in objective):
@@ -1743,6 +1826,41 @@ class Planner:
                             link["supports_global_criteria"] = list(dict.fromkeys([
                                 *link["supports_global_criteria"], *behavior_globals]))
                 compiled = validate_plan(plan)
+                resource_resolutions = [item for item in planner_resource_resolutions
+                                        if item.get("action") in {
+                                            "planner_tool_hint_ignored",
+                                            "planner_capability_declaration_ignored",
+                                        }]
+                for task in compiled["tasks"]:
+                    for operation in task.get("semantic_operations", []):
+                        capabilities, tools = resource_catalog.resources_for_operations([operation])
+                        for capability, tool in zip(capabilities, tools):
+                            resource_resolutions.append({
+                                "task_key": task["id"],
+                                "semantic_operation": operation,
+                                "semantic_needs": list(task.get("semantic_needs", [])),
+                                "semantic_source": "compiled_plan",
+                                "resolved_capability": capability,
+                                "resolved_tool": tool,
+                                "resolution_source": "runtime_catalog",
+                            })
+                self.metrics["resource_resolutions"] = resource_resolutions
+                self.metrics["compiled_runtime_plan"] = {
+                    "schema_version": PLAN_SCHEMA_VERSION,
+                    "tasks": [{
+                        "id": task["id"],
+                        "task_kind": task.get("task_kind"),
+                        "depends_on": list(task["depends_on"]),
+                        "semantic_operations": list(task.get("semantic_operations", [])),
+                        "required_capabilities": list(task.get("required_capabilities", [])),
+                        "required_tools": list(task.get("required_tools", [])),
+                        "owned_paths": list(task.get("owned_paths", [])),
+                    } for task in compiled["tasks"]],
+                }
+                self.metrics["ownership_resolutions"] = [{
+                    "task_id": task["id"],
+                    "owned_paths": list(task.get("owned_paths", [])),
+                } for task in compiled["tasks"]]
                 preferred_skill_warnings = resource_catalog.preferred_skill_warnings_for_tasks(
                     compiled["tasks"])
                 self.metrics["preferred_skill_warnings"] = preferred_skill_warnings
@@ -1754,6 +1872,13 @@ class Planner:
                 record["scope_adjustments"] = scope_adjustments
                 record["resource_resolutions"] = resource_resolutions
                 record["planner_semantic_plan"] = snapshot
+                record["semantic_plan_source"] = (
+                    "planner_model" if self.decide is not None else "deterministic_fallback"
+                )
+                record["semantic_plan_schema_version"] = SEMANTIC_PLAN_SCHEMA_VERSION
+                record["compiled_plan_schema_version"] = PLAN_SCHEMA_VERSION
+                record["compiled_runtime_plan"] = self.metrics["compiled_runtime_plan"]
+                record["ownership_resolutions"] = self.metrics["ownership_resolutions"]
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 return compiled

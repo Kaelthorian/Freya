@@ -78,47 +78,64 @@ before accepting the candidate. Inspect `task_analysis.contract_invalid` and
 the `fallback_*` metrics to identify the exact field if repair still fails.
 
 The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
-The catalog is rebuilt from `capabilities.py`, worker schemas exposed by
-`Toolbox`, and the one active Skill, `freya-core`. It sends capability
-operation summaries, tool purposes, and Skill descriptions/use cases plus
-required/recommended capability metadata, without
-Skill instruction bodies. Resource ID enums in the Ollama response schema are
-dynamic. The Planner chooses semantic needs, capabilities, tool references,
-preferred Skills and QA. `plan_scope.py` first removes optional unrequested
-external actions/criteria and rewires dependencies. Mixed external/artifact
-tasks or loss of a Task Spec validation check fail closed. Resource references
-are then validated;
-unknown or ambiguous IDs fail as `UnsupportedResourceRequirement` without a
-second LLM repair call. `plan_compiler.py` checks those references again,
-generates runtime IDs, links criteria and validates the DAG. Workers
-receive a deterministic rendering of the Task Spec, never an independent
-`operational_prompt`. The old Analyst v3 path is retained for injected
-compatibility adapters and historical tests.
+The catalog is rebuilt from `capabilities.py` and worker schemas exposed by
+`Toolbox`. It provides semantic operation IDs and descriptions. Planner emits
+task meaning, dependencies, outcomes, criteria, semantic needs and exact
+`owned_paths`; it never emits capabilities, tools or Skills. `plan_scope.py`
+first removes optional unrequested external actions and criteria, then rewires
+dependencies. Mixed external/artifact tasks or loss of a Task Spec validation
+check fail closed. Workers receive a deterministic rendering of the Task Spec,
+never an independent `operational_prompt`. The old Analyst v3 path is retained
+for injected compatibility adapters and historical tests.
 
-Planner `preferred_skills` values, including obsolete IDs, are normalized to
-`freya-core`; the resolver can record one ignored-preference warning. Every
-dynamic agent receives that Skill. Its declared tool list is validated against
-the global `Toolbox` registry at Store startup. Task capabilities and Policy
-still determine the effective tool surface. Unknown tools and incompatible
-tool/capability pairs remain errors.
+Semantic Plan schema version 2 is compiled into runtime plan schema version 4.
+The Runtime Resource Catalog owns the canonical semantic-operation to
+capability to tool mapping; `plan_compiler.py` alone applies it. Each semantic
+task includes `task_kind`; AgentFactory consumes that compiled classification.
+For example, `modify_file` derives `filesystem.modify` and `edit_file`; `create_file` derives
+`filesystem.create` and `write_file`; `run_python_script` derives
+`execution.python_script` and `run_command`; and `run_pytest` derives
+`execution.pytest` and `run_command`. Unknown operations and unsupported
+external actions fail closed. A real structural contradiction can receive one
+bounded repair; an unknown or unsupported resource cannot.
 
-Resource Resolver derives a capability only from a specific task operation
-(for example,
-`run_command` plus “Execute a Python script” yields
-`execution.python_script`; “Run pytest” yields `execution.pytest`). A tool
-proposal alone gives no authority. An unneeded `run_command` is removed;
-an ambiguous needed command raises `ToolCapabilityMismatch` when its declared
-capabilities do not support it. `planning_metrics.planner_semantic_plan` and
+`Planner.create_plan` is a compatibility-only API for injected pre-Semantic-Plan
+adapters and historical callers. The built-in Task Spec orchestration requires
+`create_plan_for_spec`; that path compiles semantic operations before scheduling.
+New adapters should implement the Task Spec method and must not select runtime
+capabilities or tools.
+
+Tasks that own files declare exact `owned_paths`; duplicate file owners and unsafe
+relative paths fail planning. A requester does not claim an existing owner's file.
+Worker ownership enforcement is separate from
+capability policy: a foreign read still follows `filesystem.read`, while a
+foreign write stops before mutation and opens a durable cross-task request.
+Intent grants never cross an orchestration, requester, owner, exact path or
+operation boundary. Only an explicitly approved, same-scope intent match may
+avoid another human prompt. The derived owner change agent receives only the
+owner's pre-existing read/write capabilities and one-file scope after the
+original owner node finishes, then uses the ordinary selector, runtime and
+evaluator. A failed or uncertain handoff resumes
+the requester with the cause; it never silently broadens scope or capabilities.
+Restart recovery closes unfinished handoffs and their pending approvals with the
+interrupted orchestration instead of leaving actionable approvals behind.
+
+Every dynamic agent receives `freya-core`. Its declared tool list is checked
+against `Toolbox`, while the compiled capability policy determines the
+effective tool surface. Planner Skill preferences are ignored and cannot
+change assignment or authority.
+
+`planning_metrics.planner_semantic_plan` and
 `freya.plan_compiler.started.planner_semantic_plan` retain a bounded sanitized
-pre-resolution task view. `freya.plan.scope_adjusted` records omitted external
-work and compiler details include resource resolutions.
+semantic snapshot. `freya.plan.resources_resolved` and
+`freya.plan.ownership_resolved` record the compiler's separate runtime and
+owner decisions; `freya.plan.scope_adjusted` records omitted external work.
 
-Planner reconciliation is a safety floor over both sources: if the model plan
-contains a write or local execution, it derives `filesystem.read` for
-read-back; it removes `filesystem.overwrite` unless the user explicitly asked
-to replace an existing artifact; and it collapses an accidental audit node from
-an otherwise simple file/program task. A language mention in a debugging task
-does not turn that task into Python program creation.
+Planner reconciliation preserves Task Spec intent, adds read-back operations
+for writes, removes overwrite unless replacement was explicitly requested,
+and collapses accidental audit nodes for simple file/program work. A language
+mention in a debugging task does not turn that task into Python program
+creation.
 
 After planning, Freya creates one ephemeral least-privilege agent for each ready
 plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
@@ -127,9 +144,10 @@ seven declared tools come from the Skill, while Policy selects the effective
 worker schemas and evaluates every invocation. Planner Skill preferences do
 not affect assignment. Provenance is persisted for audit and terminal cleanup.
 
-For a generic file, the Planner creates one dynamic worker with
-`filesystem.create` plus read-back `filesystem.read`. A Python Hello World
-task additionally needs `execution.python_script` to run the result.
+For a generic file, Planner requests `create_file` plus `read_file`; the Plan
+Compiler derives `filesystem.create`/`write_file` and read-back
+`filesystem.read`/`read_file`. A Python Hello World task additionally requests
+`run_python_script`, compiled to `execution.python_script`/`run_command`.
 These low-risk flows finish after the requested artifact is written, read back,
 and, for Python, executed with exit code 0 and expected output. Their worker
 prompt is generated from the exact effective `box.schemas` surface, so an
@@ -138,8 +156,9 @@ Git, a test suite, QA, or a Code Auditor. Skill tools never expand task policy.
 
 For a Python console calculator that needs interactive input, the semantic
 plan normalizer collapses model-created file/function/test subtasks into one
-implementation node, then appends one dependent QA node. QA receives
-`filesystem.read` and `execution.python_script`, with `freya-core` assigned.
+implementation node, then appends one dependent QA node. QA requests
+`read_file` and `run_python_script`; the Plan Compiler derives its effective
+capabilities and tools.
 For this exact one-case calculator request, Freya uses `run_command` once with
 bounded stdin lines `3` and `5` to verify output `8` and exit code `0`. The
 implementation receives only `filesystem.create` and `filesystem.read`;

@@ -181,48 +181,64 @@ Planner repair call.
 
 ```json
 {
-  "goal": "Repair authentication and verify the fix",
-  "summary": "Inspect, diagnose, fix and verify authentication.",
-  "complexity": "simple",
+  "summary": "Inspect, repair and verify authentication.",
+  "success_criteria": ["Authentication is repaired and verified."],
   "tasks": [{
-    "id": "repair-auth",
+    "key": "repair-auth",
+    "task_kind": "code_change",
     "objective": "Repair and verify authentication",
     "description": "Inspect the login flow, repair the fault and verify the result.",
     "depends_on": [],
-    "required_capabilities": ["filesystem.read", "filesystem.modify"],
-    "preferred_skills": ["python-development"],
-    "success_criteria": ["A regression check confirms that login works after the fix."]
+    "semantic_needs": ["Read and modify the existing authentication files."],
+    "operations": ["read_file", "modify_file", "run_pytest"],
+    "success_criteria": ["A regression check confirms that login works after the fix."],
+    "owned_paths": ["src/auth.py"]
   }],
-  "success_criteria": ["Authentication is repaired and verified."],
-  "criterion_links": {
-    "global": [{"id": "gc-1", "criterion": "Authentication is repaired and verified."}],
-    "local": [{"id": "tc-repair-auth-1", "task_id": "repair-auth",
-      "criterion": "A regression check confirms that login works after the fix.",
-      "supports_global_criteria": ["gc-1"]}]
-  }
+  "unsupported_requirements": []
 }
 ```
 
-`required_capabilities` are validated registry IDs that describe likely task
-needs; they do not grant permission. Planner `preferred_skills` values are
-ignored and normalized to `freya-core`, including unknown old IDs. The Analyst also
-records a canonical internal `task_kind`; the Planner uses it to derive safe
-verification needs. A write normally adds `filesystem.read` for read-back, and
-a Python program adds `execution.python_script`; `filesystem.overwrite` is not
-added unless explicitly required. Low-risk file/program creation stays one task
-without QA or `code-audit`; interactive work gets QA and more complex mutation
-plans may get a dependent read-only audit.
-Planner reconciliation also repairs model plans that contradict the Analyst:
-local writes/execution receive read-back evidence, accidental overwrite is
-removed, and a debugging task mentioning Python is not reclassified as program
-creation. Normalized task metadata also retains `task_kind` and available
-boolean `task_characteristics` hints for AgentFactory selection.
-For every ready plan task, Freya creates a validated ephemeral agent. Its complete
-policy allows only the declared requirements (`ask` for dangerous capabilities)
-and denies the rest. The factory assigns `freya-core` and reads its declared
-tools directly. The agent's effective Tool list remains the policy projection;
-the Skill never adds capability authority. Unknown tool IDs and incompatible
-tool/capability pairs remain errors.
+This Semantic Plan schema is version 2. Each task includes a `task_kind` for
+AgentFactory. Its `operations` are registered semantic IDs, not runtime tools
+or permissions. The Plan Compiler maps
+`modify_file` to `filesystem.modify`/`edit_file`, `create_file` to
+`filesystem.create`/`write_file`, and `run_pytest` to
+`execution.pytest`/`run_command`. The compiled plan schema is version 4 and is
+the only input to AgentFactory. Legacy capability and tool declarations are
+ignored as non-authoritative hints. Unknown operations and unsupported external
+actions fail closed; only genuine structural contradictions get one bounded
+repair. The Planner owns `task_kind`; the Task Analyst records only canonical
+user intent. A write adds read-back verification, overwrite requires explicit
+replacement intent, and a Python mention in a debugging task does not
+reclassify it as program creation.
+
+For example, the compiler persists a runtime task equivalent to:
+
+```json
+{
+  "id": "task-1",
+  "task_kind": "code_change",
+  "semantic_operations": ["modify_file"],
+  "required_tools": ["edit_file"],
+  "required_capabilities": ["filesystem.modify"],
+  "owned_paths": ["src/auth.py"]
+}
+```
+Low-risk file/program creation remains one task; interactive work can add a
+dependent QA task. Duplicate normalized path owners fail compilation.
+Existing persisted runtime plans keep their compiled `required_capabilities` and
+`required_tools` snapshots and need no database schema migration. New planning,
+Recovery and Integration responses use semantic operation fields. A legacy
+injected adapter may still return resource hints, but those hints are discarded
+before runtime compilation. Newly appended or recovered tasks require a
+registered `task_kind`; their resources are derived through the same catalog and
+Recovery cannot exceed the superseded task resource budget.
+For every ready plan task, Freya creates a validated ephemeral agent. Its
+complete policy allows only compiled requirements (`ask` for dangerous
+capabilities) and denies the rest. The factory assigns `freya-core` and cannot
+add capabilities or tools. The effective Tool list remains the policy
+projection; the Skill never adds capability authority. Unknown tool IDs and
+incompatible tool/capability pairs remain errors.
 
 After planning, `freya.agent_factory.started` precedes construction.
 `freya.agent_created` identifies the generated agent, role, Planner preferred
@@ -374,7 +390,19 @@ integration adapters are loopback-only and tool-free.
 | GET | `/api/approvals/{id}` | read one sanitized approval request |
 | POST | `/api/approvals/{id}/approve-once` | approve the exact action once |
 | POST | `/api/approvals/{id}/approve-task` | approve matching actions for this task |
+| POST | `/api/approvals/{id}/approve-file-intent` | approve a cross-task change and allow high-confidence same-purpose reuse for this exact file and orchestration scope |
 | POST | `/api/approvals/{id}/deny` | deny the pending action |
+
+Cross-task approvals appear in the same pending-approval list and include
+`cross_task_modification` details: requester and owner plan-task IDs, exact
+target path, requested change, reason, `needed_for`, and `blocking`. For these
+requests, `approve-once` authorizes only this handoff; `approve-file-intent`
+creates a reusable grant scoped to the orchestration, requester task, owner
+task, exact path and requested `create`, `modify` or `overwrite` operation. `approve-task` is not available for a
+cross-task request. Grant reuse never grants a capability, and ambiguous intent
+matches remain pending for the operator. Owner changes run through an ephemeral
+owner-scoped agent and must pass semantic evaluation before the requester
+resumes.
 
 Create/patch fields are `name`, `description`, `role`, `enabled`, `tools`, `skills`,
 and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`,
@@ -471,6 +499,15 @@ Logs group delegated runtime events by `orchestration_id` when present, so one F
 and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. An identical `write_file` produces no `workspace.diff`, no workspace progress and an action result with `already_satisfied=true`, `changed=false`. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
+
+Planning audit events separate semantic proposals from compiler decisions:
+`freya.planner.semantic_plan_proposed` records operations and ownership,
+`freya.plan.resources_resolved` records derived capability/tool pairs,
+`freya.plan.ownership_resolved` records normalized file owners, and
+`freya.plan.compiled` records the validated runtime plan. Recovery and
+Integration replan events include resource resolutions for newly added tasks.
+`worker.execution.completed` and `worker.execution.failed` report technical
+execution outcomes; semantic task acceptance is recorded only by Evaluator.
 
 For structured worker output, `task.result_contract` records the required
 fields, validation error, repair attempt/result, whether fallback normalization

@@ -86,6 +86,15 @@ class AgentFactory:
         text = " ".join(
             str(task.get(key) or "") for key in ("objective", "description", "task_type")
         ).casefold()
+        explicit_kind = str(task.get("task_kind") or "").strip().casefold()
+        if explicit_kind:
+            if explicit_kind == "review":
+                return "auditor"
+            if explicit_kind == "testing":
+                return "qa"
+            return "worker"
+
+        # Compatibility for persisted pre-semantic plans without task_kind.
         task_kind = AgentFactory.task_kind(task)
         characteristics = task.get("task_characteristics") if isinstance(task.get("task_characteristics"), dict) else {}
         interactive = bool(characteristics.get("interactive") or characteristics.get("requires_user_input"))
@@ -174,12 +183,6 @@ class AgentFactory:
         if (not isinstance(preferred_skills, list)
                 or any(not isinstance(item, str) for item in preferred_skills)):
             raise ValueError("preferred_skills must be a list of strings.")
-        recovery_state = task.get("_recovery_workspace_state")
-        if recovery_state is not None and "filesystem.read" not in required:
-            # Recovery inspection is a safe, task-derived prerequisite.  It is
-            # deliberately narrower than write authority and still passes
-            # through the generated policy and selector checks below.
-            required.append("filesystem.read")
         records = (
             list(skills) if skills is not None
             else self.store.list_skills(enabled=True)
@@ -197,6 +200,22 @@ class AgentFactory:
         raw_tools = task.get("required_tools", [])
         if not isinstance(raw_tools, list) or any(not isinstance(item, str) for item in raw_tools):
             raise ValueError("required_tools must be a list of strings.")
+        semantic_operations = task.get("semantic_operations")
+        if semantic_operations is not None:
+            if (not isinstance(semantic_operations, list)
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in semantic_operations)):
+                raise ValueError("semantic_operations must be a list of operation IDs.")
+            derived_capabilities, derived_tools = catalog.resources_for_operations(
+                semantic_operations)
+            if set(required) != set(derived_capabilities):
+                raise ValueError(
+                    "Compiled task capabilities do not match its semantic operations."
+                )
+            if set(raw_tools) != set(derived_tools):
+                raise ValueError(
+                    "Compiled task tools do not match its semantic operations."
+                )
         normalized_tools = []
         for requested in raw_tools:
             resolved = catalog.resolve("tool", requested)
@@ -258,6 +277,13 @@ class AgentFactory:
                 "factory_version": self.version,
                 "ephemeral": True,
             },
+            # Worker-enforced ownership is task-scoped and independent from
+            # capability policy. Reads remain unaffected by this write scope.
+            "task_owned_paths": list(task.get("owned_paths", [])),
+            "task_write_owners": dict(task.get("_write_owners", {})),
+            # Generated plan agents always have an explicit write boundary.
+            # Legacy plans without path metadata therefore fail closed.
+            "task_write_scope_enforced": True,
         })
         payload = normalize_agent({
             "name": name,

@@ -65,9 +65,13 @@ browser → HTTP API → SQLite
 
 The Task Analyst determines **what** the user wants and whether a material
 question remains. Its output cannot choose agents, tools, capabilities, Skills
-or dependencies. The Planner determines **how** to accomplish the canonical
-Task Spec, including task count, capabilities and validation. The Plan Compiler
-generates runtime IDs and verifies all references and cycles.
+or dependencies. The Planner determines the semantic decomposition of the
+canonical Task Spec: task count, dependencies, outcomes, criteria, logical file
+owners and registered semantic operations. It does not choose concrete tools,
+capabilities or Skills. The Runtime Resource Catalog holds the canonical
+semantic-operation-to-capability-to-tool mapping. The Plan Compiler alone
+applies that mapping, assigns runtime IDs, validates ownership and the DAG, and
+produces the durable execution plan.
 The Agent Factory determines
 **who** executes each planned task by constructing a task-specific identity,
 Skill set and least-privilege policy. The Agent Selector independently validates
@@ -83,6 +87,21 @@ supersede, or rerun accepted tasks. The Result Integrator determines **what
 grounded response to present**, but it cannot change correctness. These
 orchestration-level components are tool-free and consume only bounded,
 sanitized evidence.
+
+| Decision | Primary owner | Output |
+| --- | --- | --- |
+| User intent and material clarification | Task Analyst | Canonical Task Spec |
+| Task decomposition, task kind and semantic operations | Planner | Semantic Plan |
+| Resource resolution, runtime IDs, dependencies and ownership validation | Plan Compiler + Runtime Resource Catalog | Compiled Runtime Plan |
+| Runtime permission for each action | Capability Policy | Allow, ask or deny |
+| Agent identity and execution contract | AgentFactory | Ephemeral agent |
+| Tool execution and objective evidence | Worker Runtime | Technical result and evidence |
+| Lifecycle, dispatch, approvals and coordination | Freya / Orchestrator | Orchestration state |
+| Dependency readiness | Execution Graph | Ready task set |
+| Local task acceptance | Evaluator | Evaluation decision |
+| Bounded local failure strategy | Recovery / Replanner | Recovery action or revised plan |
+| Whole-system correctness | Global Verifier | Global decision |
+| Final response from accepted facts | Result Integrator | User-facing result |
 
 Skills remain declarative guidance and never grant capabilities. During the
 single-Skill configuration, `freya-core` is the only active Skill and is
@@ -187,6 +206,10 @@ submission replay is idempotent. After three answered rounds, unresolved
 material questions fail with `task_analysis.clarification_cycle_detected`;
 resolved questions proceed to planning.
 The Planner emits `freya.planning.started` and `freya.plan.created`.
+`freya.planner.semantic_plan_proposed` records task meaning and semantic
+operations. `freya.plan.resources_resolved`,
+`freya.plan.ownership_resolved` and `freya.plan.compiled` record the compiler's
+derived runtime requirements, normalized owners and compiled plan separately.
 Workers receive only a deterministic rendering of the Task Spec plus their
 compiled task step. The planner may add controlled Python QA for an interactive
 calculator; a simple task need not create an auditor.
@@ -205,6 +228,10 @@ Graph execution emits `freya.graph.initialized`, `freya.task.ready`,
 `freya.task.dispatched`, `freya.task.waiting_for_approval`, terminal task events,
 and `freya.graph.completed`. Together with selection and delegation snapshots,
 these events reconstruct Plan Task → Selection → Agent → Runtime Task → Result.
+The Worker emits `worker.execution.completed` or
+`worker.execution.failed` for technical execution only; Evaluator acceptance
+is persisted separately. Recovery and Integration revision events include the
+semantic operation to capability to tool resolution records for new tasks.
 Semantic review emits `freya.evaluation.started` once and then exactly one
 `freya.evaluation.completed` or `freya.evaluation.failed`. Completion events
 carry the validated criterion-by-criterion decision and metrics; non-accepted
@@ -279,17 +306,13 @@ The deterministic Task Analyst fallback preserves recognized multi-part actions
 and does not infer an unspecified language or interface. The legacy version-3
 `task_analyst.py` contract remains for injected compatibility adapters only.
 
-`Planner.create_plan_for_spec` receives the canonical Task Spec. Its model
-output describes semantic task keys, dependencies, semantic needs, required
-capabilities, worker tools, preferred Skills and local checks. Before each
-planning call, `orchestrator.py` creates a `RuntimeResourceCatalog` from the
-capability registry, the schemas exposed by `Toolbox`, and enabled Skill
-definitions in SQLite. The catalog includes semantic summaries and a stable
-content hash; Skill summaries include required and recommended capabilities,
-but exclude instructions and procedures. Ollama receives
-dynamic resource enums plus those summaries. The capability registry describes
-operations such as bounded stdin, captured output and exit status for
-`execution.python_script`; it does not describe per-agent policy.
+`Planner.create_plan_for_spec` receives the canonical Task Spec and emits
+Semantic Plan schema version 2. Each task contains `task_kind`, semantic needs,
+registered operation IDs, dependencies, outcomes, criteria and exact `owned_paths`; it
+contains no tool, capability or Skill IDs. Before planning,
+`orchestrator.py` creates a fresh `RuntimeResourceCatalog` from the capability
+registry and `Toolbox`. It exposes semantic operation IDs and descriptions,
+not concrete runtime resources. The catalog has a stable content hash.
 
 After JSON parsing, `plan_scope.py` compares the semantic proposal with explicit
 or clarified Task Spec intent. An optional external-only task or model-created
@@ -300,43 +323,42 @@ would leave a Task Spec validation expectation uncovered fail as
 publication, hosting, upload or remote actions. Explicitly requested external
 work remains in the plan and still needs supported resources and Policy.
 The bounded, sanitized `planner_semantic_plan` snapshot records proposed task
-keys, objectives, needs, resources, Skills and dependencies before resolution.
+keys, objectives, needs, semantic operations, owners and dependencies before
+resolution. The original human prompt remains audit evidence and is not a
+downstream intent source; workers receive a deterministic rendering of the
+validated CanonicalTaskSpec.
 
-Resource validation then accepts exact IDs or one
-unambiguous alias explicitly declared by a registry. Unknown or ambiguous
-capabilities and tools fail before `plan_compiler.py` runs. Planner Skill
-preferences are replaced with `freya-core` before ID validation. Tool IDs
-are checked against the global `Toolbox` schema catalog, even when Planner
-context or an injected catalog contains other IDs; an unknown tool emits
-`UnknownTool`. A selected tool alone never supplies a capability. A specific
-operation in task objective/semantic needs can derive exactly one compatible
-capability, such as executing a Python script or running pytest. An unneeded
-`run_command` proposal is removed without adding execution authority. An
-ambiguous required command with incompatible declared capabilities raises
-`ToolCapabilityMismatch`; when no capabilities were declared, unclear
-inference raises `AmbiguousToolCapability`. A mismatch does not trigger
-model repair. `plan_compiler.py` rechecks references,
+The Plan Compiler validates every operation against the catalog and derives
+the complete runtime requirement set. For example, `modify_file` maps to
+`filesystem.modify` and `edit_file`; `create_file` maps to
+`filesystem.create` and `write_file`; `run_python_script` maps to
+`execution.python_script` and `run_command`; `run_pytest` maps to
+`execution.pytest` and `run_command`. Unknown operations or unsupported
+external actions fail closed. Planner-supplied legacy capability and tool
+fields are ignored; they never create or widen authority. The Plan Compiler
 assigns task and criterion IDs, resolves dependencies, rejects cycles and
-produces durable plan schema version 1. Capability-only plans derive their
-tool transports from the capability registry. Additive resource metadata
-remains compatible with legacy version 1 plans. The Agent Factory repeats
-tool/capability compatibility checks as a second boundary.
+duplicate normalized file owners, and produces compiled plan schema version 4.
+It permits one bounded repair for a genuine structural contradiction. Unknown
+resources and unsupported actions do not trigger repair.
 
-`preferred_skills` values from Planner are ignored, including old or unknown
-Skill IDs. The resolver records an ignored-preference warning and AgentFactory
-assigns `freya-core` without a Skill-capability prerequisite. Startup validates
-every declared `freya-core.tools` ID against `Toolbox`; unknown IDs fail with
-`SkillConfigurationError`. No Skill adds a capability to task policy.
+The Agent Factory consumes the compiled plan and cannot add capabilities or
+tools. It uses compiled `task_kind` to assign worker, QA or auditor role;
+legacy plans without that field retain their prior deterministic role fallback.
+It assigns `freya-core`; the Skill declares available tools, while
+capability policy projects the effective worker schemas. No Skill adds a
+capability to task policy. Startup validates every declared `freya-core.tools`
+ID against `Toolbox`; unknown IDs fail with `SkillConfigurationError`.
 
-Tools remain concrete worker operations; capabilities remain declarative action
-requirements; Skills remain knowledge and instructions. `freya-core` declares
-the complete tool set, and capability policy filters the effective worker
-schemas. Every operation still passes through the
-worker's fail-closed policy engine. Selecting a resource does not authorize it.
-Derived capabilities are requirements only; the generated task policy and
-worker policy checks remain the authority for each concrete action.
-The source human prompt is retained for audit and omitted from Planner context;
-a worker sees a deterministic rendering of the ready Task Spec.
+Tools remain concrete worker operations; capabilities remain declared action
+requirements in the compiled plan; semantic operations remain planning intent;
+Skills remain guidance. The Worker reports `execution_complete` or
+`execution_failed` as technical outcomes only. It cannot accept its own result.
+The Evaluator alone accepts local task evidence. The Orchestrator owns lifecycle
+and dependency coordination. Recovery may replan only its deterministic local
+scope and may compile new operations only within the superseded tasks' existing
+capability budget. Integration Replanner applies the same rule against the
+compiled plan budget. The Global Verifier accepts the whole objective from
+grounded evidence, and Result Integrator can only render accepted facts.
 
 ## Activity and performance read model
 
@@ -482,6 +504,9 @@ transcripts and private reasoning are not reused.
 
 Replanning produces a complete cumulative effective plan. Accepted and
 superseded historical snapshots remain unchanged and new work uses new task IDs.
+Every new Recovery task must carry a registered `task_kind` and semantic
+operation IDs; the shared Plan Compiler helper resolves them through the same
+Runtime Resource Catalog and enforces the superseded-task resource budget.
 The Recovery Advisor may propose `affected_task_ids`, but deterministic DAG logic
 computes `allowed_replan_scope`: the `recovery_pending` source plus only its
 transitive descendants that remain `pending` or `ready` and have no execution
@@ -542,6 +567,11 @@ reconstruction and the explicitly isolated legacy exception are specified in
 [Integration proof contract](INTEGRATION_PROOF.md). Generic state updates cannot
 grant production Success; finalization revalidates proof against persisted
 authority in its write transaction.
+
+Append-only Integration tasks also require a registered `task_kind` and
+semantic operations. The Runtime Resource Catalog resolves their capabilities
+and tools, and the append-only validator rejects work outside the compiled
+resource budget.
 
 `build_integration_input` runs deterministic preconditions before any global
 model call. Every active effective task (all effective-plan tasks except
@@ -693,6 +723,46 @@ visible in metrics, but the task token budget is unlimited when `max_tokens=0`
 runtime resource use. Even in that mode, each Worker model call is capped at
 2048 output tokens (768 for structured-output repair); the cumulative task
 token budget remains unlimited.
+
+### Cross-task file ownership
+
+Every task that owns planned files declares exact workspace-relative
+`owned_paths`. Plan validation rejects conflicting owners, and generated plan
+agents enforce their own exact path list before a filesystem mutation. A task
+that requests a change to another task's file must not claim that path; reads
+remain governed by the normal capability policy. A write to a file owned by another task is
+stopped before the tool handler runs and emits a structured request containing
+the target path, requested change, reason, need and blocking flag. The Worker
+finishes as `WaitingForApproval`; it does not wait for an agent or send a direct
+agent-to-agent message.
+
+Freya resolves the owner only inside the same orchestration and checks the
+dependency graph for cycles. Reusable human grants are scoped to that
+orchestration, requester task, owner task, exact file and requested operation.
+The operation is preserved as `create`, `modify` or `overwrite` from the
+capability resolved before the ownership check.
+`Approve once` covers only the current request. `Approve similar purpose for
+this file` creates a reusable intent grant. An exact normalized repeat may be
+matched deterministically; a bounded, tool-free local intent comparison may
+accept a semantically equivalent purpose only at high confidence. A mismatch,
+uncertain result, or unavailable matcher remains a human approval. Neither a
+grant nor an approval changes capability policy.
+
+After approval, Freya builds a temporary change task using only the owning
+task's already declared `filesystem.read` and write capabilities, after the
+original owner node has reached a terminal graph state so its later writes
+cannot overwrite the coordinated change. The derived agent's write scope is
+the one requested file. It goes through the normal
+Agent Factory, Agent Selector, Runtime and Evaluator; only evaluator acceptance
+marks the handoff complete and resumes the requester in a fresh attempt.
+Denial, owner failure, failed evaluation, invalid ownership and detected cycles
+resume the requester with the recorded outcome so it can choose another
+permitted approach or report the blocker. The cross-task tables and events keep
+the request, durable approval, scoped grant, owner runtime task and evaluation
+result auditable.
+If restart recovery fails the orchestration, it also closes its unfinished
+cross-task requests and pending approvals in the same database transaction;
+no owner handoff resumes from a partially dispatched state.
 
 The worker tracks successful post-write validation actions. Ten consecutive
 successful validations, or ten identical successful actions, produce an

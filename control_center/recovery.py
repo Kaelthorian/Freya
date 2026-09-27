@@ -15,12 +15,15 @@ from typing import Any, Callable
 
 from .config import validate_endpoint
 from .planner import (allocate_new_task_ids, MAX_PLAN_TASKS, PLAN_RESPONSE_FORMAT,
+                      TASK_KIND_VALUES,
                       PlanValidationError, validate_plan)
+from .plan_compiler import compile_semantic_task_resources
+from .runtime_resources import RuntimeResourceCatalog, SEMANTIC_OPERATION_CAPABILITIES
 from .security import sanitize
 from .transport import model_profile, model_request, request_json
 
 
-RECOVERY_VERSION = 1
+RECOVERY_VERSION = 3
 FAILURE_ANALYSIS_VERSION = 1
 RECOVERY_ACTIONS = {"retry_same_agent", "retry_different_agent", "replan_subgraph", "fail"}
 RECOVERY_FIELDS = {"action", "reason", "instructions", "exclude_agent_ids", "affected_task_ids"}
@@ -49,11 +52,46 @@ RECOVERY_RESPONSE_FORMAT = {
     "additionalProperties": False,
 }
 
+RECOVERY_TASK_FIELDS = {
+    "id", "task_kind", "objective", "description", "depends_on", "operations",
+    "semantic_needs", "success_criteria", "owned_paths",
+}
+RECOVERY_PLAN_FIELDS = {
+    "goal", "summary", "complexity", "tasks", "success_criteria", "criterion_links",
+}
+RECOVERY_PLAN_RESPONSE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "string"},
+        "summary": {"type": "string"},
+        "complexity": {"type": "string", "enum": ["simple", "multi_step"]},
+        "tasks": {
+            "type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
+            "items": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
+                "objective": {"type": "string"},
+                "description": {"type": "string"},
+                "depends_on": {"type": "array", "items": {"type": "string"}},
+                "operations": {"type": "array", "items": {
+                    "type": "string", "enum": sorted(SEMANTIC_OPERATION_CAPABILITIES),
+                }},
+                "semantic_needs": {"type": "array", "items": {"type": "string"}},
+                "success_criteria": {"type": "array", "items": {"type": "string"}},
+                "owned_paths": {"type": "array", "items": {"type": "string"}},
+            }, "required": sorted(RECOVERY_TASK_FIELDS), "additionalProperties": False},
+        },
+        "success_criteria": {"type": "array", "items": {"type": "string"}},
+        "criterion_links": deepcopy(PLAN_RESPONSE_FORMAT["properties"]["criterion_links"]),
+    },
+    "required": sorted(RECOVERY_PLAN_FIELDS), "additionalProperties": False,
+}
+
 REVISION_RESPONSE_FORMAT = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
-        "plan": PLAN_RESPONSE_FORMAT,
+        "plan": RECOVERY_PLAN_RESPONSE_FORMAT,
         "superseded_task_ids": {"type": "array", "items": {"type": "string"}},
     },
     "required": sorted(REVISION_FIELDS),
@@ -173,6 +211,31 @@ def validate_replan_revision(*, current_plan: dict[str, Any], revised_plan: dict
     new_ids = set(revised) - current_ids
     if new_ids & historical_task_ids:
         raise RecoveryValidationError("Revision reuses a historical task id.")
+    capability_budget = {
+        capability for task_id in superseded
+        for capability in current[task_id].get("required_capabilities", [])
+    }
+    catalog = RuntimeResourceCatalog.build()
+    for task_id in new_ids:
+        task = revised[task_id]
+        requested = set(task.get("required_capabilities", []))
+        if not requested <= capability_budget:
+            raise RecoveryValidationError(
+                "Recovery cannot introduce capabilities outside the superseded task scope."
+            )
+        declared_tools = task.get("required_tools", [])
+        for tool_id in declared_tools:
+            if not (set(catalog.capabilities_for_tool(tool_id)) & requested):
+                raise RecoveryValidationError(
+                    "Recovery task tool does not match its existing capability budget."
+                )
+        if "semantic_operations" in task:
+            derived_capabilities, derived_tools = catalog.resources_for_operations(
+                task["semantic_operations"])
+            if set(derived_capabilities) != requested or set(derived_tools) != set(declared_tools):
+                raise RecoveryValidationError(
+                    "Recovery task resources do not match the deterministic operation mapping."
+                )
     for task in revised_plan["tasks"]:
         if task["id"] not in superseded and set(task["depends_on"]) & superseded:
             raise RecoveryValidationError("Active revised tasks cannot depend on superseded tasks.")
@@ -846,6 +909,25 @@ class Replanner:
                 "superseded_task_ids": _ids(value["superseded_task_ids"],
                                                 "revision.superseded_task_ids")}
 
+    @staticmethod
+    def _semantic_plan_view(plan: dict[str, Any]) -> dict[str, Any]:
+        """Give Recovery plan meaning without exposing compiled resource IDs."""
+        # Keep the model-facing payload stable for reproducible prompts and
+        # diagnostics; sets are useful for validation, but not serialization.
+        result = {key: deepcopy(plan[key]) for key in (
+            "goal", "summary", "complexity", "success_criteria", "criterion_links",
+        ) if key in plan}
+        result["tasks"] = [{
+            "id": task["id"], "task_kind": task.get("task_kind", "general"),
+            "objective": task["objective"],
+            "description": task["description"], "depends_on": list(task["depends_on"]),
+            "operations": list(task.get("semantic_operations", [])),
+            "semantic_needs": list(task.get("semantic_needs", [])),
+            "success_criteria": list(task["success_criteria"]),
+            "owned_paths": list(task.get("owned_paths", [])),
+        } for task in plan["tasks"]]
+        return result
+
     def create_revision(self, *, current_plan: dict[str, Any], source_task_id: str,
                         affected_task_ids: list[str], allowed_task_ids: set[str],
                         protected_task_ids: set[str], accepted_task_ids: set[str],
@@ -855,7 +937,10 @@ class Replanner:
             raise RecoveryGenerationError("No replanning model is configured.")
         if isinstance(max_model_calls, bool) or not isinstance(max_model_calls, int) or max_model_calls < 1:
             raise RecoveryGenerationError("The replanning model-call budget is exhausted.")
-        bounded = sanitize({"current_plan": current_plan, "source_task_id": source_task_id,
+        current_plan = validate_plan(deepcopy(current_plan))
+        current_by_id = {item["id"]: item for item in current_plan["tasks"]}
+        bounded = sanitize({"current_plan": self._semantic_plan_view(current_plan),
+                            "source_task_id": source_task_id,
                             "affected_task_ids": affected_task_ids,
                             "allowed_task_ids": sorted(allowed_task_ids),
                             "protected_task_ids": sorted(protected_task_ids),
@@ -866,9 +951,13 @@ class Replanner:
         parsed = None
         for prompt in (
             "Return a complete effective plan revision and explicitly list superseded task ids. "
-            "Preserve the current plan goal, summary and global success criteria exactly.",
+            "Preserve the current plan goal, summary and global success criteria exactly. "
+            "For each task, supply a registered task_kind and semantic operations only. Do not choose tools, capabilities, "
+            "or Skills. New work must compile within the existing superseded-task resource budget. "
+            "Declare exact workspace-relative owned_paths for every new file owner.",
             "Repair the prior response. Return only strict plan-revision JSON with no extra fields. "
-            "Do not change the current plan goal, summary or global success criteria.",
+            "Do not change the current plan goal, summary or global success criteria, and do not "
+            "choose tools, capabilities, or Skills. Use only registered task_kind and semantic operation IDs.",
         )[:max_model_calls]:
             self.metrics["model_calls"] += 1
             try:
@@ -886,13 +975,23 @@ class Replanner:
         if not isinstance(raw_plan, dict) or not isinstance(raw_plan.get("tasks"), list):
             raise RecoveryValidationError("Recovery effective plan must contain tasks.")
         from .planner import _identifier
-        current_ids = {item["id"] for item in current_plan["tasks"]}
+        current_ids = set(current_by_id)
+        legacy_resource_fields = {
+            "required_capabilities", "required_tools", "preferred_skills",
+            "semantic_operations", "task_kind", "task_characteristics",
+        }
+        allowed_task_fields = RECOVERY_TASK_FIELDS | legacy_resource_fields
         seen_existing = set()
         additions = []
         addition_indexes = []
         for index, task in enumerate(raw_plan["tasks"]):
             if not isinstance(task, dict):
                 raise RecoveryValidationError("Recovery task must be an object.")
+            if set(task) - allowed_task_fields:
+                raise RecoveryValidationError("Recovery task contains unknown semantic fields.")
+            operations = task.get("operations", [])
+            if not isinstance(operations, list) or any(not isinstance(item, str) for item in operations):
+                raise RecoveryValidationError("Recovery task operations must be a list of IDs.")
             ident = _identifier(task.get("id"), f"recovery task {index} id")
             if ident in current_ids and ident not in seen_existing:
                 seen_existing.add(ident)
@@ -903,6 +1002,48 @@ class Replanner:
             additions, current_ids | historical_task_ids, current_ids)
         for index, task in zip(addition_indexes, allocated):
             raw_plan["tasks"][index] = task
+        catalog = RuntimeResourceCatalog.build()
+        resource_resolutions = []
+        for index, task in enumerate(raw_plan["tasks"]):
+            ident = _identifier(task.get("id"), f"recovery task {index} id")
+            if ident in current_by_id:
+                existing = current_by_id[ident]
+                proposed_operations = task.get("operations", [])
+                if proposed_operations and "semantic_operations" in existing:
+                    if proposed_operations != existing["semantic_operations"]:
+                        raise RecoveryValidationError(
+                            "Recovery cannot change the compiled operations of an existing task."
+                        )
+                compiled = deepcopy(existing)
+                for field in ("objective", "description", "depends_on", "success_criteria"):
+                    compiled[field] = deepcopy(task[field])
+                for field in ("semantic_needs", "owned_paths"):
+                    if field in existing or task.get(field):
+                        compiled[field] = deepcopy(task.get(field, existing.get(field, [])))
+                raw_plan["tasks"][index] = compiled
+                continue
+            semantic_task = {
+                "id": ident,
+                "objective": task.get("objective", ""),
+                "description": task.get("description", ""),
+                "depends_on": task.get("depends_on", []),
+                "operations": task.get("operations", []),
+                **({"task_kind": task["task_kind"]} if "task_kind" in task else {}),
+                "semantic_needs": task.get("semantic_needs", []),
+                "success_criteria": task.get("success_criteria", []),
+                "owned_paths": task.get("owned_paths", []),
+                **{field: deepcopy(task[field]) for field in legacy_resource_fields
+                   if field in task},
+            }
+            try:
+                normalized = catalog.validate_semantic_plan({"tasks": [semantic_task]})["tasks"][0]
+                resource_resolutions.extend(catalog.resource_resolutions)
+                raw_plan["tasks"][index] = compile_semantic_task_resources(
+                    normalized, catalog, require_task_kind=True)
+            except (TypeError, ValueError) as exc:
+                raise RecoveryValidationError(
+                    "Recovery task has an invalid semantic operation or task classification."
+                ) from exc
         remap = {base: final for base, final in zip(
             allocation["normalized_ids"], allocation["final_ids"])
             if allocation["normalized_ids"].count(base) == 1 and base not in current_ids}
@@ -937,4 +1078,5 @@ class Replanner:
             accepted_task_ids=set(accepted_task_ids), historical_task_ids=set(historical_task_ids),
             max_tasks=max_tasks,
         )
+        parsed["resource_resolutions"] = resource_resolutions
         return {**parsed, "metrics": dict(self.metrics)}

@@ -95,6 +95,19 @@ class ExecutionGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ready and selected"):
             graph.mark_running("a", "runtime-2", "delegation-2")
 
+    def test_cross_task_wait_resumes_only_as_a_fresh_ready_attempt(self):
+        graph = ExecutionGraph(execution_plan([planned_task("a")]))
+        graph.mark_selected("a", "agent", "selection")
+        graph.mark_running("a", "runtime", "delegation")
+        graph.apply_runtime_status("a", "WaitingForApproval")
+        graph.resume_cross_task_wait("a", "Owner change completed.")
+        node = graph.node("a")
+        self.assertEqual(node["state"], "ready")
+        self.assertEqual(node["attempt_prompt"], "Owner change completed.")
+        self.assertIsNone(node["runtime_task_id"])
+        with self.assertRaisesRegex(ValueError, "Only a requester waiting"):
+            graph.resume_cross_task_wait("a", "duplicate resume")
+
     def test_success_unlocks_direct_child(self):
         graph = ExecutionGraph(self.chain())
         graph.mark_selected("a", "agent", "selection")

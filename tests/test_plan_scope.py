@@ -8,7 +8,9 @@ from control_center.orchestrator import Orchestrator
 from control_center.plan_compiler import compile_semantic_plan
 from control_center.plan_scope import PlannerScopeError, reconcile_plan_scope, semantic_categories
 from control_center.planner import Planner
-from control_center.runtime_resources import RuntimeResourceCatalog, ToolCapabilityMismatch
+from control_center.runtime_resources import (
+    AmbiguousToolCapability, RuntimeResourceCatalog, UnsupportedResourceRequirement,
+)
 from control_center.storage import Store
 from control_center.task_spec import TaskSpecAnalyst, deterministic_task_spec
 
@@ -28,14 +30,17 @@ def web_plan():
                                  "The calculator is deployed to production."],
             "tasks": [{
                 "key": "build_calculator", "objective": "Create the web calculator",
+                "task_kind": "file_creation",
                 "description": "Create index.html with four arithmetic operations.",
                 "semantic_needs": ["Create index.html."], "depends_on": [],
                 "required_capabilities": ["filesystem.create", "filesystem.read"],
+                "owned_paths": ["index.html"],
                 "required_tools": ["write_file", "read_file"],
                 "preferred_skills": [],
                 "success_criteria": ["The web calculator performs four operations."],
             }, {
                 "key": "deploy_calculator", "objective": "Deploy calculator to production",
+                "task_kind": "external_action",
                 "description": "Publish the application to hosting.",
                 "semantic_needs": ["deploy_calculator"],
                 "depends_on": ["build_calculator"],
@@ -53,7 +58,7 @@ class PlanScopeTests(unittest.TestCase):
         compiled = planner.create_plan_for_spec(spec, RuntimeResourceCatalog.build().as_dict())
         self.assertEqual([task["id"] for task in compiled["tasks"]], ["task-1"])
         self.assertEqual(compiled["tasks"][0]["required_capabilities"],
-                         ["filesystem.create", "filesystem.read"])
+                         ["filesystem.create"])
         self.assertNotIn("run_command", compiled["tasks"][0]["required_tools"])
         self.assertFalse(any("deploy" in item.lower() for item in compiled["success_criteria"]))
         self.assertNotIn("deploy", compiled["summary"].lower())
@@ -62,7 +67,8 @@ class PlanScopeTests(unittest.TestCase):
         self.assertEqual(planner.metrics["semantic_compiler"]["status"], "Success")
         raw = planner.metrics["planner_semantic_plan"]["tasks"][1]
         self.assertEqual(raw["semantic_needs"], ["deploy_calculator"])
-        self.assertEqual(raw["required_tools"], ["run_command"])
+        self.assertNotIn("required_tools", raw)
+        self.assertNotIn("required_capabilities", raw)
 
         with TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.sqlite3")
@@ -77,6 +83,16 @@ class PlanScopeTests(unittest.TestCase):
                            if event["event_type"] == "freya.plan_compiler.started")
             self.assertEqual(started["planner_semantic_plan"]["tasks"][1]["key"],
                              "deploy_calculator")
+            proposed = next(json.loads(event["payload_json"]) for event in events
+                            if event["event_type"] == "freya.planner.semantic_plan_proposed")
+            self.assertNotIn("required_capabilities", json.dumps(proposed["semantic_plan"]))
+            resolved = next(json.loads(event["payload_json"]) for event in events
+                            if event["event_type"] == "freya.plan.resources_resolved")
+            create_resolution = next(item for item in resolved["resource_resolutions"]
+                                     if item.get("semantic_operation") == "create_file")
+            self.assertEqual(create_resolution["resolved_tool"], "write_file")
+            self.assertEqual(create_resolution["resolved_capability"], "filesystem.create")
+            self.assertEqual(create_resolution["semantic_needs"], ["Create index.html."])
 
     def test_clarified_calculator_reaches_durable_execution_graph(self):
         prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
@@ -112,6 +128,7 @@ class PlanScopeTests(unittest.TestCase):
         semantic = web_plan()
         semantic["tasks"].append({
             "key": "document", "objective": "Document the local calculator",
+            "task_kind": "review",
             "description": "Read index.html and describe its operations.",
             "semantic_needs": ["Read index.html."],
             "depends_on": ["deploy_calculator"],
@@ -180,7 +197,7 @@ class PlanScopeTests(unittest.TestCase):
         value, adjustments = reconcile_plan_scope(spec, semantic)
         self.assertEqual(adjustments, [])
         self.assertEqual(len(value["tasks"]), 2)
-        with self.assertRaises(ToolCapabilityMismatch):
+        with self.assertRaises(UnsupportedResourceRequirement):
             compile_semantic_plan(value, spec)
 
     def test_explicit_deployment_does_not_authorize_unrelated_email(self):
@@ -208,7 +225,7 @@ class PlanScopeTests(unittest.TestCase):
         })
         semantic["tasks"][1]["success_criteria"] = ["An email is sent."]
         semantic["success_criteria"] = ["An email is sent."]
-        with self.assertRaises(ToolCapabilityMismatch):
+        with self.assertRaises(UnsupportedResourceRequirement):
             compile_semantic_plan(semantic, spec)
 
     def test_mixed_artifact_and_external_task_fails_closed(self):
@@ -227,10 +244,10 @@ class PlanScopeTests(unittest.TestCase):
         })
         semantic["tasks"][0]["description"] = "Run command. api_key=example-sensitive-value"
         planner = Planner(lambda prompt, context: semantic)
-        with self.assertRaises(ToolCapabilityMismatch):
+        with self.assertRaises(UnsupportedResourceRequirement):
             planner.create_plan_for_spec(web_spec())
         raw = planner.metrics["semantic_compiler"]["planner_semantic_plan"]["tasks"][0]
-        self.assertEqual(raw["required_tools"], ["run_command"])
+        self.assertNotIn("required_tools", raw)
         self.assertNotIn("example-sensitive-value", raw["description"])
 
 
@@ -245,29 +262,30 @@ class SemanticToolResolutionTests(unittest.TestCase):
             "required_capabilities": capabilities,
         }]})["tasks"][0]
 
+    def resources(self, task):
+        return self.catalog.resources_for_operations(task["operations"])
+
     def test_python_execution_follows_semantic_operation(self):
         task = self.resolve("Run calculator.py with inputs 3 and 5",
                             "Execute calculator.py with controlled stdin.",
                             ["filesystem.read"])
-        self.assertEqual(task["required_capabilities"],
-                         ["filesystem.read", "execution.python_script"])
+        self.assertEqual(self.resources(task),
+                         (["execution.python_script"], ["run_command"]))
         self.assertEqual(self.catalog.resource_resolutions[0]["resolved_capability"],
                          "execution.python_script")
 
     def test_pytest_is_selected_instead_of_python_script(self):
         task = self.resolve("Run pytest for the calculator Python script",
                             "Run pytest for calculator tests.", ["filesystem.read"])
-        self.assertEqual(task["required_capabilities"],
-                         ["filesystem.read", "execution.pytest"])
+        self.assertEqual(self.resources(task), (["execution.pytest"], ["run_command"]))
 
     def test_compile_check_selects_py_compile(self):
         task = self.resolve("Compile-check Python source",
                             "Compile-check Python calculator.py.", ["filesystem.read"])
-        self.assertEqual(task["required_capabilities"],
-                         ["filesystem.read", "execution.py_compile"])
+        self.assertEqual(self.resources(task), (["execution.py_compile"], ["run_command"]))
 
     def test_ambiguous_command_still_fails(self):
-        with self.assertRaises(ToolCapabilityMismatch):
+        with self.assertRaises(AmbiguousToolCapability):
             self.resolve("Run a command", "Run an arbitrary command.",
                          ["filesystem.read"])
 
@@ -278,26 +296,28 @@ class SemanticToolResolutionTests(unittest.TestCase):
             "required_capabilities": ["filesystem.create"],
             "required_tools": ["write_file", "run_command"],
         }]})["tasks"][0]
-        self.assertEqual(result["required_tools"], ["write_file"])
-        self.assertEqual(result["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(result["operations"], ["create_file"])
+        self.assertIn("planner_tool_hint_ignored", {
+            item.get("action") for item in self.catalog.resource_resolutions})
+        self.assertEqual(self.resources(result), (["filesystem.create"], ["write_file"]))
 
     def test_create_need_recovers_from_only_unneeded_command_proposal(self):
         semantic = {"tasks": [{
-            "key": "create", "objective": "Create index.html",
+            "key": "create", "task_kind": "file_creation",
+            "objective": "Create index.html",
             "semantic_needs": ["Create calculator UI."],
             "required_capabilities": [], "required_tools": ["run_command"],
+            "owned_paths": ["index.html"],
         }]}
         task = self.catalog.validate_semantic_plan(semantic)["tasks"][0]
-        self.assertEqual(task["required_capabilities"], ["filesystem.create"])
-        self.assertEqual(task["required_tools"], [])
+        self.assertEqual(task["operations"], ["create_file"])
         compiled = compile_semantic_plan(semantic, web_spec())
         self.assertEqual(compiled["tasks"][0]["required_tools"], ["write_file"])
 
     def test_readback_wording_does_not_imply_python_execution(self):
         task = self.resolve("Verify Python source", "Read calculator.py to verify its content.",
                             ["filesystem.read"])
-        self.assertEqual(task["required_capabilities"], ["filesystem.read"])
-        self.assertEqual(task["required_tools"], [])
+        self.assertEqual(self.resources(task), (["filesystem.read"], ["read_file"]))
 
 
 if __name__ == "__main__":

@@ -67,23 +67,26 @@ archival event reports archival `Success` separately from the run's final
   not the worker trust boundary.
 - Keep `capabilities.py` as the tool-to-action registry and `policy.py` as the
   single decision point. Store effective policies in task snapshots.
-- Planner `required_capabilities` are declarative requirements. They must use
-  the capability registry but must never mutate or bypass agent policy.
-- Rebuild the Runtime Resource Catalog for each planning request. Keep it
-  derived from the global capability and Toolbox registries plus enabled Skills;
-  context-provided tool IDs must not extend the global worker tool catalog.
-  Do not duplicate IDs in Planner prompts.
-  Validate capability and tool IDs, plus declared unique aliases,
-  immediately after parse and again at the compiler/factory boundary. Unknown
-  resource errors are fail-closed and do not trigger an LLM repair call.
-- Keep `semantic_needs`, `required_capabilities`, `required_tools` and
-  `preferred_skills` distinct. The resolver derives a capability only when a
-  specific operation in the task objective or semantic needs identifies it;
-  tool registration alone is insufficient. An unneeded `run_command` proposal
-  is removed. Reject genuinely required unsupported pairs with
-  `ToolCapabilityMismatch` and unclear inference with `AmbiguousToolCapability`. A tool
-  selection never grants access: the Agent Factory derives worker schemas from
-  the capability policy and every action still passes through `policy.py`.
+- Keep a versioned Semantic Plan separate from the compiled runtime plan.
+  Task Analyst supplies canonical intent. Planner supplies task kind, semantic
+  operations, dependencies, outcomes, criteria and logical file owners only; it
+  never selects capabilities, tools, Skills, or runtime IDs.
+- Rebuild `RuntimeResourceCatalog` for each orchestration from the global
+  capability and Toolbox registries. Keep one canonical semantic-operation to
+  capability to tool mapping. `PlanCompiler` alone applies that mapping and
+  emits the compiled plan. Recovery and Integration use its shared task
+  compiler and remain inside their existing capability budgets.
+- Treat Planner resource fields from legacy adapters as non-authoritative
+  hints. The compiler derives every runtime requirement from semantic
+  operations. Unknown operations, unknown resources and unsupported external
+  actions fail closed without model repair. A tool registration never grants
+  access; AgentFactory cannot add capabilities or tools, and every invocation
+  still passes through `policy.py`.
+- Preserve semantic and derived decisions in separate audit events. Keep exact
+  `owned_paths`, reject duplicate normalized owners, and log the semantic
+  operation to capability to tool mapping produced by the compiler.
+- Worker completion is technical only. It reports execution completion or
+  failure; only Evaluator acceptance unlocks dependencies and semantic success.
 - Compare model-proposed external work with explicit or clarified Task Spec
   intent before resolving tools. Do not infer deployment, publication, remote
   hosting or network side effects from web artifact creation. Preserve Task

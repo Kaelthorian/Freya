@@ -271,7 +271,8 @@ class Runtime:
         if task_id in self.pending:
             self.pending.remove(task_id)
         if worker:
-            self.store.cancel_pending_approvals(task_id, "cancelled: " + str(fields.get("error") or fields.get("status") or "worker stopped"))
+            if fields.get("status") != "WaitingForApproval":
+                self.store.cancel_pending_approvals(task_id, "cancelled: " + str(fields.get("error") or fields.get("status") or "worker stopped"))
             # Capture already emitted counters/events before terminating an in-flight call.
             try:
                 for _ in range(1000):
@@ -285,7 +286,8 @@ class Runtime:
             fields["duration_seconds"] = round(time.monotonic() - worker["started"], 3)
             self._stop_worker(worker)
         else:
-            self.store.cancel_pending_approvals(task_id, "cancelled: task finished before resolution")
+            if fields.get("status") != "WaitingForApproval":
+                self.store.cancel_pending_approvals(task_id, "cancelled: task finished before resolution")
         fields.update({"finished_at": now(), "progress": 100})
         allowed_fields = {
             "status", "started_at", "finished_at", "duration_seconds", "steps", "progress",
@@ -379,6 +381,11 @@ class Runtime:
                                     str(request.get("reason") or "Approval required."), approval_id=approval_id,
                                     mark_waiting=True,
                                 )
+                                cross_task_request = request.get("cross_task_modification")
+                                if isinstance(cross_task_request, dict):
+                                    self.store.create_cross_task_modification_request(
+                                        cross_task_request, approval["id"],
+                                    )
                                 worker["approval_id"] = approval["id"]
                                 self.store.append_event(task_id, {
                                     "event_type": "approval.requested", "level": "warning",
@@ -386,6 +393,8 @@ class Runtime:
                                     "capability": approval["capability"], "approval_id": approval["id"],
                                     "action_summary": approval["action_summary"], "resource": approval["resource"],
                                     "reason": approval["reason"], "arguments": approval["arguments"],
+                                    **({"cross_task_modification": self.store.get_cross_task_modification_request(approval["id"])}
+                                       if isinstance(cross_task_request, dict) else {}),
                                 })
                                 self._refresh_agent(worker["agent_id"])
                             if kind == "event":

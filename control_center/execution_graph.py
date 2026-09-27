@@ -154,6 +154,22 @@ class ExecutionGraph:
             waiting_reason="", started_at=started_at, updated_at=started_at,
         )
 
+    def resume_cross_task_wait(self, task_id: str, prompt: str,
+                               timestamp: str | None = None) -> None:
+        """Open a fresh requester attempt after Freya resolves a file-owner wait."""
+        node = self.node(task_id)
+        if node["state"] != "waiting_for_approval":
+            raise ValueError("Only a requester waiting for cross-task approval can resume.")
+        if not node.get("runtime_task_id"):
+            raise ValueError("Cross-task requester has no persisted runtime attempt.")
+        node.update(
+            state="ready", selected_agent_id=None, selection_id=None,
+            runtime_task_id=None, delegation_id=None, evaluation_id=None,
+            evaluation_status=None, recovery_action_id=None,
+            attempt_prompt=str(prompt), waiting_reason="", result=None, error=None,
+            started_at=None, finished_at=None, updated_at=timestamp,
+        )
+
     def apply_runtime_status(self, task_id: str, status: str, *, result: Any = None,
                              error: str | None = None, timestamp: str | None = None) -> bool:
         node = self.node(task_id)

@@ -14,13 +14,19 @@ import time
 from typing import Any, Callable
 
 from .config import validate_endpoint
-from .planner import (MAX_PLAN_TASKS, TASK_FIELDS, allocate_new_task_ids, validate_plan)
+from .planner import (MAX_PLAN_TASKS, TASK_KIND_VALUES, allocate_new_task_ids,
+                      validate_plan)
+from .plan_compiler import compile_semantic_task_resources
+from .runtime_resources import (
+    RuntimeResourceCatalog, SEMANTIC_OPERATION_CAPABILITIES,
+    UnsupportedResourceRequirement,
+)
 from .security import sanitize
 from .transport import model_profile, model_request, request_json
 from .integration_proof import build_proof_metadata, criterion_key
 
 
-INTEGRATION_VERSION = 3
+INTEGRATION_VERSION = 5
 GLOBAL_STATUSES = {"accepted", "needs_work", "blocked", "error"}
 CRITERION_STATUSES = {"satisfied", "unsatisfied", "partial", "unknown"}
 GLOBAL_ACTIONS = {
@@ -49,6 +55,10 @@ GLOBAL_FIELDS = {
 }
 GLOBAL_CRITERION_FIELDS = {"criterion", "status", "reason", "evidence"}
 INTEGRATION_REPLAN_FIELDS = {"summary", "tasks"}
+INTEGRATION_SEMANTIC_TASK_FIELDS = {
+    "id", "task_kind", "objective", "description", "depends_on", "operations", "semantic_needs",
+    "success_criteria", "owned_paths",
+}
 FINAL_RESPONSE_FIELDS = {"summary", "completed", "evidence", "limitations"}
 
 MAX_OUTPUT_CHARS = 128_000
@@ -95,12 +105,17 @@ INTEGRATION_REPLAN_RESPONSE_FORMAT = {
         "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
                   "items": {"type": "object", "properties": {
                       "id": {"type": "string"}, "objective": {"type": "string"},
+                      "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                       "description": {"type": "string"},
                       "depends_on": {"type": "array", "items": {"type": "string"}},
-                      "required_capabilities": {"type": "array", "items": {"type": "string"}},
-                      "preferred_skills": {"type": "array", "items": {"type": "string"}},
+                      "operations": {"type": "array", "items": {
+                          "type": "string", "enum": sorted(SEMANTIC_OPERATION_CAPABILITIES),
+                      }},
+                      "semantic_needs": {"type": "array", "items": {"type": "string"}},
                       "success_criteria": {"type": "array", "items": {"type": "string"}},
-                  }, "required": sorted(TASK_FIELDS), "additionalProperties": False}},
+                      "owned_paths": {"type": "array", "items": {"type": "string"}},
+                  }, "required": sorted(INTEGRATION_SEMANTIC_TASK_FIELDS),
+                     "additionalProperties": False}},
     },
     "required": sorted(INTEGRATION_REPLAN_FIELDS), "additionalProperties": False,
 }
@@ -911,6 +926,31 @@ def validate_integration_revision(*, current_plan: dict[str, Any], new_tasks: li
     if set(appended_ids) & set(historical_task_ids):
         raise IntegrationValidationError("Integration revision reused a historical task ID.")
     appended = set(appended_ids)
+    capability_budget = {
+        capability for task in current["tasks"]
+        for capability in task.get("required_capabilities", [])
+    }
+    catalog = RuntimeResourceCatalog.build()
+    for task_id in appended_ids:
+        task = revised_by_id[task_id]
+        requested = set(task.get("required_capabilities", []))
+        if not requested <= capability_budget:
+            raise IntegrationValidationError(
+                "Integration cannot introduce capabilities outside the compiled plan scope."
+            )
+        for tool_id in task.get("required_tools", []):
+            if not (set(catalog.capabilities_for_tool(tool_id)) & requested):
+                raise IntegrationValidationError(
+                    "Integration task tool does not match its capability scope."
+                )
+        if "semantic_operations" in task:
+            derived_capabilities, derived_tools = catalog.resources_for_operations(
+                task["semantic_operations"])
+            if set(derived_capabilities) != requested or set(derived_tools) != set(
+                    task.get("required_tools", [])):
+                raise IntegrationValidationError(
+                    "Integration task resources do not match the deterministic operation mapping."
+                )
     old_links = [item for item in current["criterion_links"]["local"]
                  if item["task_id"] in current_by_id]
     new_old_links = [item for item in revised["criterion_links"]["local"]
@@ -933,6 +973,28 @@ def validate_integration_revision(*, current_plan: dict[str, Any], new_tasks: li
 class IntegrationReplanner(_MeasuredModel):
     """Add only new tasks that close one persisted global gap."""
 
+    @staticmethod
+    def _semantic_plan_view(plan: dict[str, Any]) -> dict[str, Any]:
+        """Hide compiled capabilities and tools from semantic re-planning."""
+        return {
+            "goal": plan.get("goal", ""),
+            "summary": plan.get("summary", ""),
+            "complexity": plan.get("complexity", "simple"),
+            "success_criteria": list(plan.get("success_criteria", [])),
+            "criterion_links": deepcopy(plan.get("criterion_links", {})),
+            "tasks": [{
+                "id": task.get("id", ""),
+                "task_kind": task.get("task_kind", "general"),
+                "objective": task.get("objective", ""),
+                "description": task.get("description", ""),
+                "depends_on": list(task.get("depends_on", [])),
+                "operations": list(task.get("semantic_operations", [])),
+                "semantic_needs": list(task.get("semantic_needs", [])),
+                "success_criteria": list(task.get("success_criteria", [])),
+                "owned_paths": list(task.get("owned_paths", [])),
+            } for task in plan.get("tasks", [])],
+        }
+
     def create_revision(self, *, current_plan: dict[str, Any], integration: dict[str, Any],
                         accepted_task_ids: set[str], historical_task_ids: set[str],
                         max_tasks: int = MAX_PLAN_TASKS, max_model_calls: int = 2) -> dict[str, Any]:
@@ -941,8 +1003,9 @@ class IntegrationReplanner(_MeasuredModel):
             raise IntegrationGenerationError("No integration replanner model is configured.")
         if isinstance(max_model_calls, bool) or not isinstance(max_model_calls, int) or max_model_calls < 1:
             raise IntegrationGenerationError("Integration replanning model-call budget is exhausted.")
+        semantic_current_plan = self._semantic_plan_view(validate_plan(deepcopy(current_plan)))
         context = sanitize({
-            "current_effective_plan": current_plan,
+            "current_effective_plan": semantic_current_plan,
             "global_gap": {key: integration.get(key) for key in
                            ("status", "summary", "criteria", "cross_task_issues",
                             "missing_evidence", "responsible_task_ids")},
@@ -953,7 +1016,12 @@ class IntegrationReplanner(_MeasuredModel):
         prompts = [
             "Return only new tasks needed to close the global gap. Do not repeat, modify, delete, "
             "or supersede any existing task. Dependencies on existing tasks require accepted status. "
-            "Give each new local criterion an explicit criterion_links entry when it proves a global ID.",
+            "Set a registered task_kind and describe semantic operations only. Do not choose tools, capabilities, or Skills; "
+            "Freya compiles operation IDs through the runtime catalog and rejects scope expansion. "
+            "Give each new local criterion an explicit criterion_links entry when it proves a global ID. "
+            "Declare exact workspace-relative owned_paths for new files. Never claim a path already "
+            "owned by an existing task; leave an existing owner's path unclaimed when the new task "
+            "must request a coordinated cross-task change.",
             "Repair the prior invalid append-only response once. Return strict JSON only.",
         ]
         last_error: Exception | None = None
@@ -968,6 +1036,31 @@ class IntegrationReplanner(_MeasuredModel):
                     parsed["tasks"], historical_task_ids | {task["id"] for task in current_plan["tasks"]},
                     {task["id"] for task in current_plan["tasks"]},
                 )
+                catalog = RuntimeResourceCatalog.build()
+                compiled_additions = []
+                resource_resolutions = []
+                for item in allocated:
+                    legacy_resource_fields = {
+                        "required_capabilities", "required_tools", "preferred_skills",
+                        "semantic_operations",
+                    }
+                    if (not isinstance(item, dict)
+                            or set(item) - (INTEGRATION_SEMANTIC_TASK_FIELDS
+                                            | legacy_resource_fields)):
+                        raise IntegrationValidationError(
+                            "Integration task contains unknown semantic fields."
+                        )
+                    semantic_item = deepcopy(item)
+                    if "operations" not in semantic_item and isinstance(
+                            semantic_item.get("semantic_operations"), list):
+                        semantic_item["operations"] = semantic_item["semantic_operations"]
+                    normalized = catalog.validate_semantic_plan({"tasks": [semantic_item]})["tasks"][0]
+                    resource_resolutions.extend(catalog.resource_resolutions)
+                    compiled_additions.append(
+                        compile_semantic_task_resources(
+                            normalized, catalog, require_task_kind=True)
+                    )
+                allocated = compiled_additions
                 revised = validate_integration_revision(
                     current_plan=current_plan, new_tasks=allocated,
                     accepted_task_ids=accepted_task_ids,
@@ -1002,7 +1095,12 @@ class IntegrationReplanner(_MeasuredModel):
                 return {"summary": summary, "plan": revised, "id_allocation": allocation,
                         "new_task_ids": [item["id"] for item in revised["tasks"]
                                          if item["id"] not in {task["id"] for task in current_plan["tasks"]}],
+                        "resource_resolutions": resource_resolutions,
                         "metrics": dict(self.metrics)}
+            except UnsupportedResourceRequirement as exc:
+                raise IntegrationGenerationError(
+                    "Integration requested an unsupported runtime resource: " + str(exc)
+                ) from exc
             except (IntegrationValidationError, TypeError, ValueError) as exc:
                 last_error = exc
         raise IntegrationGenerationError(

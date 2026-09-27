@@ -11,6 +11,7 @@ from control_center.config import normalize_agent
 from control_center.execution_graph import ExecutionGraph
 from control_center.integration import (
     GLOBAL_RESPONSE_FORMAT,
+    INTEGRATION_REPLAN_RESPONSE_FORMAT,
     GlobalVerifier,
     IntegrationGenerationError,
     IntegrationPreconditionError,
@@ -39,6 +40,34 @@ def task(task_id, depends_on=None, criterion=None, capabilities=None):
         "required_capabilities": list(capabilities or []),
         "preferred_skills": [],
         "success_criteria": [criterion or f"{task_id} is complete"],
+    }
+
+
+def semantic_task(task_id, depends_on=None, *, operations=None, owned_paths=None,
+                  semantic_need="Complete the requested semantic operation.", task_kind=None):
+    operations = list(operations or [])
+    if task_kind is None:
+        if "modify_file" in operations or "overwrite_file" in operations:
+            task_kind = "code_change"
+        elif "create_file" in operations:
+            task_kind = "file_creation"
+        elif any(operation in operations for operation in (
+                "run_python_script", "run_pytest", "run_unittest", "compile_python", "lint_python")):
+            task_kind = "testing"
+        elif "read_file" in operations:
+            task_kind = "review"
+        else:
+            task_kind = "general"
+    return {
+        "id": task_id,
+        "task_kind": task_kind,
+        "objective": f"Complete {task_id}",
+        "description": f"Implement and verify {task_id}",
+        "depends_on": list(depends_on or []),
+        "operations": operations,
+        "semantic_needs": [semantic_need],
+        "success_criteria": [f"{task_id} is complete"],
+        "owned_paths": list(owned_paths or []),
     }
 
 
@@ -391,6 +420,35 @@ class FingerprintAndReplanTests(unittest.TestCase):
         )
         self.assertEqual([item["id"] for item in revised["tasks"]], ["a", "c"])
 
+    def test_integration_schema_uses_semantic_operations_only(self):
+        task_schema = INTEGRATION_REPLAN_RESPONSE_FORMAT["properties"]["tasks"]["items"]
+        fields = task_schema["properties"]
+        self.assertIn("operations", fields)
+        self.assertIn("task_kind", fields)
+        self.assertNotIn("required_capabilities", fields)
+        self.assertNotIn("required_tools", fields)
+        self.assertNotIn("preferred_skills", fields)
+
+    def test_integration_cannot_compile_capabilities_outside_current_budget(self):
+        from control_center.runtime_resources import RuntimeResourceCatalog
+
+        catalog = RuntimeResourceCatalog.build()
+        create_caps, create_tools = catalog.resources_for_operations(["create_file"])
+        overwrite_caps, overwrite_tools = catalog.resources_for_operations(["overwrite_file"])
+        existing = task("a", capabilities=create_caps)
+        existing.update({"required_tools": create_tools,
+                         "semantic_operations": ["create_file"],
+                         "owned_paths": ["src/app.py"]})
+        appended = task("b", ["a"], capabilities=overwrite_caps)
+        appended.update({"required_tools": overwrite_tools,
+                         "semantic_operations": ["overwrite_file"],
+                         "owned_paths": ["src/output.py"]})
+        with self.assertRaisesRegex(IntegrationValidationError, "outside the compiled plan scope"):
+            validate_integration_revision(
+                current_plan=plan([existing]), new_tasks=[appended],
+                accepted_task_ids={"a"}, historical_task_ids={"a"}, max_tasks=2,
+            )
+
     def test_new_task_dependency_on_nonaccepted_task_is_rejected(self):
         with self.assertRaisesRegex(IntegrationValidationError, "non-accepted"):
             validate_integration_revision(
@@ -442,7 +500,8 @@ class FingerprintAndReplanTests(unittest.TestCase):
             calls.append(prompt)
             if len(calls) == 1:
                 return "bad"
-            return {"summary": "Add integration verification.", "tasks": [task("c", ["a"])]}
+            return {"summary": "Add integration verification.",
+                    "tasks": [semantic_task("c", ["a"])]}
 
         result = IntegrationReplanner(model).create_revision(
             current_plan=plan(), integration=global_result(["x"], "needs_work"),
@@ -450,6 +509,41 @@ class FingerprintAndReplanTests(unittest.TestCase):
         )
         self.assertEqual(result["new_task_ids"], ["c"])
         self.assertEqual(len(calls), 2)
+
+    def test_replanner_preserves_exact_paths_for_new_file_owners(self):
+        existing = task("a", capabilities=["filesystem.create"])
+        existing["owned_paths"] = ["src/main.py"]
+        appended = semantic_task(
+            "c", ["a"], operations=["create_file"],
+            semantic_need="Create a summary file.", owned_paths=["docs/summary.txt"],
+        )
+        observed = {}
+
+        def model(prompt, context):
+            observed.update(context["current_effective_plan"]["tasks"][0])
+            return {"summary": "Add a grounded summary artifact.", "tasks": [appended]}
+
+        result = IntegrationReplanner(model).create_revision(
+            current_plan=plan([existing]), integration=global_result(["summary exists"], "needs_work"),
+            accepted_task_ids={"a"}, historical_task_ids={"a"}, max_tasks=2,
+        )
+        self.assertEqual(result["plan"]["tasks"][-1]["owned_paths"], ["docs/summary.txt"])
+        self.assertEqual(result["plan"]["tasks"][-1]["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(result["plan"]["tasks"][-1]["required_tools"], ["write_file"])
+        self.assertIn("operations", observed)
+        self.assertNotIn("required_capabilities", observed)
+        self.assertNotIn("required_tools", observed)
+
+    def test_replanner_rejects_new_task_without_task_kind(self):
+        appended = semantic_task("c", operations=["create_file"], owned_paths=["src/c.txt"])
+        appended.pop("task_kind")
+        with self.assertRaises(IntegrationGenerationError):
+            IntegrationReplanner(lambda prompt, context: {
+                "summary": "Add a file task.", "tasks": [appended],
+            }).create_revision(
+                current_plan=plan(), integration=global_result(["x"], "needs_work"),
+                accepted_task_ids={"a"}, historical_task_ids={"a"}, max_tasks=2,
+            )
 
     def test_replanner_budget_one_does_not_repair(self):
         calls = []

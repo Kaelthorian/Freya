@@ -221,9 +221,16 @@ class Application:
             self._agent_event(agent, "agent.created")
             return 201, agent
         if method == "POST" and len(parts) == 3 and parts[0] == "approvals":
-            action = {"approve-once": "approved_once", "approve-task": "approved_task", "deny": "denied"}.get(parts[2])
+            action = {"approve-once": "approved_once", "approve-task": "approved_task",
+                      "approve-file-intent": "approved_file_intent", "deny": "denied"}.get(parts[2])
             if action is None:
                 raise ApiError(404, "Approval action not available.")
+            if self.store.get_cross_task_modification_request_by_approval(parts[1]) is not None:
+                if not self.orchestrator:
+                    raise ApiError(503, "Freya orchestrator is unavailable.")
+                if action == "approved_task":
+                    raise ApiError(400, "Cross-task requests support one-time or same-file intent approval.")
+                return 200, self.orchestrator.resolve_cross_task_approval(parts[1], action)
             return 200, self.runtime.resolve_approval(parts[1], action)
         if method == "POST" and parts == ["agents"]:
             payload = normalize_agent(body)

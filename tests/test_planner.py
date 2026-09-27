@@ -77,6 +77,7 @@ class PlannerValidationTests(unittest.TestCase):
     def test_simple_artifact_collapse_keeps_explicit_criterion_link(self):
         global_text = "hola_mundo.txt contains exactly hola mundo."
         first = task("create", "Create hola_mundo.txt", required_capabilities=["filesystem.create"],
+                     owned_paths=["hola_mundo.txt"],
                      success_criteria=["The file exists."])
         second = task("verify", "Read hola_mundo.txt", depends_on=["create"],
                       required_capabilities=["filesystem.read"],
@@ -95,6 +96,7 @@ class PlannerValidationTests(unittest.TestCase):
         result = Planner(lambda prompt, context: generated).create_plan(
             "Create hola_mundo.txt", {"task_analysis": deterministic_task_analysis("Create hola_mundo.txt")})
         self.assertEqual(len(result["tasks"]), 1)
+        self.assertEqual(result["tasks"][0]["owned_paths"], ["hola_mundo.txt"])
         linked = next(item for item in result["criterion_links"]["local"]
                       if item["id"] == "tc-verify")
         self.assertEqual(linked["task_id"], "create")
@@ -402,6 +404,12 @@ class PlannerValidationTests(unittest.TestCase):
     def test_duplicate_normalized_task_ids_are_rejected(self):
         with self.assertRaisesRegex(PlanValidationError, "unique"):
             validate_plan(plan([task("Inspect Auth"), task("inspect-auth")], complexity="multi_step"))
+
+    def test_duplicate_exact_path_owners_are_rejected(self):
+        first = task("first", owned_paths=["src/calculator.py"])
+        second = task("second", owned_paths=["src/calculator.py"])
+        with self.assertRaisesRegex(PlanValidationError, "Conflicting write ownership"):
+            validate_plan(plan([first, second], complexity="multi_step"))
 
     def test_missing_dependency_is_rejected(self):
         with self.assertRaisesRegex(PlanValidationError, "unknown task"):

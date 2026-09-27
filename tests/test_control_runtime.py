@@ -887,7 +887,12 @@ class WorkerTests(unittest.TestCase):
                                                           "completion_criteria": []}})
         self.assertEqual(result["status"], "Success", result["error"])
         self.assertTrue(result["task_execution_successful"])
+        self.assertEqual(result["execution_outcome"], "execution_complete")
         self.assertEqual(result["workspace_changes"], 0)
+        completion = next(item["event"] for item in self.events
+                          if item.get("event", {}).get("event_type") == "worker.execution.completed")
+        self.assertEqual(completion["status"], "ExecutionComplete")
+        self.assertNotIn("accepted", completion)
 
     def test_web_calculator_worker_to_evaluator_uses_real_write_and_readback(self):
         source_prompt = (

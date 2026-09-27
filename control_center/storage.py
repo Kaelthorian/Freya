@@ -28,6 +28,9 @@ from .skills import (BUILTIN_SKILLS, CORE_SKILL_ID, CORE_TOOLS, CORE_WRITE_FILE_
                      skill_summary, validate_skill_tools)
 from .security import sanitize
 from .tools import argument_summary
+from .cross_task import (CrossTaskRequestError, normalize_owned_path,
+                         normalize_owned_paths, owned_path_key,
+                         validate_cross_task_intent)
 
 
 TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
@@ -1722,6 +1725,20 @@ class Store(IntegrationStoreMixin):
                     "('running','waiting_for_approval','evaluating','recovery_pending','ready','pending')",
                     (now, row["id"]),
                 )
+                c.execute(
+                    "UPDATE approval_requests SET status='denied',resolution=?,resolved_at=? "
+                    "WHERE status='pending' AND id IN (SELECT approval_id "
+                    "FROM cross_task_modification_requests WHERE orchestration_id=? "
+                    "AND status NOT IN ('completed','denied','blocked','cycle_detected','cancelled'))",
+                    (message, now, row["id"]),
+                )
+                c.execute(
+                    "UPDATE cross_task_modification_requests SET status='cancelled',"
+                    "approval_source='orchestration_interrupted',human_resolution=?,updated_at=? "
+                    "WHERE orchestration_id=? AND status NOT IN "
+                    "('completed','denied','blocked','cycle_detected','cancelled')",
+                    (message, now, row["id"]),
+                )
                 event = {"event_type": "freya.interrupted", "status": "Failed", "message": message}
                 c.execute(
                     "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,message,payload_json) "
@@ -2066,6 +2083,38 @@ class Store(IntegrationStoreMixin):
         item["arguments"] = _load(item.pop("arguments_json", "{}")) or {}
         return item
 
+    @staticmethod
+    def _cross_task_request(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["blocking"] = bool(item.get("blocking"))
+        item["intent_match"] = _load(item.pop("intent_match_json", "{}")) or {}
+        item["owner_evaluation"] = _load(item.pop("owner_evaluation_json", "{}")) or {}
+        item["owner_task_snapshot"] = _load(item.pop("owner_task_snapshot_json", "{}")) or {}
+        return item
+
+    @staticmethod
+    def _cross_task_grant(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["approved_intent"] = _load(item.pop("approved_intent_json", "{}")) or {}
+        item["source_request"] = _load(item.pop("source_request_json", "{}")) or {}
+        return item
+
+    @classmethod
+    def _approval_with_cross_task(cls, connection: sqlite3.Connection,
+                                  row: sqlite3.Row | None, approval_id: str = "") -> dict:
+        item = cls._approval(row, approval_id)
+        request_row = connection.execute(
+            "SELECT * FROM cross_task_modification_requests WHERE approval_id=?",
+            (item["id"],),
+        ).fetchone()
+        if request_row is not None:
+            item["cross_task_modification"] = cls._cross_task_request(request_row)
+        return item
+
     def create_approval(self, task_id: str, agent_id: str, capability: str, tool: str,
                         arguments: dict[str, Any] | None = None, action_summary: str = "",
                         resource: str = "", reason: str = "", approval_id: str | None = None,
@@ -2091,12 +2140,12 @@ class Store(IntegrationStoreMixin):
                     "UPDATE task_executions SET status='WaitingForApproval' WHERE task_id=? AND status IN ('Queued','Running','Paused')",
                     (task_id,),
                 )
-            return self._approval(connection.execute(
+            return self._approval_with_cross_task(connection, connection.execute(
                 "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
 
     def get_approval(self, approval_id: str) -> dict:
         with self._connection() as connection:
-            return self._approval(connection.execute(
+            return self._approval_with_cross_task(connection, connection.execute(
                 "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
 
     def list_approvals(self, *, status: str | None = None, task_id: str | None = None,
@@ -2114,7 +2163,7 @@ class Store(IntegrationStoreMixin):
         query += " ORDER BY created_at DESC,id DESC LIMIT ?"
         params.append(max(1, min(int(limit), 1000)))
         with self._connection() as connection:
-            return [self._approval(row) for row in connection.execute(query, params)]
+            return [self._approval_with_cross_task(connection, row) for row in connection.execute(query, params)]
 
     def resolve_approval(self, approval_id: str, status: str, resolution: str | None = None) -> dict:
         if status not in {"approved_once", "approved_task", "denied"}:
@@ -2137,8 +2186,314 @@ class Store(IntegrationStoreMixin):
                 "UPDATE approval_requests SET status=?,resolution=?,resolved_at=? WHERE id=? AND status='pending'",
                 (status, str(resolution or status)[:1000], now, approval_id),
             )
-            return self._approval(connection.execute(
+            return self._approval_with_cross_task(connection, connection.execute(
                 "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone(), approval_id)
+
+    def create_cross_task_modification_request(self, request: dict[str, Any],
+                                               approval_id: str) -> dict[str, Any]:
+        """Persist a validated ownership handoff linked to an existing approval row."""
+        if not isinstance(request, dict):
+            raise CrossTaskRequestError("Cross-task request must be an object.")
+        intent = validate_cross_task_intent(request)
+        target_path = normalize_owned_path(request.get("target_path"))
+        request_id = str(request.get("request_id") or "").strip()
+        requester_task = str(request.get("requester_plan_task_id") or "").strip()
+        owner_task = str(request.get("target_owner_plan_task_id") or "").strip()
+        orchestration_id = str(request.get("orchestration_id") or "").strip()
+        requester_runtime_id = str(request.get("requester_runtime_task_id") or "").strip()
+        if not all((request_id, requester_task, owner_task, orchestration_id, requester_runtime_id)):
+            raise CrossTaskRequestError("Cross-task request identifiers are required.")
+        if request_id != approval_id:
+            raise CrossTaskRequestError("Cross-task request and approval IDs must match.")
+        if request.get("requested_operation") not in {"create", "modify", "overwrite"} or not isinstance(request.get("blocking"), bool):
+            raise CrossTaskRequestError("Cross-task request operation or blocking flag is invalid.")
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            approval = connection.execute(
+                "SELECT task_id,agent_id,capability,tool,status FROM approval_requests WHERE id=?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None:
+                raise KeyError(approval_id)
+            if (approval["task_id"] != requester_runtime_id
+                    or approval["tool"] != "cross_task_modification"
+                    or approval["capability"] != "cross_task.modify"
+                    or approval["status"] != "pending"):
+                raise ValueError("Cross-task request does not match its parent approval.")
+            connection.execute(
+                "INSERT INTO cross_task_modification_requests(id,orchestration_id,requester_plan_task_id,"
+                "requester_runtime_task_id,requester_agent_id,target_owner_plan_task_id,target_path,"
+                "normalized_target_path,requested_operation,requested_change,reason,needed_for,blocking,status,"
+                "approval_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_id, orchestration_id, requester_task, requester_runtime_id,
+                 approval["agent_id"], owner_task, target_path, owned_path_key(target_path),
+                 request["requested_operation"], intent["requested_change"], intent["reason"], intent["needed_for"],
+                 int(request["blocking"]), "pending", approval_id, now, now),
+            )
+            return self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (request_id,),
+            ).fetchone()) or {}
+
+    def get_cross_task_modification_request(self, request_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            value = self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (request_id,),
+            ).fetchone())
+            if value is None:
+                raise KeyError(request_id)
+            return value
+
+    def get_cross_task_modification_request_by_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE approval_id=?", (approval_id,),
+            ).fetchone())
+
+    def list_cross_task_modification_requests(self, orchestration_id: str,
+                                             statuses: list[str] | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = [orchestration_id]
+        query = "SELECT * FROM cross_task_modification_requests WHERE orchestration_id=?"
+        if statuses:
+            query += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
+            params.extend(statuses)
+        query += " ORDER BY created_at,id"
+        with self._connection() as connection:
+            return [self._cross_task_request(row) for row in connection.execute(query, params)]
+
+    def update_cross_task_modification_request(self, request_id: str, *,
+                                              expected_statuses: list[str],
+                                              status: str, **fields: Any) -> dict[str, Any] | None:
+        allowed_statuses = {"pending", "awaiting_human", "approved_once", "approved_intent",
+                            "auto_approved", "owner_selecting", "owner_running", "owner_evaluating", "completed", "denied",
+                            "blocked", "cycle_detected", "cancelled"}
+        if status not in allowed_statuses or not expected_statuses:
+            raise ValueError("Invalid cross-task request transition.")
+        allowed = {"approval_source", "grant_id", "intent_match", "owner_runtime_task_id",
+                   "owner_agent_id", "owner_evaluation", "human_resolution",
+                   "owner_task_snapshot"}
+        if set(fields) - allowed:
+            raise ValueError("Invalid cross-task request update fields.")
+        values: dict[str, Any] = {"status": status, "updated_at": utcnow()}
+        for key, value in fields.items():
+            column = {"intent_match": "intent_match_json",
+                      "owner_evaluation": "owner_evaluation_json",
+                      "owner_task_snapshot": "owner_task_snapshot_json"}.get(key, key)
+            values[column] = _dump(value) if key in {"intent_match", "owner_evaluation"} else value
+        assignments = ",".join(f"{key}=?" for key in values)
+        placeholders = ",".join("?" for _ in expected_statuses)
+        with self._connection(write=True) as connection:
+            cursor = connection.execute(
+                f"UPDATE cross_task_modification_requests SET {assignments} WHERE id=? AND status IN ({placeholders})",
+                [*values.values(), request_id, *expected_statuses],
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (request_id,),
+            ).fetchone())
+
+    def create_cross_task_intent_grant(self, request: dict[str, Any], *,
+                                       approver: str, source_approval_id: str,
+                                       human_resolution: str) -> dict[str, Any]:
+        intent = validate_cross_task_intent(request)
+        grant_id = str(uuid4())
+        approved_at = utcnow()
+        request_copy = {key: request.get(key) for key in (
+            "orchestration_id", "requester_plan_task_id",
+            "target_owner_plan_task_id", "target_path", "requested_operation",
+            "requested_change", "reason", "needed_for", "blocking",
+        )}
+        request_copy["request_id"] = request.get("request_id") or request.get("id")
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "INSERT INTO cross_task_intent_grants(id,orchestration_id,requester_plan_task_id,"
+                "owner_plan_task_id,normalized_target_path,operation,approved_intent_json,approver,"
+                "approved_at,source_request_json,human_resolution,source_approval_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (grant_id, request["orchestration_id"], request["requester_plan_task_id"],
+                 request["target_owner_plan_task_id"], owned_path_key(request["target_path"]),
+                 request["requested_operation"], _dump(intent), str(approver)[:200], approved_at,
+                 _dump(request_copy), str(human_resolution)[:1000], source_approval_id),
+            )
+            return self._cross_task_grant(connection.execute(
+                "SELECT * FROM cross_task_intent_grants WHERE id=?", (grant_id,),
+            ).fetchone()) or {}
+
+    def find_cross_task_intent_grants(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM cross_task_intent_grants WHERE orchestration_id=? "
+                "AND requester_plan_task_id=? AND owner_plan_task_id=? "
+                "AND normalized_target_path=? AND operation=? ORDER BY approved_at,id",
+                (request["orchestration_id"], request["requester_plan_task_id"],
+                 request["target_owner_plan_task_id"], owned_path_key(request["target_path"]),
+                 request["requested_operation"]),
+            )
+            return [self._cross_task_grant(row) for row in rows]
+
+    def auto_approve_cross_task_modification_request(self, request_id: str, *,
+                                                     grant_id: str,
+                                                     intent_match: dict[str, Any]) -> dict[str, Any] | None:
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT approval_id,orchestration_id FROM cross_task_modification_requests "
+                "WHERE id=? AND status='pending'",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            run = connection.execute(
+                "SELECT status FROM orchestration_runs WHERE id=?", (row["orchestration_id"],),
+            ).fetchone()
+            if run is None or run["status"] != "Running":
+                return None
+            approval = connection.execute(
+                "UPDATE approval_requests SET status='approved_once',resolution=?,resolved_at=? "
+                "WHERE id=? AND status='pending'",
+                ("Reusable cross-task intent grant " + grant_id, now, row["approval_id"]),
+            )
+            if approval.rowcount != 1:
+                return None
+            cursor = connection.execute(
+                "UPDATE cross_task_modification_requests SET status='auto_approved',"
+                "approval_source='automatic_reuse',grant_id=?,intent_match_json=?,updated_at=? "
+                "WHERE id=? AND status='pending'",
+                (grant_id, _dump(intent_match), now, request_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (request_id,),
+            ).fetchone())
+
+    def block_cross_task_modification_request(self, request_id: str, *,
+                                              status: str, reason: str,
+                                              expected_statuses: list[str] | None = None) -> dict[str, Any] | None:
+        if status not in {"blocked", "cycle_detected"}:
+            raise ValueError("Invalid cross-task blocking status.")
+        expected_statuses = expected_statuses or [
+            "pending", "awaiting_human", "approved_once", "approved_intent",
+            "auto_approved", "owner_selecting", "owner_running", "owner_evaluating",
+        ]
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT approval_id,status FROM cross_task_modification_requests WHERE id=?",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] not in expected_statuses:
+                return None
+            connection.execute(
+                "UPDATE approval_requests SET status='denied',resolution=?,resolved_at=? "
+                "WHERE id=? AND status='pending'",
+                (str(reason)[:1000], now, row["approval_id"]),
+            )
+            cursor = connection.execute(
+                "UPDATE cross_task_modification_requests SET status=?,approval_source='freya_blocked',"
+                "human_resolution=?,updated_at=? WHERE id=? AND status=?",
+                (status, str(reason)[:1000], now, request_id, row["status"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._cross_task_request(connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (request_id,),
+            ).fetchone())
+
+    def cancel_cross_task_modification_requests(self, orchestration_id: str,
+                                                reason: str = "orchestration cancelled") -> int:
+        """Close all outstanding handoffs atomically with their approvals."""
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            rows = connection.execute(
+                "SELECT id,approval_id FROM cross_task_modification_requests "
+                "WHERE orchestration_id=? AND status NOT IN "
+                "('completed','denied','blocked','cycle_detected','cancelled')",
+                (orchestration_id,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE approval_requests SET status='denied',resolution=?,resolved_at=? "
+                    "WHERE id=? AND status='pending'",
+                    ("cancelled: " + str(reason)[:900], now, row["approval_id"]),
+                )
+                connection.execute(
+                    "UPDATE cross_task_modification_requests SET status='cancelled',"
+                    "approval_source='orchestration_cancelled',human_resolution=?,updated_at=? WHERE id=?",
+                    (str(reason)[:1000], now, row["id"]),
+                )
+            return len(rows)
+
+    def resolve_cross_task_modification_approval(self, approval_id: str,
+                                                 resolution: str) -> dict[str, Any]:
+        if resolution not in {"approved_once", "approved_file_intent", "denied"}:
+            raise ValueError("Unknown cross-task approval resolution.")
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT r.*,a.status AS approval_status,a.task_id AS approval_task_id "
+                "FROM cross_task_modification_requests r JOIN approval_requests a ON a.id=r.approval_id "
+                "WHERE r.approval_id=?", (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_id)
+            if row["approval_status"] != "pending" or row["status"] not in {"pending", "awaiting_human"}:
+                raise ValueError("Cross-task approval is no longer pending.")
+            task = connection.execute(
+                "SELECT status FROM task_executions WHERE task_id=?", (row["approval_task_id"],),
+            ).fetchone()
+            if task is None or task["status"] in {"Success", "Failed", "Cancelled"}:
+                raise ValueError("Cannot resolve cross-task approval for a terminal requester task.")
+            grant = None
+            if resolution == "approved_file_intent":
+                original = self._cross_task_request(row) or {}
+                approved_intent = validate_cross_task_intent(original)
+                grant_id = str(uuid4())
+                connection.execute(
+                    "INSERT INTO cross_task_intent_grants(id,orchestration_id,requester_plan_task_id,"
+                    "owner_plan_task_id,normalized_target_path,operation,approved_intent_json,approver,"
+                    "approved_at,source_request_json,human_resolution,source_approval_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (grant_id, row["orchestration_id"], row["requester_plan_task_id"],
+                     row["target_owner_plan_task_id"], row["normalized_target_path"], row["requested_operation"],
+                     _dump(approved_intent), "operator", now, _dump({
+                         key: original.get(key) for key in (
+                             "id", "orchestration_id", "requester_plan_task_id",
+                             "target_owner_plan_task_id", "target_path", "requested_operation",
+                             "requested_change", "reason", "needed_for", "blocking",
+                         )
+                     }), resolution, approval_id),
+                )
+                grant = self._cross_task_grant(connection.execute(
+                    "SELECT * FROM cross_task_intent_grants WHERE id=?", (grant_id,),
+                ).fetchone())
+            request_status = {
+                "approved_once": "approved_once",
+                "approved_file_intent": "approved_intent",
+                "denied": "denied",
+            }[resolution]
+            source = "human_approved_once" if resolution == "approved_once" else (
+                "human_approved_intent" if resolution == "approved_file_intent" else "human_denied"
+            )
+            connection.execute(
+                "UPDATE approval_requests SET status=?,resolution=?,resolved_at=? "
+                "WHERE id=? AND status='pending'",
+                (resolution, resolution, now, approval_id),
+            )
+            connection.execute(
+                "UPDATE cross_task_modification_requests SET status=?,approval_source=?,grant_id=?,"
+                "human_resolution=?,updated_at=? WHERE id=?",
+                (request_status, source, grant["id"] if grant else None, resolution, now, row["id"]),
+            )
+            updated = connection.execute(
+                "SELECT * FROM cross_task_modification_requests WHERE id=?", (row["id"],),
+            ).fetchone()
+            return {"request": self._cross_task_request(updated), "grant": grant,
+                    "approval": self._approval_with_cross_task(connection, connection.execute(
+                        "SELECT * FROM approval_requests WHERE id=?", (approval_id,),
+                    ).fetchone(), approval_id)}
 
     def cancel_pending_approvals(self, task_id: str, reason: str = "cancelled") -> int:
         now = utcnow()

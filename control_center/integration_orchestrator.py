@@ -368,6 +368,7 @@ class IntegrationOrchestrationMixin:
                 "integration_id": integration_id, "plan_revision_id": revision_id,
                 "revision": saved["revision"], "new_task_ids": revision["new_task_ids"],
                 "id_allocation": revision.get("id_allocation", {}),
+                "resource_resolutions": revision.get("resource_resolutions", []),
                 "message": "Freya committed an append-only integration revision.",
             })
         return True

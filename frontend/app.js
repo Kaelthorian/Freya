@@ -196,8 +196,8 @@ document.addEventListener('click', async event => {
     if (action === 'freya-workspace') return await chooseWorkspace(document.querySelector('#freya-workspace'));
     if (action === 'assign') return await assignDialog(id);
     if (action === 'refresh') return await refresh();
-    if (action === 'approve-once' || action === 'approve-task' || action === 'deny-approval') {
-      const endpoint = action === 'approve-once' ? 'approve-once' : action === 'approve-task' ? 'approve-task' : 'deny';
+    if (action === 'approve-once' || action === 'approve-task' || action === 'approve-file-intent' || action === 'deny-approval') {
+      const endpoint = action === 'approve-once' ? 'approve-once' : action === 'approve-task' ? 'approve-task' : action === 'approve-file-intent' ? 'approve-file-intent' : 'deny';
       await api('/approvals/' + id + '/' + endpoint, 'POST', {});
       toast(endpoint === 'deny' ? 'Approval denied.' : 'Approval resolved.');
       await refresh();

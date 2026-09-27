@@ -629,12 +629,16 @@ class TaskSpecTests(unittest.TestCase):
     def test_semantic_compiler_assigns_ids_and_rejects_cycle(self):
         spec = deterministic_task_spec("crea una calculadora de consola en Python que sume")
         semantic = {"tasks": [
-            {"key": "implement_calculator", "objective": "Implement calculator",
-             "depends_on": [], "required_capabilities": ["filesystem.create"],
-             "preferred_skills": [], "success_criteria": ["Program exists"]},
-            {"key": "test_calculator", "objective": "Test calculator",
-             "depends_on": ["implement_calculator"], "required_capabilities": ["filesystem.read"],
-             "preferred_skills": [], "success_criteria": ["Output is correct"]},
+            {"key": "implement_calculator", "task_kind": "program_creation",
+             "objective": "Implement calculator", "operations": ["create_file"],
+             "semantic_needs": ["Create calculator.py."], "depends_on": [],
+             "owned_paths": ["calculator.py"],
+             "success_criteria": ["Program exists"]},
+            {"key": "test_calculator", "task_kind": "testing",
+             "objective": "Test calculator", "operations": ["run_python_script"],
+             "semantic_needs": ["Run calculator.py."],
+             "depends_on": ["implement_calculator"],
+             "success_criteria": ["Output is correct"]},
         ]}
         plan = compile_semantic_plan(semantic, spec)
         self.assertEqual([task["id"] for task in plan["tasks"]], ["task-1", "task-2"])
@@ -649,10 +653,13 @@ class TaskSpecTests(unittest.TestCase):
         captured = {}
         def decide(prompt, context):
             captured["prompt"], captured["context"] = prompt, context
-            return {"tasks": [{"key": "implement", "objective": "Implement calculator",
+            return {"tasks": [{"key": "implement", "task_kind": "program_creation",
+                "objective": "Implement calculator",
                 "description": "Write the requested Python console calculator.",
-                "depends_on": [], "required_capabilities": ["filesystem.create", "filesystem.read"],
-                "preferred_skills": [], "success_criteria": ["Program exists"]}]}
+                "depends_on": [], "operations": ["create_file", "read_file"],
+                "semantic_needs": ["Create and inspect calculator.py."],
+                "owned_paths": ["calculator.py"],
+                "success_criteria": ["Program exists"]}]}
         plan = Planner(decide).create_plan_for_spec(spec)
         self.assertNotIn("source_prompt", captured["context"]["task_spec"])
         self.assertIn("Canonical Task Spec", captured["prompt"])
@@ -688,15 +695,15 @@ class TaskSpecTests(unittest.TestCase):
             "unsupported_requirements": [],
             "tasks": [{
                 "key": "implement_calculator",
+                "task_kind": "file_creation",
                 "objective": "Implement the web calculator.",
                 "description": (
                     "Assumption: use plain HTML, CSS, and JavaScript. "
                     "Create the calculator UI and implement all four requested operations."),
                 "depends_on": [],
                 "semantic_needs": ["Create a web calculator artifact."],
-                "required_capabilities": ["filesystem.create"],
-                "required_tools": ["write_file"],
-                "preferred_skills": [],
+                "operations": ["create_file"],
+                "owned_paths": ["index.html"],
                 "success_criteria": list(spec["validation_expectations"]),
             }],
         }
@@ -729,14 +736,13 @@ class TaskSpecTests(unittest.TestCase):
         semantic = {"summary": "Create and verify a Python console calculator.",
             "success_criteria": ["The calculator returns the sum of two input numbers."],
             "unsupported_requirements": [], "tasks": [{
-                "key": "implement", "objective": "Create calculator.py",
+                "key": "implement", "task_kind": "program_creation",
+                "objective": "Create calculator.py",
                 "description": "Write a Python console calculator that adds two numbers.",
                 "depends_on": [], "semantic_needs": [
                     "Create a Python source file.", "Run it with two controlled input lines."],
-                "required_capabilities": ["filesystem.create", "filesystem.read",
-                                          "execution.python_script"],
-                "required_tools": ["write_file", "read_file", "run_command"],
-                "preferred_skills": ["python-development"],
+                "operations": ["create_file", "read_file", "run_python_script"],
+                "owned_paths": ["calculator.py"],
                 "success_criteria": ["calculator.py exists and returns the requested sum."]}]}
 
         def decide(prompt, context):
@@ -757,10 +763,12 @@ class TaskSpecTests(unittest.TestCase):
         self.assertIn("run_command", qa["required_tools"])
         self.assertEqual(qa["preferred_skills"], [])
         self.assertTrue(qa["task_characteristics"]["single_case_verification"])
-        python_capability = next(item for item in captured["context"]["capabilities"]
-                                 if item["id"] == "execution.python_script")
-        self.assertTrue(any("stdin" in item for item in python_capability["operations"]))
-        self.assertIn("Runtime resource catalog", captured["prompt"])
+        self.assertNotIn("capabilities", captured["context"])
+        self.assertNotIn("tools", captured["context"])
+        self.assertNotIn("skills", captured["context"])
+        self.assertIn("run_python_script", {
+            item["id"] for item in captured["context"]["semantic_operations"]})
+        self.assertIn("Semantic operation catalog", captured["prompt"])
         self.assertEqual(captured["context"]["_semantic_plan"], True)
         compiler = planner.metrics["semantic_compiler"]
         self.assertEqual(compiler["status"], "Success")
@@ -776,31 +784,29 @@ class TaskSpecTests(unittest.TestCase):
         catalog = RuntimeResourceCatalog.build().as_dict()
         semantic = {"summary": "Create and test a calculator.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [
-                {"key": "create", "objective": "Create calculator.py", "description": "Create source.",
+                {"key": "create", "task_kind": "program_creation",
+                 "objective": "Create calculator.py", "description": "Create source.",
                  "depends_on": [], "semantic_needs": ["calculator.py"],
-                 "required_capabilities": ["filesystem.create"], "required_tools": ["write_file"],
-                 "preferred_skills": ["python-development"], "success_criteria": ["Source exists."]},
-                {"key": "implement", "objective": "Implement the sum function", "description": "Edit source.",
-                 "depends_on": ["create"], "semantic_needs": ["calculator.py"],
-                 "required_capabilities": ["filesystem.read", "filesystem.modify"],
-                 "required_tools": ["read_file", "edit_file"], "preferred_skills": ["python-development"],
-                 "success_criteria": ["The function sums values."]},
-                {"key": "test", "objective": "Create test_calculator.py", "description": "Create tests.",
-                 "depends_on": ["implement"], "semantic_needs": ["test_calculator.py"],
-                 "required_capabilities": ["filesystem.create"], "required_tools": ["write_file"],
-                 "preferred_skills": ["software-testing"], "success_criteria": ["Tests exist."]},
-                {"key": "run-tests", "objective": "Run calculator tests", "description": "Run pytest.",
+                 "operations": ["create_file", "modify_file", "read_file"],
+                 "owned_paths": ["calculator.py"],
+                 "success_criteria": ["Source exists."]},
+                {"key": "test", "task_kind": "file_creation",
+                 "objective": "Create test_calculator.py", "description": "Create tests.",
+                 "depends_on": ["create"], "semantic_needs": ["test_calculator.py"],
+                 "operations": ["create_file"], "owned_paths": ["test_calculator.py"],
+                 "success_criteria": ["Tests exist."]},
+                {"key": "run-tests", "task_kind": "testing",
+                 "objective": "Run calculator tests", "description": "Run pytest.",
                  "depends_on": ["test"], "semantic_needs": ["Run tests."],
-                 "required_capabilities": ["execution.pytest"], "required_tools": ["run_command"],
-                 "preferred_skills": ["software-testing"], "success_criteria": ["Tests pass."]},
+                 "operations": ["run_pytest"], "success_criteria": ["Tests pass."]},
             ]}
         # Include a second dependent code audit in the graph so the compactor
         # also proves that redundant QA/audit model nodes are not retained.
         semantic["tasks"].append({
-            "key": "audit", "objective": "Audit calculator code", "description": "Review it.",
+            "key": "audit", "task_kind": "review",
+            "objective": "Audit calculator code", "description": "Review it.",
             "depends_on": ["run-tests"], "semantic_needs": ["Review code."],
-            "required_capabilities": ["filesystem.read"], "required_tools": ["read_file"],
-            "preferred_skills": ["code-review"], "success_criteria": ["Code is reviewed."]})
+            "operations": ["read_file"], "success_criteria": ["Code is reviewed."]})
         result = Planner(lambda prompt, context: semantic).create_plan_for_spec(spec, catalog)
         self.assertEqual([item["id"] for item in result["tasks"]],
                          ["task-1", "qa-interactive-test"])
@@ -832,12 +838,12 @@ class TaskSpecTests(unittest.TestCase):
         catalog = RuntimeResourceCatalog.build().as_dict()
         semantic = {"summary": "Create the interactive program.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [{
-                "key": "implement", "objective": "Create calculator.py",
+                "key": "implement", "task_kind": "program_creation",
+                "objective": "Create calculator.py",
                 "description": "Create the console calculator.", "depends_on": [],
                 "semantic_needs": ["Provide two numbers through bounded stdin."],
-                "required_capabilities": ["filesystem.create", "execution.python_script"],
-                "required_tools": ["write_file", "run_command"],
-                "preferred_skills": ["python-development"],
+                "operations": ["create_file"],
+                "owned_paths": ["calculator.py"],
                 "success_criteria": ["The sum is printed correctly."]}]}
         result = Planner(lambda prompt, context: semantic).create_plan_for_spec(spec, catalog)
         qa = next(item for item in result["tasks"] if item["id"].startswith("qa-interactive-test"))
@@ -845,43 +851,75 @@ class TaskSpecTests(unittest.TestCase):
         self.assertIn("run_command", qa["required_tools"])
         self.assertNotIn("interactive-testing", qa["required_capabilities"])
 
-    def test_unknown_capability_is_rejected_before_compilation_or_repair(self):
+    def test_unknown_operation_is_rejected_before_compilation_or_repair(self):
         spec = deterministic_task_spec("crea una calculadora Python de consola que sume dos números")
         calls = []
         semantic = {"summary": "Create calculator.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [{
                 "key": "implement", "objective": "Create calculator.py", "description": "Create it.",
                 "depends_on": [], "semantic_needs": ["Run the calculator."],
-                "required_capabilities": ["made-up-capability"], "required_tools": [],
-                "preferred_skills": [], "success_criteria": ["The file exists."]}]}
+                "operations": ["made-up-operation"], "success_criteria": ["The file exists."]}]}
         planner = Planner(lambda prompt, context: (calls.append(prompt), semantic)[1])
         with self.assertRaises(UnsupportedResourceRequirement) as caught:
             planner.create_plan_for_spec(spec, RuntimeResourceCatalog.build().as_dict())
-        self.assertEqual(caught.exception.resource_type, "capability")
-        self.assertEqual(caught.exception.unknown_resource_id, "made-up-capability")
+        self.assertEqual(caught.exception.resource_type, "semantic_operation")
+        self.assertEqual(caught.exception.unknown_resource_id, "made-up-operation")
         self.assertEqual(len(calls), 1)
         self.assertEqual(planner.metrics["model_calls"], 1)
 
-    def test_unknown_skill_is_rejected_before_compilation(self):
+    def test_planner_skill_and_capability_declarations_are_non_authoritative(self):
         spec = deterministic_task_spec("crea una calculadora Python de consola que sume dos números")
         semantic = {"summary": "Create calculator.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [{
-                "key": "implement", "objective": "Create calculator.py", "description": "Create it.",
-                "depends_on": [], "semantic_needs": [], "required_capabilities": ["filesystem.create"],
+                "key": "implement", "task_kind": "program_creation",
+                "objective": "Create calculator.py", "description": "Create it.",
+                "depends_on": [], "semantic_needs": [], "operations": ["create_file"],
+                "required_capabilities": ["filesystem.overwrite", "execution.python_script"],
+                "owned_paths": ["calculator.py"],
                 "required_tools": ["write_file"], "preferred_skills": ["imaginary-python-skill"],
                 "success_criteria": ["The file exists."]}]}
-        with self.assertRaises(UnsupportedResourceRequirement) as caught:
-            Planner(lambda prompt, context: semantic).create_plan_for_spec(
-                spec, RuntimeResourceCatalog.build().as_dict())
-        self.assertEqual(caught.exception.resource_type, "skill")
+        planner = Planner(lambda prompt, context: semantic)
+        plan = planner.create_plan_for_spec(spec, RuntimeResourceCatalog.build().as_dict())
+        self.assertEqual(plan["tasks"][0]["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(plan["tasks"][0]["required_tools"], ["write_file"])
+        self.assertEqual(plan["tasks"][0]["preferred_skills"], [])
+
+    def test_structural_task_kind_contradiction_gets_one_bounded_repair(self):
+        spec = deterministic_task_spec("Modify calculator.py documentation.")
+        review_with_write = {"summary": "Update calculator documentation.",
+            "success_criteria": [], "unsupported_requirements": [], "tasks": [{
+                "key": "document", "task_kind": "review",
+                "objective": "Document calculator.py", "description": "Edit its documentation.",
+                "depends_on": [], "semantic_needs": ["Document calculator.py."],
+                "operations": ["modify_file"], "owned_paths": ["calculator.py"],
+                "success_criteria": ["The documentation is updated."],
+            }]}
+        corrected = {**review_with_write, "tasks": [{
+            **review_with_write["tasks"][0], "task_kind": "code_change",
+        }]}
+        calls = []
+
+        def model(prompt, context):
+            calls.append(prompt)
+            return review_with_write if len(calls) == 1 else corrected
+
+        compiled = Planner(model).create_plan_for_spec(spec)
+        implementation = compiled["tasks"][0]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(implementation["task_kind"], "code_change")
+        self.assertEqual(implementation["required_tools"], ["edit_file"])
+        self.assertEqual(implementation["required_capabilities"], ["filesystem.modify"])
+        self.assertEqual(AgentFactory.orchestration_role(implementation), "worker")
 
     def test_unknown_tool_is_rejected_before_compilation(self):
         spec = deterministic_task_spec("crea una calculadora Python de consola que sume dos números")
         semantic = {"summary": "Create calculator.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [{
-                "key": "implement", "objective": "Create calculator.py", "description": "Create it.",
-                "depends_on": [], "semantic_needs": [], "required_capabilities": ["filesystem.create"],
-                "required_tools": ["screen_capture"], "preferred_skills": [],
+                "key": "implement", "task_kind": "program_creation",
+                "objective": "Create calculator.py", "description": "Create it.",
+                "depends_on": [], "semantic_needs": [], "operations": ["create_file"],
+                "owned_paths": ["calculator.py"],
+                "required_tools": ["screen_capture"],
                 "success_criteria": ["The file exists."]}]}
         with self.assertRaises(UnsupportedResourceRequirement) as caught:
             Planner(lambda prompt, context: semantic).create_plan_for_spec(
@@ -893,17 +931,19 @@ class TaskSpecTests(unittest.TestCase):
         spec = deterministic_task_spec("Crea un archivo Python hello.py que imprima hola")
         semantic = {"summary": "Create and run hello.py.", "success_criteria": [],
             "unsupported_requirements": [], "tasks": [{
-                "key": "create", "objective": "Create hello.py", "description": "Create it.",
+                "key": "create", "task_kind": "program_creation",
+                "objective": "Create hello.py", "description": "Create it.",
                 "depends_on": [], "semantic_needs": ["Execute the Python file."],
-                "required_capabilities": ["run_python_script"],
-                "required_tools": ["run_workspace_command"], "preferred_skills": [],
+                "required_tools": ["run_workspace_command"],
                 "success_criteria": ["hello.py runs successfully."]}]}
         calls = []
         result = Planner(lambda prompt, context: (calls.append(prompt), semantic)[1]).create_plan_for_spec(
             spec, RuntimeResourceCatalog.build().as_dict())
         self.assertEqual(len(calls), 1)
-        self.assertEqual(result["tasks"][0]["required_capabilities"], ["execution.python_script"])
-        self.assertEqual(result["tasks"][0]["required_tools"], ["run_command"])
+        self.assertEqual(set(result["tasks"][0]["required_capabilities"]),
+                         {"filesystem.create", "execution.python_script"})
+        self.assertEqual(set(result["tasks"][0]["required_tools"]),
+                         {"write_file", "run_command"})
 
     def test_new_registered_skill_enters_catalog_and_dynamic_schema(self):
         with TemporaryDirectory() as directory:
@@ -926,10 +966,12 @@ class TaskSpecTests(unittest.TestCase):
             self.assertEqual(skill["use_when"], "When checking a small CLI arithmetic program.")
             self.assertNotIn("PRIVATE_WORKER_INSTRUCTION", json.dumps(context))
             format_schema = semantic_plan_response_format(context)
-            skill_enum = format_schema["properties"]["tasks"]["items"]["properties"]["preferred_skills"]["items"]["enum"]
-            capability_enum = format_schema["properties"]["tasks"]["items"]["properties"]["required_capabilities"]["items"]["enum"]
-            self.assertIn("arithmetic-checks", skill_enum)
-            self.assertNotIn("interactive-testing", capability_enum)
+            properties = format_schema["properties"]["tasks"]["items"]["properties"]
+            self.assertIn("operations", properties)
+            self.assertIn("task_kind", properties)
+            self.assertNotIn("required_capabilities", properties)
+            self.assertNotIn("required_tools", properties)
+            self.assertNotIn("preferred_skills", properties)
 
 
 class ClarificationIntegrationTests(unittest.TestCase):

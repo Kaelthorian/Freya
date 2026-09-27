@@ -18,6 +18,7 @@ from control_center.recovery import (
     FailureAnalyzer,
     OllamaFailureAnalyzer,
     RECOVERY_VERSION,
+    REVISION_RESPONSE_FORMAT,
     RecoveryController,
     RecoveryGenerationError,
     RecoveryValidationError,
@@ -806,10 +807,105 @@ class ReplannerTests(unittest.TestCase):
             "summary": "Replace the failed branch.",
             "plan": execution_plan([
                 planned_task("a"), planned_task("child", ["replacement"]),
-                planned_task("replacement"),
+                {**planned_task("replacement"), "task_kind": "general"},
             ]),
             "superseded_task_ids": ["a"],
         }
+
+    def test_revision_schema_exposes_operations_without_runtime_resources(self):
+        task_schema = REVISION_RESPONSE_FORMAT["properties"]["plan"]["properties"]["tasks"]["items"]
+        fields = task_schema["properties"]
+        self.assertIn("operations", fields)
+        self.assertIn("task_kind", fields)
+        self.assertNotIn("required_capabilities", fields)
+        self.assertNotIn("required_tools", fields)
+        self.assertNotIn("preferred_skills", fields)
+
+    def test_replanner_context_hides_compiled_resource_ids(self):
+        observed = {}
+
+        def model(prompt, context, revision=False):
+            observed.update(context["current_plan"]["tasks"][0])
+            return self.valid_revision()
+
+        Replanner(model).create_revision(
+            current_plan=self.current(), source_task_id="a", affected_task_ids=["a", "child"],
+            allowed_task_ids={"a", "child"}, protected_task_ids=set(),
+            accepted_task_ids=set(), historical_task_ids={"a", "child"},
+        )
+        self.assertIn("operations", observed)
+        self.assertNotIn("required_capabilities", observed)
+        self.assertNotIn("required_tools", observed)
+
+    def test_new_recovery_task_cannot_expand_compiled_capability_budget(self):
+        current_task = planned_task("a") | {
+            "required_capabilities": ["filesystem.read"],
+            "required_tools": ["read_file"],
+        }
+        current = execution_plan([current_task])
+        new_task = planned_task("replacement") | {
+            "semantic_operations": ["modify_file"],
+            "required_capabilities": ["filesystem.modify"],
+            "required_tools": ["edit_file"],
+        }
+        revised = execution_plan([current_task, new_task])
+        with self.assertRaisesRegex(RecoveryValidationError, "outside the superseded task scope"):
+            validate_replan_revision(
+                current_plan=current, revised_plan=revised,
+                source_task_id="a", affected_task_ids={"a"}, superseded_task_ids={"a"},
+                allowed_task_ids={"a"}, protected_task_ids=set(), accepted_task_ids=set(),
+                historical_task_ids={"a"}, max_tasks=4,
+            )
+
+    def test_replanner_compiles_new_task_resources_from_semantic_operations(self):
+        existing = planned_task("a") | {
+            "required_capabilities": ["filesystem.create"],
+            "required_tools": ["write_file"],
+            "semantic_operations": ["create_file"],
+            "owned_paths": ["src/app.txt"],
+        }
+        current = execution_plan([existing])
+        semantic_plan = {
+            **current,
+            "tasks": [{
+                "id": "a", "objective": existing["objective"],
+                "description": existing["description"], "depends_on": [],
+                "operations": ["create_file"], "semantic_needs": [],
+                "success_criteria": existing["success_criteria"],
+                "owned_paths": ["src/app.txt"],
+            }, {
+            "id": "replacement", "objective": "Create the replacement artifact",
+                "task_kind": "file_creation",
+                "description": "Create replacement.txt and verify it can be read.",
+                "depends_on": [], "operations": ["create_file"], "semantic_needs": [],
+                "success_criteria": ["replacement.txt is created and readable."],
+                "owned_paths": ["replacement.txt"],
+            }],
+        }
+        result = Replanner(lambda prompt, context, revision=False: {
+            "summary": "Replace the failed artifact task.", "plan": semantic_plan,
+            "superseded_task_ids": ["a"],
+        }).create_revision(
+            current_plan=current, source_task_id="a", affected_task_ids=["a"],
+            allowed_task_ids={"a"}, protected_task_ids=set(), accepted_task_ids=set(),
+            historical_task_ids={"a"},
+        )
+        replacement = next(item for item in result["plan"]["tasks"]
+                           if item["id"] == "replacement")
+        self.assertEqual(replacement["semantic_operations"], ["create_file"])
+        self.assertEqual(replacement["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(replacement["required_tools"], ["write_file"])
+        self.assertEqual(replacement["task_kind"], "file_creation")
+
+    def test_replanner_rejects_new_task_without_task_kind(self):
+        revision = self.valid_revision()
+        revision["plan"]["tasks"][-1].pop("task_kind")
+        with self.assertRaises(RecoveryValidationError):
+            Replanner(lambda prompt, context, revision=False: revision).create_revision(
+                current_plan=self.current(), source_task_id="a", affected_task_ids=["a", "child"],
+                allowed_task_ids={"a", "child"}, protected_task_ids=set(),
+                accepted_task_ids=set(), historical_task_ids=set(),
+            )
 
     def test_valid_revision_preserves_failed_snapshot_and_adds_new_task(self):
         result = Replanner(lambda prompt, context, revision=False: self.valid_revision()).create_revision(

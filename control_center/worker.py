@@ -26,6 +26,8 @@ from control_center.policy import PolicyEngine, policy_from_legacy
 from control_center.agent_context import (build_agent_context, build_effective_agent, normalize_autonomy,
                                                normalize_result_output, skills_for_workspace,
                                                validate_structured_output)
+from control_center.cross_task import (CrossTaskRequestError, normalize_intent_text,
+                                       normalize_owned_path, owned_path_key)
 
 
 READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff"}
@@ -115,6 +117,14 @@ class NoProgressDetected(TaskStopped):
 
 class BlockedActionCycle(TaskStopped):
     """The worker kept requesting denied or deterministically blocked actions."""
+
+
+class CrossTaskWait(RuntimeError):
+    """The Worker stopped before an unowned file could be modified."""
+
+    def __init__(self, request: dict[str, Any]):
+        self.request = request
+        super().__init__("CROSS_TASK_MODIFICATION_REQUIRED")
 
 
 def _policy_denial_signature(tool: str, capability: str, arguments: dict[str, Any]) -> str:
@@ -326,6 +336,19 @@ class PolicyToolbox(Toolbox):
             # tool that cannot produce meaningful evidence for this task.
             self.enabled.discard("git_diff")
         self.autonomy = normalize_autonomy(config.get("autonomy"))
+        self.task_id = str((config.get("provenance") or {}).get("plan_task_id") or "")
+        raw_owned_paths = config.get("task_owned_paths", [])
+        if not isinstance(raw_owned_paths, list):
+            raise ValueError("Task owned_paths must be a list.")
+        self.task_owned_path_keys = {owned_path_key(path) for path in raw_owned_paths}
+        raw_owners = config.get("task_write_owners", {})
+        if not isinstance(raw_owners, dict):
+            raise ValueError("Task write ownership index must be an object.")
+        self.task_write_owners = {
+            owned_path_key(path): str(owner)
+            for path, owner in raw_owners.items()
+        }
+        self.task_write_scope_enforced = config.get("task_write_scope_enforced") is True
         self.once_grants: set[str] = set()
         self.task_grants: set[str] = set()
         self.resolver = CapabilityResolver(self.workspace)
@@ -395,6 +418,58 @@ class PolicyToolbox(Toolbox):
             self.once_grants.remove(key)
             return True, "one-time approval"
         return False, ""
+
+    def _ownership_result(self, name: str, arguments: dict[str, Any], action: str) -> ToolResult | None:
+        """Enforce task ownership after policy approval and before any mutation."""
+        if not self.task_write_scope_enforced or name not in WRITE_TOOLS:
+            return None
+        try:
+            target = self.safe_path(str(arguments.get("path", "")))
+            relative = normalize_owned_path(target.relative_to(self.workspace).as_posix())
+        except (OSError, ValueError, CrossTaskRequestError) as exc:
+            return ToolResult(
+                name, f"The write is outside this task's owned file scope: {exc}",
+                False, 0, capability=action, policy_decision="deny",
+                policy_reason="Task write scope denied the path.", executed=False,
+                error_class="write_scope_denied",
+            )
+        key = relative.casefold()
+        owner = self.task_write_owners.get(key)
+        # The per-agent exact scope is authoritative, including for a derived
+        # owner agent that must change only one file from a larger owned set.
+        if key in self.task_owned_path_keys:
+            return None
+        if owner and owner != self.task_id:
+            try:
+                for field in ("requested_change", "reason", "needed_for"):
+                    normalize_intent_text(arguments.get(field), field)
+                if not isinstance(arguments.get("blocking"), bool):
+                    raise CrossTaskRequestError("blocking must be a boolean.")
+            except CrossTaskRequestError as exc:
+                return ToolResult(
+                    name,
+                    "CROSS_TASK_MODIFICATION_DETAILS_REQUIRED\n"
+                    "No file was modified. Retry with a concrete requested_change, reason, needed_for, "
+                    "and blocking boolean. Do not put implementation code in these fields.\n" + str(exc),
+                    False, 0, capability=action, policy_decision="deferred",
+                    policy_reason="Freya requires an auditable cross-task modification request.",
+                    executed=False, error_class="cross_task_modification_incomplete",
+                    owner_task_id=owner, target_path=relative,
+                )
+            return ToolResult(
+                name, "CROSS_TASK_MODIFICATION_REQUIRED\n"
+                "No file was modified. Freya must coordinate this change with its owner.",
+                False, 0, capability=action, policy_decision="cross_task_required",
+                policy_reason="Another plan task exclusively owns this file.",
+                executed=False, error_class="cross_task_modification_required",
+                owner_task_id=owner, target_path=relative,
+            )
+        return ToolResult(
+            name, "WRITE_SCOPE_DENIED\nThis task does not own the requested file.",
+            False, 0, capability=action, policy_decision="deny",
+            policy_reason="The plan assigns no owner for this write path.",
+            executed=False, error_class="write_scope_denied", target_path=relative,
+        )
 
     def write_is_already_satisfied(self, arguments: dict[str, Any]) -> bool:
         """Check an in-scope UTF-8 write without invoking overwrite policy."""
@@ -531,7 +606,12 @@ class PolicyToolbox(Toolbox):
             return ToolResult(name, f"Tool {name} was not executed.\nCapability:\n{action}\nPolicy result:\nAPPROVAL_REQUIRED\nReason:\n{reason}",
                               False, 0, capability=action, policy_decision="approval_required",
                               policy_reason=reason, executed=False, error_class="approval_required")
-        result = super().invoke(name, args)
+        ownership_result = self._ownership_result(name, args, action)
+        if ownership_result is not None:
+            return ownership_result
+        tool_args = {key: value for key, value in args.items()
+                     if key not in {"requested_change", "reason", "needed_for", "blocking"}}
+        result = super().invoke(name, tool_args)
         result.capability = action
         result.policy_decision = "allow"
         result.policy_reason = decision.reason + (f" ({grant_reason})" if grant_reason else "")
@@ -737,6 +817,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     action_history: list[str] = []
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     mutation_failure = ""
+    cross_task_request: dict[str, Any] | None = None
     try:
         while True:
             remaining = guard()
@@ -913,6 +994,60 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     else:
                         result = (ToolResult(name, argument_error, False, 0, error_class="invalid_request") if argument_error
                                   else box.invoke(name, safe_args))
+                    if result.error_class == "cross_task_modification_required":
+                        provenance = config.get("provenance") if isinstance(config.get("provenance"), dict) else {}
+                        request = {
+                            "request_id": uuid.uuid4().hex,
+                            "orchestration_id": str(provenance.get("orchestration_id") or ""),
+                            "requester_plan_task_id": str(provenance.get("plan_task_id") or ""),
+                            "requester_runtime_task_id": str(task.get("id") or ""),
+                            "target_owner_plan_task_id": result.owner_task_id,
+                            "target_path": result.target_path,
+                            "requested_operation": str(result.capability or "").removeprefix("filesystem."),
+                            "requested_change": normalize_intent_text(safe_args.get("requested_change"), "requested_change"),
+                            "reason": normalize_intent_text(safe_args.get("reason"), "reason"),
+                            "needed_for": normalize_intent_text(safe_args.get("needed_for"), "needed_for"),
+                            "blocking": safe_args.get("blocking"),
+                            "status": "pending",
+                        }
+                        if (not request["orchestration_id"] or not request["requester_plan_task_id"]
+                                or not request["target_owner_plan_task_id"]
+                                or not isinstance(request["blocking"], bool)):
+                            raise CrossTaskRequestError("The persisted plan/task ownership context is incomplete.")
+                        cross_task_request = request
+                        runtime_actions.append({
+                            "tool": name, "arguments": {"path": result.target_path},
+                            "capability": result.capability or common.get("capability", "unknown"),
+                            "policy_decision": result.policy_decision,
+                            "policy_reason": result.policy_reason, "success": False,
+                            "executed": False, "error_class": result.error_class,
+                        })
+                        publish("event", event={
+                            "event_type": "cross_task_modification.requested", "level": "warning",
+                            "status": "Pending", **request,
+                            "tool": name, "capability": result.capability,
+                            "reason": request["reason"], "needed_for": request["needed_for"],
+                            "message": "The Worker stopped before writing; Freya must coordinate the file owner.",
+                        })
+                        publish("approval_requested", request={
+                            "id": request["request_id"],
+                            "capability": "cross_task.modify",
+                            "tool": "cross_task_modification",
+                            "arguments": request,
+                            "action_summary": "Task requests a scoped change to a file owned by another plan task.",
+                            "resource": request["target_path"],
+                            "reason": request["reason"],
+                            "cross_task_modification": request,
+                        })
+                        publish("event", event={
+                            **common, "event_type": "step.finished", "level": "warning",
+                            "status": "WaitingForApproval", "output": result.output,
+                            "capability": result.capability or common.get("capability", "unknown"),
+                            "policy_decision": "cross_task_required",
+                            "policy_reason": result.policy_reason,
+                            "error_class": result.error_class,
+                        })
+                        raise CrossTaskWait(request)
                     no_progress_reason = ""
                     if (result.policy_decision == "deny" and result.error_class not in {
                             "unknown_tool", "tool_unavailable"} and not argument_error):
@@ -1423,6 +1558,21 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                      "output": verification_state})
         elif not verification_state["requested"]:
             verification_state["skipped_with_reason"] = "Verification disabled by configuration."
+    except CrossTaskWait as exc:
+        telemetry["stop_reason"] = "CROSS_TASK_MODIFICATION_REQUIRED"
+        telemetry["cross_task_request_id"] = exc.request.get("request_id")
+        update()
+        return sanitize(clean({
+            **metrics, **telemetry, "status": "WaitingForApproval",
+            "task_execution_successful": False,
+            "result": {
+                "summary": "Freya is coordinating the requested change with the file owner.",
+                "actions": runtime_actions, "artifacts": [],
+                "verification": verification_state, "limitations": [],
+            },
+            "verification": verification_state, "error": "", "progress": 100,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }, token))
     except Exception as exc:
         telemetry["runtime_exception"] = True
         error = str(exc)
@@ -1575,7 +1725,17 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     elif mutation_failure:
         result_output = mutation_failure
     update()
-    return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed", "task_execution_successful": success, "result": result_output,
+    execution_outcome = "execution_complete" if success else "execution_failed"
+    publish("event", event={
+        "event_type": "worker.execution.completed" if success else "worker.execution.failed",
+        "level": "info" if success else "error",
+        "status": "ExecutionComplete" if success else "ExecutionFailed",
+        "execution_outcome": execution_outcome,
+        "message": "Worker execution finished; semantic acceptance remains with Evaluator.",
+    })
+    return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed",
+                  "execution_outcome": execution_outcome,
+                  "task_execution_successful": success, "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,
                   "duration_seconds": round(time.monotonic() - started, 3)}, token))
 

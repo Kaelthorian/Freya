@@ -260,7 +260,22 @@ export async function logs() {
 
 export function approvals() {
   const items = state.approvals || [];
-  const cards = items.length ? '<div class="approval-list">' + items.map(item => '<article class="panel approval-card"><div class="approval-card-header"><div><span class="eyebrow">PENDING APPROVAL</span><h2>' + esc(item.action_summary || item.capability) + '</h2></div>' + badge(item.status || 'pending') + '</div><div class="key-values"><span>Capability</span><code>' + esc(item.capability) + '</code><span>Tool</span><code>' + esc(item.tool) + '</code><span>Resource</span><code>' + esc(item.resource || '.') + '</code><span>Reason</span><span>' + esc(item.reason) + '</span><span>Arguments</span><pre>' + esc(serialize(item.arguments || {})) + '</pre><span>Created</span><span>' + date(item.created_at, true) + '</span></div><div class="approval-actions"><button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve once</button><button class="button secondary" data-action="approve-task" data-id="' + esc(item.id) + '">Approve for task</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button></div></article>').join('') + '</div>' : '<section class="panel big-empty">' + empty('check', 'No pending approvals', 'Tasks continue automatically when their configured capabilities and autonomy allow them.') + '</section>';
+  const cards = items.length ? '<div class="approval-list">' + items.map(item => {
+    const cross = item.cross_task_modification;
+    const details = cross
+      ? '<span>Target file</span><code>' + esc(cross.target_path) + '</code>'
+        + '<span>File owner task</span><code>' + esc(cross.target_owner_plan_task_id) + '</code>'
+        + '<span>Operation</span><code>' + esc(cross.requested_operation) + '</code>'
+        + '<span>Requested change</span><span>' + esc(cross.requested_change) + '</span>'
+        + '<span>Why</span><span>' + esc(cross.reason) + '</span>'
+        + '<span>Needed for</span><span>' + esc(cross.needed_for) + '</span>'
+        + '<span>Blocking</span><span>' + (cross.blocking ? 'Yes' : 'No') + '</span>'
+      : '<span>Capability</span><code>' + esc(item.capability) + '</code><span>Tool</span><code>' + esc(item.tool) + '</code><span>Resource</span><code>' + esc(item.resource || '.') + '</code><span>Reason</span><span>' + esc(item.reason) + '</span><span>Arguments</span><pre>' + esc(serialize(item.arguments || {})) + '</pre>';
+    const actions = cross
+      ? '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve this change once</button><button class="button secondary" data-action="approve-file-intent" data-id="' + esc(item.id) + '">Approve similar purpose for this file</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>'
+      : '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve once</button><button class="button secondary" data-action="approve-task" data-id="' + esc(item.id) + '">Approve for task</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>';
+    return '<article class="panel approval-card"><div class="approval-card-header"><div><span class="eyebrow">' + (cross ? 'CROSS-TASK FILE CHANGE' : 'PENDING APPROVAL') + '</span><h2>' + esc(item.action_summary || item.capability) + '</h2></div>' + badge(item.status || 'pending') + '</div><div class="key-values">' + details + '<span>Created</span><span>' + date(item.created_at, true) + '</span></div><div class="approval-actions">' + actions + '</div></article>';
+  }).join('') + '</div>' : '<section class="panel big-empty">' + empty('check', 'No pending approvals', 'Tasks continue automatically when their configured capabilities and autonomy allow them.') + '</section>';
   return heading('Approvals', 'Review actions that are waiting for a human decision.', '', 'WORKSPACE / APPROVALS') + cards;
 }
 

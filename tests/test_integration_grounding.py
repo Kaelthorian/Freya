@@ -426,6 +426,7 @@ class GroundedLifecycleTests(unittest.TestCase):
             "id": "create-file", "objective": objective,
             "description": "Write the requested file and read it back.", "depends_on": [],
             "required_capabilities": ["filesystem.create", "filesystem.read"],
+            "owned_paths": ["hola_mundo.txt"],
             "preferred_skills": ["simple-file-artifact"], "success_criteria": local_criteria,
         }], global_criteria)
         initial["criterion_links"] = {
