@@ -138,6 +138,24 @@ class EnforcementTests(unittest.TestCase):
         self.assertEqual(changed.error_class, "policy_denied")
         self.assertEqual(target.read_bytes(), b"same")
 
+    def test_different_second_write_remains_a_real_overwrite(self):
+        first = self.box.invoke("write_file", {"path": "x.js", "content": "abc"})
+        self.assertTrue(first.success)
+        second = self.box.invoke("write_file", {"path": "x.js", "content": "xyz"})
+        self.assertFalse(second.success)
+        self.assertFalse(second.already_satisfied)
+        self.assertEqual(second.capability, "filesystem.overwrite")
+        self.assertEqual(second.error_class, "approval_required")
+        self.assertEqual((self.workspace / "x.js").read_text(encoding="utf-8"), "abc")
+
+    def test_identical_content_outside_agent_workspace_is_not_a_noop(self):
+        outside = self.root / "outside.txt"
+        outside.write_text("same", encoding="utf-8")
+        result = self.box.invoke("write_file", {"path": "../outside.txt", "content": "same"})
+        self.assertFalse(result.success)
+        self.assertFalse(result.already_satisfied)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "same")
+
     def test_deny_and_ask_never_execute(self):
         self.config["capability_policy"]["capabilities"]["filesystem"]["create"] = {"mode": "deny"}
         denied = PolicyToolbox(self.root, self.workspace, self.config, ["write_file"]).invoke("write_file", {"path": "a.py", "content": "x"})

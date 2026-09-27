@@ -36,6 +36,13 @@ SEMANTIC_OPERATION_CAPABILITIES = {
     "lint_python": "execution.ruff",
 }
 
+# An existing-file operation cannot be carried out from project metadata alone.
+# This is a runtime requirement, not an extra Planner-authored operation.
+OPERATION_PREREQUISITES = {
+    "modify_file": ("read_file",),
+    "overwrite_file": ("read_file",),
+}
+
 SEMANTIC_OPERATION_DESCRIPTIONS = {
     "create_file": "Create a new file in the selected workspace.",
     "read_file": "Read or inspect a file in the selected workspace.",
@@ -401,8 +408,12 @@ class RuntimeResourceCatalog:
     def resources_for_operations(self, operation_ids: Iterable[str]) -> tuple[list[str], list[str]]:
         """Derive registered capabilities and tools from semantic operation IDs."""
         operations = list(dict.fromkeys(operation_ids))
-        capabilities = []
+        expanded = []
         for operation_id in operations:
+            expanded.append(operation_id)
+            expanded.extend(OPERATION_PREREQUISITES.get(operation_id, ()))
+        capabilities = []
+        for operation_id in expanded:
             capability_id = SEMANTIC_OPERATION_CAPABILITIES.get(operation_id)
             if capability_id is None:
                 raise UnknownSemanticOperation(operation_id)
@@ -439,15 +450,8 @@ class RuntimeResourceCatalog:
         unsupported = plan.get("unsupported_requirements", [])
         if not isinstance(unsupported, list):
             raise ValueError("unsupported_requirements must be a list.")
-        if unsupported:
-            item = unsupported[0]
-            if not isinstance(item, dict):
-                raise ValueError("unsupported_requirements entries must be objects.")
-            raise UnsupportedResourceRequirement(
-                item.get("resource_type", "resource"), item.get("resource_id", ""),
-                semantic_need=item.get("semantic_need", ""),
-                reason=item.get("reason", "No available runtime resource satisfies this requirement."),
-            )
+        if any(not isinstance(item, dict) for item in unsupported):
+            raise ValueError("unsupported_requirements entries must be objects.")
         tasks = plan.get("tasks")
         if not isinstance(tasks, list):
             raise ValueError("Semantic plan must contain tasks.")

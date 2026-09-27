@@ -224,7 +224,7 @@ class ExecutionGraph:
         elif status == "blocked":
             target, error = "recovery_pending", "Semantic evaluation could not determine task success."
         elif status == "error":
-            target, error = "recovery_pending", "Semantic evaluator failed."
+            target, error = "recovery_pending", "Evaluator infrastructure failed; no semantic decision was made."
         else:
             raise ValueError(f"Unknown evaluation status: {status}.")
         node.update(

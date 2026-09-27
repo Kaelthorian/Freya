@@ -51,6 +51,22 @@ immutable and versioned.
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
 `planning_metrics`, selection snapshots, delegations, execution attempts,
 evaluations, recovery actions, plan revisions, and events needed to reconstruct it.
+Freya also persists bounded per-run ProjectState metadata for generated agents.
+The internal `project_context` worker tool can query artifact, symbol, task and
+summary metadata from the latest dispatch snapshot; it never returns file
+contents and has no HTTP route. ProjectState changes are parent-owned and worker
+candidate updates are committed only after semantic evaluation accepts the task.
+The requester's observed artifact revision is recorded with cross-task
+modification requests so the owner can inspect the current snapshot and reread
+the file before changing it.
+For generated tasks, `modify_file` and `overwrite_file` compile with
+`filesystem.read` and `read_file`. The worker accepts an existing-file write
+only after a current read in the same attempt; `READ_BEFORE_WRITE_REQUIRED`
+and `STALE_ARTIFACT` are recoverable tool results. A zero-write mutating task
+can return `already_satisfied_candidate` with observed path, SHA-256 and
+revision when its declared targets were read and remain current. Evaluator
+accepts or rejects the task against its criteria; otherwise the worker reports
+`ExpectedWorkspaceMutationNotObserved`.
 `GET /api/orchestrations/{id}/activity` returns a backend-derived chronological
 timeline and performance read model. Its `events` include system actors even
 when `agent_id` is null; `phases` pair persisted start/end events and calculate
@@ -192,13 +208,23 @@ Planner repair call.
     "semantic_needs": ["Read and modify the existing authentication files."],
     "operations": ["read_file", "modify_file", "run_pytest"],
     "success_criteria": ["A regression check confirms that login works after the fix."],
-    "owned_paths": ["src/auth.py"]
+    "owned_paths": ["src/auth.py"],
+    "write_targets": ["src/auth.py"]
   }],
   "unsupported_requirements": []
 }
 ```
 
-This Semantic Plan schema is version 2. Each task includes a `task_kind` for
+`unsupported_requirements` is a Planner proposal, not a resource decision.
+The Plan Compiler checks it against explicit Task Spec obligations and the
+runtime operation catalog. A false claim enters one bounded Planner repair;
+the repair input contains `canonical_task_spec`, `previous_semantic_plan`,
+`compiler_error` and preservation rules. Plan-wide `success_criteria` belong
+to Global Verification; task-level `success_criteria` belong to the local
+Evaluator. Exact matching text may create a proof link without copying a global
+criterion into a task.
+
+This Semantic Plan schema is version 3. Each task includes a `task_kind` for
 AgentFactory. Its `operations` are registered semantic IDs, not runtime tools
 or permissions. The Plan Compiler maps
 `modify_file` to `filesystem.modify`/`edit_file`, `create_file` to
@@ -221,11 +247,18 @@ For example, the compiler persists a runtime task equivalent to:
   "semantic_operations": ["modify_file"],
   "required_tools": ["edit_file"],
   "required_capabilities": ["filesystem.modify"],
-  "owned_paths": ["src/auth.py"]
+  "owned_paths": ["src/auth.py"],
+  "write_targets": ["src/auth.py"],
+  "foreign_write_targets": []
 }
 ```
 Low-risk file/program creation remains one task; interactive work can add a
-dependent QA task. Duplicate normalized path owners fail compilation.
+dependent QA task. The plan also persists `write_owners`, mapping normalized
+paths to permanent plan-task IDs. A separate task intending to modify this file
+keeps its own node, declares `write_targets: ["src/auth.py"]`, and receives
+`foreign_write_targets: [{"path": "src/auth.py", "owner_plan_task_id": "task-1"}]`.
+Two creators of one path invalidate the plan; ambiguous modifier ownership gets
+one bounded Planner repair.
 Existing persisted runtime plans keep their compiled `required_capabilities` and
 `required_tools` snapshots and need no database schema migration. New planning,
 Recovery and Integration responses use semantic operation fields. A legacy
@@ -290,6 +323,11 @@ failure blocks descendants without stopping independent work. Node states are
 `superseded`. Runtime `Success` enters `evaluating`; only an `accepted`
 evaluation becomes node `success`. Other semantic outcomes enter
 `recovery_pending` and receive exactly one bounded decision for that attempt.
+Evaluator infrastructure failures persist as `status=error` with
+`evaluation_status=error`, `failure_class=evaluator_infrastructure`, and
+`recommended_runtime_action=retry_evaluation`; they have no semantic
+`recommended_action` and do not rerun the Worker. The existing recovery path
+closes the affected attempt without an automatic evaluator retry.
 Retry decisions create a new selection, Runtime task, delegation, evaluation
 and attempt record. Same-agent retry revalidates and reuses the exact generated
 agent ID. Different-agent retry creates a new generated identity/Skill variant,
@@ -508,6 +546,12 @@ Planning audit events separate semantic proposals from compiler decisions:
 Integration replan events include resource resolutions for newly added tasks.
 `worker.execution.completed` and `worker.execution.failed` report technical
 execution outcomes; semantic task acceptance is recorded only by Evaluator.
+Related events include `artifact.read_observed`,
+`artifact.read_before_write_required`, `artifact.stale_read_detected`,
+`task.already_satisfied_candidate`, `task.responsibility_context_generated`,
+`worker.write_already_satisfied`, `evaluation.deterministic_evidence_matched`,
+`evaluation.semantic_review_required`, `evaluation.infrastructure_failed`,
+`project_context.symbol_reported` and `project_context.symbol_verified`.
 
 For structured worker output, `task.result_contract` records the required
 fields, validation error, repair attempt/result, whether fallback normalization
@@ -523,7 +567,16 @@ including `changed` and `already_satisfied` for no-op writes; `artifacts` contai
 successful file changes, and `verification.evidence` may contain
 `command_execution` records with `command`, `exit_code`, `output` and
 `supports_acceptance_criteria`. A passed command record linked to every exact
-planned criterion produces deterministic acceptance. Runtime exceptions build
+planned criterion produces deterministic acceptance.
+For a purely factual file creation/presence criterion, the Evaluator matches
+exact paths from planned `write_targets` or `owned_paths` against successful
+`filesystem.create` actions, created artifacts, created workspace diffs, or
+successful read-back. Every relevant target needs evidence. Later denied writes
+cannot undo an earlier creation; successful removal evidence prevents acceptance
+from stale creation records. Mixed criteria keep proven facts and send remaining
+semantic questions to the LLM. The bounded evaluation snapshot carries action,
+artifact, diff and plan-target metadata separately without full diff contents.
+Runtime exceptions build
 this contract from the action ledger and skip model repair. An identical denied
 action is fingerprinted and answered locally with
 `ACTION_BLOCKED_PERMANENTLY_FOR_CURRENT_STATE`; the response does not execute

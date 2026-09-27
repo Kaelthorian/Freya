@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from control_center.api import Application
+from control_center.config import normalize_agent
 from control_center.http import ControlServer
 from control_center.orchestrator import Orchestrator
 from control_center.planner import Planner
@@ -85,6 +86,34 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(detail["total_tokens"], 21)
         self.assertNotIn("hidden", json.dumps(detail))
         self.assertEqual(self.request("GET", "/api/agents")[1], [])
+
+    def test_task_api_hides_generated_worker_project_context(self):
+        agent = self.store.create_agent(normalize_agent({
+            "name": "Generated worker",
+            "config": {"provenance": {
+                "generated_by_freya": True, "orchestration_id": "run-1",
+                "plan_task_id": "task-1", "attempt": 1,
+                "factory_version": 1, "ephemeral": True,
+            }},
+        }, allow_provenance=True))
+        snapshot = {
+            "revision": 5, "artifacts": [{"path": "src/private-name.py",
+                                            "sha256": "a" * 64}],
+            "tasks": [], "manifest": {"file_count": 1},
+        }
+        task = self.store.create_task(
+            agent["id"], "Inspect project metadata", str(self.directory),
+            runtime_context={"project_state_snapshot": snapshot},
+        )
+        self.assertEqual(
+            self.store.get_task(task["id"])["config"]["runtime_context"]
+            ["project_state_snapshot"], snapshot,
+        )
+
+        status, detail = self.request("GET", "/api/tasks/" + task["id"])
+        self.assertEqual(status, 200)
+        self.assertNotIn("runtime_context", detail["config"])
+        self.assertNotIn("src/private-name.py", json.dumps(detail))
 
     def test_orchestration_activity_endpoint_includes_system_actor_rows(self):
         run = self.store.create_orchestration("Track system activity")

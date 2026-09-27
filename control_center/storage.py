@@ -101,6 +101,14 @@ class Store(IntegrationStoreMixin):
             ):
                 if name not in orchestration_columns:
                     connection.execute(f"ALTER TABLE orchestration_runs ADD COLUMN {name} {definition}")
+            cross_task_columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(cross_task_modification_requests)"
+            )}
+            if "requester_observed_revision" not in cross_task_columns:
+                connection.execute(
+                    "ALTER TABLE cross_task_modification_requests "
+                    "ADD COLUMN requester_observed_revision INTEGER NOT NULL DEFAULT 0"
+                )
             node_columns = {row[1] for row in connection.execute(
                 "PRAGMA table_info(orchestration_task_nodes)"
             )}
@@ -446,7 +454,10 @@ class Store(IntegrationStoreMixin):
         task["capability_policy"] = task["config"].get("capability_policy")
         return task
 
-    def create_task(self, agent_id: str, prompt: str, workspace: str) -> dict:
+    def create_task(self, agent_id: str, prompt: str, workspace: str,
+                    runtime_context: dict[str, Any] | None = None) -> dict:
+        if runtime_context is not None and not isinstance(runtime_context, dict):
+            raise ValueError("Runtime task context must be an object.")
         task_id, execution_id, now = str(uuid4()), str(uuid4()), utcnow()
         with self._connection(write=True) as connection:
             agent = self._agent(connection, agent_id)
@@ -455,6 +466,8 @@ class Store(IntegrationStoreMixin):
                                                         policy=effective["capability_policy"])
             snapshot_config = dict(agent["config"])
             snapshot_config.update({key: effective[key] for key in ("identity", "behavior", "autonomy", "verification", "output", "capability_policy")})
+            if runtime_context is not None:
+                snapshot_config["runtime_context"] = sanitize(runtime_context)
             skill_snapshots = [skill_snapshot(skill) for skill in effective["skills"]]
             connection.execute(
                 "INSERT INTO tasks(id,agent_id,agent_name,prompt,workspace,config_json,tools_json,agent_role,agent_description,agent_instructions,skills_json,created_at) "
@@ -484,6 +497,100 @@ class Store(IntegrationStoreMixin):
         with self._connection(write=True) as c:
             c.execute("INSERT INTO orchestration_runs(id,prompt,config_json,created_at,updated_at) VALUES(?,?,?,?,?)", (oid, sanitize(prompt), _dump(config or {}), now, now))
         return self.get_orchestration(oid)
+
+    def get_project_state(self, orchestration_id: str) -> dict[str, Any] | None:
+        """Read the durable shared state for one orchestration."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT schema_version,revision,state_json,updated_at "
+                "FROM orchestration_project_states WHERE orchestration_id=?",
+                (orchestration_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        state = _load(row["state_json"])
+        if not isinstance(state, dict):
+            raise RuntimeError("Persisted project state is invalid.")
+        state["schema_version"] = int(row["schema_version"])
+        state["revision"] = int(row["revision"])
+        state["updated_at"] = row["updated_at"]
+        return state
+
+    def commit_project_state(self, orchestration_id: str, *,
+                             expected_revision: int | None,
+                             state: dict[str, Any],
+                             events: list[dict[str, Any]] | None = None,
+                             update_state: bool = True) -> dict[str, Any] | None:
+        """Conditionally save project state and its audit events atomically."""
+        if not isinstance(state, dict) or not isinstance(update_state, bool):
+            raise ValueError("Project state commit requires an object and update flag.")
+        if expected_revision is not None and (
+                isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+                or expected_revision < 0):
+            raise ValueError("expected_revision must be a non-negative integer or None.")
+        if events is None:
+            events = []
+        if not isinstance(events, list) or any(not isinstance(item, dict) for item in events):
+            raise ValueError("Project state events must be an array of objects.")
+        with self._connection(write=True) as connection:
+            run = connection.execute(
+                "SELECT 1 FROM orchestration_runs WHERE id=?", (orchestration_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(orchestration_id)
+            row = connection.execute(
+                "SELECT revision,state_json FROM orchestration_project_states WHERE orchestration_id=?",
+                (orchestration_id,),
+            ).fetchone()
+            actual_revision = int(row["revision"]) if row is not None else None
+            if actual_revision != expected_revision:
+                return None
+            timestamp = utcnow()
+            if update_state:
+                next_revision = 1 if actual_revision is None else actual_revision + 1
+                next_state = sanitize(state)
+                next_state.update({
+                    "schema_version": int(next_state.get("schema_version", 1)),
+                    "orchestration_id": orchestration_id,
+                    "revision": next_revision,
+                    "updated_at": timestamp,
+                })
+                connection.execute(
+                    "INSERT INTO orchestration_project_states(orchestration_id,schema_version,revision,state_json,updated_at) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(orchestration_id) DO UPDATE SET "
+                    "schema_version=excluded.schema_version,revision=excluded.revision,"
+                    "state_json=excluded.state_json,updated_at=excluded.updated_at",
+                    (orchestration_id, next_state["schema_version"], next_revision,
+                     _dump(next_state), timestamp),
+                )
+            else:
+                if row is None:
+                    raise ValueError("Cannot append project-state events before initialization.")
+                next_state = _load(row["state_json"])
+                next_state["revision"] = actual_revision
+                next_state["updated_at"] = timestamp
+            for raw_event in events:
+                payload = dict(raw_event)
+                payload.setdefault("orchestration_id", orchestration_id)
+                trace = self._trace_fields(
+                    payload, source="orchestration", trace_id=orchestration_id,
+                    agent_name=payload.get("actor_name") or "ProjectState",
+                    actor_role=payload.get("actor_role") or "project_state",
+                    workspace=payload.get("workspace"), timestamp=timestamp,
+                )
+                payload.update(trace)
+                payload["orchestration_id"] = orchestration_id
+                payload.setdefault("state_revision", next_state.get("revision", 0))
+                connection.execute(
+                    "INSERT INTO orchestration_events(orchestration_id,timestamp,event_type,status,agent_id,task_id,message,payload_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (orchestration_id, payload["when"],
+                     str(payload.get("event_type") or "project_context.update"),
+                     payload.get("status"), payload.get("agent_id"), None,
+                     sanitize(payload.get("message", payload.get("reason", ""))),
+                     _dump(payload)),
+                )
+            return next_state
 
 
     def save_task_spec(self, oid: str, spec: dict[str, Any]) -> dict | None:
@@ -975,7 +1082,8 @@ class Store(IntegrationStoreMixin):
         item["context_truncated"] = bool(item["context_truncated"])
         item["deterministic"] = bool(item["deterministic"])
         for field in ("confidence", "criteria", "issues", "missing_evidence",
-                      "recommended_action"):
+                      "recommended_action", "evaluation_status", "failure_class",
+                      "recommended_runtime_action"):
             item[field] = evaluation.get(field)
         if include_snapshot:
             item["snapshot"] = snapshot
@@ -1162,7 +1270,7 @@ class Store(IntegrationStoreMixin):
             "needs_revision": "Semantic evaluation requires revision.",
             "rejected": "Semantic evaluation rejected the task result.",
             "blocked": "Semantic evaluation could not determine task success.",
-            "error": "Semantic evaluator failed.",
+            "error": "Evaluator infrastructure failed; no semantic decision was made.",
         }[status]
         summary = str(evaluation.get("summary") or "").strip()
         if error and summary:
@@ -2207,6 +2315,10 @@ class Store(IntegrationStoreMixin):
             raise CrossTaskRequestError("Cross-task request and approval IDs must match.")
         if request.get("requested_operation") not in {"create", "modify", "overwrite"} or not isinstance(request.get("blocking"), bool):
             raise CrossTaskRequestError("Cross-task request operation or blocking flag is invalid.")
+        observed_revision = request.get("requester_observed_revision", 0)
+        if (isinstance(observed_revision, bool) or not isinstance(observed_revision, int)
+                or observed_revision < 0):
+            raise CrossTaskRequestError("requester_observed_revision must be a non-negative integer.")
         now = utcnow()
         with self._connection(write=True) as connection:
             approval = connection.execute(
@@ -2223,11 +2335,11 @@ class Store(IntegrationStoreMixin):
             connection.execute(
                 "INSERT INTO cross_task_modification_requests(id,orchestration_id,requester_plan_task_id,"
                 "requester_runtime_task_id,requester_agent_id,target_owner_plan_task_id,target_path,"
-                "normalized_target_path,requested_operation,requested_change,reason,needed_for,blocking,status,"
-                "approval_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "normalized_target_path,requester_observed_revision,requested_operation,requested_change,reason,needed_for,blocking,status,"
+                "approval_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (request_id, orchestration_id, requester_task, requester_runtime_id,
                  approval["agent_id"], owner_task, target_path, owned_path_key(target_path),
-                 request["requested_operation"], intent["requested_change"], intent["reason"], intent["needed_for"],
+                 observed_revision, request["requested_operation"], intent["requested_change"], intent["reason"], intent["needed_for"],
                  int(request["blocking"]), "pending", approval_id, now, now),
             )
             return self._cross_task_request(connection.execute(

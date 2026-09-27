@@ -77,8 +77,25 @@ class AgentContextTests(unittest.TestCase):
             "verification": {}, "limitations": [],
         })
         self.assertEqual(valid["summary"], "Done")
+        update = validate_structured_output({
+            "summary": "Done", "project_context_update": {
+                "artifacts": [{"path": "src/module.py", "purpose": "Parser source."}],
+                "symbols": [{"name": "parse_item", "kind": "function", "path": "src/module.py"}],
+                "dependencies": [{"path": "src/module.py", "depends_on": "src/base.py",
+                                  "relationship": "Reads defaults."}],
+            },
+        })
+        self.assertEqual(update["project_context_update"]["symbols"][0]["name"], "parse_item")
+        self.assertEqual(update["project_context_update"]["symbols"][0]["kind"], "function")
+        self.assertEqual(update["project_context_update"]["symbols"][0]["artifact_path"], "src/module.py")
         with self.assertRaises(ValueError):
             validate_structured_output({"summary": "Done", "unexpected": True})
+        with self.assertRaisesRegex(ValueError, "normalized relative"):
+            validate_structured_output({
+                "summary": "Done", "project_context_update": {
+                    "artifacts": [{"path": "../outside.py"}],
+                },
+            })
 
     def test_git_inspection_skill_is_filtered_outside_repository(self):
         visible, excluded = skills_for_workspace([

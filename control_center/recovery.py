@@ -17,7 +17,7 @@ from .config import validate_endpoint
 from .planner import (allocate_new_task_ids, MAX_PLAN_TASKS, PLAN_RESPONSE_FORMAT,
                       TASK_KIND_VALUES,
                       PlanValidationError, validate_plan)
-from .plan_compiler import compile_semantic_task_resources
+from .plan_compiler import compile_semantic_task_resources, extend_compiled_write_ownership
 from .runtime_resources import RuntimeResourceCatalog, SEMANTIC_OPERATION_CAPABILITIES
 from .security import sanitize
 from .transport import model_profile, model_request, request_json
@@ -54,7 +54,7 @@ RECOVERY_RESPONSE_FORMAT = {
 
 RECOVERY_TASK_FIELDS = {
     "id", "task_kind", "objective", "description", "depends_on", "operations",
-    "semantic_needs", "success_criteria", "owned_paths",
+    "semantic_needs", "success_criteria", "owned_paths", "write_targets",
 }
 RECOVERY_PLAN_FIELDS = {
     "goal", "summary", "complexity", "tasks", "success_criteria", "criterion_links",
@@ -79,7 +79,9 @@ RECOVERY_PLAN_RESPONSE_FORMAT = {
                 "semantic_needs": {"type": "array", "items": {"type": "string"}},
                 "success_criteria": {"type": "array", "items": {"type": "string"}},
                 "owned_paths": {"type": "array", "items": {"type": "string"}},
-            }, "required": sorted(RECOVERY_TASK_FIELDS), "additionalProperties": False},
+                "write_targets": {"type": "array", "items": {"type": "string"}},
+            }, "required": sorted(RECOVERY_TASK_FIELDS - {"write_targets"}),
+               "additionalProperties": False},
         },
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "criterion_links": deepcopy(PLAN_RESPONSE_FORMAT["properties"]["criterion_links"]),
@@ -925,6 +927,7 @@ class Replanner:
             "semantic_needs": list(task.get("semantic_needs", [])),
             "success_criteria": list(task["success_criteria"]),
             "owned_paths": list(task.get("owned_paths", [])),
+            "write_targets": list(task.get("write_targets", [])),
         } for task in plan["tasks"]]
         return result
 
@@ -954,7 +957,8 @@ class Replanner:
             "Preserve the current plan goal, summary and global success criteria exactly. "
             "For each task, supply a registered task_kind and semantic operations only. Do not choose tools, capabilities, "
             "or Skills. New work must compile within the existing superseded-task resource budget. "
-            "Declare exact workspace-relative owned_paths for every new file owner.",
+            "Declare exact workspace-relative write_targets for every intended write and "
+            "owned_paths only for new files owned by this plan task. Existing owners never change.",
             "Repair the prior response. Return only strict plan-revision JSON with no extra fields. "
             "Do not change the current plan goal, summary or global success criteria, and do not "
             "choose tools, capabilities, or Skills. Use only registered task_kind and semantic operation IDs.",
@@ -1017,7 +1021,11 @@ class Replanner:
                 compiled = deepcopy(existing)
                 for field in ("objective", "description", "depends_on", "success_criteria"):
                     compiled[field] = deepcopy(task[field])
-                for field in ("semantic_needs", "owned_paths"):
+                if task.get("owned_paths", existing.get("owned_paths", [])) != existing.get("owned_paths", []):
+                    raise RecoveryValidationError("Recovery cannot transfer an existing task's file ownership.")
+                if task.get("write_targets", existing.get("write_targets", [])) != existing.get("write_targets", []):
+                    raise RecoveryValidationError("Recovery cannot change an existing task's write targets.")
+                for field in ("semantic_needs",):
                     if field in existing or task.get(field):
                         compiled[field] = deepcopy(task.get(field, existing.get(field, [])))
                 raw_plan["tasks"][index] = compiled
@@ -1032,6 +1040,7 @@ class Replanner:
                 "semantic_needs": task.get("semantic_needs", []),
                 "success_criteria": task.get("success_criteria", []),
                 "owned_paths": task.get("owned_paths", []),
+                "write_targets": task.get("write_targets", []),
                 **{field: deepcopy(task[field]) for field in legacy_resource_fields
                    if field in task},
             }
@@ -1067,7 +1076,8 @@ class Replanner:
                                                 link["task_id"])
         parsed["id_allocation"] = allocation
         try:
-            parsed["plan"] = validate_plan(raw_plan)
+            parsed["plan"] = validate_plan(
+                extend_compiled_write_ownership(raw_plan, current_plan))
         except PlanValidationError as exc:
             raise RecoveryGenerationError("Replanner produced an invalid effective plan: " + str(exc)) from exc
         parsed["plan"] = validate_replan_revision(

@@ -81,14 +81,14 @@ The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
 The catalog is rebuilt from `capabilities.py` and worker schemas exposed by
 `Toolbox`. It provides semantic operation IDs and descriptions. Planner emits
 task meaning, dependencies, outcomes, criteria, semantic needs and exact
-`owned_paths`; it never emits capabilities, tools or Skills. `plan_scope.py`
+`owned_paths` and `write_targets`; it never emits capabilities, tools or Skills. `plan_scope.py`
 first removes optional unrequested external actions and criteria, then rewires
 dependencies. Mixed external/artifact tasks or loss of a Task Spec validation
 check fail closed. Workers receive a deterministic rendering of the Task Spec,
 never an independent `operational_prompt`. The old Analyst v3 path is retained
 for injected compatibility adapters and historical tests.
 
-Semantic Plan schema version 2 is compiled into runtime plan schema version 4.
+Semantic Plan schema version 3 is compiled into runtime plan schema version 4.
 The Runtime Resource Catalog owns the canonical semantic-operation to
 capability to tool mapping; `plan_compiler.py` alone applies it. Each semantic
 task includes `task_kind`; AgentFactory consumes that compiled classification.
@@ -98,6 +98,15 @@ For example, `modify_file` derives `filesystem.modify` and `edit_file`; `create_
 `execution.pytest` and `run_command`. Unknown operations and unsupported
 external actions fail closed. A real structural contradiction can receive one
 bounded repair; an unknown or unsupported resource cannot.
+The Compiler owns the single scope reconciliation and semantic-plan validation
+pass. It verifies Planner `unsupported_requirements` against requested intent
+and the runtime catalog before resource resolution. Task nodes are never merged.
+The unique creator owns a path; one writer or one explicit owner also resolves
+deterministically. Two modifiers claiming ownership without a creator produce
+`OwnershipAmbiguous` and one bounded repair; two creators invalidate the plan.
+A bounded repair receives the complete
+rejected Semantic Plan and structured diagnostics. Local task checks and global
+plan checks are kept separate.
 
 `Planner.create_plan` is a compatibility-only API for injected pre-Semantic-Plan
 adapters and historical callers. The built-in Task Spec orchestration requires
@@ -105,20 +114,63 @@ adapters and historical callers. The built-in Task Spec orchestration requires
 New adapters should implement the Task Spec method and must not select runtime
 capabilities or tools.
 
-Tasks that own files declare exact `owned_paths`; duplicate file owners and unsafe
-relative paths fail planning. A requester does not claim an existing owner's file.
+Tasks declare exact `write_targets` for intended writes and `owned_paths` for
+permanent responsibility. The compiled plan persists `write_owners`, while each
+task records `foreign_write_targets` with the owner plan-task ID. A requester
+does not claim an existing owner's file. Unsafe relative paths fail planning.
 Worker ownership enforcement is separate from
 capability policy: a foreign read still follows `filesystem.read`, while a
 foreign write stops before mutation and opens a durable cross-task request.
 Intent grants never cross an orchestration, requester, owner, exact path or
 operation boundary. Only an explicitly approved, same-scope intent match may
 avoid another human prompt. The derived owner change agent receives only the
-owner's pre-existing read/write capabilities and one-file scope after the
-original owner node finishes, then uses the ordinary selector, runtime and
+approved operation and one-file scope after the original owner node finishes.
+The original owner node remains terminal; the ephemeral agent acts for its
+plan-task identity and uses the ordinary selector, runtime and
 evaluator. A failed or uncertain handoff resumes
 the requester with the cause; it never silently broadens scope or capabilities.
 Restart recovery closes unfinished handoffs and their pending approvals with the
 interrupted orchestration instead of leaving actionable approvals behind.
+Recovery and Integration revisions preserve the owner index for every existing
+path and resolve ownership only for new paths.
+
+`project_state.py` keeps a versioned, per-orchestration metadata ledger beside
+the immutable plan. Its bounded initial manifest stores workspace-relative
+paths, sizes and hashes, not file contents. Dispatch and retry snapshots refresh
+hashes and include current-task/direct-dependency status and relevant artifact
+metadata. A snapshot is also refreshed before a cross-task owner action. Stale
+or missing artifacts advance their revision and invalidate prior verification.
+Dynamic agents can query only their bounded snapshot through the internal
+`project_context` tool. That tool is read-only metadata access, uses the
+capability policy engine, and is not Planner-selectable or available to manual
+agents. The compiler derives `filesystem.read`/`read_file` for modification
+and overwrite operations. A pure create operation keeps only create authority.
+Read access covers the policy-permitted workspace, including foreign-owned
+artifacts; the permanent write owner remains authoritative. The Worker checks
+the observed content hash before each existing-file write. A stale or missing
+read is recoverable after `read_file`.
+
+For zero-write mutating tasks, the Worker checks current reads of declared
+targets and returns an `already_satisfied_candidate` with hashes and revisions.
+Only Evaluator can accept it against the task criteria. No current target read
+retains `ExpectedWorkspaceMutationNotObserved`. The execution prompt shows a
+bounded set of direct plan responsibilities and tells agents to leave explicitly
+assigned later work to its task unless a coherent base artifact requires it.
+
+Workers may return `project_context_update` candidates with artifact purpose,
+symbol and dependency metadata. The parent ignores them until the Evaluator
+accepts the task. It then checks artifact paths against the Worker write ledger,
+rehashes the actual workspace files and preserves the plan owner. A symbol is
+reported with `name`, optional `kind`, `signature`, `path` (or legacy
+`artifact_path`) and `purpose`. It is
+marked verified only when its declaration and reported signature match the
+current artifact bytes; dependency relationships remain labeled as observed
+reports. Cross-task modification requests persist the artifact revision seen by
+the requester, and the owner rereads current state before applying the change.
+For generated tasks with ProjectState, successful file read-back leaves one
+final model response opportunity to report symbols when the model budget allows.
+ProjectState lifecycle events use the regular orchestration event trace. There
+is no HTTP endpoint that returns the worker snapshot or file contents.
 
 Every dynamic agent receives `freya-core`. Its declared tool list is checked
 against `Toolbox`, while the compiled capability policy determines the

@@ -109,7 +109,8 @@ class Runtime:
             self.thread = threading.Thread(target=self._loop, name="control-center-scheduler", daemon=True)
             self.thread.start()
 
-    def submit(self, agent_id: str, prompt: str, workspace_path: str | None = None) -> dict[str, Any]:
+    def submit(self, agent_id: str, prompt: str, workspace_path: str | None = None,
+               runtime_context: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.lock:
             if self.closed:
                 raise ValueError("Runtime is shut down.")
@@ -132,7 +133,9 @@ class Runtime:
             else:
                 workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
                 workspace.mkdir(parents=True, exist_ok=False)
-            task = self.store.create_task(agent_id, prompt, str(workspace))
+            task = self.store.create_task(
+                agent_id, prompt, str(workspace), runtime_context=runtime_context,
+            )
             self.pending.append(task["id"])
             self.store.append_event(task["id"], {"event_type": "task.queued", "level": "info", "status": "Queued",
                                                    "reason": "Waiting for an available worker and workspace; each agent runs one task at a time."})

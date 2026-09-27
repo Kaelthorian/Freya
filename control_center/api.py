@@ -46,6 +46,17 @@ class Application:
                 "ram_percent": memory.percent, "ram_used_bytes": memory.used,
                 "ram_total_bytes": memory.total}
 
+    @staticmethod
+    def _public_task(task: dict) -> dict:
+        """Keep the generated worker's dispatch context out of task API snapshots."""
+        result = dict(task)
+        config = result.get("config")
+        if isinstance(config, dict) and "runtime_context" in config:
+            public_config = dict(config)
+            public_config.pop("runtime_context", None)
+            result["config"] = public_config
+        return result
+
     def _idle_required(self, agent_id):
         tasks = self.store.list_tasks(agent_id=agent_id, limit=10000)
         if any(task["status"] in LIVE for task in tasks):
@@ -126,13 +137,15 @@ class Application:
         if len(parts) == 2 and parts[0] == "agents":
             return self.store.get_agent(parts[1])
         if parts == ["tasks"]:
-            return self.store.list_tasks(agent_id=query.get("agent_id") or None,
-                                         status=query.get("status") or None, limit=self._limit(query))
+            tasks = self.store.list_tasks(agent_id=query.get("agent_id") or None,
+                                          status=query.get("status") or None,
+                                          limit=self._limit(query))
+            return [self._public_task(task) for task in tasks]
         if len(parts) == 2 and parts[0] == "tasks":
             task = self.store.get_task(parts[1])
             task["timeline"] = self.store.list_steps(parts[1])
             task["events"] = self.store.list_events(task_id=parts[1], limit=10000)
-            return task
+            return self._public_task(task)
         if parts == ["logs"]:
             filters = {k: v for k, v in query.items() if k in {"agent_id", "level", "tool", "date_from", "date_to", "orchestration_id"} and v}
             filters["error_only"] = query.get("error_only", "").lower() in {"true", "1"}
@@ -344,7 +357,7 @@ class Application:
                 if task["status"] not in LIVE:
                     raise ApiError(409, "The task has already finished.")
                 self.runtime.cancel(task["id"])
-                return 200, self.store.get_task(task["id"])
+                return 200, self._public_task(self.store.get_task(task["id"]))
             if parts[2] == "retry":
                 if task["status"] in LIVE:
                     raise ApiError(409, "The task is still active.")

@@ -124,10 +124,12 @@ class AgentFactoryTests(unittest.TestCase):
             preferred_skills=[], required_capabilities=["filesystem.read"],
         ))
         agent = created["agent"]
-        self.assertEqual(agent["tools"], ["read_file"])
+        self.assertEqual(agent["tools"], ["project_context", "read_file"])
         self.assertNotIn("write_file", agent["tools"])
         self.assertNotIn("run_command", agent["tools"])
-        self.assertEqual(self.active_modes(agent), {"filesystem.read": "allow"})
+        self.assertEqual(self.active_modes(agent), {
+            "filesystem.read": "allow", "project.read_context": "allow",
+        })
 
     def test_generic_file_task_selects_simple_artifact_skill(self):
         created = self.create(planned_task(
@@ -172,6 +174,7 @@ class AgentFactoryTests(unittest.TestCase):
                 "filesystem.create", "filesystem.read", "execution.python_script",
             ],
             owned_paths=["hello.py"],
+            _write_owners={"hello.py": "task-a"},
             preferred_skills=[
                 "python-development", "simple-file-artifact", "interactive-testing", "debugging",
             ],
@@ -179,7 +182,9 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         agent = built["agent"]
         self.assertEqual(built["skill_ids"], ["freya-core"])
-        self.assertEqual(agent["tools"], ["read_file", "write_file", "run_command"])
+        self.assertEqual(agent["tools"], [
+            "project_context", "read_file", "write_file", "run_command",
+        ])
 
         def answer(content="Finished.", calls=None):
             value = {"message": {"role": "assistant", "content": content},
@@ -214,8 +219,9 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertEqual(result["status"], "Success", result["error"])
         self.assertTrue(result["verification"]["attempted"])
         self.assertTrue(result["verification"]["passed"])
-        command = next(item for item in result["verification"]["evidence"]
-                       if item.get("type") == "command_execution")
+        command = next((item for item in result["verification"]["evidence"]
+                        if item.get("type") == "command_execution"), None)
+        self.assertIsNotNone(command, result["verification"])
         self.assertEqual(command["exit_code"], 0)
         self.assertIn("Hello World", command["output"])
         self.assertFalse(any(event.get("event", {}).get("event_type") == "task.blocked"
@@ -228,10 +234,13 @@ class AgentFactoryTests(unittest.TestCase):
             task_kind="file_creation",
             required_capabilities=["filesystem.create", "filesystem.read"],
             owned_paths=["hola.txt"],
+            _write_owners={"hola.txt": "task-a"},
             preferred_skills=["simple-file-artifact", "python-development", "debugging", "interactive-testing"],
         ))
         self.assertEqual(built["skill_ids"], ["freya-core"])
-        self.assertEqual(built["agent"]["tools"], ["read_file", "write_file"])
+        self.assertEqual(built["agent"]["tools"], [
+            "project_context", "read_file", "write_file",
+        ])
         responses = iter([
             {"message": {"role": "assistant", "content": "", "tool_calls": [{
                 "function": {"name": "write_file", "arguments": {"path": "hola.txt", "content": "hola mundo"}}
@@ -281,8 +290,11 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertNotIn("read_file", created["effective_tools"])
         self.assertNotIn("filesystem.read", created["required_capabilities"])
         self.assertNotIn("filesystem.overwrite", created["required_capabilities"])
-        self.assertEqual(self.active_modes(created["agent"])["filesystem.read"], "deny")
-        self.assertEqual(self.active_modes(created["agent"]).get("filesystem.overwrite"), "deny")
+        self.assertEqual(self.active_modes(created["agent"])
+                         .get("filesystem.read", "deny"), "deny")
+        self.assertEqual(self.active_modes(created["agent"])["project.read_context"], "allow")
+        self.assertEqual(self.active_modes(created["agent"])
+                         .get("filesystem.overwrite", "deny"), "deny")
 
     def test_recovery_state_selects_debugging_without_debug_words_in_objective(self):
         created = self.create(planned_task(
@@ -311,7 +323,10 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertEqual(created["required_capabilities"], ["filesystem.create"])
-        self.assertEqual(self.active_modes(created["agent"]), {"filesystem.create": "allow"})
+        self.assertEqual(self.active_modes(created["agent"]), {
+            "filesystem.create": "allow",
+            "project.read_context": "allow",
+        })
         self.assertEqual(created["skill_omissions"], [])
         self.assertIn("planner skill preference ignored", created["warnings"][0])
 
@@ -325,7 +340,7 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertEqual(created["skill_omissions"], [])
         self.assertEqual(set(self.active_modes(created["agent"])),
-                         {"filesystem.create", "filesystem.read"})
+                         {"filesystem.create", "filesystem.read", "project.read_context"})
 
     def test_core_skill_tools_do_not_grant_authority(self):
         created = self.create(planned_task(
@@ -354,7 +369,9 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         self.assertEqual(created["skill_ids"], ["freya-core"])
         self.assertEqual(created["required_capabilities"], ["filesystem.read"])
-        self.assertEqual(self.active_modes(created["agent"]), {"filesystem.read": "allow"})
+        self.assertEqual(self.active_modes(created["agent"]), {
+            "filesystem.read": "allow", "project.read_context": "allow",
+        })
 
     def test_selected_tool_cannot_bypass_the_capability_policy(self):
         with self.assertRaises(ToolCapabilityMismatch) as caught:
@@ -376,13 +393,17 @@ class AgentFactoryTests(unittest.TestCase):
 
     def test_factory_accepts_only_the_catalog_mapping_for_modify_file(self):
         created = self.create(planned_task(
-            required_capabilities=["filesystem.modify"],
-            required_tools=["edit_file"],
+            required_capabilities=["filesystem.modify", "filesystem.read"],
+            required_tools=["edit_file", "read_file"],
             semantic_operations=["modify_file"],
             owned_paths=["calculator.py"],
         ))
-        self.assertEqual(created["required_capabilities"], ["filesystem.modify"])
-        self.assertEqual(created["effective_tools"], ["edit_file"])
+        self.assertEqual(created["required_capabilities"], ["filesystem.modify", "filesystem.read"])
+        self.assertEqual(created["effective_tools"], [
+            "project_context", "read_file", "edit_file",
+        ])
+        self.assertNotIn("paths", created["agent"]["config"]["capability_policy"]
+                         ["capabilities"]["filesystem"]["read"])
         self.assertNotIn("execution.python_script", self.active_modes(created["agent"]))
         self.assertNotIn("run_command", created["effective_tools"])
 
@@ -391,8 +412,8 @@ class AgentFactoryTests(unittest.TestCase):
             objective="Review and update calculator.py",
             task_kind="code_change",
             semantic_operations=["modify_file"],
-            required_capabilities=["filesystem.modify"],
-            required_tools=["edit_file"],
+            required_capabilities=["filesystem.modify", "filesystem.read"],
+            required_tools=["edit_file", "read_file"],
             owned_paths=["calculator.py"],
         ))
         self.assertEqual(created["role"], "worker")
@@ -425,7 +446,9 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         self.assertEqual(created["role"], "qa")
         self.assertEqual(created["skill_ids"], ["freya-core"])
-        self.assertEqual(created["effective_tools"], ["read_file", "run_command"])
+        self.assertEqual(created["effective_tools"], [
+            "project_context", "read_file", "run_command",
+        ])
         self.assertTrue(created["agent"]["config"]["verification"]["stop_after_acceptance_evidence"])
 
     def test_code_auditor_is_independent_and_read_only(self):
@@ -443,7 +466,7 @@ class AgentFactoryTests(unittest.TestCase):
         ))
         self.assertNotEqual(implementation["agent"]["id"], audit["agent"]["id"])
         self.assertEqual(audit["agent"]["config"]["orchestration_role"], "auditor")
-        self.assertEqual(audit["agent"]["tools"], ["read_file"])
+        self.assertEqual(audit["agent"]["tools"], ["project_context", "read_file"])
 
     def test_multiple_capabilities_receive_only_derived_tools(self):
         required = [
@@ -453,9 +476,11 @@ class AgentFactoryTests(unittest.TestCase):
             preferred_skills=[], required_capabilities=required,
         ))["agent"]
         self.assertEqual(
-            agent["tools"], ["list_files", "read_file", "search_code", "git_diff"]
+            agent["tools"], [
+                "project_context", "list_files", "read_file", "search_code", "git_diff",
+            ]
         )
-        self.assertEqual(set(self.active_modes(agent)), set(required))
+        self.assertEqual(set(self.active_modes(agent)), set(required) | {"project.read_context"})
         self.assertLessEqual(len(agent["skills"]), 8)
 
     def test_overlapping_capabilities_do_not_duplicate_tools(self):
@@ -463,7 +488,7 @@ class AgentFactoryTests(unittest.TestCase):
             preferred_skills=[],
             required_capabilities=["filesystem.create", "filesystem.overwrite"],
         ))["agent"]
-        self.assertEqual(agent["tools"], ["write_file"])
+        self.assertEqual(agent["tools"], ["project_context", "write_file"])
 
     def test_runtime_config_cannot_inject_authority(self):
         for field, value in (
@@ -555,7 +580,7 @@ class AgentFactoryTests(unittest.TestCase):
 
     def test_modern_graph_uses_dynamic_worker_with_only_task_analyst_persistent(self):
         final = self.run_orchestration(["accepted"], with_task_analyst=True)
-        self.assertEqual(final["status"], "Success")
+        self.assertEqual(final["status"], "Success", final.get("error") or final.get("task_spec"))
         roles = {
             str(agent.get("config", {}).get("orchestration_role"))
             for agent in self.store.list_agents()
@@ -572,7 +597,7 @@ class AgentFactoryTests(unittest.TestCase):
         final = self.run_orchestration(["needs_revision", "accepted"])
         selected = [item["selected_agent_id"] for item in final["attempts"]
                     if item["plan_task_id"] == "task-a"]
-        self.assertEqual(final["status"], "Success")
+        self.assertEqual(final["status"], "Success", final.get("error") or final.get("task_spec"))
         self.assertEqual(len(selected), 2)
         self.assertEqual(selected[0], selected[1])
 
@@ -580,7 +605,7 @@ class AgentFactoryTests(unittest.TestCase):
         final = self.run_orchestration(["rejected", "accepted"])
         selected = [item["selected_agent_id"] for item in final["attempts"]
                     if item["plan_task_id"] == "task-a"]
-        self.assertEqual(final["status"], "Success")
+        self.assertEqual(final["status"], "Success", final.get("error") or final.get("task_spec"))
         self.assertEqual(len(selected), 2)
         self.assertNotEqual(selected[0], selected[1])
         task_policies = [
@@ -604,17 +629,20 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
 
     def test_calculator_golden_path_omits_preferred_skill_and_reaches_runtime(self):
-        prompt = "Crea una calculadora web que sume, reste, multiplique y divida"
+        prompt = ("Crea una calculadora web en calculator.html que sume, reste, "
+                  "multiplique y divida")
         semantic = {"summary": "Create a web calculator.", "success_criteria": [],
                     "unsupported_requirements": [], "tasks": [{
-            "key": "implement", "objective": "Create calculator.py",
-            "description": "Create the calculator web implementation.",
-            "depends_on": [], "semantic_needs": ["Create calculator.py."],
+            "key": "implement", "task_kind": "file_creation",
+            "objective": "Create calculator.html",
+            "description": "Create the standalone web calculator page.",
+            "depends_on": [],
+            "semantic_needs": ["Create calculator.html as the web calculator page."],
             "required_capabilities": ["filesystem.create"],
-            "owned_paths": ["calculator.py"],
+            "owned_paths": ["calculator.html"],
             "required_tools": ["write_file"],
             "preferred_skills": ["python-development"],
-            "success_criteria": ["calculator.py exists."],
+            "success_criteria": ["calculator.html exists."],
         }]}
         runtime = ImmediateRuntime(self.store)
         planner = Planner(lambda request, context: json.dumps(semantic))
@@ -633,14 +661,16 @@ class AgentFactoryTests(unittest.TestCase):
         final = self.store.get_orchestration(run["id"])
         event_types = [event["event_type"] for event in final["events"]]
         self.assertEqual(final["task_spec"]["status"], "READY_FOR_PLANNING")
-        self.assertIsNotNone(final["plan"])
+        self.assertIsNotNone(final["plan"],
+                             {"status": final.get("status"), "error": final.get("error"),
+                              "events": [item.get("event_type") for item in final.get("events", [])]})
         self.assertEqual(len(submitted), 1)
         self.assertEqual(submitted[0]["status"], "Success")
         self.assertNotIn("freya.agent_factory.failed", event_types)
         self.assertNotIn("freya.agent_factory.skill_omitted", event_types)
         created = next(json.loads(event["payload_json"]) for event in final["events"]
                        if event["event_type"] == "freya.agent_created")
-        self.assertEqual(created["planner_preferred_skills"], ["freya-core"])
+        self.assertEqual(created["planner_preferred_skills"], [])
         self.assertEqual(created["resolved_skills"], ["freya-core"])
         self.assertEqual(created["required_capabilities"], ["filesystem.create"])
         compiler = next(json.loads(event["payload_json"]) for event in final["events"]
@@ -651,7 +681,8 @@ class AgentFactoryTests(unittest.TestCase):
     def test_successful_agent_archival_does_not_inherit_global_verifier_failure(self):
         final = self.run_orchestration(["accepted"],
                                        global_verifier=GlobalVerifier(lambda prompt, context: "bad"))
-        self.assertEqual(final["status"], "Failed")
+        self.assertEqual(final["status"], "Failed", final.get("error") or final.get("task_spec"))
+        self.assertTrue(final["evaluations"], final.get("error") or final.get("task_spec"))
         self.assertEqual(final["evaluations"][0]["status"], "accepted")
         archived = [json.loads(item["payload_json"]) for item in final["events"]
                     if item["event_type"] == "freya.dynamic_agent.archived"]

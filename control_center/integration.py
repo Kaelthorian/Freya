@@ -16,7 +16,7 @@ from typing import Any, Callable
 from .config import validate_endpoint
 from .planner import (MAX_PLAN_TASKS, TASK_KIND_VALUES, allocate_new_task_ids,
                       validate_plan)
-from .plan_compiler import compile_semantic_task_resources
+from .plan_compiler import compile_semantic_task_resources, extend_compiled_write_ownership
 from .runtime_resources import (
     RuntimeResourceCatalog, SEMANTIC_OPERATION_CAPABILITIES,
     UnsupportedResourceRequirement,
@@ -57,7 +57,7 @@ GLOBAL_CRITERION_FIELDS = {"criterion", "status", "reason", "evidence"}
 INTEGRATION_REPLAN_FIELDS = {"summary", "tasks"}
 INTEGRATION_SEMANTIC_TASK_FIELDS = {
     "id", "task_kind", "objective", "description", "depends_on", "operations", "semantic_needs",
-    "success_criteria", "owned_paths",
+    "success_criteria", "owned_paths", "write_targets",
 }
 FINAL_RESPONSE_FIELDS = {"summary", "completed", "evidence", "limitations"}
 
@@ -114,7 +114,8 @@ INTEGRATION_REPLAN_RESPONSE_FORMAT = {
                       "semantic_needs": {"type": "array", "items": {"type": "string"}},
                       "success_criteria": {"type": "array", "items": {"type": "string"}},
                       "owned_paths": {"type": "array", "items": {"type": "string"}},
-                  }, "required": sorted(INTEGRATION_SEMANTIC_TASK_FIELDS),
+                      "write_targets": {"type": "array", "items": {"type": "string"}},
+                  }, "required": sorted(INTEGRATION_SEMANTIC_TASK_FIELDS - {"write_targets"}),
                      "additionalProperties": False}},
     },
     "required": sorted(INTEGRATION_REPLAN_FIELDS), "additionalProperties": False,
@@ -906,7 +907,7 @@ def validate_integration_revision(*, current_plan: dict[str, Any], new_tasks: li
     if criterion_links is not None:
         candidate["criterion_links"] = deepcopy(criterion_links)
     candidate["complexity"] = "simple" if len(candidate["tasks"]) == 1 else "multi_step"
-    revised = validate_plan(candidate)
+    revised = validate_plan(extend_compiled_write_ownership(candidate, current))
     if len(revised["tasks"]) > int(max_tasks):
         raise IntegrationValidationError("Integration revision exceeds the configured task limit.")
     if revised["criterion_links"]["global"] != current["criterion_links"]["global"]:
@@ -992,6 +993,7 @@ class IntegrationReplanner(_MeasuredModel):
                 "semantic_needs": list(task.get("semantic_needs", [])),
                 "success_criteria": list(task.get("success_criteria", [])),
                 "owned_paths": list(task.get("owned_paths", [])),
+                "write_targets": list(task.get("write_targets", [])),
             } for task in plan.get("tasks", [])],
         }
 
@@ -1019,9 +1021,9 @@ class IntegrationReplanner(_MeasuredModel):
             "Set a registered task_kind and describe semantic operations only. Do not choose tools, capabilities, or Skills; "
             "Freya compiles operation IDs through the runtime catalog and rejects scope expansion. "
             "Give each new local criterion an explicit criterion_links entry when it proves a global ID. "
-            "Declare exact workspace-relative owned_paths for new files. Never claim a path already "
-            "owned by an existing task; leave an existing owner's path unclaimed when the new task "
-            "must request a coordinated cross-task change.",
+            "Declare exact workspace-relative write_targets for every intended write and owned_paths "
+            "only for newly owned files. A task targeting an existing owner's file leaves that path "
+            "out of owned_paths; Freya routes it through the coordinated cross-task change flow.",
             "Repair the prior invalid append-only response once. Return strict JSON only.",
         ]
         last_error: Exception | None = None

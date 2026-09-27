@@ -91,7 +91,7 @@ def semantic_plan_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(tasks, list):
         return {"invalid_tasks_type": type(tasks).__name__}
     fields = ("key", "task_kind", "objective", "description", "semantic_needs", "operations",
-              "depends_on", "success_criteria", "owned_paths")
+              "depends_on", "success_criteria", "owned_paths", "write_targets")
     result = []
     for item in tasks[:20]:
         if not isinstance(item, dict):

@@ -175,6 +175,48 @@ response/replan, Storage atomically rechecks `Integrating`, the plan revision
 and the current graph fingerprint. Cancellation, timeout or any snapshot change
 therefore wins over late model output.
 
+`orchestration_project_states` stores one versioned ProjectState per run. Its
+bounded manifest records workspace-relative paths, file sizes and SHA-256
+hashes, plus permanent plan-task ownership; it never stores file contents.
+Manifest traversal skips common generated directories and links, stops at 500
+files or depth 8 by default, and hashes only regular files up to 1 MB. Project
+state writes use an expected-revision transaction and append traceable events.
+Snapshots are refreshed before each dispatch, recovery retry, and cross-task
+owner action. A changed or missing tracked artifact advances its artifact
+revision and marks prior verification and symbol metadata stale. The snapshot
+sent to a worker is relevance-ranked and bounded to 500 artifacts and 12,000
+prompt characters by default; it contains the current task and direct
+dependencies, not file contents.
+
+Every generated agent gets the internal `project_context` tool under
+`project.read_context`. It queries only the dispatch snapshot (`summary`,
+`artifact`, `symbol`, `task` or metadata `search`), passes through the same
+capability policy engine, and is omitted from the Planner catalog and manual
+agent configuration. The Runtime Resource Catalog derives `filesystem.read`
+and `read_file` for `modify_file` and `overwrite_file`; pure `create_file` does
+not acquire read access. Read policy covers permitted workspace artifacts,
+including foreign-owned ones. Ownership restricts writes only. The Worker
+requires a successful read of current bytes in the same attempt before editing
+or overwriting an existing file; changed hashes return `STALE_ARTIFACT` and
+require a fresh read. A truncated `read_file` response does not authorize a
+write because the agent has not seen the full source. After the Evaluator accepts a task, ProjectState accepts only
+artifact paths present in the Worker action ledger, verifies the file still
+exists under the assigned workspace, and records its current hash. Worker
+symbol reports are checked against the current artifact bytes and declaration
+line; dependency reports are stored as observed metadata. Rejected or
+unverifiable claims do not become verified state. Cross-task requests retain
+the requester's observed artifact revision, while the owner receives a fresh
+snapshot and must inspect and read the current file before editing.
+
+When a mutating task has no successful write, a current read of every declared
+target permits an `already_satisfied_candidate` result with artifact hash and
+revision evidence. This is technical completion only; Evaluator judges each
+planned criterion. Without current target reads, the Worker retains
+`ExpectedWorkspaceMutationNotObserved`. Dispatch prompts include bounded direct
+dependency, dependent and shared-path responsibilities to keep each worker on
+its assigned step. Agents can report relevant symbol kind, signature, path and
+purpose; ProjectState verifies names against accepted artifact bytes when possible.
+
 
 Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. The worker also persists every successful or denied runtime action in the structured result. A successful `run_command` whose output directly satisfies a quoted-output, exit-code, or JSON completion criterion becomes `command_execution` verification evidence; the final verification flags are derived from that evidence rather than from the model's prose. The persistence layer normalizes every runtime and orchestration event with `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how` and a stable `trace_id`. This is derived centrally from the assigned agent, task snapshot and orchestration, so Task Analyst, Planner, Programmer, Code Auditor and other selected agents cannot disappear from the audit trail when an emitter omits a display field. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
@@ -305,16 +347,23 @@ after safe normalization or source-grounded completion completes after one call.
 The deterministic Task Analyst fallback preserves recognized multi-part actions
 and does not infer an unspecified language or interface. The legacy version-3
 `task_analyst.py` contract remains for injected compatibility adapters only.
+Registered action, interface and language tokens may be corrected by one edit
+only when exactly one canonical token matches. The original wording remains in
+requirements and a `task_analysis.lexical_normalization` event records the
+canonical interpretation. A clarified interface or language modifier in a
+model-proposed explicit entry is separated using clarification history and the
+deterministic Task Spec floor before the unchanged scope validator runs.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec and emits
-Semantic Plan schema version 2. Each task contains `task_kind`, semantic needs,
-registered operation IDs, dependencies, outcomes, criteria and exact `owned_paths`; it
+Semantic Plan schema version 3. Each task contains `task_kind`, semantic needs,
+registered operation IDs, dependencies, outcomes, criteria, exact `owned_paths`
+and `write_targets`; it
 contains no tool, capability or Skill IDs. Before planning,
 `orchestrator.py` creates a fresh `RuntimeResourceCatalog` from the capability
 registry and `Toolbox`. It exposes semantic operation IDs and descriptions,
 not concrete runtime resources. The catalog has a stable content hash.
 
-After JSON parsing, `plan_scope.py` compares the semantic proposal with explicit
+After JSON parsing, the Plan Compiler invokes `plan_scope.py` to compare the semantic proposal with explicit
 or clarified Task Spec intent. An optional external-only task or model-created
 deployment criterion is removed before resource resolution; dependent tasks
 inherit its prerequisites. Mixed artifact/external tasks and removal that
@@ -328,7 +377,20 @@ resolution. The original human prompt remains audit evidence and is not a
 downstream intent source; workers receive a deterministic rendering of the
 validated CanonicalTaskSpec.
 
-The Plan Compiler validates every operation against the catalog and derives
+The Plan Compiler checks each `unsupported_requirements` proposal against the
+Task Spec and registered runtime operations. Product behavior such as arithmetic
+is implemented through file operations and cannot be declared an unsupported
+runtime resource by the Planner. A requested runtime action without a matching
+registered operation raises `UnsupportedResourceRequirement`; an incorrect supported claim
+causes one bounded repair. The repair payload contains the exact previous
+Semantic Plan, structured compiler diagnostics and preservation rules.
+
+The Compiler preserves every distinct plan task. It assigns one permanent owner
+per normalized path: the unique creator, otherwise one explicit owner, otherwise
+the sole writer. A duplicate ownership claim from a noncreator is converted to
+a foreign write when the creator is unique. Two creators invalidate the plan;
+two modifier owners without a creator raise `OwnershipAmbiguous` for one bounded
+Planner repair. It validates every operation against the catalog and derives
 the complete runtime requirement set. For example, `modify_file` maps to
 `filesystem.modify` and `edit_file`; `create_file` maps to
 `filesystem.create` and `write_file`; `run_python_script` maps to
@@ -337,9 +399,12 @@ the complete runtime requirement set. For example, `modify_file` maps to
 external actions fail closed. Planner-supplied legacy capability and tool
 fields are ignored; they never create or widen authority. The Plan Compiler
 assigns task and criterion IDs, resolves dependencies, rejects cycles and
-duplicate normalized file owners, and produces compiled plan schema version 4.
-It permits one bounded repair for a genuine structural contradiction. Unknown
-resources and unsupported actions do not trigger repair.
+invalid ownership, and produces compiled plan schema version 4. The compiled
+plan persists `write_owners`; each task records `foreign_write_targets`.
+Global success criteria remain on the plan for Global Verification. Local task
+criteria remain on their own tasks for the Evaluator; the Compiler links an exact
+match but never appends a global criterion to the final task by position.
+Unknown resources and genuinely unsupported actions do not trigger repair.
 
 The Agent Factory consumes the compiled plan and cannot add capabilities or
 tools. It uses compiled `task_kind` to assign worker, QA or auditor role;
@@ -438,18 +503,24 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` is read-only and receives only planned task fields, a bounded
-Runtime result/error/verification record, and selected agent/runtime/attempt
-IDs. Existing sanitization runs before model input and persistence. Result and
+`Evaluator` is read-only and receives planned task fields including exact write
+targets, bounded structured Runtime actions/artifacts/workspace-diff metadata,
+result/error/verification, and selected agent/runtime/attempt IDs. Full diff
+contents are excluded from the structured evidence fields. Sanitization runs
+before model input and persistence. Result and
 verification output, evidence counts and item lengths are bounded; any clipping
 sets durable `context_truncated=true`. Agent output and verification text are
 explicitly untrusted data and cannot alter the system prompt, schema or
 configuration.
 
-Deterministic checks run before any model call. Failed verification evidence
-forces `rejected`; requested but unavailable or inconclusive verification
-forces `blocked`; and test/lint/build criteria without passing objective
-evidence are `blocked`. These outcomes cannot be overridden by agent claims or prompt injection.
+Deterministic checks run before any model call and apply per criterion. A pure
+file creation/presence criterion is proven by a successful scoped create,
+created artifact or workspace diff, or successful read-back for every relevant
+planned target. Denied later writes do not undo that evidence; later successful
+removal does. Relevant failed tests reject their criterion, while a missing
+required test/lint/build result blocks it. Mixed tasks retain proven facts and
+send only semantic questions to the LLM. Agent claims cannot override these
+facts.
 For filesystem-only tasks, when Git diff and a permitted test suite are not
 available, the Worker can use a policy-allowed `read_file` read-back for every
 modified path as objective evidence. `write_file` content is compared exactly;
@@ -458,19 +529,19 @@ failed and the evaluator still fails closed. Otherwise the tool-free
 `OllamaEvaluator` requests a strict JSON schema containing `accepted`,
 `needs_revision`, `rejected`, or `blocked`,
 with every planned success criterion represented exactly once. Invalid output
-gets one repair attempt and then fails closed as evaluator infrastructure
-`error`.
+gets one repair attempt and then persists evaluator infrastructure `error`
+without a semantic rejection or Worker retry.
 
 Evaluator calls are serialized to one model call at a time. Defaults are the
 separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
 `http://127.0.0.1:11434`, and 120-second timeout. Explicit
 `--evaluator-offline` uses deterministic evidence-only behavior for tests and
-offline operation. It accepts only when configured verification was requested,
-attempted and passed without contradictory evidence. Runtime result text is
+offline operation. It accepts directly proven objective criteria or configured
+verification that was requested, attempted and passed. Runtime result text is
 untrusted agent output, not objective verification: a non-empty result, success
 claim, or embedded instruction cannot produce acceptance. Without sufficient
-objective evidence, offline evaluation returns `blocked` and marks every
-criterion `unknown`. The Orchestrator's compatibility fallback uses this same
+objective evidence, offline evaluation returns `blocked`; already proven
+criteria remain satisfied. The Orchestrator's compatibility fallback uses this same
 conservative evaluator; it never silently converts an unverified Runtime
 success into semantic success. Cancellation, timeout, or restart wins over a late result;
 the atomic commit rechecks orchestration state, node state, Runtime task and
@@ -726,10 +797,11 @@ token budget remains unlimited.
 
 ### Cross-task file ownership
 
-Every task that owns planned files declares exact workspace-relative
-`owned_paths`. Plan validation rejects conflicting owners, and generated plan
-agents enforce their own exact path list before a filesystem mutation. A task
-that requests a change to another task's file must not claim that path; reads
+Every write task declares exact workspace-relative `write_targets`. A path's
+permanent plan-task owner is recorded in `owned_paths` and `write_owners`; other
+writers carry a `foreign_write_targets` entry with the owner ID. Plan validation
+rejects inconsistent mappings, and generated agents check both their exact
+scope and the owner index before mutation. Reads
 remain governed by the normal capability policy. A write to a file owned by another task is
 stopped before the tool handler runs and emits a structured request containing
 the target path, requested change, reason, need and blocking flag. The Worker
@@ -748,8 +820,8 @@ accept a semantically equivalent purpose only at high confidence. A mismatch,
 uncertain result, or unavailable matcher remains a human approval. Neither a
 grant nor an approval changes capability policy.
 
-After approval, Freya builds a temporary change task using only the owning
-task's already declared `filesystem.read` and write capabilities, after the
+After approval, Freya builds an ephemeral owner-side agent with read access and
+only the approved filesystem operation for the exact path. It waits until the
 original owner node has reached a terminal graph state so its later writes
 cannot overwrite the coordinated change. The derived agent's write scope is
 the one requested file. It goes through the normal
@@ -759,7 +831,12 @@ Denial, owner failure, failed evaluation, invalid ownership and detected cycles
 resume the requester with the recorded outcome so it can choose another
 permitted approach or report the blocker. The cross-task tables and events keep
 the request, durable approval, scoped grant, owner runtime task and evaluation
-result auditable.
+result auditable. The original owner node remains terminal, including `success`.
+Owner actions for the same normalized path are serialized within an orchestration;
+actions on different paths remain independent in the scheduler.
+Recovery and Integration preserve every existing `write_owners` entry. New
+revision tasks may own only newly assigned paths; writes to an existing owner's
+path become `foreign_write_targets` and use the same handoff.
 If restart recovery fails the orchestration, it also closes its unfinished
 cross-task requests and pending approvals in the same database transaction;
 no owner handoff resumes from a partially dispatched state.

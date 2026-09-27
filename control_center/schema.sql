@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS cross_task_modification_requests (
     target_owner_plan_task_id TEXT NOT NULL,
     target_path TEXT NOT NULL,
     normalized_target_path TEXT NOT NULL,
+    requester_observed_revision INTEGER NOT NULL DEFAULT 0,
     requested_operation TEXT NOT NULL,
     requested_change TEXT NOT NULL,
     reason TEXT NOT NULL,
@@ -208,6 +209,13 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
     effective_plan_json TEXT,
     current_plan_revision INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orchestration_project_states (
+    orchestration_id TEXT PRIMARY KEY REFERENCES orchestration_runs(id),
+    schema_version INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    state_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS orchestration_task_specs (

@@ -14,9 +14,11 @@ from control_center.evaluator import (
     EvaluationValidationError,
     Evaluator,
     OllamaEvaluator,
+    technical_failure_evaluation,
     validate_evaluation,
 )
 from control_center.execution_graph import ExecutionGraph
+from control_center.planner import PLAN_SCHEMA_VERSION
 from control_center.storage import Store
 
 
@@ -60,6 +62,153 @@ def decision(criteria, status="accepted"):
 
 
 class EvaluatorTests(unittest.TestCase):
+    @staticmethod
+    def created_result(path="calculator.js", *, denied=False):
+        actions = [{"tool": "write_file", "arguments": {"path": path},
+                    "capability": "filesystem.create", "policy_decision": "allow",
+                    "success": True, "changed": True, "already_satisfied": False}]
+        if denied:
+            actions.extend({"tool": "write_file", "arguments": {"path": path},
+                            "capability": "filesystem.overwrite", "policy_decision": "deny",
+                            "success": False, "changed": False, "error_class": error}
+                           for error in ("policy_denied", "repeated_policy_denied"))
+        return {"summary": "An overwrite was denied; cannot continue.",
+                "actions": actions, "artifacts": [{"path": path, "change_type": "created"}],
+                "workspace_diffs": [{"path": path, "change_type": "created",
+                                     "diff": "+private source should stay out of structured evidence"}]}
+
+    def test_exact_created_file_with_later_denials_is_deterministic_success(self):
+        criterion = "The JavaScript file should be created in the workspace."
+        plan = {**planned([criterion]), "write_targets": ["calculator.js"],
+                "owned_paths": ["calculator.js"], "semantic_operations": ["create_file"]}
+        calls = []
+        outcome = Evaluator(lambda prompt, context: calls.append(context)).evaluate(
+            planned_task=plan,
+            runtime_task=runtime(result=self.created_result(denied=True), verification={
+                "requested": True, "attempted": False, "passed": False,
+                "failed": False, "unavailable": True, "evidence": [],
+            }), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertTrue(outcome["deterministic"])
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_success")
+        self.assertEqual(calls, [])
+        context = outcome["context_snapshot"]
+        self.assertEqual(context["planned_task"]["write_targets"], ["calculator.js"])
+        self.assertEqual(context["runtime_task"]["artifacts"][0]["change_type"], "created")
+        self.assertNotIn("diff", context["runtime_task"]["workspace_diffs"][0])
+
+    def test_create_action_without_readback_proves_presence(self):
+        criterion = "The file x.js should be created"
+        result = self.created_result("x.js")
+        result["artifacts"] = []
+        result["workspace_diffs"] = []
+        outcome = Evaluator(lambda *_: self.fail("LLM must not run")).evaluate(
+            planned_task={**planned([criterion]), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertIn("filesystem.create", outcome["criteria"][0]["evidence"][0])
+
+    def test_named_artifact_creation_without_file_word_is_factual(self):
+        criterion = "x.js should be created"
+        outcome = Evaluator(lambda *_: self.fail("LLM must not run")).evaluate(
+            planned_task={**planned([criterion]), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=self.created_result("x.js")),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+
+    def test_spanish_file_existence_is_factual(self):
+        criterion = "El archivo x.js existe en el workspace."
+        outcome = Evaluator(lambda *_: self.fail("LLM must not run")).evaluate(
+            planned_task={**planned([criterion]), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=self.created_result("x.js")),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+
+    def test_failed_create_does_not_prove_presence(self):
+        criterion = "The file x.js should be created"
+        result = {"actions": [{"tool": "write_file", "arguments": {"path": "x.js"},
+                                "capability": "filesystem.create", "success": False,
+                                "changed": False}], "artifacts": [], "workspace_diffs": []}
+        outcome = Evaluator(offline=True).evaluate(
+            planned_task={**planned([criterion]), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertNotEqual(outcome["status"], "accepted")
+        self.assertNotEqual(outcome["metrics"]["decision_source"], "deterministic_success")
+
+    def test_explicit_criterion_path_must_match_planned_target_exactly(self):
+        criterion = "The file x.js should be created."
+        outcome = Evaluator(offline=True).evaluate(
+            planned_task={**planned([criterion]), "write_targets": ["y.js"]},
+            runtime_task=runtime(result=self.created_result("y.js"), verification={
+                "requested": False, "attempted": True, "passed": False,
+                "failed": False, "unavailable": True,
+                "evidence": [{"check": "filesystem:read_file:x.js", "status": "passed"}],
+            }),
+            execution_node=node(),
+        )
+        self.assertNotEqual(outcome["status"], "accepted")
+
+    def test_multiple_targets_require_all_and_later_removal_invalidates_presence(self):
+        criterion = "The project files are created in the workspace."
+        plan = {**planned([criterion]), "write_targets": ["index.html", "styles.css", "app.js"]}
+        partial = self.created_result("index.html")
+        self.assertEqual(Evaluator(offline=True).evaluate(
+            planned_task=plan, runtime_task=runtime(result=partial), execution_node=node(),
+        )["status"], "blocked")
+        complete = {"actions": [], "artifacts": [{"path": path, "change_type": "created"}
+                    for path in plan["write_targets"]], "workspace_diffs": []}
+        self.assertEqual(Evaluator(offline=True).evaluate(
+            planned_task=plan, runtime_task=runtime(result=complete), execution_node=node(),
+        )["status"], "accepted")
+        complete["workspace_diffs"].append({"path": "app.js", "change_type": "deleted"})
+        self.assertNotEqual(Evaluator(offline=True).evaluate(
+            planned_task=plan, runtime_task=runtime(result=complete), execution_node=node(),
+        )["status"], "accepted")
+
+    def test_mixed_criteria_preserve_proven_file_and_review_semantics(self):
+        criteria = ["The file x.js exists.", "The implementation handles ambiguous input correctly."]
+        seen = []
+        def model(prompt, context):
+            seen.append(context["criterion_facts"])
+            answer = decision(criteria, "needs_revision")
+            answer["criteria"][0]["status"] = "unsatisfied"
+            answer["criteria"][1]["status"] = "unsatisfied"
+            return answer
+        outcome = Evaluator(model).evaluate(
+            planned_task={**planned(criteria), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=self.created_result("x.js", denied=True)),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["metrics"]["decision_source"], "llm_semantic")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+        self.assertEqual(outcome["criteria"][1]["status"], "unsatisfied")
+        self.assertEqual(seen[0][0]["status"], "PROVEN SATISFIED")
+        self.assertEqual(seen[0][1]["status"], "REQUIRES SEMANTIC REVIEW")
+        offline = Evaluator(offline=True).evaluate(
+            planned_task={**planned(criteria), "write_targets": ["x.js"]},
+            runtime_task=runtime(result=self.created_result("x.js")),
+            execution_node=node(),
+        )
+        self.assertEqual(offline["status"], "blocked")
+        self.assertEqual([item["status"] for item in offline["criteria"]],
+                         ["satisfied", "unknown"])
+
+    def test_technical_failure_record_is_not_semantic_rejection(self):
+        criteria = ["The explanation clearly describes the architecture."]
+        record = technical_failure_evaluation("Invalid model output", criteria)
+        self.assertEqual(record["evaluation_status"], "error")
+        self.assertEqual(record["failure_class"], "evaluator_infrastructure")
+        self.assertEqual(record["recommended_runtime_action"], "retry_evaluation")
+        self.assertNotIn("recommended_action", record)
+        self.assertNotEqual(record["status"], "rejected")
+
     def test_linked_successful_command_accepts_each_exact_criterion(self):
         criteria = ["The script outputs 'Hello, World!' to the console"]
         model_calls = []
@@ -526,7 +675,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
         }
         run = self.store.create_orchestration("Evaluate")
         self.store.transition_orchestration(run["id"], "Queued", "Planning")
-        self.store.save_orchestration_plan(run["id"], plan, 1)
+        self.store.save_orchestration_plan(run["id"], plan, PLAN_SCHEMA_VERSION)
         graph = ExecutionGraph(plan)
         self.store.initialize_execution_graph(run["id"], graph.serialize())
         self.store.transition_orchestration(run["id"], "Planned", "Running")
@@ -544,6 +693,23 @@ class EvaluationPersistenceTests(unittest.TestCase):
         graph.apply_runtime_status("task-a", "Success", result="done")
         self.store.save_execution_graph(run["id"], graph.serialize())
         return run, agent, task, plan
+
+    def test_infrastructure_error_persists_without_semantic_rejection(self):
+        run, agent, task, _ = self.evaluating_fixture()
+        envelope = technical_failure_evaluation("Invalid output after repair", ["The change is complete."])
+        record = self.store.commit_evaluation(
+            "technical-error", run["id"], "task-a", runtime_task_id=task["id"],
+            agent_id=agent["id"], attempt=1, evaluator_version=EVALUATOR_VERSION,
+            evaluation=envelope, metrics={"model_calls": 2}, snapshot={"input": {}},
+            context_truncated=False, deterministic=False,
+        )
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(record["failure_class"], "evaluator_infrastructure")
+        self.assertIsNone(record["recommended_action"])
+        self.assertEqual(record["recommended_runtime_action"], "retry_evaluation")
+        graph = self.store.get_execution_graph(run["id"])
+        self.assertEqual(graph["nodes"][0]["evaluation_status"], "error")
+        self.assertEqual(graph["nodes"][0]["state"], "recovery_pending")
 
     def test_evaluation_persists_version_metrics_snapshot_and_node_reference(self):
         run, agent, task, _ = self.evaluating_fixture()

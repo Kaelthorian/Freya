@@ -16,7 +16,11 @@ from control_center.tools import Toolbox
 class RuntimeResourceCatalogTests(unittest.TestCase):
     def test_catalog_matches_capability_registry_and_worker_schemas(self):
         catalog = RuntimeResourceCatalog.build()
-        self.assertEqual(set(catalog.ids("capability")), {item.id for item in CAPABILITIES})
+        self.assertEqual(
+            set(catalog.ids("capability")),
+            {item.id for item in CAPABILITIES if item.id != "project.read_context"},
+        )
+        self.assertNotIn("project.read_context", catalog.ids("capability"))
         schema_ids = {item["function"]["name"] for item in Toolbox.schema_catalog()}
         self.assertEqual(set(catalog.ids("tool")), schema_ids)
         command = next(item for item in catalog.tools if item["id"] == "run_command")
@@ -82,21 +86,17 @@ class RuntimeResourceCatalogTests(unittest.TestCase):
              {"id": "capability.two", "aliases": ["shared"]}], [], [])
         self.assertIsNone(ambiguous.resolve("capability", "shared"))
 
-    def test_explicit_unsupported_need_produces_typed_error(self):
+    def test_catalog_does_not_treat_planner_unsupported_claim_as_authority(self):
         catalog = RuntimeResourceCatalog.build()
-        with self.assertRaises(UnsupportedResourceRequirement) as caught:
-            catalog.validate_semantic_plan({
-                "tasks": [],
-                "unsupported_requirements": [{
-                    "semantic_need": "Capture a screen image",
-                    "resource_type": "tool",
-                    "resource_id": "screen_capture",
-                    "reason": "No screenshot tool is registered.",
-                }],
-            })
-        self.assertEqual(caught.exception.resource_type, "tool")
-        self.assertEqual(caught.exception.unknown_resource_id, "screen_capture")
-        self.assertEqual(caught.exception.semantic_need, "Capture a screen image")
+        normalized = catalog.validate_semantic_plan({
+            "tasks": [],
+            "unsupported_requirements": [{
+                "semantic_need": "Capture a screen image",
+                "reason": "No screenshot tool is registered.",
+            }],
+        })
+        self.assertEqual(normalized["tasks"], [])
+        self.assertNotIn("unsupported_requirements", normalized)
 
     def test_selected_tool_derives_compatible_capabilities_before_compilation(self):
         task_spec = deterministic_task_spec("Crea un programa Python que imprima hola")
@@ -199,7 +199,9 @@ class RuntimeResourceCatalogTests(unittest.TestCase):
                       catalog.preferred_skill_warnings[0]["message"])
 
     def test_modify_file_semantics_deterministically_resolve_edit_file(self):
-        spec = deterministic_task_spec("Modify calculator.py to print the correct result.")
+        spec = deterministic_task_spec(
+            "Modify calculator.py for a Python console calculator that adds and subtracts numbers."
+        )
         semantic = {"summary": "Update calculator", "tasks": [{
             "key": "modify", "task_kind": "code_change",
             "objective": "Modify calculator.py",
@@ -212,11 +214,14 @@ class RuntimeResourceCatalogTests(unittest.TestCase):
         compiled = compile_semantic_plan(semantic, spec)
         task = compiled["tasks"][0]
         self.assertEqual(task["semantic_operations"], ["modify_file"])
-        self.assertEqual(task["required_capabilities"], ["filesystem.modify"])
-        self.assertEqual(task["required_tools"], ["edit_file"])
+        self.assertEqual(task["required_capabilities"], ["filesystem.modify", "filesystem.read"])
+        self.assertEqual(task["required_tools"], ["edit_file", "read_file"])
 
     def test_edit_file_hint_corrects_the_incompatible_planner_capability(self):
-        spec = deterministic_task_spec("Modify calculator.py documentation.")
+        spec = deterministic_task_spec(
+            "Update documentation in the Python console calculator calculator.py "
+            "that adds and subtracts numbers."
+        )
         semantic = {"summary": "Document the calculator source.", "tasks": [{
             "key": "document", "task_kind": "code_change",
             "objective": "Document calculator.py",
@@ -232,9 +237,16 @@ class RuntimeResourceCatalogTests(unittest.TestCase):
         compiled = compile_semantic_plan(semantic, spec)
         task = compiled["tasks"][0]
         self.assertEqual(task["semantic_operations"], ["modify_file"])
-        self.assertEqual(task["required_tools"], ["edit_file"])
-        self.assertEqual(task["required_capabilities"], ["filesystem.modify"])
+        self.assertEqual(task["required_tools"], ["edit_file", "read_file"])
+        self.assertEqual(task["required_capabilities"], ["filesystem.modify", "filesystem.read"])
         self.assertNotIn("execution.python_script", task["required_capabilities"])
+
+    def test_overwrite_requires_read_but_pure_create_does_not(self):
+        catalog = RuntimeResourceCatalog.build()
+        self.assertEqual(catalog.resources_for_operations(["overwrite_file"]),
+                         (["filesystem.overwrite", "filesystem.read"], ["write_file", "read_file"]))
+        self.assertEqual(catalog.resources_for_operations(["create_file"]),
+                         (["filesystem.create"], ["write_file"]))
 
     def test_semantic_needs_derive_create_python_pytest_and_unknown_tool_fails_closed(self):
         catalog = RuntimeResourceCatalog.build()

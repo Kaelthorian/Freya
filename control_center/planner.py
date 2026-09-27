@@ -23,11 +23,12 @@ from .runtime_resources import (
     UnsupportedResourceRequirement,
 )
 from .skills import SkillCompatibilityError
-from .plan_scope import PlannerScopeError, reconcile_plan_scope, semantic_plan_snapshot
-from .cross_task import (CrossTaskRequestError, normalize_owned_paths, owned_path_key)
+from .plan_scope import PlannerScopeError, semantic_plan_snapshot
+from .cross_task import (MAX_OWNED_PATHS, CrossTaskRequestError,
+                         normalize_owned_paths, owned_path_key)
 
 
-SEMANTIC_PLAN_SCHEMA_VERSION = 2
+SEMANTIC_PLAN_SCHEMA_VERSION = 3
 PLAN_SCHEMA_VERSION = 4
 MAX_PLAN_TASKS = 20
 # User prompts are accepted without an application-level character limit.
@@ -57,7 +58,7 @@ TASK_FIELDS = {
     "preferred_skills", "success_criteria",
 }
 TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools",
-                        "semantic_operations", "owned_paths"}
+                        "semantic_operations", "owned_paths", "write_targets", "foreign_write_targets"}
 TASK_KIND_VALUES = {
     "file_creation", "program_creation", "code_change", "review", "testing",
     "analysis", "external_action", "general",
@@ -88,6 +89,11 @@ PLAN_RESPONSE_FORMAT = {
                     "required_tools": {"type": "array", "items": {"type": "string"}},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
                     "owned_paths": {"type": "array", "items": {"type": "string"}},
+                    "write_targets": {"type": "array", "items": {"type": "string"}},
+                    "foreign_write_targets": {"type": "array", "items": {"type": "object",
+                        "properties": {"path": {"type": "string"},
+                                       "owner_plan_task_id": {"type": "string"}},
+                        "required": ["path", "owner_plan_task_id"], "additionalProperties": False}},
                     "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                     "task_characteristics": {"type": "object"},
                 },
@@ -95,6 +101,7 @@ PLAN_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
+        "write_owners": {"type": "object", "additionalProperties": {"type": "string"}},
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "criterion_links": {"type": "object", "properties": {
             "global": {"type": "array", "items": {"type": "object", "properties": {
@@ -157,6 +164,7 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
         "operations": {"type": "array", "items": {"type": "string", "enum": operation_ids}},
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "owned_paths": {"type": "array", "items": {"type": "string"}},
+        "write_targets": {"type": "array", "items": {"type": "string"}},
     }
     unsupported = {"type": "array", "items": {"type": "object", "properties": {
         "semantic_need": {"type": "string"},
@@ -206,12 +214,6 @@ PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS = (
     "Task Spec requires them or they are reasonably necessary to implement the requested behavior."
 )
 
-_SIMPLE_ARTIFACT_HINT = re.compile(
-    r"(?:\.[a-z0-9]{1,8}\b|\b(?:file|archivo|script|document|documento)\b)",
-    re.IGNORECASE,
-)
-
-
 def _is_code_audit_task(task: dict[str, Any]) -> bool:
     return (
         "code-review" in task.get("preferred_skills", [])
@@ -255,95 +257,10 @@ def _is_trivial_task(plan: dict[str, Any], analysis: Any) -> bool:
     return set(task.get("required_capabilities", [])) <= allowed
 
 
-def _collapse_simple_artifact_plan(plan: dict[str, Any]) -> dict[str, Any]:
-    """Merge an over-decomposed linear file workflow into one worker task."""
-    tasks = plan.get("tasks", [])
-    if not isinstance(tasks, list) or not 2 <= len(tasks) <= 6:
-        return plan
-    combined_text = " ".join(
-        [str(plan.get("goal", "")), str(plan.get("summary", ""))]
-        + [str(task.get("objective", "")) + " " + str(task.get("description", ""))
-           for task in tasks]
-    )
-    if not _SIMPLE_ARTIFACT_HINT.search(combined_text):
-        return plan
-    for index, task in enumerate(tasks):
-        dependencies = set(task.get("depends_on", []))
-        expected = set() if index == 0 else {tasks[index - 1]["id"]}
-        if dependencies != expected:
-            return plan
-        if any(not str(capability).startswith(("filesystem.", "execution.", "git."))
-               for capability in task.get("required_capabilities", [])):
-            return plan
-
-    def unique(values: list[str], maximum: int) -> list[str]:
-        result: list[str] = []
-        seen: set[str] = set()
-        for value in values:
-            if value not in seen:
-                seen.add(value)
-                result.append(value)
-            if len(result) >= maximum:
-                break
-        return result
-
-    try:
-        owned_paths = normalize_owned_paths(
-            [path for task in tasks for path in task.get("owned_paths", [])]
-        )
-    except CrossTaskRequestError as exc:
-        raise PlanValidationError(f"Collapsed task owned_paths are invalid: {exc}") from exc
-
-    objective = str(plan.get("goal") or tasks[0]["objective"]).strip()
-    if len(objective) > MAX_OBJECTIVE_CHARS:
-        objective = str(tasks[0]["objective"]).strip()[:MAX_OBJECTIVE_CHARS]
-    description = "Complete the requested artifact workflow in one pass: " + "; ".join(
-        str(task["description"]).strip() for task in tasks
-    )
-    merged = {
-        "id": tasks[0]["id"],
-        "objective": objective,
-        "description": description[:MAX_DESCRIPTION_CHARS],
-        "depends_on": list(tasks[0].get("depends_on", [])),
-        "required_capabilities": unique(
-            [capability for task in tasks for capability in task.get("required_capabilities", [])],
-            MAX_CAPABILITIES,
-        ),
-        "preferred_skills": unique(
-            [skill for task in tasks for skill in task.get("preferred_skills", [])],
-            MAX_PREFERRED_SKILLS,
-        ),
-        "success_criteria": unique(
-            [criterion for task in tasks for criterion in task.get("success_criteria", [])],
-            MAX_CRITERIA,
-        ),
-        "owned_paths": owned_paths,
-    }
-    collapsed = dict(plan)
-    collapsed["complexity"] = "simple"
-    collapsed["tasks"] = [merged]
-    links = plan.get(CRITERION_LINKS_FIELD)
-    if isinstance(links, dict):
-        merged_links = []
-        for criterion in merged["success_criteria"]:
-            sources = [item for item in links["local"]
-                       if item["criterion"].casefold() == criterion.casefold()]
-            if not sources:
-                continue
-            supported = list(dict.fromkeys(
-                global_id for item in sources
-                for global_id in item["supports_global_criteria"]
-            ))
-            merged_links.append({**sources[0], "task_id": merged["id"],
-                                 "supports_global_criteria": supported})
-        collapsed[CRITERION_LINKS_FIELD] = {"global": links["global"], "local": merged_links}
-    return validate_plan(collapsed)
-
-
 def _normalize_python_console_calculator(plan: dict[str, Any],
                                          task_spec: dict[str, Any],
                                          resource_catalog: RuntimeResourceCatalog | None = None) -> dict[str, Any]:
-    """Keep the user's one-file calculator request to implementation plus QA."""
+    """Deprecated legacy console adapter; never applies to web/desktop work."""
     objective = str(task_spec.get("objective") or "").casefold()
     context_text = " ".join(
         str(item.get("description") or "")
@@ -1142,7 +1059,7 @@ def _inferred_owned_paths(objective: str, task_kind: str,
 def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                    repair_model_criteria: bool = False) -> dict[str, Any]:
     """Return a stable representation while enforcing field types and bounds."""
-    raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD})
+    raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD, "write_owners"})
     complexity = _text(raw["complexity"], "plan.complexity", 32).casefold().replace("-", "_")
     if complexity not in {"simple", "multi_step"}:
         raise PlanValidationError("plan.complexity must be simple or multi_step.")
@@ -1207,6 +1124,28 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                 raise PlanValidationError(
                     f"plan.tasks[{index}].owned_paths is invalid: {exc}"
                 ) from exc
+        if "write_targets" in task:
+            try:
+                normalized_task["write_targets"] = normalize_owned_paths(task["write_targets"])
+            except CrossTaskRequestError as exc:
+                raise PlanValidationError(
+                    f"plan.tasks[{index}].write_targets is invalid: {exc}") from exc
+        if "foreign_write_targets" in task:
+            foreign = task["foreign_write_targets"]
+            if not isinstance(foreign, list) or len(foreign) > MAX_OWNED_PATHS:
+                raise PlanValidationError(f"plan.tasks[{index}].foreign_write_targets is invalid.")
+            normalized_foreign = []
+            for item in foreign:
+                if not isinstance(item, dict) or set(item) != {"path", "owner_plan_task_id"}:
+                    raise PlanValidationError(f"plan.tasks[{index}].foreign_write_targets entry is invalid.")
+                try:
+                    path = normalize_owned_paths([item["path"]])[0]
+                except (CrossTaskRequestError, IndexError, TypeError) as exc:
+                    raise PlanValidationError("Invalid foreign write path.") from exc
+                normalized_foreign.append({"path": path,
+                                           "owner_plan_task_id": _identifier(
+                                               item["owner_plan_task_id"], "foreign owner")})
+            normalized_task["foreign_write_targets"] = normalized_foreign
         if "task_kind" in task:
             task_kind = _text(task["task_kind"], f"plan.tasks[{index}].task_kind", 64).casefold()
             if task_kind not in TASK_KIND_VALUES:
@@ -1234,6 +1173,16 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
         "success_criteria": _text_list(raw["success_criteria"], "plan.success_criteria",
                                         MAX_CRITERIA, allow_empty=False),
     }
+    if "write_owners" in raw:
+        owners = raw["write_owners"]
+        if not isinstance(owners, dict):
+            raise PlanValidationError("plan.write_owners must be an object.")
+        try:
+            result["write_owners"] = {
+                owned_path_key(path): _identifier(owner, "plan.write_owners owner")
+                for path, owner in owners.items()}
+        except (CrossTaskRequestError, TypeError, ValueError) as exc:
+            raise PlanValidationError("plan.write_owners is invalid.") from exc
     result[CRITERION_LINKS_FIELD] = _normalize_criterion_links(
         raw.get(CRITERION_LINKS_FIELD), result["success_criteria"], tasks, diagnostics,
         repair_model_criteria=repair_model_criteria)
@@ -1263,6 +1212,19 @@ def validate_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                     f"Conflicting write ownership for {path}: {previous} and {task['id']}."
                 )
             ownership[key] = task["id"]
+    if "write_owners" in plan and plan["write_owners"] != ownership:
+        raise PlanValidationError("Plan write_owners does not match permanent task ownership.")
+    for task in plan["tasks"]:
+        foreign = task.get("foreign_write_targets", [])
+        targets = {owned_path_key(path) for path in task.get("write_targets", [])}
+        expected = {key: owner for key, owner in ownership.items()
+                    if key in targets and owner != task["id"]}
+        actual = {owned_path_key(item["path"]): item["owner_plan_task_id"] for item in foreign}
+        if actual != expected or len(actual) != len(foreign):
+            if foreign or "write_targets" in task:
+                raise PlanValidationError(
+                    f"Task {task['id']} foreign_write_targets does not match plan ownership.")
+    plan["write_owners"] = ownership
     known = set(ids)
     graph: dict[str, list[str]] = {}
     for task in plan["tasks"]:
@@ -1513,8 +1475,8 @@ class Planner:
         value = _expand_model_task_ids(value, diagnostics)
         value = _remove_analyst_acceptance_placeholders(value, analysis, diagnostics)
         declared_links = isinstance(value, dict) and CRITERION_LINKS_FIELD in value
-        plan = _collapse_simple_artifact_plan(validate_plan(
-            value, diagnostics=diagnostics, repair_model_criteria=True))
+        plan = validate_plan(
+            value, diagnostics=diagnostics, repair_model_criteria=True)
         plan = _reconcile_task_analysis(plan, analysis)
         plan = _append_qa_task(plan, analysis)
         plan = _append_code_audit_task(plan, analysis)
@@ -1691,10 +1653,16 @@ class Planner:
             PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS + "\n\n"
             "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
             "success_criteria and tasks. Each task has a meaningful key, task_kind, objective, description, "
-            "depends_on (semantic task keys), semantic_needs, operations, success_criteria and owned_paths. "
+            "depends_on (semantic task keys), semantic_needs, operations, success_criteria, "
+            "owned_paths and write_targets. "
             "task_kind must be one of " + json.dumps(sorted(TASK_KIND_VALUES)) + ". "
             "For a write task, choose a precise, "
             "workspace-relative exact file path; do not use broad patterns. Do not supply runtime IDs, "
+            "Within one plan, one concrete writable path has one permanent plan-task owner. "
+            "owned_paths declares lasting responsibility; write_targets declares files this task "
+            "intends to write, including files owned by another task. Keep distinct task nodes "
+            "distinct, even when they write the same file. The unique creator owns a created file. "
+            "A later modifier of that file declares it in write_targets and leaves owned_paths empty. "
             "criterion IDs, criterion links, "
             "execution nodes or UUIDs; Freya compiles those deterministically. Use the fewest "
             "workers needed. Decide implementation, controlled QA, research and audit only when "
@@ -1704,7 +1672,9 @@ class Planner:
             "Freya deterministically maps operations to runtime resources. Keep semantic_needs "
             "as explanations and include every concrete operation needed by the task. "
             "Creating a web artifact does not imply deployment, publication, hosting, or external execution. "
-            "If a requested semantic operation is not represented, describe it in unsupported_requirements "
+            "Product behavior is a semantic need, not a runtime operation. For example, multiplication "
+            "can be implemented with create_file; do not declare it unsupported. "
+            "If a requested runtime action is not represented, describe it in unsupported_requirements "
             "using only semantic_need and reason. Runtime policy remains authoritative. "
             "Semantic operation catalog: "
             + json.dumps(resource_view, ensure_ascii=False, separators=(",", ":"))
@@ -1731,6 +1701,7 @@ class Planner:
                 "depends_on": [], "semantic_needs": ["Create and inspect the requested program."],
                 "operations": operations,
                 "owned_paths": owned_paths,
+                "write_targets": owned_paths,
                 "success_criteria": [
                     "The requested artifact exists and can be inspected."],
             }], "success_criteria": [], "unsupported_requirements": []}
@@ -1766,23 +1737,44 @@ class Planner:
 
         compiler_started_at = ""
         compiler_started = 0.0
+        original_for_repair = None
+        affected_for_repair: set[int] = set()
+        preserve_all_repair_tasks = False
         for attempt in range(2):
             try:
                 compiler_started_at = compiler_timestamp()
                 compiler_started = time.monotonic()
+                value = None
                 value = json.loads(semantic) if isinstance(semantic, str) else semantic
+                if (attempt and (affected_for_repair or preserve_all_repair_tasks)
+                        and isinstance(value, dict)
+                        and isinstance(original_for_repair, dict)):
+                    old_tasks = original_for_repair.get("tasks", [])
+                    new_by_key = {task.get("key"): task for task in value.get("tasks", [])
+                                  if isinstance(task, dict)}
+                    old_keys = {task.get("key") for task in old_tasks if isinstance(task, dict)}
+                    if not set(new_by_key) <= old_keys:
+                        raise PlanValidationError(
+                            "Planner repair added a new semantic task outside the rejected boundary.")
+                    for index, task in enumerate(old_tasks, 1):
+                        if (index not in affected_for_repair and isinstance(task, dict)
+                                and new_by_key.get(task.get("key")) != task):
+                            raise PlanValidationError(
+                                "Planner repair changed or removed an unaffected semantic task.")
                 snapshot = semantic_plan_snapshot(value)
                 self.metrics["planner_semantic_plan"] = snapshot
                 self.metrics.setdefault("planner_semantic_plan_attempts", []).append(snapshot)
-                value, scope_adjustments = reconcile_plan_scope(spec, value)
-                self.metrics["scope_adjustments"] = scope_adjustments
-                value = resource_catalog.validate_semantic_plan(value)
-                planner_resource_resolutions = list(resource_catalog.resource_resolutions)
                 plan = compile_semantic_plan(value, spec, resource_catalog=resource_catalog)
+                scope_adjustments = list(resource_catalog.scope_adjustments)
+                self.metrics["scope_adjustments"] = scope_adjustments
+                planner_resource_resolutions = list(resource_catalog.resource_resolutions)
+                self.metrics["compiler_events"] = list(resource_catalog.compiler_events)
                 plan = _normalize_python_console_calculator(plan, spec, resource_catalog)
                 objective = spec["objective"].casefold()
                 if ("python" in objective and any(word in objective for word in
-                    ("calculadora", "calculator"))):
+                    ("calculadora", "calculator")) and any(word in objective for word in
+                    ("consola", "console")) and not any(word in objective for word in
+                    ("web", "desktop", "escritorio"))):
                     plan = _append_qa_task(
                         plan, {"task_characteristics": {"requires_user_input": True}}, resource_catalog)
                     qa_task = next((task for task in plan["tasks"]
@@ -1847,6 +1839,7 @@ class Planner:
                 self.metrics["resource_resolutions"] = resource_resolutions
                 self.metrics["compiled_runtime_plan"] = {
                     "schema_version": PLAN_SCHEMA_VERSION,
+                    "write_owners": dict(compiled.get("write_owners", {})),
                     "tasks": [{
                         "id": task["id"],
                         "task_kind": task.get("task_kind"),
@@ -1855,11 +1848,15 @@ class Planner:
                         "required_capabilities": list(task.get("required_capabilities", [])),
                         "required_tools": list(task.get("required_tools", [])),
                         "owned_paths": list(task.get("owned_paths", [])),
+                        "write_targets": list(task.get("write_targets", [])),
+                        "foreign_write_targets": list(task.get("foreign_write_targets", [])),
                     } for task in compiled["tasks"]],
                 }
                 self.metrics["ownership_resolutions"] = [{
                     "task_id": task["id"],
                     "owned_paths": list(task.get("owned_paths", [])),
+                    "write_targets": list(task.get("write_targets", [])),
+                    "foreign_write_targets": list(task.get("foreign_write_targets", [])),
                 } for task in compiled["tasks"]]
                 preferred_skill_warnings = resource_catalog.preferred_skill_warnings_for_tasks(
                     compiled["tasks"])
@@ -1879,6 +1876,7 @@ class Planner:
                 record["compiled_plan_schema_version"] = PLAN_SCHEMA_VERSION
                 record["compiled_runtime_plan"] = self.metrics["compiled_runtime_plan"]
                 record["ownership_resolutions"] = self.metrics["ownership_resolutions"]
+                record["compiler_events"] = self.metrics["compiler_events"]
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 return compiled
@@ -1890,6 +1888,7 @@ class Planner:
                 record["planner_semantic_plan"] = self.metrics.get("planner_semantic_plan", {})
                 record["scope_adjustments"] = self.metrics.get("scope_adjustments", [])
                 record["resource_resolutions"] = self.metrics.get("resource_resolutions", [])
+                record["compiler_events"] = list(getattr(resource_catalog, "compiler_events", []))
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 raise
@@ -1898,9 +1897,38 @@ class Planner:
                     compiler_started_at, compiler_started, "Failed",
                     attempt_number=attempt + 1, error=exc,
                 )
+                record["compiler_events"] = list(getattr(resource_catalog, "compiler_events", []))
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
                 if attempt or self.decide is None:
                     raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
-                repair = request + "\nRepair this semantic plan without adding internal IDs. Error: " + str(exc)
-                semantic = self._call(repair, {**limited_context, "_freya_repair": True})
+                if not isinstance(value, dict):
+                    raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
+                original_for_repair = copy.deepcopy(value)
+                message = str(exc)[:600]
+                affected_paths = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", message)
+                affected_ids = sorted({int(number) for number in re.findall(r"\btask-(\d+)\b", message)})
+                affected_for_repair = set(affected_ids)
+                preserve_all_repair_tasks = message.startswith("Planner unsupported claim")
+                error_type = type(exc).__name__
+                diagnostic = {"type": error_type, "message": message,
+                              "affected_tasks": [f"task-{number}" for number in affected_ids],
+                              "affected_paths": affected_paths}
+                self.metrics.setdefault("planner_events", []).append({
+                    "event_type": "planner.repair_requested", "error_type": error_type,
+                    "affected_tasks": diagnostic["affected_tasks"],
+                    "affected_paths": affected_paths,
+                    "original_task_count": len(value.get("tasks", []))})
+                repair_payload = {
+                    "instruction": "Repair only the compiler-rejected part of this semantic plan. Return the complete semantic plan JSON.",
+                    "canonical_task_spec": public_spec,
+                    "previous_semantic_plan": original_for_repair,
+                    "compiler_error": diagnostic,
+                    "rules": {"preserve_unaffected_tasks": True,
+                              "preserve_user_scope": True, "do_not_add_requirements": True},
+                }
+                encoded = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
+                if len(encoded) > 40000:
+                    raise PlanGenerationError("Semantic plan repair payload exceeds the bounded limit.") from exc
+                semantic = self._call(encoded, {**limited_context, "_freya_repair": True})
+                self.metrics["planner_events"].append({"event_type": "planner.repair_completed"})

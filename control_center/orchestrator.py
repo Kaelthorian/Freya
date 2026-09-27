@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,7 @@ from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATU
 from .task_spec import TaskSpecAnalyst, render_task_spec, validate_task_spec
 from .cross_task import owned_path_key
 from .cross_task import CrossTaskIntentMatcher
+from .project_state import ProjectStateManager
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -77,10 +79,21 @@ class Orchestrator(IntegrationOrchestrationMixin):
                        "max_semantic_attempts_per_task": 3,
                        "max_plan_revisions": 2, "max_recovery_actions": 8,
                        "max_recovery_model_calls": 16, "max_integration_rounds": 2,
-                       "max_integration_model_calls": 12}
+                       "max_integration_model_calls": 12,
+                       "project_context_max_manifest_files": 500,
+                       "project_context_max_manifest_depth": 8,
+                       "project_context_max_snapshot_artifacts": 500,
+                       "project_context_max_prompt_chars": 12_000}
         self.recovery_lock = threading.Lock()
         self.failure_analysis_lock = threading.Lock()
         self.config.update(config or {})
+        self.project_state = ProjectStateManager(
+            store,
+            max_manifest_files=self.config["project_context_max_manifest_files"],
+            max_manifest_depth=self.config["project_context_max_manifest_depth"],
+            max_snapshot_artifacts=self.config["project_context_max_snapshot_artifacts"],
+            max_prompt_chars=self.config["project_context_max_prompt_chars"],
+        )
         for field in ("max_delegated_tasks", "max_parallel_tasks", "max_semantic_attempts_per_task",
                       "max_plan_revisions", "max_recovery_actions",
                       "max_recovery_model_calls", "max_integration_rounds",
@@ -208,7 +221,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
         return selected
     @staticmethod
     def _execution_prompt(operational_prompt: str, planned_task: dict,
-                          attempt_prompt: str = "") -> str:
+                          attempt_prompt: str = "",
+                          project_context: str = "",
+                          responsibility_context: str = "") -> str:
         """Send the Task Analyst's operational brief to every delegated worker."""
         spec_text = str(operational_prompt or "").strip()
         canonical = spec_text.startswith("{") and '"deliverables":' in spec_text
@@ -224,11 +239,84 @@ class Orchestrator(IntegrationOrchestrationMixin):
             sections.append("Step context:\n" + description)
         if criteria:
             sections.append("Step success criteria:\n" + "\n".join("- " + str(item) for item in criteria))
+        if responsibility_context:
+            sections.append(responsibility_context)
         if attempt_prompt.strip():
             sections.append("RECOVERY INSTRUCTIONS:\n" + attempt_prompt.strip())
+        if project_context.strip():
+            sections.append(project_context.strip())
         sections.append("Complete this step without inventing requirements outside the " +
                         ("Canonical Task Spec." if canonical else "Task Analyst operational brief."))
         return "\n\n".join(section for section in sections if section.strip())
+
+    @staticmethod
+    def _responsibility_context(plan: dict[str, Any], task: dict[str, Any]) -> str:
+        """Show only direct plan neighbors and shared concrete paths."""
+        task_id = str(task.get("id") or "")
+        dependencies = set(task.get("depends_on") or [])
+        own_paths = set(task.get("write_targets") or task.get("owned_paths") or [])
+        related = []
+        for other in plan.get("tasks", []):
+            if not isinstance(other, dict) or other.get("id") == task_id:
+                continue
+            other_paths = set(other.get("write_targets") or other.get("owned_paths") or [])
+            relation = ("Earlier" if other.get("id") in dependencies else
+                        "Later" if task_id in (other.get("depends_on") or []) else
+                        "Related" if own_paths & other_paths else "")
+            if relation:
+                related.append((relation, other))
+        lines = ["PLAN RESPONSIBILITY CONTEXT", "Your responsibility: " +
+                 str(task.get("objective") or "")[:350]]
+        for relation, other in related[:8]:
+            paths = sorted(own_paths & set(other.get("write_targets") or other.get("owned_paths") or []))[:4]
+            lines.append(f"- {relation} {other.get('id')}: {str(other.get('objective') or '')[:250]}"
+                         + ("; shared paths: " + ", ".join(paths) if paths else ""))
+        lines.append("Complete your delegated step. Do not proactively implement work explicitly "
+                     "assigned to another plan task unless needed to make your own artifact valid or coherent.")
+        return "\n".join(lines)[:3000]
+
+    def _project_context_for_dispatch(self, orchestration_id: str,
+                                     plan: dict[str, Any], task: dict[str, Any],
+                                     run: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        workspace = self._workspace_for_run(run)
+        if not workspace:
+            return None, ""
+        graph = None
+        try:
+            graph_snapshot = self.store.get_execution_graph(orchestration_id)
+            graph = graph_snapshot.get("nodes", []) if isinstance(graph_snapshot, dict) else None
+        except (KeyError, ValueError):
+            graph = None
+        snapshot, rendered = self.project_state.snapshot_for_dispatch(
+            orchestration_id, plan, task, workspace, graph,
+        )
+        self.store.add_orchestration_event(orchestration_id, {
+            "event_type": "task.responsibility_context_generated", "status": "Success",
+            "plan_task_id": task.get("id"), "related_task_count": sum(
+                1 for other in plan.get("tasks", []) if isinstance(other, dict)
+                and (other.get("id") in (task.get("depends_on") or [])
+                     or task.get("id") in (other.get("depends_on") or []))),
+        })
+        return {"project_state_snapshot": snapshot}, rendered
+
+    def _submit_runtime_task(self, agent_id: str, prompt: str, workspace: str | None,
+                             runtime_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        submit = self.runtime.submit
+        if runtime_context is None:
+            return submit(agent_id, prompt, workspace)
+        try:
+            parameters = inspect.signature(submit).parameters.values()
+            accepts_context = any(
+                item.name == "runtime_context" or item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_context = False
+        if accepts_context:
+            return submit(agent_id, prompt, workspace, runtime_context=runtime_context)
+        # Small injected runtimes used by extensions and tests may implement
+        # the historical three-argument protocol.
+        return submit(agent_id, prompt, workspace)
 
     def _snapshot_delegation(self, delegation_id: str, task: dict) -> None:
         result = {
@@ -767,12 +855,26 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "semantic_plan": semantic_plan,
                     "message": "Planner supplied task meaning and semantic operations.",
                 })
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "planner.semantic_plan_proposed",
+                    "phase": "planner", "actor_type": "model"
+                    if compiler.get("semantic_plan_source") == "planner_model" else "runtime",
+                    "task_count": semantic_plan.get("task_count", 0),
+                    "message": "Planner proposed a bounded semantic task plan.",
+                })
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan_compiler.started", "timestamp": compiler["started_at"],
                 "status": "Running", "message": "Plan Compiler started runtime preparation.",
                 "planner_semantic_plan": compiler.get("planner_semantic_plan", {}),
                 **common,
             })
+            for diagnostic in compiler.get("compiler_events", []):
+                if isinstance(diagnostic, dict) and isinstance(diagnostic.get("event_type"), str):
+                    self.store.add_orchestration_event(oid, {
+                        **diagnostic, "phase": "plan_compiler", "actor_type": "runtime",
+                        "status": "Success" if compiler.get("status") == "Success" else "Warning",
+                        "message": diagnostic.get("message", "Plan Compiler recorded a bounded decision."),
+                    })
             for adjustment in compiler.get("scope_adjustments", []):
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.plan.scope_adjusted", "status": "Warning",
@@ -820,6 +922,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "compiled_plan_schema_version": compiler.get("compiled_plan_schema_version"),
                     "compiled_runtime_plan": compiler["compiled_runtime_plan"],
                     "message": "Plan Compiler produced the validated runtime contract.",
+                })
+        for diagnostic in planning_metrics.get("planner_events", []):
+            if isinstance(diagnostic, dict) and isinstance(diagnostic.get("event_type"), str):
+                self.store.add_orchestration_event(oid, {
+                    **diagnostic, "phase": "planner", "actor_type": "runtime",
+                    "status": "Success", "message": "Planner completed a bounded semantic repair step.",
                 })
 
     def _fail_planning(self, oid: str, exc: Exception,
@@ -1006,11 +1114,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 else:
                     factory_task = dict(task)
                     plan_snapshot = current_run.get("effective_plan") or current_run.get("plan") or {}
-                    factory_task["_write_owners"] = {
+                    factory_task["_write_owners"] = dict(plan_snapshot.get("write_owners") or {
                         owned_path_key(path): owner["id"]
                         for owner in plan_snapshot.get("tasks", [])
                         for path in owner.get("owned_paths", [])
-                    }
+                    })
                     if recovery_workspace_state:
                         factory_task["_recovery_workspace_state"] = recovery_workspace_state
                     if recovery_reason:
@@ -1203,8 +1311,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
         if outcome.get("status") == "error":
             evaluation = {key: outcome[key] for key in (
                 "status", "confidence", "summary", "criteria", "issues",
-                "missing_evidence", "recommended_action",
-            )}
+                "missing_evidence", "evaluation_status", "failure_class",
+                "recommended_runtime_action",
+            ) if key in outcome}
         metrics = dict(outcome.get("metrics") or {})
         snapshot = {
             "evaluator_version": EVALUATOR_VERSION,
@@ -1235,6 +1344,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
             )
             if record is None:
                 return
+            if evaluation["status"] == "accepted" and runtime_task.get("workspace"):
+                self.project_state.accept_task_update(
+                    oid, plan, planned_task, runtime_task,
+                    target.get("selected_agent_id"),
+                )
             event_type = ("freya.evaluation.failed" if technical_error
                           else "freya.evaluation.completed")
             evaluation_output = {
@@ -1247,6 +1361,33 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 evaluation_output["input"] = self._evaluation_log_input(
                     outcome.get("context_snapshot") or {},
                 )
+            if evaluation["status"] == "error":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "evaluation.infrastructure_failed", "status": "Failed",
+                    "task_id": task_id, "evaluation_id": evaluation_id,
+                    "evaluation_status": "error", "message": evaluation["summary"],
+                })
+            else:
+                facts = (outcome.get("context_snapshot") or {}).get("criterion_facts") or []
+                for fact in facts:
+                    if fact.get("status") == "PROVEN SATISFIED":
+                        for proof in fact.get("proof", []):
+                            for evidence_type in proof.get("evidence_type", []):
+                                self.store.add_orchestration_event(oid, {
+                                    "event_type": "evaluation.deterministic_evidence_matched",
+                                    "status": "Success", "task_id": task_id,
+                                    "evaluation_id": evaluation_id,
+                                    "criterion": fact.get("criterion"),
+                                    "path": proof.get("path"),
+                                    "evidence_type": evidence_type,
+                                })
+                    elif not outcome.get("deterministic"):
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "evaluation.semantic_review_required",
+                            "status": "Success", "task_id": task_id,
+                            "evaluation_id": evaluation_id,
+                            "criterion": fact.get("criterion"),
+                        })
             self.store.add_orchestration_event(oid, {
                 "event_type": event_type,
                 "status": "Failed" if evaluation["status"] != "accepted" else "Success",
@@ -1557,6 +1698,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "requester_runtime_task_id": request.get("requester_runtime_task_id"),
             "target_owner_plan_task_id": request.get("target_owner_plan_task_id"),
             "target_path": request.get("target_path"),
+            "requester_observed_revision": request.get("requester_observed_revision", 0),
             "requested_operation": request.get("requested_operation"),
             "requested_change": request.get("requested_change"),
             "reason": request.get("reason"), "needed_for": request.get("needed_for"),
@@ -1615,8 +1757,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                                    status="Pending", approval_id=request.get("approval_id"))
             owner = planned.get(request.get("target_owner_plan_task_id"))
             owned = {owned_path_key(path) for path in (owner or {}).get("owned_paths", [])}
+            ownership_index = plan.get("write_owners") or {
+                owned_path_key(path): item["id"] for item in plan.get("tasks", [])
+                for path in item.get("owned_paths", [])}
+            indexed_owner = ownership_index.get(owned_path_key(request.get("target_path")))
             cycle = owner is not None and self._cross_task_cycle_would_form(plan, request)
-            in_owner_scope = owner is not None and owned_path_key(request.get("target_path")) in owned
+            in_owner_scope = (owner is not None and indexed_owner == owner.get("id")
+                              and owned_path_key(request.get("target_path")) in owned)
+            if in_owner_scope:
+                self._cross_task_event(oid, "cross_task_modification.owner_resolved", request,
+                                       status="Running")
             owner_can_write = False
             if in_owner_scope:
                 try:
@@ -1626,7 +1776,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     owner_can_write = False
             if not in_owner_scope or not owner_can_write or cycle:
                 reason = ("cross_task_dependency_cycle" if cycle else
-                          "The owning plan task lacks declared read and write capabilities for this file."
+                          "The scoped owner action cannot serve this request."
                           if in_owner_scope else "The request does not match a plan-owned file.")
                 blocked = self.store.block_cross_task_modification_request(
                     request["id"], status="cycle_detected" if cycle else "blocked", reason=reason,
@@ -1715,32 +1865,28 @@ class Orchestrator(IntegrationOrchestrationMixin):
     @staticmethod
     def _cross_task_change_task(plan: dict[str, Any], owner: dict[str, Any],
                                 request: dict[str, Any]) -> dict[str, Any]:
-        """Build an exact-file child task using only the owner's declared access."""
+        """Build an exact-file agent action for the permanent plan-task owner."""
         target_path = str(request.get("target_path") or "")
         target_key = owned_path_key(target_path)
         owner_paths = {owned_path_key(item) for item in owner.get("owned_paths", [])}
         if target_key not in owner_paths:
             raise ValueError("The requested file is outside the owning task's declared scope.")
-        owner_capabilities = owner.get("required_capabilities", [])
-        if not isinstance(owner_capabilities, list):
-            raise ValueError("The owning task has an invalid capability declaration.")
+        ownership_index = plan.get("write_owners") or {
+            owned_path_key(path): item["id"] for item in plan.get("tasks", [])
+            for path in item.get("owned_paths", [])}
+        indexed_owner = ownership_index.get(target_key)
+        if indexed_owner != owner.get("id"):
+            raise ValueError("The permanent plan ownership index disagrees with the owner task.")
         operation = str(request.get("requested_operation") or "")
         requested_capability = "filesystem." + operation
-        if (operation not in {"create", "modify", "overwrite"}
-                or requested_capability not in owner_capabilities):
-            raise ValueError("The owning task must already declare the requested filesystem write capability.")
-        if "filesystem.read" not in owner_capabilities:
-            raise ValueError("The owning task must already declare filesystem.read.")
+        if operation not in {"create", "modify", "overwrite"}:
+            raise ValueError("The requested filesystem write operation is invalid.")
         write_capabilities = [requested_capability]
         requester = str(request.get("requester_plan_task_id") or "requester")
         change = str(request.get("requested_change") or "").strip()
         reason = str(request.get("reason") or "").strip()
         needed_for = str(request.get("needed_for") or "").strip()
-        owners = {
-            owned_path_key(path): str(task.get("id") or "")
-            for task in plan.get("tasks", []) if isinstance(task, dict)
-            for path in task.get("owned_paths", [])
-        }
+        owners = dict(ownership_index)
         return {
             # Keep the original owner plan-task identity in agent provenance so
             # Worker enforces the same declared owner at the filesystem gate.
@@ -1757,6 +1903,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "required_tools": [],
             "semantic_needs": ["Apply and read back the explicitly approved change to the exact owned file."],
             "owned_paths": [target_path],
+            "write_targets": [target_path],
+            "foreign_write_targets": [],
             "preferred_skills": list(owner.get("preferred_skills", [])),
             "success_criteria": [
                 f"The approved requested change is applied to {target_path}.",
@@ -1844,6 +1992,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
         try:
             task = self._cross_task_change_task(plan, owner, request)
             created = self._create_dynamic_agent(oid, task, 1)
+            self._cross_task_event(oid, "cross_task_modification.owner_agent_created", request,
+                                   status="Running", owner_agent_id=created["agent"]["id"])
             context = self._selection_context(run)
             selection = self.selector.select_agent(task, [created["agent"]], context)
             selection = dict(selection)
@@ -1877,19 +2027,26 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if self.clock() >= deadline:
                 self._timeout(oid)
                 return
+            runtime_context, project_context = self._project_context_for_dispatch(
+                oid, plan, task, run,
+            )
             prompt = self._execution_prompt(
                 operational_prompt,
                 task,
                 "Perform only the approved, exact-file change recorded by Freya. "
                 "The approval covers this request; it does not grant capabilities or broader file access. "
-                f"Coordination request ID: {request['id']}.",
+                f"Coordination request ID: {request['id']}. "
+                f"The requester observed artifact revision {request.get('requester_observed_revision', 0)}; "
+                "inspect the current project context and read the latest file before editing.",
+                project_context,
+                self._responsibility_context(plan, task),
             )
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] != "Running":
                     self._archive_dynamic_agents(oid)
                     return
-                runtime_task = self.runtime.submit(
-                    selected_agent_id, prompt, self._workspace_for_run(run),
+                runtime_task = self._submit_runtime_task(
+                    selected_agent_id, prompt, self._workspace_for_run(run), runtime_context,
                 )
                 delegation_id = self.store.add_delegation(
                     oid, selected_agent_id, prompt, runtime_task["id"],
@@ -1905,6 +2062,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if dispatched is None:
                     self.runtime.cancel(runtime_task["id"])
                     return
+                self._cross_task_event(oid, "cross_task_modification.owner_action_started",
+                                       dispatched, status="Running",
+                                       owner_runtime_task_id=runtime_task["id"])
                 self.store.add_orchestration_event(oid, {
                     "event_type": "cross_task_modification.dispatched",
                     "status": runtime_task["status"],
@@ -1925,6 +2085,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 expected_statuses=["owner_selecting"],
             )
             if blocked:
+                self._cross_task_event(oid, "cross_task_modification.failed", blocked,
+                                       status="blocked", message=reason)
                 self._cross_task_event(oid, "cross_task_modification.blocked", blocked,
                                        status="blocked", message=reason)
                 self._resume_cross_task_requester(oid, blocked, "blocked", reason)
@@ -1969,12 +2131,25 @@ class Orchestrator(IntegrationOrchestrationMixin):
         accepted = outcome.get("status") == "accepted"
         status = "completed" if accepted else "blocked"
         reason = str(outcome.get("summary") or "The owner change did not pass independent evaluation.")
+        if accepted and owner is not None:
+            owner_runtime_task = self.store.get_task(request["owner_runtime_task_id"])
+            owner_planned_task = self._cross_task_change_task(plan, owner, request)
+            if owner_runtime_task.get("workspace"):
+                self.project_state.accept_task_update(
+                    oid, plan, owner_planned_task, owner_runtime_task,
+                    request.get("owner_agent_id"), mark_task_accepted=False,
+                )
         updated = self.store.update_cross_task_modification_request(
             request["id"], expected_statuses=["owner_evaluating"], status=status,
             owner_evaluation=outcome,
             **({"approval_source": request.get("approval_source", "")} if accepted else {}),
         )
         if updated:
+            self._cross_task_event(oid, "cross_task_modification.owner_action_evaluated", updated,
+                                   status=status, owner_evaluation=outcome)
+            self._cross_task_event(oid, "cross_task_modification.fulfilled" if accepted
+                                   else "cross_task_modification.failed", updated,
+                                   status=status, message=reason)
             self._cross_task_event(
                 oid, "cross_task_modification.completed" if accepted
                 else "cross_task_modification.evaluation_rejected", updated,
@@ -1993,6 +2168,12 @@ class Orchestrator(IntegrationOrchestrationMixin):
         for request in requests:
             status = request.get("status")
             if status in {"approved_once", "approved_intent", "auto_approved"}:
+                target_key = owned_path_key(request["target_path"])
+                if any(other["id"] != request["id"]
+                       and owned_path_key(other["target_path"]) == target_key
+                       and other.get("status") in {"owner_selecting", "owner_running", "owner_evaluating"}
+                       for other in requests):
+                    continue
                 graph_nodes = self.store.get_execution_graph(oid)["nodes"]
                 owner_node = next((item for item in graph_nodes
                                    if item.get("plan_task_id") == request.get("target_owner_plan_task_id")), None)
@@ -2002,6 +2183,13 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     # agent runs, so later owner writes cannot overwrite it.
                     continue
                 with self.lock:
+                    current_requests = self.store.list_cross_task_modification_requests(oid)
+                    if any(other["id"] != request["id"]
+                           and owned_path_key(other["target_path"]) == target_key
+                           and other.get("status") in {
+                               "owner_selecting", "owner_running", "owner_evaluating"}
+                           for other in current_requests):
+                        continue
                     claimed = self.store.update_cross_task_modification_request(
                         request["id"], expected_statuses=[status], status="owner_selecting",
                     )
@@ -2017,6 +2205,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     task = None
                 if task and task["status"] in {"Success", "Failed", "Cancelled"}:
                     if task["status"] == "Success":
+                        self._cross_task_event(oid, "cross_task_modification.owner_action_completed",
+                                               request, status="Running",
+                                               owner_runtime_task_id=request["owner_runtime_task_id"])
                         with self.lock:
                             evaluating = self.store.update_cross_task_modification_request(
                                 request["id"], expected_statuses=["owner_running"],
@@ -2031,6 +2222,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             expected_statuses=["owner_running"],
                         )
                         if blocked:
+                            self._cross_task_event(oid, "cross_task_modification.failed", blocked,
+                                                   status="blocked", message=sanitize(reason)[:1000])
                             self._cross_task_event(oid, "cross_task_modification.owner_failed", blocked,
                                                    status="blocked", message=sanitize(reason)[:1000])
                             self._resume_cross_task_requester(oid, blocked, "blocked", reason)
@@ -2257,13 +2450,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             task["id"], "Selected agent is executing another task.", utcnow(),
                         )
                         continue
+                    runtime_context, project_context = self._project_context_for_dispatch(
+                        oid, plan, task, run,
+                    )
                     execution_prompt = self._execution_prompt(
                         operational_prompt, task, node.get("attempt_prompt") or "",
+                        project_context, self._responsibility_context(plan, task),
                     )
                     try:
-                        runtime_task = self.runtime.submit(
+                        runtime_task = self._submit_runtime_task(
                             agent_id, execution_prompt,
-                            self._workspace_for_run(run),
+                            self._workspace_for_run(run), runtime_context,
                         )
                     except ValueError as exc:
                         refreshed = self.store.get_agent(agent_id)
@@ -2477,7 +2674,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         for tool in task.get("required_tools", [])}),
                     "resource_catalog_version": resource_summary.get("resource_catalog_version"),
                 })
-                self._workspace_for_run(planned)
+                workspace = self._workspace_for_run(planned)
+                if workspace:
+                    self.project_state.initialize(oid, plan, workspace)
                 graph = ExecutionGraph(plan)
                 self.store.initialize_execution_graph(oid, graph.serialize())
                 self.store.add_orchestration_event(oid, {
@@ -2577,7 +2776,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         for tool in task.get("required_tools", [])}),
                     "resource_catalog_version": resource_summary.get("resource_catalog_version"),
                 })
-                self._workspace_for_run(planned)
+                workspace = self._workspace_for_run(planned)
+                if workspace:
+                    self.project_state.initialize(oid, plan, workspace)
                 graph = ExecutionGraph(plan)
                 self.store.initialize_execution_graph(oid, graph.serialize())
                 self.store.add_orchestration_event(oid, {
@@ -2645,6 +2846,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if planned is None:
                 return
             self._record_planner_normalization(oid, planning_metrics)
+            workspace = self._workspace_for_run(planned)
+            if workspace:
+                self.project_state.initialize(oid, plan, workspace)
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.plan.created", "status": "Planned",
                 "message": "Freya created and saved the structured plan.",
@@ -2717,9 +2921,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         agent = self.store.get_agent(agent_id)
                         if agent.get("enabled") is not True:
                             raise ValueError("Selected agent is disabled or unavailable.")
-                        execution_prompt = self._execution_prompt(operational_prompt, item, objective)
-                        task = self.runtime.submit(
-                            agent_id, execution_prompt, self._workspace_for_run(running),
+                        plan_snapshot = running.get("effective_plan") or running.get("plan") or {}
+                        planned_context_task = next((candidate for candidate in plan_snapshot.get("tasks", [])
+                                                     if candidate.get("id") == item.get("planned_task_id")), item)
+                        runtime_context, project_context = self._project_context_for_dispatch(
+                            oid, plan_snapshot, planned_context_task, running,
+                        )
+                        execution_prompt = self._execution_prompt(
+                            operational_prompt, item, objective, project_context,
+                            self._responsibility_context(plan_snapshot, planned_context_task),
+                        )
+                        task = self._submit_runtime_task(
+                            agent_id, execution_prompt, self._workspace_for_run(running), runtime_context,
                         )
                         delegation_id = self.store.add_delegation(
                             oid, agent_id, execution_prompt, task["id"],

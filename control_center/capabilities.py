@@ -31,6 +31,9 @@ class Capability:
 
 
 CAPABILITIES: tuple[Capability, ...] = (
+    # Internal, read-only orchestration context. It is intentionally omitted
+    # from the Planner resource catalog and does not map to filesystem access.
+    Capability("project.read_context", "project", "Query accepted project context for this orchestration", tool="project_context", actions=("operation", "path", "query", "task_id", "limit"), operations=("Read bounded artifact, symbol, dependency, task and project metadata.",)),
     Capability("filesystem.list", "filesystem", "List files in the task workspace", tool="list_files", actions=("path",), operations=("List workspace files and directories.",)),
     Capability("filesystem.read", "filesystem", "Read UTF-8 text files from the task workspace", tool="read_file", actions=("path",), operations=("Read a workspace-relative text file.", "Inspect generated source and output files.")),
     Capability("filesystem.search", "filesystem", "Search text files in the task workspace", tool="search_code", actions=("path", "query"), operations=("Search workspace files by text or regular expression.",)),
@@ -89,6 +92,8 @@ class CapabilityResolver:
 
     def resolve(self, tool: str, arguments: dict[str, Any] | None = None) -> str:
         args = arguments or {}
+        if tool == "project_context":
+            return "project.read_context"
         if tool == "read_file":
             return "filesystem.read"
         if tool == "list_files":
@@ -152,4 +157,7 @@ class CapabilityResolver:
 
 
 def capability_catalog() -> list[dict[str, Any]]:
-    return [item.as_dict() for item in CAPABILITIES]
+    # Project context is installed by AgentFactory for generated agents. It is
+    # not a Planner-selectable operation or a general-purpose Toolbox tool.
+    return [item.as_dict() for item in CAPABILITIES
+            if item.id != "project.read_context"]

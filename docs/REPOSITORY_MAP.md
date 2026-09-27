@@ -17,11 +17,12 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── planner.py            semantic strategy and legacy plan schema compatibility
 │   ├── plan_scope.py         semantic scope guard and bounded pre-resolution plan snapshot
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
-│   ├── plan_compiler.py      resource derivation, deterministic IDs, semantic dependencies and DAG validation
+│   ├── plan_compiler.py      scope reconciliation, unsupported-claim verification, permanent plan-task ownership, resource derivation, IDs and DAG validation
 │   ├── cross_task.py         exact file ownership validation and bounded reusable-intent matching
 │   ├── agent_factory.py      dynamic agents, freya-core assignment, task policy and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
+│   ├── project_state.py      per-orchestration artifact metadata, bounded context snapshots and accepted updates
 │   ├── evaluator.py          criterion evidence checks, decision schema and tool-free Ollama adapter
 │   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier contract, direct-proof decision, append-only replanner and grounded result integrator
@@ -82,11 +83,13 @@ selects them.
    `orchestrator.py` builds a fresh
    `RuntimeResourceCatalog` from `capabilities.py` and `Toolbox` schemas.
    `planner.py` receives only semantic operation IDs and descriptions; it emits
-   task meaning, kind, dependencies, outcomes, criteria and logical file owners.
-   `plan_scope.py` removes work not supported by explicit Task Spec intent.
-   `plan_compiler.py` is the only component that maps semantic operations to
+   task meaning, kind, dependencies, outcomes, criteria, durable `owned_paths` and `write_targets`.
+   `plan_compiler.py` calls `plan_scope.py` to remove work not supported by
+   explicit Task Spec intent, then verifies unsupported claims and assigns one
+   permanent plan-task owner per concrete write path without merging tasks. It is the only component that maps semantic operations to
    concrete capabilities and tools, assigns runtime IDs and validates the owner
-   map and DAG. Semantic Plan schema is version 2; compiled plan schema is
+   map and DAG. Recovery and Integration keep existing owners fixed when they
+   revise the compiled plan. Semantic Plan schema is version 3; compiled plan schema is
    version 4. The legacy `task_analyst.py` contract is retained for injected
    compatibility adapters.
    `execution_graph.py` releases ready tasks in plan order. Low-risk generic file
@@ -97,9 +100,12 @@ selects them.
    File-only implementation stops on a matching read-back; single-case QA stops
    when that one command supplies evidence for every planned criterion.
    For each ready task,
-   `agent_factory.py` creates one validated ephemeral agent whose complete
-   policy comes only from the compiled plan; it cannot add capabilities or
-   tools. Every dynamic agent receives
+   `agent_factory.py` creates one validated ephemeral agent whose planned
+   capabilities come from the compiled plan. It also installs the internal,
+   read-only `project_context` capability for generated agents. Modification
+   and overwrite tasks derive `filesystem.read` and `read_file` through the
+   catalog, including visibility of foreign-owned workspace artifacts;
+   ownership still scopes writes. Pure creation does not imply read. Every dynamic agent receives
    `freya-core`; its seven declared tools are checked against `Toolbox` at
    startup. Planner Skill preferences are ignored with a warning. Tool
    availability never grants a capability: Policy limits the worker schemas
@@ -107,6 +113,10 @@ selects them.
    The Runtime Resource Catalog provides one canonical semantic-operation to
    capability to tool mapping. Unknown operations and unsupported actions fail
    closed. The policy engine still decides each invocation.
+   The Worker records current file hashes before existing-file writes and
+   returns zero-write candidates to Evaluator only when declared targets were
+   read. `orchestrator.py` adds bounded direct plan responsibilities to each
+   execution prompt; ProjectState verifies reported symbols after acceptance.
    `tools.py` resolves filesystem paths inside the assigned workspace. For
    Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
    allowlisted command to `sandbox.py`; Docker receives only a disposable
@@ -133,7 +143,7 @@ selects them.
    the action ledger without model repair. `task.result_contract` logs sanitized
    diagnostics, while `freya.evaluation.completed` logs criterion decisions and
    bounded input evidence for non-accepted outcomes.
-   The worker also stops duplicate writes after successful read-back and reports
+   The worker also stops byte-identical duplicate writes without requiring read-back and reports
    missing-file reads without repeating them unchanged; semantic recovery then
    fails deterministic absent-artifact inputs instead of rotating agents.
    Recovery carries bounded workspace state into the next attempt and
@@ -159,6 +169,9 @@ selects them.
    evaluates the immutable policy in `policy.py`, and only then dispatches to
    `tools.py` inside the configured workspace root. Unknown and unavailable
    tools are distinct feedback classes; deterministic denials are not retried.
+   `project_state.py` supplies generated workers a bounded metadata snapshot
+   and a read-only metadata query; only the parent persists it, and only after
+   Evaluator acceptance of grounded worker candidates.
 6. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
    replay changes using monotonic event IDs; WaitingForApproval blocks the worker
    until a durable once/task/deny resolution arrives.
@@ -170,6 +183,7 @@ selects them.
 | Web endpoint or folder browsing | `control_center/api.py`, `http.py`, `tests/test_control_api.py` |
 | Freya Activity timeline or performance calculation | `control_center/activity.py`, `storage.py`, `api.py`, `frontend/views.js`, `frontend/app.js`, `frontend/styles.css`, `tests/test_activity.py`, `tests/test_control_api.py` |
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
+| Orchestration project metadata, artifact revisions or context queries | `project_state.py`, `storage.py`, `schema.sql`, `worker.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_project_state.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
@@ -188,7 +202,7 @@ selects them.
 | Dynamic agent construction, freya-core assignment, provenance or lifecycle | `agent_factory.py`, `orchestrator.py`, `skills.py`, `storage.py`, `config.py`, `tests/test_agent_factory.py`, `tests/test_core_sandbox.py` |
 | Agent classification, scoring or selection snapshots | `agent_selector.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `tests/test_agent_selector.py` |
 | DAG state, dependency scheduling or graph API | `execution_graph.py`, `orchestrator.py`, `storage.py`, `api.py`, `schema.sql`, `tests/test_execution_graph.py` |
-| Cross-task file ownership, intent grants, cycle checks or owner handoffs | `cross_task.py`, `planner.py`, `plan_compiler.py`, `integration.py`, `worker.py`, `orchestrator.py`, `runtime.py`, `storage.py`, `api.py`, `schema.sql`, `frontend/views.js`, `frontend/app.js`, `tests/test_cross_task.py` |
+| Cross-task file ownership, intent grants, cycle checks or owner handoffs | `cross_task.py`, `planner.py`, `plan_compiler.py`, `config.py`, `agent_factory.py`, `integration.py`, `worker.py`, `orchestrator.py`, `runtime.py`, `storage.py`, `api.py`, `schema.sql`, `frontend/views.js`, `frontend/app.js`, `tests/test_cross_task.py`, `tests/test_semantic_pipeline.py` |
 | Semantic result evaluation or evaluation API | `evaluator.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `api.py`, `tests/test_evaluator.py` |
 | Global integration, append-only recovery or final response | `integration.py`, `integration_orchestrator.py`, `integration_storage.py`, `orchestrator.py`, `schema.sql`, `api.py`, `tests/test_integration.py` |
 | Agent configuration validation | `config.py`, `tests/test_control_security.py` |

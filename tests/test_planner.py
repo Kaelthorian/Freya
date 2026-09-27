@@ -74,7 +74,7 @@ class PlannerValidationTests(unittest.TestCase):
         self.assertEqual(result["complexity"], "simple")
         self.assertEqual(len(result["tasks"]), 1)
 
-    def test_simple_artifact_collapse_keeps_explicit_criterion_link(self):
+    def test_simple_artifact_keeps_distinct_tasks_and_explicit_criterion_link(self):
         global_text = "hola_mundo.txt contains exactly hola mundo."
         first = task("create", "Create hola_mundo.txt", required_capabilities=["filesystem.create"],
                      owned_paths=["hola_mundo.txt"],
@@ -95,11 +95,11 @@ class PlannerValidationTests(unittest.TestCase):
                          })
         result = Planner(lambda prompt, context: generated).create_plan(
             "Create hola_mundo.txt", {"task_analysis": deterministic_task_analysis("Create hola_mundo.txt")})
-        self.assertEqual(len(result["tasks"]), 1)
+        self.assertEqual(len(result["tasks"]), 2)
         self.assertEqual(result["tasks"][0]["owned_paths"], ["hola_mundo.txt"])
         linked = next(item for item in result["criterion_links"]["local"]
                       if item["id"] == "tc-verify")
-        self.assertEqual(linked["task_id"], "create")
+        self.assertEqual(linked["task_id"], "verify")
         self.assertEqual(linked["supports_global_criteria"], ["gc-file"])
 
     def test_valid_multi_step_plan_preserves_dependency_order(self):
@@ -727,7 +727,7 @@ class PlannerGenerationTests(unittest.TestCase):
         self.assertEqual(len(result["tasks"]), 5)
         self.assertEqual(result["tasks"][-1]["preferred_skills"], ["code-review"])
 
-    def test_linear_single_artifact_plan_adds_one_audit_task(self):
+    def test_linear_single_artifact_plan_preserves_all_tasks(self):
         raw = plan(
             complexity="multi_step",
             goal="Create a calculator suma.bat that asks for two numbers and returns their sum.",
@@ -741,11 +741,11 @@ class PlannerGenerationTests(unittest.TestCase):
         )
         result = Planner(lambda prompt, context: json.dumps(raw)).create_plan(raw["goal"])
         self.assertEqual(result["complexity"], "multi_step")
-        self.assertEqual(len(result["tasks"]), 2)
+        self.assertEqual(len(result["tasks"]), 3)
         self.assertIn("suma.bat", result["tasks"][0]["objective"])
-        self.assertEqual(result["tasks"][0]["required_capabilities"],
-                         ["filesystem.create", "filesystem.modify", "filesystem.read"])
-        self.assertEqual(result["tasks"][1]["preferred_skills"], ["code-review"])
+        self.assertEqual(result["tasks"][0]["required_capabilities"], ["filesystem.create"])
+        self.assertEqual(result["tasks"][1]["depends_on"], ["create-file"])
+        self.assertEqual(result["tasks"][2]["depends_on"], ["write-content"])
 
     def test_trivial_program_analysis_uses_one_implementation_task(self):
         raw = plan(

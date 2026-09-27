@@ -103,6 +103,7 @@ class CrossTaskStoreTests(unittest.TestCase):
     def _request(self, orchestration_id=None, *, requester_task="task-requester",
                  owner_task="task-owner", path="config/cache.toml",
                  requested_change="Add an explicit cache expiry setting",
+                 observed_revision=0,
                  operation="modify"):
         runtime_task = self.store.create_task(
             self.requester["id"], "Request the cache change", "workspace",
@@ -121,6 +122,7 @@ class CrossTaskStoreTests(unittest.TestCase):
             "requester_runtime_task_id": runtime_task["id"],
             "target_owner_plan_task_id": owner_task,
             "target_path": path,
+            "requester_observed_revision": observed_revision,
             "requested_operation": operation,
             "requested_change": requested_change,
             "reason": "Prevent stale cache entries from persisting",
@@ -129,6 +131,11 @@ class CrossTaskStoreTests(unittest.TestCase):
         }
         self.store.create_cross_task_modification_request(request, approval_id)
         return request
+
+    def test_requester_observed_revision_is_persisted(self):
+        request = self._request(observed_revision=12)
+        saved = self.store.get_cross_task_modification_request(request["request_id"])
+        self.assertEqual(saved["requester_observed_revision"], 12)
 
     def test_approve_once_does_not_create_reusable_grant(self):
         request = self._request()
@@ -190,17 +197,24 @@ class CrossTaskStoreTests(unittest.TestCase):
         self.assertEqual(task["owned_paths"], ["config/cache.toml"])
         self.assertEqual(task["required_capabilities"], ["filesystem.read", "filesystem.modify"])
         self.assertNotIn("execution.python_script", task["required_capabilities"])
-        with self.assertRaisesRegex(ValueError, "declare filesystem.read"):
+        owner_with_create_only = {**plan["tasks"][1],
+                                  "required_capabilities": ["filesystem.create"]}
+        scoped = Orchestrator._cross_task_change_task(plan, owner_with_create_only, request)
+        self.assertEqual(scoped["required_capabilities"], ["filesystem.read", "filesystem.modify"])
+        with self.assertRaisesRegex(ValueError, "invalid"):
             Orchestrator._cross_task_change_task(
-                plan, {**plan["tasks"][1], "required_capabilities": ["filesystem.modify"]}, request,
-            )
-        with self.assertRaisesRegex(ValueError, "requested filesystem write capability"):
-            Orchestrator._cross_task_change_task(
-                plan, plan["tasks"][1], {**request, "requested_operation": "overwrite"},
-            )
+                plan, plan["tasks"][1], {**request, "requested_operation": "run_command"})
 
 
 class WorkerOwnershipTests(unittest.TestCase):
+    def test_manual_agent_cannot_claim_plan_task_scope(self):
+        with self.assertRaisesRegex(ValueError, "reserved for Freya"):
+            normalize_agent({"name": "Manual", "config": {
+                "task_owned_paths": ["owner.txt"],
+                "task_write_owners": {"owner.txt": "owner"},
+                "task_write_scope_enforced": True,
+            }})
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -216,6 +230,8 @@ class WorkerOwnershipTests(unittest.TestCase):
             "provenance": {"plan_task_id": "requester"},
             "task_owned_paths": ["requester.txt"],
             "task_write_owners": {"requester.txt": "requester", "owner.txt": "owner"},
+            "task_foreign_write_targets": [
+                {"path": "owner.txt", "owner_plan_task_id": "owner"}],
             "task_write_scope_enforced": True,
             "autonomy": {"create_files": "automatic", "modify_files": "automatic"},
         }
@@ -239,10 +255,35 @@ class WorkerOwnershipTests(unittest.TestCase):
             "needed_for": "The consumer configuration requires bounded retention",
             "blocking": True,
         }
+        unread = self.toolbox.invoke("edit_file", arguments)
+        self.assertEqual(unread.error_class, "read_before_write_required")
+        self.assertTrue(self.toolbox.invoke("read_file", {"path": "owner.txt"}).success)
         result = self.toolbox.invoke("edit_file", arguments)
         self.assertEqual(result.error_class, "cross_task_modification_required")
         self.assertFalse(result.executed)
         self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_undeclared_foreign_target_fails_closed(self):
+        self.toolbox.task_foreign_write_targets.clear()
+        result = self.toolbox.invoke("edit_file", {
+            "path": "owner.txt", "old": "before", "new": "after",
+            "requested_change": "Update owner file", "reason": "Required change",
+            "needed_for": "Dependent task", "blocking": True,
+        })
+        self.assertEqual(result.error_class, "write_scope_denied")
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_identical_foreign_write_does_not_bypass_ownership(self):
+        result = self.toolbox.invoke("write_file", {"path": "owner.txt", "content": "before"})
+        self.assertFalse(result.success)
+        self.assertFalse(result.already_satisfied)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_owned_path_must_match_permanent_owner_index(self):
+        self.toolbox.task_write_owners["requester.txt"] = "owner"
+        result = self.toolbox.invoke("write_file", {"path": "requester.txt", "content": "blocked"})
+        self.assertEqual(result.error_class, "write_scope_denied")
+        self.assertFalse((self.workspace / "requester.txt").exists())
 
     def test_hard_policy_deny_precedes_ownership_handoff_even_with_action_grant(self):
         arguments = {
@@ -324,10 +365,14 @@ class _CoordinatorStore:
 
 
 def _coordinator_fixture(status="pending"):
-    plan = {"tasks": [
+    plan = {"goal": "Coordinate a cache change", "summary": "Coordinate a cache change",
+            "complexity": "multi_step", "success_criteria": ["The tasks complete."], "tasks": [
         {"id": "requester", "objective": "Complete the consuming task", "depends_on": [],
-         "required_capabilities": ["filesystem.read"], "owned_paths": ["consumer.py"]},
+         "description": "Complete the consuming task", "required_capabilities": ["filesystem.read"],
+         "preferred_skills": [], "success_criteria": ["Consumer completes."],
+         "owned_paths": ["consumer.py"]},
         {"id": "owner", "objective": "Maintain cache configuration", "depends_on": [],
+         "description": "Maintain cache configuration", "preferred_skills": [],
          "required_capabilities": ["filesystem.read", "filesystem.modify"],
          "owned_paths": ["config/cache.toml"], "success_criteria": ["Owner task completes"]},
     ]}
@@ -351,6 +396,7 @@ class CrossTaskCoordinatorTests(unittest.TestCase):
         value.cross_task_intent_matcher = matcher
         value.evaluator = evaluator
         value.evaluator_lock = threading.Lock()
+        value.lock = threading.RLock()
         value.clock = lambda: 1.0
         return value
 
@@ -426,6 +472,10 @@ class CrossTaskCoordinatorTests(unittest.TestCase):
         plan, request = _coordinator_fixture("owner_evaluating")
         request.update(owner_runtime_task_id="owner-runtime", owner_agent_id="owner-agent")
         store = _CoordinatorStore(plan, request)
+        store.graph.mark_selected("owner", "original-owner-agent", "original-selection")
+        store.graph.mark_running("owner", "original-owner-runtime", "original-delegation")
+        store.graph.apply_runtime_status("owner", "Success")
+        store.graph.apply_evaluation("owner", "original-evaluation", "accepted", "Original owner done")
         class AcceptingEvaluator:
             def evaluate(self, **_):
                 return {"status": "accepted", "summary": "Approved file change verified."}
@@ -433,10 +483,30 @@ class CrossTaskCoordinatorTests(unittest.TestCase):
         orchestrator._evaluate_cross_task_owner_change("run", request, 10.0)
         self.assertEqual(store.request["status"], "completed")
         self.assertEqual(store.graph.node("requester")["state"], "ready")
+        self.assertEqual(store.graph.node("owner")["state"], "success")
         self.assertIn("do not repeat", store.graph.node("requester")["attempt_prompt"])
         event_types = [item["event_type"] for item in store.events]
         self.assertLess(event_types.index("cross_task_modification.completed"),
                         event_types.index("cross_task_modification.requester_resumed"))
+
+    def test_owner_actions_serialize_same_path_but_allow_other_paths(self):
+        for other_path, should_dispatch in (("CONFIG/cache.toml", False),
+                                            ("config/other.toml", True)):
+            with self.subTest(other_path=other_path):
+                plan, request = _coordinator_fixture("approved_once")
+                store = _CoordinatorStore(plan, request)
+                store.graph.mark_selected("owner", "original-owner", "selection")
+                store.graph.mark_running("owner", "original-runtime", "delegation")
+                store.graph.apply_runtime_status("owner", "Success")
+                store.graph.apply_evaluation("owner", "evaluation", "accepted", "Done")
+                other = {**request, "id": "other", "target_path": other_path,
+                         "status": "owner_selecting"}
+                store.list_cross_task_modification_requests = lambda *_: [dict(store.request), other]
+                orchestrator = self.orchestrator(store)
+                dispatched = []
+                orchestrator._dispatch_cross_task_owner_change = lambda *_: dispatched.append(True)
+                orchestrator._advance_cross_task_requests("run", 10.0, "Original task brief")
+                self.assertEqual(bool(dispatched), should_dispatch)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from control_center.config import DEFAULT_CONFIG, normalize_agent
 from control_center.evaluator import Evaluator
+from control_center.execution_graph import ExecutionGraph
 from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.task_spec import render_task_spec, validate_task_spec
@@ -449,6 +450,9 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(actions[0]["changed"])
         self.assertTrue(actions[1]["already_satisfied"])
         self.assertFalse(actions[1]["changed"])
+        self.assertFalse(any(action.get("policy_decision") == "deny" for action in actions))
+        self.assertTrue(any(event.get("event", {}).get("event_type") == "worker.write_already_satisfied"
+                            for event in self.events))
         self.assertEqual(
             result["result"]["summary"],
             "Execution completed; requested workspace state is already satisfied.",
@@ -498,13 +502,67 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(evaluator_result["actions"]), 2)
         self.assertEqual(len(evaluator_result["artifacts"]), 1)
         self.assertTrue(evaluator_result["workspace_diffs"])
-        self.assertTrue(evaluator_input["runtime_task"]["verification"]["evidence"])
+
+    def test_created_javascript_duplicate_write_evaluates_and_unlocks_dependent_task(self):
+        source = "export const add = (a, b) => a + b;\n"
+        criterion = "The JavaScript file should be created in the workspace."
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.js", "content": source})]),
+            answer(calls=[("write_file", {"path": "calculator.js", "content": source})]),
+        ], prompt="Create calculator.js", config={
+            "output": {"format": "structured", "include": [
+                "summary", "actions", "artifacts", "verification", "limitations",
+            ]},
+            "verification": {"enabled": True, "inspect_changes": False,
+                             "run_available_tests": False, "require_tool_evidence": True,
+                             "completion_criteria": [criterion]},
+        })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["workspace_changes"], 1)
+        actions = result["result"]["actions"]
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[0]["capability"], "filesystem.create")
+        self.assertTrue(actions[0]["changed"])
+        self.assertTrue(actions[1]["already_satisfied"])
+        self.assertFalse(actions[1]["changed"])
+        self.assertFalse(any(item["policy_decision"] == "deny" for item in actions))
+        plan_task = {
+            "id": "task-3", "objective": "Create JavaScript logic",
+            "description": "Create the JavaScript file", "depends_on": [],
+            "required_capabilities": ["filesystem.create"], "preferred_skills": [],
+            "success_criteria": [criterion], "owned_paths": ["calculator.js"],
+            "write_targets": ["calculator.js"], "semantic_operations": ["create_file"],
+        }
+        outcome = Evaluator(lambda *_: self.fail("LLM must not be called")).evaluate(
+            planned_task=plan_task,
+            runtime_task={"status": result["status"], "result": result["result"],
+                          "verification": result["verification"], "error": result["error"]},
+            execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime",
+                            "attempt": 1},
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_success")
+        next_task = {**plan_task, "id": "task-4", "depends_on": ["task-3"],
+                     "objective": "Continue implementation", "write_targets": [],
+                     "owned_paths": [], "required_capabilities": []}
+        graph = ExecutionGraph({"goal": "Continue implementation", "summary": "Two tasks",
+                                "complexity": "multi_step", "tasks": [plan_task, next_task],
+                                "success_criteria": ["Tasks complete"]})
+        graph.mark_selected("task-3", "agent", "selection")
+        graph.mark_running("task-3", "runtime", "delegation")
+        graph.apply_runtime_status("task-3", "Success", result=result["result"])
+        graph.apply_evaluation("task-3", "evaluation", outcome["status"], outcome["summary"])
+        self.assertEqual(graph.refresh_dependencies(), [
+            {"task_id": "task-4", "from": "pending", "to": "ready"},
+        ])
 
     def test_initial_already_satisfied_write_finishes_without_artifact_and_evaluator_reviews(self):
         content = 'print("hola")\n'
         criterion = "The calculator supports addition, subtraction, multiplication and division."
-        (self.workspace / "calculator.py").write_text(content, encoding="utf-8")
+        (self.workspace / "calculator.py").write_bytes(content.encode("utf-8"))
         result = self.run_worker([
+            answer(calls=[("read_file", {"path": "calculator.py"})]),
             answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
         ], tools=["write_file", "read_file"], prompt="Create calculator.py",
             task_characteristics={"requires_filesystem_write": True}, config={
@@ -517,8 +575,8 @@ class WorkerTests(unittest.TestCase):
                 },
             })
         self.assertEqual(result["status"], "Success", result["error"])
-        self.assertEqual(result["model_calls"], 1)
-        action = result["result"]["actions"][0]
+        self.assertEqual(result["model_calls"], 2)
+        action = result["result"]["actions"][1]
         self.assertTrue(action["success"])
         self.assertTrue(action["already_satisfied"])
         self.assertFalse(action["changed"])
@@ -540,15 +598,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(evaluation["status"], "blocked")
         self.assertEqual(evaluation["criteria"][0]["status"], "unknown")
         runtime_result = json.loads(evaluator.last_context["runtime_task"]["result"])
-        self.assertTrue(runtime_result["actions"][0]["already_satisfied"])
+        self.assertTrue(runtime_result["actions"][1]["already_satisfied"])
         self.assertEqual(runtime_result["artifacts"], [])
 
     def test_repeated_identical_already_satisfied_write_stops_on_second_request(self):
         content = "print('hola')\n"
         write = ("write_file", {"path": "calculator.py", "content": content})
-        (self.workspace / "calculator.py").write_text(content, encoding="utf-8")
+        (self.workspace / "calculator.py").write_bytes(content.encode("utf-8"))
         result = self.run_worker([
-            answer(calls=[write, ("read_file", {"path": "calculator.py"})]),
+            answer(calls=[("read_file", {"path": "calculator.py"}), write,
+                          ("read_file", {"path": "calculator.py"})]),
             answer(calls=[write]),
             answer("The worker should not request this third model call."),
         ], tools=["write_file", "read_file"], prompt="Create calculator.py",
@@ -561,10 +620,10 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["model_calls"], 2)
         self.assertEqual(len(self.payloads), 2)
         actions = result["result"]["actions"]
-        self.assertTrue(actions[0]["already_satisfied"])
-        self.assertEqual(actions[1]["tool"], "read_file")
-        self.assertTrue(actions[2]["already_satisfied"])
-        self.assertFalse(actions[2]["changed"])
+        self.assertTrue(actions[1]["already_satisfied"])
+        self.assertEqual(actions[2]["tool"], "read_file")
+        self.assertTrue(actions[3]["already_satisfied"])
+        self.assertFalse(actions[3]["changed"])
         self.assertEqual(result["result"]["artifacts"], [])
         self.assertTrue(any(
             event.get("event", {}).get("event_type") == "task.auto_completed"
@@ -822,6 +881,106 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(contract_event["output"]["result_contract_valid"])
         self.assertFalse(contract_event["output"]["task_execution_successful"])
 
+    def test_existing_source_read_allows_no_write_candidate_for_evaluator(self):
+        source = "def add(a, b):\n    return a + b\n"
+        (self.workspace / "calculator.py").write_text(source, encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "calculator.py"})]),
+            answer('{"summary":"add is already implemented","actions":[],"artifacts":[],"verification":{},"limitations":[]}'),
+        ], tools=["read_file", "edit_file"], prompt="Implement add()", config={
+            "permissions": "workspace",
+            "provenance": {"generated_by_freya": True, "plan_task_id": "writer"},
+            "task_owned_paths": ["calculator.py"],
+            "task_write_owners": {"calculator.py": "writer"},
+            "task_write_scope_enforced": True,
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {"enabled": False},
+        }, task_characteristics={"requires_filesystem_write": True})
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["already_satisfied_candidate"])
+        self.assertEqual(result["result"]["already_satisfied_candidate"]["artifact_observations"][0]["path"],
+                         "calculator.py")
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertTrue(any(item.get("event", {}).get("event_type") == "task.already_satisfied_candidate"
+                            for item in self.events))
+        self.assertTrue(any(item.get("event", {}).get("event_type") == "artifact.read_observed"
+                            for item in self.events))
+        criterion = "add(a, b) returns the sum."
+        planned = {"id": "writer", "objective": "Implement add()",
+                   "success_criteria": [criterion], "required_capabilities": ["filesystem.modify"]}
+        def decision(_prompt, context):
+            observed = json.loads(context["runtime_task"]["result"])
+            self.assertIn(source.strip(), observed["actions"][0]["output"])
+            return {"status": "accepted", "confidence": 1.0,
+                    "summary": "The current function satisfies the criterion.",
+                    "criteria": [{"criterion": criterion, "status": "satisfied",
+                                  "reason": "The read source contains the implementation.",
+                                  "evidence": ["read_file calculator.py"]}],
+                    "issues": [], "missing_evidence": [], "recommended_action": "accept"}
+        evaluation = Evaluator(model=decision).evaluate(
+            planned_task=planned, runtime_task=result,
+            execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime", "attempt": 1})
+        self.assertEqual(evaluation["status"], "accepted")
+        without_semantic_review = Evaluator(offline=True).evaluate(
+            planned_task=planned, runtime_task=result,
+            execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime", "attempt": 1})
+        self.assertEqual(without_semantic_review["status"], "blocked")
+
+    def test_read_before_edit_is_recoverable_and_emits_event(self):
+        (self.workspace / "calculator.py").write_bytes(b"before\n")
+        config = {
+            "permissions": "workspace",
+            "capability_policy": {"capabilities": {"filesystem": {
+                "read": {"mode": "allow"}, "modify": {"mode": "allow"}}}},
+            "provenance": {"generated_by_freya": True, "plan_task_id": "writer"},
+            "task_owned_paths": ["calculator.py"],
+            "task_write_owners": {"calculator.py": "writer"},
+            "task_write_scope_enforced": True,
+            "verification": {"enabled": False},
+        }
+        result = self.run_worker([
+            answer(calls=[("edit_file", {"path": "calculator.py", "old": "before", "new": "after"}),
+                          ("read_file", {"path": "calculator.py"}),
+                          ("edit_file", {"path": "calculator.py", "old": "before", "new": "after"})]),
+            answer("Updated calculator.py."),
+        ], tools=["edit_file", "read_file"], config=config,
+            task_characteristics={"requires_filesystem_write": True})
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual((self.workspace / "calculator.py").read_text(encoding="utf-8"), "after\n")
+        events = [item.get("event", {}).get("event_type") for item in self.events]
+        self.assertIn("artifact.read_before_write_required", events)
+        self.assertIn("artifact.read_observed", events)
+
+    def test_generated_file_task_can_report_symbols_after_readback(self):
+        source = "def add(a, b):\n    return a + b\n"
+        reported = {"summary": "Created add().", "actions": [], "artifacts": [],
+                    "verification": {}, "limitations": [],
+                    "project_context_update": {"artifacts": [],
+                        "symbols": [{"name": "add", "kind": "function", "path": "calc.py",
+                                     "signature": "add(a, b)", "purpose": "Return the sum."}],
+                        "dependencies": []}}
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calc.py", "content": source})]),
+            answer(calls=[("read_file", {"path": "calc.py"})]),
+            answer(json.dumps(reported)),
+        ], tools=["write_file", "read_file"], config={
+            "permissions": "workspace",
+            "capability_policy": {"capabilities": {"filesystem": {
+                "create": {"mode": "allow"}, "read": {"mode": "allow"}},
+                "project": {"read_context": {"mode": "allow"}}}},
+            "provenance": {"generated_by_freya": True, "plan_task_id": "writer"},
+            "task_owned_paths": ["calc.py"], "task_write_owners": {"calc.py": "writer"},
+            "task_write_scope_enforced": True,
+            "runtime_context": {"project_state_snapshot": {"revision": 0, "artifacts": [], "tasks": []}},
+            "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
+            "verification": {"enabled": True, "inspect_changes": False,
+                             "run_available_tests": False, "require_tool_evidence": True,
+                             "completion_criteria": ["calc.py exists and can be read."]},
+        }, task_characteristics={"requires_filesystem_write": True})
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 3)
+        self.assertEqual(result["result"]["project_context_update"]["symbols"][0]["name"], "add")
+
     def test_successful_format_repair_cannot_fabricate_a_missing_write(self):
         repaired_claim = {
             "summary": "Created repaired.txt.",
@@ -993,8 +1152,8 @@ document.querySelector("#calculate").addEventListener("click", () => {
         )
         self.assertEqual(evaluation["status"], "accepted")
         self.assertEqual(evaluation["criteria"][0]["status"], "satisfied")
-        self.assertIn("filesystem:read_file:calculator/index.html",
-                      evaluation["criteria"][0]["evidence"])
+        self.assertTrue(any(item.startswith("filesystem:read_file:calculator/index.html")
+                            for item in evaluation["criteria"][0]["evidence"]))
 
     def test_prose_wrapped_json_action_is_executed(self):
         wrapped = ('I will inspect the workspace and then create the requested file.\n'

@@ -28,9 +28,10 @@ from control_center.agent_context import (build_agent_context, build_effective_a
                                                validate_structured_output)
 from control_center.cross_task import (CrossTaskRequestError, normalize_intent_text,
                                        normalize_owned_path, owned_path_key)
+from control_center.project_state import MAX_HASH_BYTES, query_project_snapshot
 
 
-READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff"}
+READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff", "project_context"}
 WRITE_TOOLS = {"write_file", "edit_file"}
 EXEC_TOOLS = {"run_command"}
 REASONS = {
@@ -41,6 +42,7 @@ REASONS = {
     "write_file": "Save the requested file in the workspace.",
     "edit_file": "Apply an exact replacement in an allowed file.",
     "run_command": "Run an allowed command to validate the work.",
+    "project_context": "Query accepted project metadata without reading file contents.",
 }
 NON_RETRYABLE_ERROR_CLASSES = {
     "policy_denied", "repeated_policy_denied", "blocked_action_cycle",
@@ -64,6 +66,12 @@ Tool usage rules:
   limitation.
 - The operational brief is already present in the task context. Do not invent or
   read a prerequisite brief file unless the current task explicitly names it.
+- Project Context is an index for discovery. The current source file is authoritative.
+  Read an existing artifact before modifying it or depending on its implementation.
+  Report relevant functions, classes and APIs in project_context_update.symbols
+  with name, kind, signature, path and purpose when you create them.
+- Read an existing artifact before changing it. If a write reports
+  STALE_ARTIFACT, read the latest version and reconsider the change before retrying.
 - A missing-file read is a missing input, not a permission grant. Do not repeat
   the same missing-file read; report it or choose a different permitted strategy.
 - Use only the tools listed in AVAILABLE TOOLS. Do not call, request or invent any other tool.
@@ -337,10 +345,37 @@ class PolicyToolbox(Toolbox):
             self.enabled.discard("git_diff")
         self.autonomy = normalize_autonomy(config.get("autonomy"))
         self.task_id = str((config.get("provenance") or {}).get("plan_task_id") or "")
+        provenance = config.get("provenance") if isinstance(config.get("provenance"), dict) else {}
+        runtime_context = config.get("runtime_context") if isinstance(config.get("runtime_context"), dict) else {}
+        snapshot = runtime_context.get("project_state_snapshot")
+        self.project_context_snapshot = (
+            snapshot if provenance.get("generated_by_freya") is True and isinstance(snapshot, dict)
+            else None
+        )
+        self.observed_artifact_hashes: dict[str, dict[str, Any]] = {}
+        self.project_artifact_revisions: dict[str, int] = {}
+        if self.project_context_snapshot:
+            for artifact in self.project_context_snapshot.get("artifacts", []):
+                if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+                    continue
+                try:
+                    self.project_artifact_revisions[owned_path_key(artifact["path"])] = int(
+                        artifact.get("revision", 0)
+                    )
+                except (TypeError, ValueError, CrossTaskRequestError):
+                    continue
         raw_owned_paths = config.get("task_owned_paths", [])
         if not isinstance(raw_owned_paths, list):
             raise ValueError("Task owned_paths must be a list.")
         self.task_owned_path_keys = {owned_path_key(path) for path in raw_owned_paths}
+        raw_foreign = config.get("task_foreign_write_targets", [])
+        if not isinstance(raw_foreign, list) or any(
+                not isinstance(item, dict) or set(item) != {"path", "owner_plan_task_id"}
+                for item in raw_foreign):
+            raise ValueError("Task foreign_write_targets must be a list of path-owner pairs.")
+        self.task_foreign_write_targets = {
+            owned_path_key(item["path"]): str(item["owner_plan_task_id"])
+            for item in raw_foreign}
         raw_owners = config.get("task_write_owners", {})
         if not isinstance(raw_owners, dict):
             raise ValueError("Task write ownership index must be an object.")
@@ -365,17 +400,47 @@ class PolicyToolbox(Toolbox):
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
-        return [schema for schema in super().schemas
-                if schema["function"]["name"] in self.enabled]
+        schemas = [schema for schema in super().schemas
+                   if schema["function"]["name"] in self.enabled]
+        if self.project_context_snapshot is not None and "project_context" in self.enabled:
+            schemas.append(self._project_context_schema())
+        return schemas
+
+    @staticmethod
+    def _project_context_schema() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": "project_context",
+                "description": "Query this orchestration's accepted project metadata. Returns no file contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": [
+                            "summary", "artifact", "symbol", "task", "search",
+                        ]},
+                        "path": {"type": "string", "description": "Exact workspace-relative artifact path."},
+                        "query": {"type": "string", "description": "Symbol name or metadata search text."},
+                        "task_id": {"type": "string", "description": "Plan task ID."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                    },
+                    "required": ["operation"],
+                    "additionalProperties": False,
+                },
+            },
+        }
 
     @property
     def registered_tools(self) -> set[str]:
         """All concrete tools known to the runtime, including disabled ones."""
-        return {
+        names = {
             str(schema["function"]["name"])
             for schema in super().schemas
             if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
         }
+        if self.project_context_snapshot is not None and "project_context" in self.enabled:
+            names.add("project_context")
+        return names
 
     def _tool_feedback(self) -> str:
         names = [
@@ -435,11 +500,38 @@ class PolicyToolbox(Toolbox):
             )
         key = relative.casefold()
         owner = self.task_write_owners.get(key)
+        scoped_owner = key in self.task_owned_path_keys and owner == self.task_id
+        scoped_foreign = bool(owner and owner != self.task_id and
+                              self.task_foreign_write_targets.get(key) == owner)
+        if target.is_file() and (scoped_owner or scoped_foreign):
+            observation = self.observed_artifact_hashes.get(key)
+            digest = self._artifact_digest(target)
+            if digest is None:
+                return ToolResult(
+                    name, "The existing artifact exceeds the bounded read-before-write verification limit. "
+                    "No file was modified.", False, 0, capability=action,
+                    policy_decision="blocked", policy_reason="Current artifact hash could not be verified.",
+                    executed=False, error_class="artifact_hash_unavailable", target_path=relative,
+                )
+            if observation is None:
+                return ToolResult(
+                    name, "READ_BEFORE_WRITE_REQUIRED\nRead the current artifact before modifying it. "
+                    "No file was modified.", False, 0, capability=action,
+                    policy_decision="blocked", policy_reason="Current source has not been read in this attempt.",
+                    executed=False, error_class="read_before_write_required", target_path=relative,
+                )
+            if observation.get("sha256") != digest:
+                return ToolResult(
+                    name, "STALE_ARTIFACT\nRead the latest source and reconsider the change. "
+                    "No file was modified.", False, 0, capability=action,
+                    policy_decision="blocked", policy_reason="Observed hash no longer matches current bytes.",
+                    executed=False, error_class="stale_artifact", target_path=relative,
+                )
         # The per-agent exact scope is authoritative, including for a derived
         # owner agent that must change only one file from a larger owned set.
-        if key in self.task_owned_path_keys:
+        if key in self.task_owned_path_keys and owner == self.task_id:
             return None
-        if owner and owner != self.task_id:
+        if owner and owner != self.task_id and self.task_foreign_write_targets.get(key) == owner:
             try:
                 for field in ("requested_change", "reason", "needed_for"):
                     normalize_intent_text(arguments.get(field), field)
@@ -478,8 +570,15 @@ class PolicyToolbox(Toolbox):
         if not isinstance(path, str) or not isinstance(content, str):
             return False
         try:
+            if self.task_write_scope_enforced:
+                candidate = self.safe_path(path)
+                key = owned_path_key(candidate.relative_to(self.workspace).as_posix())
+                if (key not in self.task_owned_path_keys
+                        or self.task_write_owners.get(key) != self.task_id):
+                    return False
             self.validate("write_file", arguments)
             target = self.safe_path(path)
+            key = owned_path_key(target.relative_to(self.workspace).as_posix())
             expected = content.encode("utf-8")
             return (
                 len(expected) <= MAX_WRITE_BYTES and target.is_file()
@@ -494,6 +593,63 @@ class PolicyToolbox(Toolbox):
         if name == "write_file" and self.write_is_already_satisfied(args):
             return "filesystem.create"
         return self.resolver.resolve(name, args)
+
+    @staticmethod
+    def _artifact_digest(path: Path) -> str | None:
+        try:
+            if path.stat().st_size > MAX_HASH_BYTES or path.is_symlink():
+                return None
+            digest = hashlib.sha256()
+            total = 0
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_HASH_BYTES:
+                        return None
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return None
+
+    def record_file_observation(self, path: str, expected_hash: str | None = None) -> None:
+        """Remember only the hash/revision of a successful explicit file read."""
+        try:
+            target = self.safe_path(path)
+            relative = normalize_owned_path(target.relative_to(self.workspace).as_posix())
+            key = owned_path_key(relative)
+            digest = self._artifact_digest(target)
+            if digest is not None and (expected_hash is None or digest == expected_hash):
+                self.observed_artifact_hashes[key] = {
+                    "sha256": digest,
+                    "revision": self.project_artifact_revisions.get(key, 0),
+                }
+        except (OSError, ValueError, CrossTaskRequestError):
+            return
+
+    def observed_revision(self, path: str) -> int:
+        try:
+            return int(self.observed_artifact_hashes.get(owned_path_key(path), {}).get("revision", 0))
+        except (TypeError, ValueError, CrossTaskRequestError):
+            return 0
+
+    def current_observations(self, paths: list[str]) -> list[dict[str, Any]]:
+        """Return read evidence only while every requested source still matches."""
+        evidence = []
+        for path in paths:
+            try:
+                target = self.safe_path(path)
+                key = owned_path_key(target.relative_to(self.workspace).as_posix())
+                observed = self.observed_artifact_hashes.get(key)
+                if not target.is_file() or observed is None or observed.get("sha256") != self._artifact_digest(target):
+                    return []
+                evidence.append({"path": path, "sha256": observed["sha256"],
+                                 "revision": observed.get("revision", 0)})
+            except (OSError, ValueError, CrossTaskRequestError):
+                return []
+        return evidence
 
     def _resource_context(self, name: str, resource: str, args: dict[str, Any]) -> dict[str, Any]:
         context: dict[str, Any] = {}
@@ -561,7 +717,7 @@ class PolicyToolbox(Toolbox):
             output = json.dumps({
                 "success": True, "changed": False,
                 "already_satisfied": True, "path": path,
-                "message": "File already contains the requested content.",
+                "message": "The requested state already exists. Do not repeat this write. Continue with remaining task requirements or finish.",
             }, ensure_ascii=False, sort_keys=True)
             return ToolResult(
                 name, "ALREADY_SATISFIED\n" + output, True, 0,
@@ -611,11 +767,40 @@ class PolicyToolbox(Toolbox):
             return ownership_result
         tool_args = {key: value for key, value in args.items()
                      if key not in {"requested_change", "reason", "needed_for", "blocking"}}
-        result = super().invoke(name, tool_args)
+        if name == "project_context":
+            try:
+                if self.project_context_snapshot is None:
+                    raise ValueError("Project context is unavailable for this task.")
+                query = query_project_snapshot(self.project_context_snapshot, tool_args)
+                result = ToolResult(
+                    name, query["json"], True, 0,
+                    capability=action, policy_decision="allow",
+                    policy_reason=decision.reason, executed=True,
+                )
+            except (TypeError, ValueError) as exc:
+                result = ToolResult(
+                    name, "INVALID_REQUEST\n" + str(exc), False, 0,
+                    capability=action, policy_decision="invalid_request",
+                    policy_reason="Project context query was rejected.",
+                    executed=False, error_class="invalid_request",
+                )
+        else:
+            read_hash = None
+            if name == "read_file" and isinstance(args.get("path"), str):
+                try:
+                    read_hash = self._artifact_digest(self.safe_path(args["path"]))
+                except (OSError, ValueError):
+                    pass
+            result = super().invoke(name, tool_args)
+        if name == "project_context" and not result.success:
+            return result
         result.capability = action
         result.policy_decision = "allow"
         result.policy_reason = decision.reason + (f" ({grant_reason})" if grant_reason else "")
         result.executed = True
+        if name == "read_file" and result.success and isinstance(args.get("path"), str):
+            if read_hash is not None and not result.output.endswith("\n[output truncated]"):
+                self.record_file_observation(args["path"], read_hash)
         if name in WRITE_TOOLS and result.success:
             result.changed = True
         return result
@@ -623,6 +808,11 @@ class PolicyToolbox(Toolbox):
     def validate(self, name: str, arguments: dict[str, Any]) -> None:
         if name not in self.enabled or name not in READ_TOOLS | WRITE_TOOLS | EXEC_TOOLS:
             raise ValueError("Tool is disabled or unavailable: " + name)
+        if name == "project_context":
+            if self.project_context_snapshot is None:
+                raise ValueError("Project context is unavailable for this task.")
+            query_project_snapshot(self.project_context_snapshot, arguments)
+            return
         # Explicit capability policies supersede legacy permission levels.  The
         # legacy checks are retained only for agents without a policy.
         permission = self.config.get("permissions", "read_only")
@@ -817,6 +1007,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     action_history: list[str] = []
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     mutation_failure = ""
+    already_satisfied_candidate: dict[str, Any] | None = None
     cross_task_request: dict[str, Any] | None = None
     try:
         while True:
@@ -1004,6 +1195,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             "target_owner_plan_task_id": result.owner_task_id,
                             "target_path": result.target_path,
                             "requested_operation": str(result.capability or "").removeprefix("filesystem."),
+                            "requester_observed_revision": (
+                                box.observed_revision(result.target_path)
+                                if hasattr(box, "observed_revision") else 0
+                            ),
                             "requested_change": normalize_intent_text(safe_args.get("requested_change"), "requested_change"),
                             "reason": normalize_intent_text(safe_args.get("reason"), "reason"),
                             "needed_for": normalize_intent_text(safe_args.get("needed_for"), "needed_for"),
@@ -1159,6 +1354,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         if name == "write_file" and result.changed is True and write_signature:
                             successful_write_signatures.add(write_signature)
                     if result.already_satisfied:
+                        publish("event", event={
+                            "event_type": "worker.write_already_satisfied", "level": "info",
+                            "status": "Success", "path": safe_args.get("path", ""),
+                            "message": "The requested state already exists; no write was performed.",
+                        })
                         if verification_state["requested"]:
                             verification_state["attempted"] = True
                             verification_state["evidence"].append({
@@ -1205,6 +1405,16 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 })
                     if result.success and name == "read_file":
                         path = safe_args.get("path")
+                        if isinstance(path, str):
+                            observations = box.current_observations([path]) if hasattr(box, "current_observations") else []
+                            if observations:
+                                publish("event", event={
+                                    "event_type": "artifact.read_observed", "level": "info", "status": "Success",
+                                    "path": path, "revision": observations[0]["revision"],
+                                    "sha256": observations[0]["sha256"],
+                                })
+                            if path not in modified_paths and path not in observed_files:
+                                observed_files[path] = (True, result.output)
                         if isinstance(path, str) and path in modified_paths:
                             expected = modified_paths[path]
                             matches = expected is None or result.output == expected
@@ -1216,17 +1426,19 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 verification_state["attempted"] = True
                                 verification_state["passed"] = True
                                 verification_state["unavailable"] = False
-                                success = True
-                                auto_completed = True
-                                final = json.dumps({
-                                    "summary": "Completed from the created artifact and matching read-back evidence.",
-                                    "actions": [], "artifacts": [], "verification": {}, "limitations": [],
-                                })
-                                publish("event", event={
-                                    "event_type": "task.auto_completed", "level": "info",
-                                    "status": "Success",
-                                    "reason": "The artifact was read back successfully and the evidence directly satisfied every configured file-presence criterion.",
-                                })
+                                if (getattr(box, "project_context_snapshot", None) is None
+                                        or metrics["model_calls"] >= config.get("max_model_calls", 20)):
+                                    success = True
+                                    auto_completed = True
+                                    final = json.dumps({
+                                        "summary": "Completed from the created artifact and matching read-back evidence.",
+                                        "actions": [], "artifacts": [], "verification": {}, "limitations": [],
+                                    })
+                                    publish("event", event={
+                                        "event_type": "task.auto_completed", "level": "info",
+                                        "status": "Success",
+                                        "reason": "The artifact was read back successfully and the evidence directly satisfied every configured file-presence criterion.",
+                                    })
                     if result.error_class == "ParentPathIsFile":
                         if result.blocking_path:
                             blocked_write_parents.add(result.blocking_path)
@@ -1235,6 +1447,14 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             # tool results: later calls were not executed so the model
                             # can change strategy before any sibling write is attempted.
                             message["tool_calls"] = processed_calls
+                    if result.error_class in {"read_before_write_required", "stale_artifact"}:
+                        publish("event", event={
+                            "event_type": ("artifact.read_before_write_required"
+                                           if result.error_class == "read_before_write_required"
+                                           else "artifact.stale_read_detected"),
+                            "level": "warning", "status": "Warning", "path": result.target_path,
+                            "tool": name, "error_class": result.error_class,
+                        })
                     if not result.success:
                         successful_validation_streak = 0
                         repeated_success_count = 0
@@ -1380,11 +1600,30 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 and action.get("already_satisfied") is True
                 and action.get("changed") is False
             )
-            workspace_state_observed = bool(
-                changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
-                or already_satisfied_write_actions
-            )
-            if not workspace_state_observed:
+            if not (changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts):
+                targets = list(dict.fromkeys(
+                    [str(path) for path in (config.get("task_owned_paths") or []) if isinstance(path, str)] +
+                    [str(item["path"]) for item in (config.get("task_foreign_write_targets") or [])
+                     if isinstance(item, dict) and isinstance(item.get("path"), str)]
+                ))
+                if not targets and already_satisfied_write_actions:
+                    targets = list(dict.fromkeys(
+                        str((action.get("arguments") or {}).get("path"))
+                        for action in runtime_actions if action.get("already_satisfied") is True
+                        and isinstance((action.get("arguments") or {}).get("path"), str)
+                    ))
+                observations = box.current_observations(targets) if targets and hasattr(box, "current_observations") else []
+                if observations:
+                    already_satisfied_candidate = {"artifact_observations": observations,
+                                                   "successful_writes": 0,
+                                                   "semantic_success": "pending_evaluator"}
+                    publish("event", event={
+                        "event_type": "task.already_satisfied_candidate", "level": "info",
+                        "status": "ExecutionComplete", "paths": [item["path"] for item in observations],
+                        "message": "Current artifacts were read; Evaluator must decide whether the objective is met.",
+                    })
+            if not (changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
+                    or already_satisfied_candidate):
                 mutation_failure = (
                     "ExpectedWorkspaceMutationNotObserved: this task requires a workspace "
                     "mutation, but no successful write action or resulting artifact was recorded."
@@ -1686,6 +1925,34 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 if workspace_diffs:
                     result_output["workspace_diffs"] = workspace_diffs
                 result_output["verification"] = verification_state
+                if already_satisfied_candidate:
+                    result_output["already_satisfied_candidate"] = already_satisfied_candidate
+                if getattr(box, "project_context_snapshot", None) is not None:
+                    reported_update = result_output.get("project_context_update")
+                    reported_update = reported_update if isinstance(reported_update, dict) else {}
+                    purposes: dict[str, str] = {}
+                    for reported in reported_update.get("artifacts", []):
+                        if not isinstance(reported, dict) or not isinstance(reported.get("path"), str):
+                            continue
+                        try:
+                            purposes[owned_path_key(reported["path"])] = str(reported.get("purpose") or "")[:800]
+                        except (ValueError, CrossTaskRequestError):
+                            continue
+                    candidate_artifacts = []
+                    for artifact in runtime_artifacts:
+                        try:
+                            key = owned_path_key(artifact.get("path", ""))
+                        except (TypeError, ValueError, CrossTaskRequestError):
+                            continue
+                        candidate_artifacts.append({
+                            "path": artifact["path"],
+                            "purpose": purposes.get(key, ""),
+                        })
+                    result_output["project_context_update"] = {
+                        "artifacts": candidate_artifacts,
+                        "symbols": list(reported_update.get("symbols", []))[:100],
+                        "dependencies": list(reported_update.get("dependencies", []))[:100],
+                    }
                 if mutation_failure:
                     result_output["summary"] = "Task failed because the required workspace mutation was not observed."
                     if mutation_failure not in result_output["limitations"]:
@@ -1735,6 +2002,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     })
     return sanitize(clean({**metrics, **telemetry, "status": "Success" if success else "Failed",
                   "execution_outcome": execution_outcome,
+                  "already_satisfied_candidate": bool(success and already_satisfied_candidate),
                   "task_execution_successful": success, "result": result_output,
                   "verification": verification_state, "error": error, "progress": 100,
                   "duration_seconds": round(time.monotonic() - started, 3)}, token))

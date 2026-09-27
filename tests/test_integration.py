@@ -420,6 +420,20 @@ class FingerprintAndReplanTests(unittest.TestCase):
         )
         self.assertEqual([item["id"] for item in revised["tasks"]], ["a", "c"])
 
+    def test_appended_writer_keeps_existing_plan_task_owner(self):
+        existing = task("a", capabilities=["filesystem.modify"])
+        existing["owned_paths"] = ["src/main.py"]
+        appended = task("b", ["a"], capabilities=["filesystem.modify"])
+        appended.update({"owned_paths": ["src/main.py"],
+                         "write_targets": ["src/main.py"]})
+        revised = validate_integration_revision(
+            current_plan=plan([existing]), new_tasks=[appended],
+            accepted_task_ids={"a"}, historical_task_ids={"a"}, max_tasks=2)
+        self.assertEqual(revised["write_owners"], {"src/main.py": "a"})
+        self.assertEqual(revised["tasks"][1]["owned_paths"], [])
+        self.assertEqual(revised["tasks"][1]["foreign_write_targets"],
+                         [{"path": "src/main.py", "owner_plan_task_id": "a"}])
+
     def test_integration_schema_uses_semantic_operations_only(self):
         task_schema = INTEGRATION_REPLAN_RESPONSE_FORMAT["properties"]["tasks"]["items"]
         fields = task_schema["properties"]

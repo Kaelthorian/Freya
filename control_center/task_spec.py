@@ -92,6 +92,13 @@ _ACTION_LABELS = {
     "filter": "filtrar",
     "export": "exportar",
 }
+_TYPO_ACTION_TOKENS = {surface: action for action, surfaces in _ACTION_SURFACES.items()
+                       for surface in surfaces if len(surface) >= 6}
+_TYPO_INTERFACE_TOKENS = {"consola": "console", "console": "console",
+                          "desktop": "desktop_gui", "escritorio": "desktop_gui",
+                          "website": "web"}
+_TYPO_LANGUAGE_TOKENS = {"python": "Python", "javascript": "JavaScript",
+                         "typescript": "TypeScript", "powershell": "PowerShell"}
 _GROUNDING_WORDS = frozenset({
     "a", "about", "accurate", "an", "and", "as", "at", "be", "basic", "by",
     "correct", "correctly", "create", "created", "crear", "crea", "creado", "con",
@@ -161,6 +168,55 @@ def _fold_text(value: Any) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
+def _bounded_distance(left: str, right: str) -> int:
+    """Return zero, one, or two (meaning outside the permitted typo bound)."""
+    if abs(len(left) - len(right)) > 1:
+        return 2
+    if left == right:
+        return 0
+    if len(left) == len(right):
+        return min(2, sum(a != b for a, b in zip(left, right)))
+    shorter, longer = sorted((left, right), key=len)
+    index = offset = differences = 0
+    while index < len(shorter):
+        if shorter[index] == longer[index + offset]:
+            index += 1
+        else:
+            differences += 1
+            offset += 1
+            if differences > 1:
+                return 2
+    return 1
+
+
+def _nearest_semantic_token(token: str, vocabulary: dict[str, str]) -> tuple[str, str] | None:
+    """Correct one edit only when a single registered canonical token is nearest."""
+    folded = _fold_text(token)
+    if len(folded) < 6 or folded in vocabulary:
+        return None
+    candidates = [(canonical, action) for canonical, action in vocabulary.items()
+                  if _bounded_distance(folded, canonical) == 1]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def semantic_normalizations(text: str) -> list[dict[str, str]]:
+    """Report source-token provenance without changing the user's wording."""
+    vocabularies = (_TYPO_ACTION_TOKENS, _TYPO_INTERFACE_TOKENS, _TYPO_LANGUAGE_TOKENS)
+    records = []
+    for match in re.finditer(r"\b[A-Za-zÀ-ÿ]{6,}\b", text):
+        token = match.group()
+        if any(_fold_text(token) in vocabulary for vocabulary in vocabularies):
+            continue
+        candidates = [resolved for vocabulary in vocabularies
+                      if (resolved := _nearest_semantic_token(token, vocabulary)) is not None]
+        if len(candidates) == 1:
+            canonical, meaning = candidates[0]
+            records.append({"original": token, "canonical": canonical,
+                            "semantic_action": meaning,
+                            "method": "bounded_typo_normalization"})
+    return records
+
+
 def _action_matches(text: str) -> list[tuple[int, int, str]]:
     matches = []
     for group, surfaces in _ACTION_SURFACES.items():
@@ -169,6 +225,13 @@ def _action_matches(text: str) -> list[tuple[int, int, str]]:
         ) + r")(?!\w)"
         matches.extend((item.start(), item.end(), group)
                        for item in re.finditer(pattern, str(text), flags=re.IGNORECASE))
+    occupied = [(start, end) for start, end, _ in matches]
+    for token in re.finditer(r"\b[A-Za-zÀ-ÿ]{6,}\b", str(text)):
+        if any(token.start() < end and token.end() > start for start, end in occupied):
+            continue
+        resolved = _nearest_semantic_token(token.group(), _TYPO_ACTION_TOKENS)
+        if resolved is not None:
+            matches.append((token.start(), token.end(), resolved[1]))
     return sorted(matches, key=lambda item: (item[0], item[1]))
 
 
@@ -477,6 +540,63 @@ def normalize_task_spec_candidate(value: Any) -> tuple[dict[str, Any], list[str]
     return candidate, changes
 
 
+def _normalize_clarified_provenance(candidate: dict[str, Any],
+                                   floor: dict[str, Any], prompt: str
+                                   ) -> list[str]:
+    """Separate a known clarified modifier from an otherwise explicit entry."""
+    changes = []
+    modifiers = []
+    for field, detector in (("interface", _detected_interface),
+                            ("language", _detected_language)):
+        if detector(prompt):
+            continue
+        clarified = [item for item in floor["constraints"]
+                     if item["source"] == RequirementSource.CLARIFIED.value
+                     and detector(item["description"])]
+        if len(clarified) == 1:
+            modifiers.append((field, detector, clarified[0]))
+    for field in ("deliverables", "requirements", "constraints"):
+        entries = candidate.get(field)
+        if not isinstance(entries, list):
+            continue
+        retained = []
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict) or item.get("source") != "explicit" or not isinstance(item.get("description"), str):
+                retained.append(item)
+                continue
+            description = item["description"]
+            for semantic_field, detector, constraint in modifiers:
+                if detector(description) != detector(constraint["description"]):
+                    continue
+                # Only the registered modifier is removed. Any remaining words
+                # still face the unchanged source-grounding validator.
+                if semantic_field == "interface":
+                    pattern = r"\b(?:(?:con|de|with)\s+)?(?:(?:interfaz|interface)\s+)?(?:web|website|consola|console|desktop|escritorio|gui)\b"
+                else:
+                    pattern = r"\b(?:(?:en|in|using)\s+)?(?:python|javascript|typescript|powershell)\b"
+                revised = re.sub(pattern, "", description, flags=re.IGNORECASE)
+                revised = re.sub(r"\s+", " ", revised).strip(" ,;:.-")
+                if revised != description.strip(" ,;:.-"):
+                    description = revised
+                    changes.append(f"{field}[{index}]:clarified_{semantic_field}_separated")
+            if description:
+                retained.append({**item, "description": description})
+        candidate[field] = retained
+    constraints = candidate.setdefault("constraints", [])
+    if isinstance(constraints, list):
+        for semantic_field, detector, constraint in modifiers:
+            for item in constraints:
+                if (isinstance(item, dict) and isinstance(item.get("description"), str)
+                        and detector(item["description"]) == detector(constraint["description"])):
+                    item["description"] = constraint["description"]
+                    item["source"] = "clarified"
+                    break
+            else:
+                constraints.append(deepcopy(constraint))
+            changes.append(f"constraints:clarified_{semantic_field}_grounded")
+    return list(dict.fromkeys(changes))
+
+
 def validate_task_spec(value: Any) -> dict[str, Any]:
     """Normalize harmless formatting while rejecting semantic or schema gaps."""
     if not isinstance(value, dict):
@@ -645,6 +765,10 @@ def _detected_interface(text: str) -> str:
         return "web"
     if re.search(r"\b(?:escritorio|desktop|gui|grafica|gr[aá]fica)\b", folded):
         return "desktop_gui"
+    for token in re.findall(r"\b[a-z]{6,}\b", folded):
+        resolved = _nearest_semantic_token(token, _TYPO_INTERFACE_TOKENS)
+        if resolved:
+            return resolved[1]
     return ""
 
 
@@ -661,6 +785,10 @@ def _detected_language(text: str) -> str:
     ):
         if re.search(pattern, folded):
             return language
+    for token in re.findall(r"\b[a-z]{6,}\b", folded):
+        resolved = _nearest_semantic_token(token, _TYPO_LANGUAGE_TOKENS)
+        if resolved:
+            return resolved[1]
     return ""
 
 
@@ -1361,6 +1489,15 @@ class TaskSpecAnalyst:
             "prompt_tokens": 0, "generated_tokens": 0, "total_tokens": 0,
             "llm_duration_seconds": 0.0,
         }
+        lexical = semantic_normalizations(prompt)
+        self.metrics["semantic_normalization"] = lexical
+        if lexical:
+            self._event("task_analysis.lexical_normalization", "Success",
+                        "Registered semantic tokens were normalized without changing source text.",
+                        semantic_normalization=lexical)
+            self._event("task_analysis.semantic_normalization", "Success",
+                        "Source tokens were associated with unique canonical meanings.",
+                        semantic_normalization=lexical)
         if self.offline:
             started = time.monotonic()
             result = deterministic_task_spec(prompt, previous, answers)
@@ -1541,6 +1678,12 @@ class TaskSpecAnalyst:
                 for field in ("deliverables", "requirements"):
                     if not candidate.get(field):
                         candidate[field] = floor[field]
+            provenance_changes = _normalize_clarified_provenance(candidate, floor, prompt)
+            changes.extend(provenance_changes)
+            if provenance_changes:
+                self._event("task_analysis.provenance_normalization", "Success",
+                            "Clarified semantic modifiers were separated from explicit entries.",
+                            normalization_changes=provenance_changes)
             result = validate_task_spec(candidate)
             _validate_scope_candidate(result, prompt, previous, answers, history)
             if floor["status"] == TaskSpecStatus.NEEDS_CLARIFICATION.value:

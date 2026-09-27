@@ -234,7 +234,11 @@ class AgentFactory:
         }
         if role in {"qa", "auditor"} and set(required) & write_capabilities:
             raise ValueError(f"Dynamic {role} agents cannot receive write capabilities.")
-        policy = self.capability_policy(required)
+        # Project metadata is available to generated agents. File reads come
+        # only from compiled semantic requirements; ownership limits writes,
+        # never visibility of another task's workspace artifact.
+        policy_capabilities = [*required, "project.read_context"]
+        policy = self.capability_policy(policy_capabilities)
         policy_tools = list(dict.fromkeys(effective_tools_for_policy(policy)))
         unavailable_tools = sorted(set(normalized_tools) - set(policy_tools))
         if unavailable_tools:
@@ -280,6 +284,7 @@ class AgentFactory:
             # Worker-enforced ownership is task-scoped and independent from
             # capability policy. Reads remain unaffected by this write scope.
             "task_owned_paths": list(task.get("owned_paths", [])),
+            "task_foreign_write_targets": list(task.get("foreign_write_targets", [])),
             "task_write_owners": dict(task.get("_write_owners", {})),
             # Generated plan agents always have an explicit write boundary.
             # Legacy plans without path metadata therefore fail closed.

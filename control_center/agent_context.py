@@ -40,7 +40,8 @@ PLANNING_MODES = {"direct", "adaptive", "explicit"}
 AMBIGUITY_MODES = {"ask", "infer_when_safe", "best_effort"}
 AUTONOMY_MODES = {"automatic", "ask", "deny"}
 OUTPUT_FORMATS = {"text", "structured"}
-OUTPUT_FIELDS = {"summary", "actions", "artifacts", "verification", "limitations"}
+OUTPUT_FIELDS = {"summary", "actions", "artifacts", "verification", "limitations",
+                 "project_context_update"}
 
 
 def _text_list(value: Any, name: str, limit: int = 20) -> list[str]:
@@ -350,7 +351,77 @@ def parse_structured_output(value: Any) -> dict[str, Any]:
     if not isinstance(verification, (dict, list, str)):
         raise ValueError("Structured output field verification must be an object, array, or text.")
     normalized["verification"] = copy.deepcopy(verification)
+    if "project_context_update" in parsed:
+        normalized["project_context_update"] = _normalize_project_context_update(
+            parsed["project_context_update"],
+        )
     return normalized
+
+
+def _normalize_project_context_path(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 512 or "\x00" in value:
+        raise ValueError(f"project_context_update {field} must be a non-empty relative path.")
+    path = value.strip().replace("\\", "/")
+    parts = path.split("/")
+    if (path.startswith("/") or ":" in path or any(part in {"", ".", ".."} for part in parts)
+            or any(char in path for char in "*?[]{}") or len(parts) > 32):
+        raise ValueError(f"project_context_update {field} must be a normalized relative file path.")
+    return path
+
+
+def _normalize_project_context_update(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) - {"artifacts", "symbols", "dependencies"}:
+        raise ValueError("project_context_update must contain only artifacts, symbols and dependencies.")
+    result: dict[str, Any] = {}
+    specifications = {
+        "artifacts": ({"path", "purpose"}, {"path"}),
+        "symbols": ({"name", "kind", "signature", "purpose", "artifact_path", "path"}, {"name"}),
+        "dependencies": ({"path", "depends_on", "relationship"}, {"path", "depends_on", "relationship"}),
+    }
+    for field, (allowed, required) in specifications.items():
+        rows = value.get(field, [])
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise ValueError(f"project_context_update {field} must be an array of at most 100 entries.")
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) - allowed or required - set(row):
+                raise ValueError(f"project_context_update {field} contains an invalid entry.")
+            item: dict[str, Any] = {}
+            if field == "artifacts":
+                item["path"] = _normalize_project_context_path(row["path"], "artifact path")
+                purpose = row.get("purpose", "")
+                if not isinstance(purpose, str) or len(purpose) > 800:
+                    raise ValueError("project_context_update artifact purpose must be text up to 800 characters.")
+                item["purpose"] = purpose.strip()
+            elif field == "symbols":
+                name = row["name"]
+                if not isinstance(name, str) or not name.strip() or len(name) > 128:
+                    raise ValueError("project_context_update symbol name must be text up to 128 characters.")
+                item["name"] = name.strip()
+                symbol_path = row.get("artifact_path", row.get("path"))
+                if not isinstance(symbol_path, str) or ("artifact_path" in row and "path" in row
+                        and row["artifact_path"] != row["path"]):
+                    raise ValueError("project_context_update symbol needs one consistent path.")
+                item["artifact_path"] = _normalize_project_context_path(symbol_path, "symbol artifact_path")
+                kind = row.get("kind", "")
+                if not isinstance(kind, str) or len(kind) > 64:
+                    raise ValueError("project_context_update symbol kind must be text up to 64 characters.")
+                item["kind"] = kind.strip()
+                for key, limit in (("signature", 300), ("purpose", 500)):
+                    text = row.get(key, "")
+                    if not isinstance(text, str) or len(text) > limit:
+                        raise ValueError(f"project_context_update symbol {key} must be text up to {limit} characters.")
+                    item[key] = text.strip()
+            else:
+                item["path"] = _normalize_project_context_path(row["path"], "dependency path")
+                item["depends_on"] = _normalize_project_context_path(row["depends_on"], "depends_on")
+                relationship = row["relationship"]
+                if not isinstance(relationship, str) or not relationship.strip() or len(relationship) > 300:
+                    raise ValueError("project_context_update dependency relationship must be text up to 300 characters.")
+                item["relationship"] = relationship.strip()
+            normalized_rows.append(item)
+        result[field] = normalized_rows
+    return result
 
 
 def validate_structured_output(value: Any) -> dict[str, Any]:
