@@ -424,6 +424,191 @@ class WorkerTests(unittest.TestCase):
             for event in self.events
         ))
 
+    def test_duplicate_write_after_mutation_stops_without_semantic_criteria_evidence(self):
+        content = 'print("hola")\n'
+        criterion = "The calculator supports addition, subtraction, multiplication and division."
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+        ], tools=["write_file", "read_file"], prompt="Create calculator.py",
+            task_characteristics={"requires_filesystem_write": True}, config={
+                "output": {"format": "structured", "include": [
+                    "summary", "actions", "artifacts", "verification", "limitations",
+                ]},
+                "verification": {
+                    "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                    "require_tool_evidence": True, "completion_criteria": [criterion],
+                },
+            })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(len(self.payloads), 2)
+        actions = result["result"]["actions"]
+        self.assertEqual(len(actions), 2)
+        self.assertTrue(actions[0]["success"])
+        self.assertTrue(actions[0]["changed"])
+        self.assertTrue(actions[1]["already_satisfied"])
+        self.assertFalse(actions[1]["changed"])
+        self.assertEqual(
+            result["result"]["summary"],
+            "Execution completed; requested workspace state is already satisfied.",
+        )
+        self.assertEqual(result["workspace_changes"], 1)
+        self.assertEqual([item["path"] for item in result["result"]["artifacts"]], ["calculator.py"])
+        self.assertTrue(result["result"]["workspace_diffs"])
+        self.assertFalse(any(
+            criterion in item.get("supports_acceptance_criteria", [])
+            for item in result["verification"]["evidence"]
+        ))
+        self.assertTrue(any(
+            event.get("event", {}).get("event_type") == "task.auto_completed"
+            and "duplicate write" in event.get("event", {}).get("reason", "")
+            for event in self.events
+        ))
+
+        evaluator_input = {}
+
+        def reject_incomplete_calculator(_prompt, context):
+            evaluator_input.update(context)
+            return {
+                "status": "needs_revision", "confidence": 1.0,
+                "summary": "The requested calculator operations are not present.",
+                "criteria": [{
+                    "criterion": criterion, "status": "unsatisfied",
+                    "reason": "The source only prints a greeting and does not implement the four operations.",
+                    "evidence": ["workspace diff for calculator.py"],
+                }],
+                "issues": ["The calculator behavior is missing."],
+                "missing_evidence": [], "recommended_action": "revise",
+            }
+
+        planned_task = {
+            "id": "T-1", "objective": "Create a calculator",
+            "description": "Implement the four arithmetic operations.",
+            "success_criteria": [criterion], "required_capabilities": [], "preferred_skills": [],
+        }
+        evaluation = Evaluator(model=reject_incomplete_calculator).evaluate(
+            planned_task=planned_task,
+            runtime_task=result,
+            execution_node={"selected_agent_id": "calculator-worker",
+                            "runtime_task_id": "calculator-runtime", "attempt": 1},
+        )
+        self.assertEqual(evaluation["status"], "needs_revision")
+        evaluator_result = json.loads(evaluator_input["runtime_task"]["result"])
+        self.assertEqual(len(evaluator_result["actions"]), 2)
+        self.assertEqual(len(evaluator_result["artifacts"]), 1)
+        self.assertTrue(evaluator_result["workspace_diffs"])
+        self.assertTrue(evaluator_input["runtime_task"]["verification"]["evidence"])
+
+    def test_initial_already_satisfied_write_finishes_without_artifact_and_evaluator_reviews(self):
+        content = 'print("hola")\n'
+        criterion = "The calculator supports addition, subtraction, multiplication and division."
+        (self.workspace / "calculator.py").write_text(content, encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("write_file", {"path": "calculator.py", "content": content})]),
+        ], tools=["write_file", "read_file"], prompt="Create calculator.py",
+            task_characteristics={"requires_filesystem_write": True}, config={
+                "output": {"format": "structured", "include": [
+                    "summary", "actions", "artifacts", "verification", "limitations",
+                ]},
+                "verification": {
+                    "enabled": True, "inspect_changes": False, "run_available_tests": False,
+                    "require_tool_evidence": True, "completion_criteria": [criterion],
+                },
+            })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 1)
+        action = result["result"]["actions"][0]
+        self.assertTrue(action["success"])
+        self.assertTrue(action["already_satisfied"])
+        self.assertFalse(action["changed"])
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertNotIn("workspace_diffs", result["result"])
+        self.assertTrue(result["verification"]["attempted"])
+        self.assertFalse(result["verification"]["passed"])
+
+        evaluator = Evaluator(offline=True)
+        evaluation = evaluator.evaluate(
+            planned_task={
+                "id": "T-1", "objective": "Create a calculator", "description": "Create calculator.py",
+                "success_criteria": [criterion], "required_capabilities": [], "preferred_skills": [],
+            },
+            runtime_task=result,
+            execution_node={"selected_agent_id": "calculator-worker",
+                            "runtime_task_id": "calculator-runtime", "attempt": 1},
+        )
+        self.assertEqual(evaluation["status"], "blocked")
+        self.assertEqual(evaluation["criteria"][0]["status"], "unknown")
+        runtime_result = json.loads(evaluator.last_context["runtime_task"]["result"])
+        self.assertTrue(runtime_result["actions"][0]["already_satisfied"])
+        self.assertEqual(runtime_result["artifacts"], [])
+
+    def test_repeated_identical_already_satisfied_write_stops_on_second_request(self):
+        content = "print('hola')\n"
+        write = ("write_file", {"path": "calculator.py", "content": content})
+        (self.workspace / "calculator.py").write_text(content, encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[write, ("read_file", {"path": "calculator.py"})]),
+            answer(calls=[write]),
+            answer("The worker should not request this third model call."),
+        ], tools=["write_file", "read_file"], prompt="Create calculator.py",
+            task_characteristics={"requires_filesystem_write": True}, config={
+                "output": {"format": "structured", "include": [
+                    "summary", "actions", "artifacts", "verification", "limitations",
+                ]},
+            })
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(len(self.payloads), 2)
+        actions = result["result"]["actions"]
+        self.assertTrue(actions[0]["already_satisfied"])
+        self.assertEqual(actions[1]["tool"], "read_file")
+        self.assertTrue(actions[2]["already_satisfied"])
+        self.assertFalse(actions[2]["changed"])
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertTrue(any(
+            event.get("event", {}).get("event_type") == "task.auto_completed"
+            and "same already-satisfied write repeated" in event.get("event", {}).get("reason", "")
+            for event in self.events
+        ))
+
+    def test_failed_first_write_does_not_complete_from_already_satisfied_path(self):
+        config = {
+            **DEFAULT_CONFIG,
+            "output": {"format": "structured", "include": [
+                "summary", "actions", "artifacts", "verification", "limitations",
+            ]},
+            "verification": {
+                "enabled": False, "inspect_changes": False, "run_available_tests": False,
+                "require_tool_evidence": False, "completion_criteria": [],
+            },
+        }
+        toolbox = PolicyToolbox(self.root, self.workspace, config, ["write_file"])
+        failed_write = ToolResult(
+            "write_file", "The write was not executed.", False, 0,
+            capability="filesystem.create", policy_decision="invalid_request",
+            executed=False, error_class="invalid_request",
+        )
+        final = json.dumps({
+            "summary": "The requested write failed.", "actions": [], "artifacts": [],
+            "verification": {}, "limitations": ["The write was not executed."],
+        })
+        with patch.object(toolbox, "invoke", return_value=failed_write):
+            result = self.run_worker([
+                answer(calls=[("write_file", {"path": "calculator.py", "content": "print(1 + 1)\n"})]),
+                answer(final),
+            ], tools=["write_file"], prompt="Create calculator.py",
+                task_characteristics={"requires_filesystem_write": True}, config=config,
+                toolbox=toolbox)
+        self.assertEqual(result["status"], "Failed")
+        self.assertFalse(result["result"]["actions"][0]["success"])
+        self.assertFalse(result["result"]["actions"][0]["already_satisfied"])
+        self.assertEqual(result["workspace_changes"], 0)
+        self.assertFalse(any(
+            event.get("event", {}).get("event_type") == "task.auto_completed"
+            for event in self.events
+        ))
+
     def test_identical_policy_denial_is_intercepted_before_second_tool_execution(self):
         existing = self.workspace / "existing.py"
         existing.write_text("print('old')", encoding="utf-8")

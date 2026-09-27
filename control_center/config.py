@@ -35,7 +35,8 @@ TOOL_CATALOG = [
 DEFAULT_TOOLS = ["list_files", "read_file", "write_file", "edit_file", "search_code"]
 DEFAULT_CONFIG = {
     # Optional orchestration role. ``worker`` keeps the normal selector path;
-    # ``task_analyst`` marks the agent that may interpret prompts before planning.
+    # ``task_analyst`` is retained only for legacy config; production prompt
+    # interpretation is system-owned.
     "orchestration_role": "worker",
     "model": "qwen2.5-coder:7b",
     "endpoint": "http://127.0.0.1:11434",

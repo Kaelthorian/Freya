@@ -39,39 +39,43 @@ python -m control_center --max-parallel-tasks 4 --max-delegated-tasks 20
 If the total delegated-task limit is below the requested parallel value, the
 effective graph parallelism is clamped to that total limit.
 
-Structured planning uses local Ollama by default:
+The Planner and built-in Task Analyst use loopback Ollama with separate
+configuration:
 
 ```powershell
 python -m control_center --planner-model qwen2.5-coder:7b `
-  --planner-endpoint http://127.0.0.1:11434 --planner-timeout 120
+  --planner-endpoint http://127.0.0.1:11434 --planner-timeout 120 `
+  --task-analyst-model qwen2.5-coder:7b `
+  --task-analyst-endpoint http://127.0.0.1:11434 --task-analyst-timeout 120
 ```
 
-The planner endpoint must remain loopback-only. Use `--planner-offline` only
-when explicitly choosing the deterministic one-task fallback, such as an
-offline test environment. Provider errors fail planning and do not trigger the
-fallback.
+Both endpoints remain loopback-only. `--planner-offline` selects only the
+Planner's deterministic one-task mode; `--task-analyst-offline` separately
+selects the Task Analyst's deterministic intent fallback. Neither setting
+controls the other component.
 
-Before planning, production Freya uses `TaskSpecAnalyst` to build
-one canonical, versioned Task Spec from the user's request. An enabled agent
-with `config.orchestration_role=task_analyst` supplies the loopback model;
-without one, conservative deterministic analysis still runs. The Analyst
-has no tools and never assigns workers or capabilities. It records explicit,
-clarified and assumed requirements, asks only high-impact questions and
-leaves an ambiguous run in `NeedsClarification`. The user answers through
-`POST /api/orchestrations/{id}/clarifications`; the same run resumes and
-stores both question and answer. The runtime keeps question IDs across
-versions, assigns a new ID only for a new semantic field, and discards answered
-or optional model questions. `user_decisions` is a container, never a question
+Before planning, production Freya uses its built-in `TaskSpecAnalyst` to build
+one canonical, versioned Task Spec from the user's request. It is a system
+component independent of persisted agents and agent presets. It has no tools
+and never assigns workers or capabilities. It records explicit and clarified
+requirements, asks only high-impact questions and leaves an ambiguous run in
+`NeedsClarification`. It does not invent an implementation language, interface,
+assumption or extra behavior. After one bounded repair, its deterministic
+fallback preserves source-grounded deliverables and every recognized action
+without adding product scope. The user answers through
+`POST /api/orchestrations/{id}/clarifications`; the same run resumes and stores
+both question and answer. The runtime keeps question IDs across versions,
+assigns a new ID only for a new semantic field, and discards answered or
+optional model questions. `user_decisions` is a container, never a question
 field. Exact answer submission replays are idempotent. After three answer
 rounds, an unresolved material question fails with a cycle diagnostic rather
 than opening another clarification. A ready spec can be revised through
 `POST /api/orchestrations/{id}/revise-spec` only before a plan is persisted;
-the store fences late output from a planner using the previous version. `TaskSpecAnalyst` repairs one malformed
-model response, then falls back conservatively on technical failure. It sends
-Ollama the same closed JSON Schema documented in `task_spec.py` and normalizes
-only declared aliases and safe container/default differences before validation.
-Inspect `task_analysis.contract_invalid` and the `fallback_*` Task Analyst
-metrics to identify the exact field if a repair still fails.
+the store fences late output from a planner using the previous version.
+`TaskSpecAnalyst` repairs one invalid model response. It sends Ollama the closed
+JSON Schema documented in `task_spec.py`, then applies source-grounding checks
+before accepting the candidate. Inspect `task_analysis.contract_invalid` and
+the `fallback_*` metrics to identify the exact field if repair still fails.
 
 The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
 The catalog is rebuilt from `capabilities.py`, worker schemas exposed by
@@ -165,10 +169,10 @@ For filesystem-only tasks without Git or tests, the Worker may instead verify
 each modified file with an allowed `read_file` read-back; missing or mismatched
 read-back evidence remains blocked or failed.
 
-Task Analyst language policy applies in model, offline, no-analyst and deterministic
-fallback paths: standalone program creation defaults to Python 3.10+ when no
-language is named; code changes preserve the detected project stack. A language
-assumption clears only a language-only blocker, never unrelated missing inputs.
+The built-in Task Analyst leaves an unnamed programming language and interface
+unspecified. The Planner chooses implementation strategy from the ready Task
+Spec; a clarification is asked only when a missing decision changes the product
+rather than its implementation.
 
 For each non-accepted evaluation, `freya.evaluation.completed` includes the
 validated decision by criterion and a bounded summary of the exact task and
@@ -336,10 +340,11 @@ preconfigured pipeline agents are required.
 The agent editor uses progressive disclosure: identity fields stay visible for
 quick setup, while Skills, model, workspace, capabilities, tools, behavior,
 verification, autonomy, output, and limits are compact expandable sections. The
-API presets cover Programmer, Task Analyst, QA Tester and Code Auditor for
-manual/direct-task and legacy compatibility workflows. The Agents page keeps the
-existing Programmer quick-create action, but those presets are not prerequisites
-for modern dynamic orchestration.
+API presets cover Programmer, QA Tester and Code Auditor. The old Task Analyst
+JSON export is marked legacy and is not returned as a creatable preset; modern
+orchestration always uses the built-in system component. The Agents page keeps
+the existing Programmer quick-create action, and pipeline presets are not
+prerequisites for modern dynamic orchestration.
 
 The active Skills catalog contains only `freya-core`. The server archives older
 Skill rows on startup without deleting historical snapshots. Creation/import
@@ -443,10 +448,10 @@ evidence to make a regression pass. See [Integration proof contract](INTEGRATION
 ### Ollama calls
 
 Production chat requests stream through `control_center/transport.py`. Set
-`--planner-timeout`, `--evaluator-timeout`, `--recovery-timeout`, or
-`--integration-timeout` as inactivity limits; they do not replace the hard
-limits in `MODEL_PROFILES`. The Task Analyst reads its bounded agent setting,
-and the Worker also obeys its remaining task wall-clock budget. Adjust output
+`--planner-timeout`, `--task-analyst-timeout`, `--evaluator-timeout`,
+`--recovery-timeout`, or `--integration-timeout` as inactivity limits; they do
+not replace the hard limits in `MODEL_PROFILES`. The Worker also obeys its
+remaining task wall-clock budget. Adjust output
 and repair token caps together in `MODEL_PROFILES` when a validated response
 needs more room. The transport reconstructs the existing response shape for
 structured parsers and tool calls.

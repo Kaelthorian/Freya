@@ -41,11 +41,12 @@ coverage for model-declared executable global criteria. Invalid references or
 ambiguous substitutions fail before delegation. An Analyst AC ID or description
 used as a global-row placeholder is removed only when exact local text can
 resolve its references to the plan's authoritative criteria. It reports ID correction counts
-through orchestration events. `orchestrator.py` runs the Task Analyst first when
-an enabled agent has `config.orchestration_role=task_analyst` (with a legacy
-name/role fallback), then persists that snapshot before it selects and
-delegates to existing agents through `Runtime`; workers cannot create agents or
-bypass tool policy.
+through orchestration events. `orchestrator.py` runs the built-in `TaskSpecAnalyst`
+first and persists that snapshot before it selects and delegates to existing
+agents through `Runtime`; persisted agents and presets do not select or configure
+this system component. Its model, loopback endpoint, timeout and explicit offline
+fallback have independent `--task-analyst-*` CLI settings. Workers cannot create
+agents or bypass tool policy.
 
 `integration.py` owns the canonical global status/action matrix, strict result
 validation, one repair, and the narrow exact-check direct-proof decision.
@@ -102,9 +103,10 @@ archival event reports archival `Success` separately from the run's final
   conservatively asks when a model fails on an ambiguous request. Planner and
   workers consume only a deterministic rendering of the ready Task Spec; the
   original remains immutable audit evidence.
-- A program_creation request without a named language uses an explicit Python
-  3.10+ assumption. A code_change follows the existing project stack. Preserve
-  explicit languages and keep unrelated missing-input blockers fail-closed.
+- The Task Analyst must not infer implementation language or interface when the
+  user has not specified them. Ask only when the missing choice materially changes
+  the requested product; leave implementation choices to Planner. Preserve every
+  explicit and clarified requirement and keep unrelated blockers fail-closed.
 - Interactive plans append a dependent QA node with the registered
   `execution.python_script` capability. QA uses `freya-core`; keep Python
   execution on QA while implementation tasks receive

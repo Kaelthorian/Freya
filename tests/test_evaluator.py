@@ -84,6 +84,7 @@ class EvaluatorTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "accepted")
         self.assertTrue(outcome["deterministic"])
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_success")
         self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
         self.assertIn("exit_code=0", outcome["criteria"][0]["evidence"])
         self.assertEqual(model_calls, [])
@@ -182,6 +183,8 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "accepted")
         self.assertEqual(calls, [])
         self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+        self.assertTrue(outcome["deterministic"])
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_success")
 
     def test_offline_does_not_accept_inconsistent_unrequested_pass_flag(self):
         outcome = Evaluator(offline=True).evaluate(
@@ -238,15 +241,194 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "rejected")
         self.assertEqual(calls, [])
         self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertTrue(outcome["deterministic"])
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_failure")
 
     def test_missing_test_evidence_is_explicitly_blocked(self):
         evaluator = Evaluator(lambda prompt, context: self.fail("model must not be called"))
         outcome = evaluator.evaluate(
-            planned_task=planned(["All unit tests pass."]),
+            planned_task=planned(["All pytest tests pass."]),
             runtime_task=runtime(verification=None), execution_node=node(),
         )
         self.assertEqual(outcome["status"], "blocked")
-        self.assertEqual(outcome["missing_evidence"], ["All unit tests pass."])
+        self.assertEqual(outcome["missing_evidence"], [
+            "pytest execution/result for: All pytest tests pass.",
+        ])
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertEqual(outcome["metrics"]["decision_source"],
+                         "deterministic_missing_required_evidence")
+
+    def test_unavailable_verification_delegates_with_observed_runtime_facts(self):
+        criteria = [
+            "The project directory should be created.",
+            "The necessary files and folders should be initialized.",
+        ]
+        result = {
+            "actions": [{
+                "tool": "write_file", "success": True, "changed": True,
+                "output": "Wrote calculator-project/index.html",
+            }],
+            "artifacts": [{
+                "path": "calculator-project/index.html", "change_type": "created",
+            }],
+            "workspace_diffs": [{
+                "path": "calculator-project/index.html", "change_type": "created",
+            }],
+            "limitations": [],
+        }
+        runtime_task = runtime(result=result, verification={
+            "requested": True, "attempted": False, "passed": False,
+            "failed": False, "unavailable": True, "evidence": [],
+        })
+        bounded, _ = Evaluator._bounded_context(planned(criteria), runtime_task, node())
+        self.assertIsNone(Evaluator._hard_check(bounded, criteria))
+
+        calls = []
+
+        def model(prompt, context):
+            calls.append((prompt, context))
+            return decision(criteria)
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=planned(criteria), runtime_task=runtime_task,
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertFalse(outcome["deterministic"])
+        self.assertEqual(outcome["metrics"]["decision_source"], "llm_semantic")
+        prompt, model_context = calls[0]
+        self.assertIn("Absence of deterministic verification evidence is not by itself evidence", prompt)
+        self.assertIn("Do not infer that tests, builds, or commands passed", prompt)
+        self.assertTrue({"objective", "description", "success_criteria"} <=
+                        set(model_context["planned_task"]))
+        self.assertTrue({"status", "result", "error", "verification"} <=
+                        set(model_context["runtime_task"]))
+        visible_result = json.loads(model_context["runtime_task"]["result"])
+        self.assertEqual(visible_result["actions"], result["actions"])
+        self.assertEqual(visible_result["artifacts"], result["artifacts"])
+        self.assertEqual(visible_result["workspace_diffs"], result["workspace_diffs"])
+        self.assertEqual(visible_result["limitations"], [])
+
+    def test_nonpassing_verification_without_failure_delegates_to_model(self):
+        criteria = ["The public behavior matches the request."]
+        calls = []
+        outcome = Evaluator(
+            lambda prompt, context: (calls.append(context)
+                                     or decision(criteria, "needs_revision")),
+        ).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": False,
+                "failed": False, "unavailable": False, "evidence": [],
+            }),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "needs_revision")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertEqual(outcome["metrics"]["decision_source"], "llm_semantic")
+
+    def test_unrelated_positive_evidence_does_not_satisfy_required_pytest(self):
+        criteria = ["All pytest tests pass."]
+        evaluator = Evaluator(lambda prompt, context: self.fail("model must not be called"))
+        outcome = evaluator.evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": True,
+                "failed": False, "unavailable": False,
+                "evidence": [{
+                    "check": "filesystem:read_file:README.md", "status": "passed",
+                    "output": "README contents",
+                }],
+            }),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertIn("pytest execution/result", outcome["missing_evidence"][0])
+
+    def test_file_readback_does_not_replace_required_pytest_result(self):
+        criteria = ["The test file exists and all pytest tests pass."]
+        outcome = Evaluator(
+            lambda prompt, context: self.fail("model must not be called"),
+        ).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": True,
+                "failed": False, "unavailable": False,
+                "evidence": [{
+                    "check": "filesystem:read_file:test_file.py", "status": "passed",
+                    "output": "test source",
+                }],
+            }),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertIn("pytest execution/result", outcome["missing_evidence"][0])
+        self.assertEqual(outcome["metrics"]["decision_source"],
+                         "deterministic_missing_required_evidence")
+
+    def test_nonzero_controlled_test_exit_code_is_terminal_failure(self):
+        calls = []
+        outcome = Evaluator(
+            lambda prompt, context: (calls.append(context) or decision(["All pytest tests pass."]))
+        ).evaluate(
+            planned_task=planned(["All pytest tests pass."]),
+            runtime_task=runtime(verification={
+                "requested": True, "attempted": True, "passed": False,
+                "failed": False, "unavailable": False,
+                "evidence": [{
+                    "type": "command_execution", "check": "command_output:pytest",
+                    "status": "unknown", "tool": "run_command",
+                    "command": ["python", "-m", "pytest"], "exit_code": 1,
+                    "output": "one test failed",
+                }],
+            }),
+            execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "rejected")
+        self.assertEqual(calls, [])
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        self.assertEqual(outcome["metrics"]["decision_source"], "deterministic_failure")
+
+    def test_semantic_page_criteria_delegate_with_artifact_content(self):
+        criteria = [
+            "The generated page contains controls for addition, subtraction, multiplication and division.",
+        ]
+        html = (
+            "<button data-op='add'>Addition</button><button data-op='subtract'>Subtraction</button>"
+            "<button data-op='multiply'>Multiplication</button><button data-op='divide'>Division</button>"
+        )
+        result = {
+            "actions": [{"tool": "write_file", "success": True, "changed": True,
+                         "output": html}],
+            "artifacts": [{"path": "calculator-project/index.html", "change_type": "created",
+                           "content": html}],
+            "workspace_diffs": [{"path": "calculator-project/index.html", "change_type": "created",
+                                 "content": html}],
+            "limitations": [],
+        }
+        seen = []
+
+        def model(prompt, context):
+            seen.append(context)
+            visible_result = json.loads(context["runtime_task"]["result"])
+            for operation in ("addition", "subtraction", "multiplication", "division"):
+                self.assertIn(operation, visible_result["artifacts"][0]["content"].casefold())
+            return decision(criteria)
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=planned(criteria), runtime_task=runtime(result=result),
+            execution_node=node(),
+        )
+        self.assertIsNone(Evaluator._hard_check(
+            Evaluator._bounded_context(planned(criteria), runtime(result=result), node())[0], criteria,
+        ))
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertFalse(outcome["deterministic"])
+        self.assertEqual(len(seen), 1)
 
     def test_model_can_request_revision(self):
         criteria = ["The public behavior matches the request."]

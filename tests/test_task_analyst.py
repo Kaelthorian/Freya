@@ -4,6 +4,9 @@ import unittest
 from control_center.config import normalize_agent
 from control_center.agent_selector import AgentSelector
 from control_center.orchestrator import Orchestrator
+from control_center.task_spec import (
+    TASK_SPEC_RESPONSE_FORMAT, TaskSpecAnalyst, deterministic_task_spec,
+)
 from control_center.task_analyst import (
     OllamaTaskAnalyst,
     TaskAnalyst,
@@ -29,18 +32,6 @@ class AnalysisStore:
 
     def add_orchestration_event(self, _oid, event):
         self.events.append(event)
-
-
-class StubAnalysisAdapter:
-    def __init__(self):
-        self.metrics = {"model_calls": 1, "prompt_tokens": 12,
-                        "generated_tokens": 34, "total_tokens": 46,
-                        "duration_seconds": 0.01}
-        self.prompts = []
-
-    def analyze(self, prompt, agent):
-        self.prompts.append((prompt, agent["id"]))
-        return deterministic_task_analysis(prompt)
 
 
 class TaskAnalystTests(unittest.TestCase):
@@ -240,76 +231,83 @@ class TaskAnalystTests(unittest.TestCase):
         self.assertEqual(adapter.metrics["model_calls"], 2)
         self.assertEqual(len(responses), 0)
 
-    def test_orchestrator_runs_analysis_before_planning(self):
-        analyst = normalize_agent({
-            "name": "Interpreter", "config": {"orchestration_role": "task_analyst"},
-        })
-        analyst["id"] = "analyst-1"
-        store = AnalysisStore([analyst])
-        adapter = StubAnalysisAdapter()
-        orchestrator = Orchestrator(store, None, task_analyst=TaskAnalyst(adapter))
-        analysis, metrics = orchestrator._analyze_prompt("run-1", "Create a file")
-        self.assertEqual(adapter.prompts, [("Create a file", analyst["id"])])
-        self.assertEqual(analysis["analysis_version"], 3)
-        self.assertEqual(metrics["mode"], "model")
+    def test_orchestrator_runs_system_analysis_without_persisted_agents(self):
+        prompt = "Create a console calculator that adds two numbers."
+        basis = deterministic_task_spec(prompt)
+        candidate = {key: basis[key] for key in TASK_SPEC_RESPONSE_FORMAT["properties"]}
+        calls = []
+
+        def request(method, url, payload, timeout):
+            calls.append((url, payload, timeout))
+            return {"message": {"content": json.dumps(candidate)}}
+
+        store = AnalysisStore([])
+        store.list_agents = lambda: self.fail("system Task Analyst must not read agents")
+        analyst = TaskSpecAnalyst(model="fixture-model", request=request)
+        orchestrator = Orchestrator(store, None, task_analyst=analyst)
+        analysis, metrics = orchestrator._analyze_prompt("run-1", prompt)
+        self.assertTrue(analysis["ready_for_execution"])
+        self.assertEqual(analysis["analysis_version"], 1)
+        self.assertEqual(metrics["component"], "task_analyst")
+        self.assertTrue(metrics["system_component"])
+        self.assertEqual(metrics["model"], "fixture-model")
+        self.assertEqual(metrics["model_calls"], 1)
+        self.assertEqual(calls[0][0], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(calls[0][1]["model"], "fixture-model")
         self.assertEqual([event["event_type"] for event in store.events], [
             "freya.task_analysis.started", "freya.task_analysis.completed",
         ])
-        self.assertEqual(store.events[-1]["agent_id"], analyst["id"])
+        self.assertIsNone(store.events[-1]["agent_id"])
+        self.assertEqual(store.events[-1]["actor_type"], "task_analyst")
+        self.assertTrue(store.events[-1]["system_component"])
 
     def test_unreachable_ollama_keeps_task_analyst_fallback(self):
-        import socket
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        analyst = normalize_agent({
-            "name": "Analyst", "config": {
-                "orchestration_role": "task_analyst", "model": "fixture",
-                "endpoint": f"http://127.0.0.1:{port}",
-            },
-        })
-        analyst["id"] = "analyst-unreachable"
-        store = AnalysisStore([analyst])
-        orchestrator = Orchestrator(store, None,
-                                    task_analyst=TaskAnalyst(OllamaTaskAnalyst()))
+        def request(*_args, **_kwargs):
+            raise OSError("connection refused")
+
+        store = AnalysisStore([])
+        store.list_agents = lambda: self.fail("system Task Analyst must not read agents")
+        analyst = TaskSpecAnalyst(model="fixture-model", request=request)
+        orchestrator = Orchestrator(store, None, task_analyst=analyst)
         analysis, metrics = orchestrator._analyze_prompt("run-1", "Crea un hola mundo")
         self.assertTrue(analysis["ready_for_execution"])
         self.assertEqual(metrics["mode"], "deterministic_fallback")
         self.assertEqual(metrics["model_calls"], 1)
-        self.assertEqual(metrics["model_call_details"][0]["stop_reason"],
-                         "OLLAMA_UNREACHABLE")
+        self.assertTrue(metrics["fallback_used"])
+        self.assertTrue(metrics["fallback_reason"])
+        self.assertTrue(metrics["system_component"])
         self.assertEqual(store.events[-1]["analysis_mode"], "deterministic_fallback")
+        self.assertIsNone(store.events[-1]["agent_id"])
 
-    def test_deterministic_modes_apply_the_language_default(self):
+    def test_legacy_deterministic_analyst_keeps_compatibility_only(self):
         prompt = "Create a program that prints Hello World."
         offline_analyst = TaskAnalyst(offline=True)
-        analysis = offline_analyst.analyze(prompt, {})
-        self.assertTrue(analysis["ready_for_execution"])
-        self.assertIn("Programming language: Python 3.10+", analysis["operational_prompt"])
+        legacy = offline_analyst.analyze(prompt, {})
+        self.assertTrue(legacy["ready_for_execution"])
+        self.assertIn("Programming language: Python 3.10+", legacy["operational_prompt"])
         self.assertIn("assumptions", offline_analyst.metrics["corrected_fields"])
 
         store = AnalysisStore([])
-        orchestrator = Orchestrator(store, None)
-        no_agent_analysis, metrics = orchestrator._analyze_prompt("run-1", prompt)
-        self.assertIn("Programming language: Python 3.10+",
-                      no_agent_analysis["operational_prompt"])
-        self.assertIn("assumptions", metrics["corrected_fields"])
-        self.assertEqual(store.events[-1]["corrected_fields"], metrics["corrected_fields"])
+        store.list_agents = lambda: self.fail("system Task Analyst must not read agents")
+        orchestrator = Orchestrator(store, None, task_analyst=TaskSpecAnalyst(offline=True))
+        analysis, metrics = orchestrator._analyze_prompt("run-1", prompt)
+        self.assertTrue(analysis["ready_for_execution"])
+        self.assertEqual(analysis["task_spec"]["assumptions"], [])
+        self.assertNotIn("Python", analysis["operational_prompt"])
+        self.assertEqual(metrics["mode"], "deterministic_fallback")
+        self.assertEqual(metrics["model_calls"], 0)
+        self.assertTrue(metrics["system_component"])
+        self.assertIsNone(store.events[-1]["agent_id"])
 
     def test_orchestrator_blocks_planning_when_analysis_requires_input(self):
-        analyst = normalize_agent({
-            "name": "Interpreter", "config": {"orchestration_role": "task_analyst"},
-        })
-        analyst["id"] = "analyst-1"
-        store = AnalysisStore([analyst])
-        blocked = deterministic_task_analysis("Crea un hola mundo")
-        blocked["ready_for_execution"] = False
-        blocked["blocking_reason"] = "The user needs to specify the programming language."
-        orchestrator = Orchestrator(store, None)
-        with self.assertRaisesRegex(ValueError, "programming language"):
-            orchestrator._require_ready_analysis("run-1", blocked)
+        store = AnalysisStore([])
+        orchestrator = Orchestrator(store, None, task_analyst=TaskSpecAnalyst(offline=True))
+        analysis, _metrics = orchestrator._analyze_prompt("run-1", "Crea una calculadora")
+        with self.assertRaisesRegex(ValueError, "clarification"):
+            orchestrator._require_ready_analysis("run-1", analysis)
         self.assertEqual(store.events[-1]["event_type"], "freya.task_analysis.blocked")
-        self.assertEqual(store.events[-1]["blocking_reason"], blocked["blocking_reason"])
+        self.assertEqual(store.events[-1]["actor_type"], "task_analyst")
+        self.assertIsNone(store.events[-1]["agent_id"])
 
     def test_model_analysis_is_semantically_corrected_before_becoming_operational(self):
         flawed = deterministic_task_analysis("Create a file")

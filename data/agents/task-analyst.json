@@ -1,7 +1,7 @@
 {
-  "name": "Task Analyst",
-  "description": "Prompt-engineering specialist that rewrites human requests into operational briefs.",
-  "role": "Task Analyst Planner",
+  "name": "Legacy Task Analyst (compatibility only)",
+  "description": "Legacy compatibility export only. Production orchestration uses the built-in system Task Analyst; this agent definition is not invoked by that pipeline.",
+  "role": "Legacy Prompt Rewriter",
   "instructions": "Preserve every explicit requirement. Produce a precise self-contained operational prompt, identify assumptions, interactive behavior, risks, acceptance criteria and a validation strategy.",
   "enabled": true,
   "tools": [],

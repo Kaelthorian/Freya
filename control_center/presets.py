@@ -53,25 +53,6 @@ PROGRAMMER_PRESET: dict[str, Any] = {
     },
 }
 
-TASK_ANALYST_PRESET: dict[str, Any] = {
-    "name": "Task Analyst",
-    "description": "Prompt-engineering specialist that rewrites human requests into operational briefs.",
-    "role": "Task Analyst Planner",
-    "instructions": (
-        "Preserve every explicit requirement. Produce a precise self-contained operational prompt, "
-        "identify assumptions, interactive behavior, risks, acceptance criteria and a validation strategy."
-    ),
-    "skills": [],
-    "config": {
-        "permissions": "read_only", "orchestration_role": "task_analyst",
-        "capability_policy": _restricted_policy(set()),
-        "autonomy": copy.deepcopy(DEFAULT_AUTONOMY), "behavior": copy.deepcopy(DEFAULT_BEHAVIOR),
-        "identity": copy.deepcopy(DEFAULT_IDENTITY), "verification": copy.deepcopy(DEFAULT_VERIFICATION),
-        "output": copy.deepcopy(DEFAULT_OUTPUT), "max_steps": 1, "max_seconds": 120,
-        "max_tokens": 0, "max_model_calls": 1, "max_tool_calls": 0, "retries": 0,
-    },
-}
-
 QA_TESTER_PRESET: dict[str, Any] = {
     "name": "QA Tester",
     "description": "Independent behavioral tester for automated and interactive programs.",
@@ -123,7 +104,6 @@ CODE_AUDITOR_PRESET: dict[str, Any] = {
 
 AGENT_PRESETS: dict[str, dict[str, Any]] = {
     "programmer": PROGRAMMER_PRESET,
-    "task-analyst": TASK_ANALYST_PRESET,
     "qa-tester": QA_TESTER_PRESET,
     "code-auditor": CODE_AUDITOR_PRESET,
 }

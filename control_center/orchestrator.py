@@ -24,8 +24,6 @@ from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technica
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .runtime_resources import planner_resource_context
 from .skills import skill_summary
-from .task_analyst import (TaskAnalyst, reconciled_deterministic_task_analysis,
-                            select_task_analyst)
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
 from .task_spec import TaskSpecAnalyst, render_task_spec, validate_task_spec
 
@@ -42,7 +40,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                  recovery: RecoveryController | None = None,
                  replanner: Replanner | None = None,
                  failure_analyzer: FailureAnalyzer | None = None,
-                 task_analyst: TaskAnalyst | None = None,
+                 task_analyst: TaskSpecAnalyst | None = None,
                  global_verifier: GlobalVerifier | None = None,
                  integration_replanner: IntegrationReplanner | None = None,
                  result_integrator: ResultIntegrator | None = None,
@@ -123,6 +121,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 oid, field=field, value=value, user_message=user_message)
             spec = run["task_spec"]
             self.store.add_orchestration_event(oid, {
+                **self._task_analyst_identity(),
                 "event_type": "task_analysis.updated", "status": "Queued",
                 "spec_version": spec["version"], "task_spec": spec,
                 "revision_change": spec["revision_changes"][-1],
@@ -132,31 +131,47 @@ class Orchestrator(IntegrationOrchestrationMixin):
                          name="freya-spec-revision").start()
         return run
 
-    def _analyze_task_spec(self, oid: str, run: dict, answers: dict[str, str]) -> tuple[dict, dict]:
-        analyst_agent = select_task_analyst(self.store.list_agents())
-        analyzer = self.task_analyst if hasattr(self.task_analyst, "analyze_spec") else TaskSpecAnalyst(offline=True)
+    def _task_spec_analyst(self) -> TaskSpecAnalyst:
+        analyzer = self.task_analyst
+        if analyzer is not None and hasattr(analyzer, "analyze_spec"):
+            return analyzer
+        return TaskSpecAnalyst()
+
+    @staticmethod
+    def _task_analyst_identity() -> dict:
+        return {
+            "agent_id": None,
+            "actor_type": "task_analyst",
+            "actor_name": "Task Analyst",
+            "actor_role": "Task Analyst",
+            "system_component": True,
+        }
+
+    def _analyze_task_spec(self, oid: str, run: dict,
+                           answers: dict[str, str]) -> tuple[dict, dict]:
+        analyzer = self._task_spec_analyst()
         previous = run.get("task_spec")
+        identity = self._task_analyst_identity()
         self.store.add_orchestration_event(oid, {
+            **identity,
             "event_type": "task_analysis.started", "status": "Analyzing",
             "analysis_version": 1, "spec_version": previous["version"] if previous else 0,
-            "agent_id": analyst_agent["id"] if analyst_agent else None,
-            "message": "Task Analyst is updating the canonical user intent.",
+            "message": "The built-in Task Analyst is updating canonical user intent.",
         })
         try:
-            spec = analyzer.analyze_spec(run["prompt"], analyst_agent, previous, answers)
+            spec = analyzer.analyze_spec(run["prompt"], previous=previous, answers=answers)
         finally:
             for diagnostic_event in getattr(analyzer, "diagnostic_events", []) or []:
                 self.store.add_orchestration_event(oid, {
-                    **diagnostic_event,
-                    "agent_id": analyst_agent.get("id") if analyst_agent else None,
-                    "agent_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
-                    "actor_name": analyst_agent.get("name", "Task Analyst") if analyst_agent else "Task Analyst",
-                    "actor_role": analyst_agent.get("role") if analyst_agent else "Task Analyst",
+                    **identity, **diagnostic_event,
                 })
         spec = validate_task_spec(spec)
         if spec["status"] == "ANALYZING":
             raise ValueError("Task Analyst did not resolve the analysis state.")
         metrics = dict(getattr(analyzer, "metrics", {}) or {})
+        metrics.setdefault("component", "task_analyst")
+        metrics.setdefault("system_component", True)
+        metrics.setdefault("model_calls", 0)
         return spec, metrics
 
     def _workspace_for_run(self, run: dict) -> str | None:
@@ -534,59 +549,63 @@ class Orchestrator(IntegrationOrchestrationMixin):
         return archived
 
     def _analyze_prompt(self, oid: str, prompt: str) -> tuple[dict | None, dict]:
-        """Rewrite the human prompt once before any downstream planning."""
-        analyst = select_task_analyst(self.store.list_agents())
-        if analyst is None:
-            analysis, corrections = reconciled_deterministic_task_analysis(prompt)
-            metrics = {
-                "mode": "deterministic_no_agent", "model_calls": 0,
-                "corrected_fields": corrections,
+        """Legacy planner adapter over the built-in canonical Task Analyst."""
+        identity = self._task_analyst_identity()
+        with self.lock:
+            if self.store.get_orchestration(oid)["status"] != "Planning":
+                return None, {"mode": "cancelled", "model_calls": 0,
+                              "component": "task_analyst", "system_component": True}
+            self.store.add_orchestration_event(oid, {
+                **identity,
+                "event_type": "freya.task_analysis.started", "status": "Planning",
+                "message": "The built-in Task Analyst is structuring the human request.",
+            })
+        analyzer = self._task_spec_analyst()
+        try:
+            spec = validate_task_spec(analyzer.analyze_spec(prompt))
+            ready = spec["status"] == "READY_FOR_PLANNING"
+            analysis = {
+                "analysis_version": 1,
+                "task_spec": spec,
+                "objective": spec["objective"],
+                "requirements": spec["requirements"],
+                "assumptions": spec["assumptions"],
+                "operational_prompt": render_task_spec(spec) if ready else "",
+                "ready_for_execution": ready,
+                "blocking_reason": None if ready else (
+                    "Task Spec requires clarification: " + "; ".join(
+                        item["question"] for item in spec["clarification_questions"]
+                    )
+                ),
             }
+            metrics = dict(getattr(analyzer, "metrics", {}) or {})
+            metrics.setdefault("component", "task_analyst")
+            metrics.setdefault("system_component", True)
+            metrics.setdefault("model_calls", 0)
+        except Exception as exc:
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] == "Planning":
                     self.store.add_orchestration_event(oid, {
-                        "event_type": "freya.task_analysis.completed", "status": "Planning",
-                        "agent_name": "Freya deterministic Task Analyst",
-                        "analysis_version": analysis.get("analysis_version", 3),
-                        "analysis_mode": "deterministic_no_agent",
-                        "metrics": metrics,
-                        "task_analysis": analysis,
-                        "corrected_fields": corrections,
-                        "message": "No enabled Task Analyst was configured; Freya produced a deterministic operational brief.",
+                        **identity,
+                        "event_type": "freya.task_analysis.failed", "status": "Failed",
+                        "message": "Built-in Task Analyst failed: " + sanitize(str(exc))[:1000],
                     })
-            return analysis, metrics
-        with self.lock:
-            if self.store.get_orchestration(oid)["status"] != "Planning":
-                return None, {"mode": "cancelled", "model_calls": 0}
-            self.store.add_orchestration_event(oid, {
-                "event_type": "freya.task_analysis.started", "status": "Planning",
-                "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
-                "message": "Task Analyst is rewriting the human prompt into the operational task brief.",
-            })
-        try:
-            analyzer = self.task_analyst or TaskAnalyst(offline=True)
-            analysis = analyzer.analyze(prompt, analyst)
-            metrics = dict(getattr(analyzer, "metrics", {}) or {})
-            mode = str(metrics.get("mode") or "model")
-        except Exception as exc:
-            analysis, corrections = reconciled_deterministic_task_analysis(prompt)
-            metrics = dict(getattr(self.task_analyst, "metrics", {}) or {})
-            metrics["fallback_error"] = sanitize(str(exc))[:1000]
-            metrics["mode"] = "deterministic_fallback"
-            metrics["corrected_fields"] = corrections
-            mode = "deterministic_fallback"
+            raise
+        finally:
+            for diagnostic_event in getattr(analyzer, "diagnostic_events", []) or []:
+                self.store.add_orchestration_event(oid, {
+                    **identity, **diagnostic_event,
+                })
         with self.lock:
             if self.store.get_orchestration(oid)["status"] == "Planning":
                 self.store.add_orchestration_event(oid, {
+                    **identity,
                     "event_type": "freya.task_analysis.completed", "status": "Planning",
-                    "agent_id": analyst["id"], "agent_name": analyst.get("name", "Task Analyst"),
-                    "analysis_version": analysis.get("analysis_version", 3),
-                    # This is a bounded operational interpretation, not
-                    # hidden chain-of-thought. Keep the key explicit so the
-                    # persistence sanitizer does not remove it.
-                    "analysis_mode": mode, "metrics": metrics, "task_analysis": analysis,
-                    "corrected_fields": metrics.get("corrected_fields", []),
-                    "message": "Task Analyst produced the operational prompt used by the planner and workers.",
+                    "analysis_version": analysis["analysis_version"],
+                    "analysis_mode": metrics.get("mode", "llm"),
+                    "metrics": metrics,
+                    "task_analysis": analysis,
+                    "message": "The built-in Task Analyst produced the legacy planning summary.",
                 })
         return analysis, metrics
 
@@ -601,6 +620,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         with self.lock:
             if self.store.get_orchestration(oid)["status"] == "Planning":
                 self.store.add_orchestration_event(oid, {
+                    **self._task_analyst_identity(),
                     "event_type": "freya.task_analysis.blocked", "status": "Failed",
                     "blocking_reason": reason,
                     "message": message,
@@ -1717,8 +1737,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         # The injected legacy decision callback retains its historical test API.
         if self.decide is not None:
             return self._run_legacy(oid)
-        if (self.task_analyst is None or not hasattr(self.task_analyst, "analyze_spec")
-                or not hasattr(self.planner, "create_plan_for_spec")):
+        if not hasattr(self.planner, "create_plan_for_spec"):
             return self._run_with_legacy_analysis(oid)
         started = self.clock()
         deadline = started + float(self.config["max_wallclock_seconds"])
@@ -1743,6 +1762,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     if self.store.get_orchestration(oid)["status"] != "Planning":
                         return
                     self.store.add_orchestration_event(oid, {
+                        **self._task_analyst_identity(),
                         "event_type": "task_analysis.ready", "status": "Planning",
                         "spec_version": spec["version"],
                         "readiness_reason": spec["readiness_reason"],
@@ -1762,6 +1782,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     if updated is None:
                         return
                     self.store.add_orchestration_event(oid, {
+                        **self._task_analyst_identity(),
                         "event_type": "task_analysis.updated", "status": updated["status"],
                         "analysis_version": 1, "spec_version": spec["version"],
                         "task_spec": spec, "metrics": analysis_metrics,
@@ -1772,6 +1793,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     })
                     if spec["status"] == "NEEDS_CLARIFICATION":
                         self.store.add_orchestration_event(oid, {
+                            **self._task_analyst_identity(),
                             "event_type": "task_analysis.clarification_required",
                             "status": "NeedsClarification", "spec_version": spec["version"],
                             "questions": spec["clarification_questions"],
@@ -1779,6 +1801,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         })
                         return
                     self.store.add_orchestration_event(oid, {
+                        **self._task_analyst_identity(),
                         "event_type": "task_analysis.ready", "status": "Planning",
                         "spec_version": spec["version"], "readiness_reason": spec["readiness_reason"],
                         "message": "Task Spec is ready for planning.",

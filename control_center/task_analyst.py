@@ -1,9 +1,8 @@
-"""Prompt rewriting before structured orchestration planning.
+"""Legacy version-3 prompt-rewriting compatibility helpers.
 
-The Task Analyst receives the original user prompt, has no tools or workspace
-authority, and returns a bounded operational brief.  That brief replaces the
-human prompt for planning and delegation while the original remains persisted
-as audit evidence. Capability policy remains the only authority for execution.
+Production orchestration uses the built-in canonical `TaskSpecAnalyst` from
+`task_spec.py`; these adapters remain available only for explicit compatibility
+callers and are not selected from persisted agents by the orchestrator.
 """
 from __future__ import annotations
 
@@ -351,6 +350,7 @@ def is_task_analyst(agent: dict[str, Any]) -> bool:
 
 
 def select_task_analyst(agents: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """Legacy version-3 selector; production orchestration never calls it."""
     candidates = [agent for agent in agents if is_task_analyst(agent)]
     if not candidates:
         return None

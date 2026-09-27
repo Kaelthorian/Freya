@@ -8,7 +8,7 @@ bounded task runtime and workspace-scoped programming tools.
 ```text
 .
 ├── control_center/           web API, scheduler, workers, tools and SQLite
-│   ├── __main__.py           Planner/Evaluator/Recovery/Integration configuration and server lock
+│   ├── __main__.py           system Task Analyst and Planner/Evaluator/Recovery/Integration configuration
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── task_spec.py          canonical intent, clarification questions, revisions and deterministic rendering
@@ -39,7 +39,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── policy.py             policy schema, legacy migration and engine
 │   ├── skills.py             freya-core definition, tool validation and context rendering
 │   ├── agent_context.py      structured agent defaults, effective config and policy/tool-aware worker context
-│   ├── presets.py            manual/legacy Programmer, Task Analyst, QA Tester and Code Auditor presets
+│   ├── presets.py            creatable Programmer, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
 │   ├── index.html / styles.css
@@ -50,14 +50,16 @@ bounded task runtime and workspace-scoped programming tools.
 ├── tests/                    API, storage, runtime, activity, transport, policy, Skill and tool tests
 ├── sandbox/Dockerfile        local Python, pytest, Ruff and Git sandbox image
 ├── data/
-│   ├── agents/              versioned, importable pipeline-agent definitions
+│   ├── agents/              versioned pipeline-agent presets and legacy Task Analyst export
 │   └── (runtime files)      ignored databases, logs, locks and workspaces
 └── docs/                     architecture, API and operating instructions
 ```
 
-Only `data/agents/*.json` is versioned. These files contain shareable agent
-configuration without runtime IDs, task history, prompts, metrics or secrets
-and can be imported from the Agents page. All other `data/` content is generated
+Only `data/agents/*.json` is versioned. The Programmer, QA Tester and Code
+Auditor files are shareable agent presets; `task-analyst.json` is retained only
+as a marked legacy compatibility export and is not offered as a creatable preset.
+These files contain no runtime IDs, task history, prompts, metrics or secrets.
+All other `data/` content is generated
 and ignored by Git. User-selected workspaces can live anywhere accessible to the
 local server and are never treated as source files merely because an agent
 selects them.
@@ -67,7 +69,9 @@ selects them.
 1. `frontend/` calls `control_center/http.py`, which applies same-origin and
    loopback Host checks before dispatching to `api.py`.
 2. `api.py` validates agents and receives task requests. Production
-   `orchestrator.py` asks `task_spec.py` to derive a canonical Task Spec.
+   `orchestrator.py` runs the built-in, independently configured Task Analyst
+   in `task_spec.py` to derive a canonical Task Spec; no persisted agent or
+   preset participates in this stage.
    High-impact gaps persist `NeedsClarification` questions and pause the
    same run; `POST /orchestrations/{id}/clarifications` stores answers and
    resumes analysis. `task_spec.py` reduces proposed questions against answered

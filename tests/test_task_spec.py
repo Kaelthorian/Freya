@@ -16,7 +16,8 @@ from control_center.runtime_resources import RuntimeResourceCatalog, Unsupported
 from control_center.storage import Store
 from control_center.task_spec import (
     TASK_SPEC_RESPONSE_FORMAT, TaskSpecAnalyst, TaskSpecError, deterministic_task_spec,
-    render_task_spec, revise_ready_task_spec, validate_task_spec,
+    normalize_task_spec_candidate, render_task_spec, revise_ready_task_spec,
+    validate_task_spec,
 )
 
 
@@ -114,7 +115,7 @@ class TaskSpecTests(unittest.TestCase):
 
     def test_reported_extra_features_loop_resolves_no_once(self):
         prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
-        basis = deterministic_task_spec("crea una calculadora web que sume")
+        basis = deterministic_task_spec(prompt)
         previous = validate_task_spec({**basis, "source_prompt": prompt, "version": 2,
             "status": "NEEDS_CLARIFICATION", "user_decisions": {"platform": "Web"},
             "clarification_history": [{"question_id": "CQ-1", "field": "platform",
@@ -122,7 +123,8 @@ class TaskSpecTests(unittest.TestCase):
             "clarification_questions": [{"id": "CQ-2", "field": "additional_features",
                  "question": "Do you want any additional features?",
                  "reason": "Possible extras.", "required": True}]})
-        candidate = _analyst_response(basis)
+        candidate = _analyst_response(deterministic_task_spec(
+            prompt, previous, {"CQ-2": "No"}))
         candidate.update(status="NEEDS_CLARIFICATION", clarification_questions=[
             {"field": "additional_features", "question": "Would you like any extra functionality?",
              "reason": "Possible extras.", "required": True},
@@ -178,11 +180,11 @@ class TaskSpecTests(unittest.TestCase):
             deterministic_task_spec("haz una web para gestionar alumnos")["status"],
             "READY_FOR_PLANNING")
 
-    def test_console_program_without_language_records_python_default(self):
+    def test_console_program_without_language_does_not_assume_a_language(self):
         spec = deterministic_task_spec("crea una calculadora de consola que sume")
         self.assertEqual(spec["status"], "READY_FOR_PLANNING")
-        self.assertTrue(any("Python 3.10+" in item["description"]
-                            for item in spec["assumptions"]))
+        self.assertEqual(spec["assumptions"], [])
+        self.assertNotIn("Python", spec["objective"])
 
     def test_explicit_language_beats_python_default(self):
         spec = deterministic_task_spec("crea una calculadora de consola en JavaScript que sume")
@@ -191,12 +193,12 @@ class TaskSpecTests(unittest.TestCase):
         self.assertFalse(any("Python 3.10+" in item["description"]
                              for item in spec["assumptions"]))
 
-    def test_named_python_script_uses_safe_default(self):
+    def test_named_python_script_does_not_assume_a_console_interface(self):
         spec = deterministic_task_spec("crea calculator.py en Python que sume dos números")
-        self.assertEqual(spec["status"], "READY_FOR_PLANNING")
-        self.assertEqual(spec["clarification_questions"], [])
-        self.assertTrue(any("consola" in item["description"].casefold()
-                            for item in spec["assumptions"]))
+        self.assertEqual(spec["status"], "NEEDS_CLARIFICATION")
+        self.assertEqual([item["field"] for item in spec["clarification_questions"]],
+                         ["interface"])
+        self.assertEqual(spec["assumptions"], [])
 
     def test_user_revision_is_versioned_and_traced(self):
         spec = deterministic_task_spec("crea una calculadora de consola en Python que sume")
@@ -271,6 +273,204 @@ class TaskSpecTests(unittest.TestCase):
         self.assertEqual(analyst.metrics["total_tokens"], 20)
         self.assertEqual(len(calls), 1)
 
+    def test_builtin_task_analyst_uses_its_own_model_without_an_agent_argument(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        floor = deterministic_task_spec(prompt)
+        calls = []
+
+        def request(method, url, payload, timeout):
+            calls.append((url, payload, timeout))
+            return {"message": {"content": json.dumps(_analyst_response(floor), ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(request=request)
+        spec = analyst.analyze_spec(prompt)
+        self.assertEqual(analyst.model, "qwen2.5-coder:7b")
+        self.assertEqual(calls[0][0], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(calls[0][1]["model"], "qwen2.5-coder:7b")
+        self.assertEqual(calls[0][1]["options"]["num_ctx"], 8192)
+        self.assertEqual(calls[0][2], 120.0)
+        self.assertEqual(analyst.metrics["component"], "task_analyst")
+        self.assertEqual(analyst.metrics["mode"], "llm")
+        self.assertEqual(analyst.metrics["model_calls"], 1)
+        self.assertTrue(analyst.metrics["system_component"])
+        self.assertIn("SCOPE PRESERVATION", calls[0][1]["messages"][0]["content"])
+        self.assertEqual([item["description"] for item in spec["requirements"]],
+                         ["sume", "reste", "multiplique", "divida"])
+        self.assertEqual(spec["clarification_questions"][0]["field"], "interface")
+        self.assertEqual(spec["assumptions"], [])
+
+    def test_scope_guard_repairs_once_then_falls_back_without_losing_actions(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        invalid = _analyst_response(deterministic_task_spec(prompt))
+        invalid["requirements"] = invalid["requirements"][:1]
+        calls = []
+
+        def request(method, url, payload, timeout):
+            calls.append(payload)
+            return {"message": {"content": json.dumps(invalid, ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        spec = analyst.analyze_spec(prompt)
+        requirements = " ".join(item["description"] for item in spec["requirements"])
+        for verb in ("sume", "reste", "multiplique", "divida"):
+            self.assertIn(verb, requirements)
+        self.assertEqual(analyst.metrics["model_calls"], 2)
+        self.assertEqual(analyst.metrics["mode"], "deterministic_fallback")
+        self.assertEqual(analyst.metrics["initial_validation_error"]["error_type"],
+                         "lost_explicit_requirement")
+
+    def test_scope_guard_rejects_unrequested_product_features(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        invalid = _analyst_response(deterministic_task_spec(prompt))
+        invalid["requirements"].append({
+            "description": "Responsive design",
+            "source": "explicit",
+        })
+        calls = []
+
+        def request(method, url, payload, timeout):
+            calls.append(payload)
+            return {"message": {"content": json.dumps(invalid, ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        spec = analyst.analyze_spec(prompt)
+        self.assertTrue(analyst.metrics["fallback_used"])
+        self.assertEqual(analyst.metrics["initial_validation_error"]["error_type"],
+                         "unsupported_scope")
+        self.assertNotIn("responsive", json.dumps(spec, ensure_ascii=False).casefold())
+        self.assertEqual(analyst.metrics["model_calls"], 2)
+
+    def test_assumption_conflicting_with_pending_interface_question_is_rejected(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        invalid = _analyst_response(deterministic_task_spec(prompt))
+        invalid["assumptions"] = [{
+            "description": "Use a CLI interface",
+            "reason": "This is a typical calculator default.",
+        }]
+
+        def request(method, url, payload, timeout):
+            return {"message": {"content": json.dumps(invalid, ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        spec = analyst.analyze_spec(prompt)
+        self.assertTrue(analyst.metrics["fallback_used"])
+        self.assertEqual(analyst.metrics["initial_validation_error"]["error_type"],
+                         "assumption_question_conflict")
+        self.assertEqual(spec["assumptions"], [])
+        self.assertEqual([item["field"] for item in spec["clarification_questions"]],
+                         ["interface"])
+
+    def test_semantically_duplicate_interface_questions_collapse(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        candidate = _analyst_response(deterministic_task_spec(prompt))
+        candidate["status"] = "NEEDS_CLARIFICATION"
+        candidate["clarification_questions"].append({
+            "question": "Do you want CLI or GUI?",
+            "reason": "Choose a user interface.",
+            "field": "platform",
+            "required": True,
+        })
+
+        def request(method, url, payload, timeout):
+            return {"message": {"content": json.dumps(candidate, ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        spec = analyst.analyze_spec(prompt)
+        self.assertEqual(analyst.metrics["model_calls"], 1)
+        self.assertFalse(analyst.metrics["fallback_used"])
+        self.assertEqual(len(spec["clarification_questions"]), 1)
+        self.assertEqual(spec["clarification_questions"][0]["field"], "interface")
+
+    def test_clarification_web_preserves_actions_and_marks_source_clarified(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        first = deterministic_task_spec(prompt)
+        second = deterministic_task_spec(prompt, first, {"CQ-1": "web"})
+        responses = [_analyst_response(first), _analyst_response(second)]
+
+        def request(method, url, payload, timeout):
+            return {"message": {"content": json.dumps(responses.pop(0), ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        pending = analyst.analyze_spec(prompt)
+        ready = analyst.analyze_spec(prompt, previous=pending, answers={"CQ-1": "web"})
+        requirements = " ".join(item["description"] for item in ready["requirements"])
+        for verb in ("sume", "reste", "multiplique", "divida"):
+            self.assertIn(verb, requirements)
+        self.assertEqual(ready["status"], "READY_FOR_PLANNING")
+        self.assertEqual(ready["user_decisions"]["interface"], "web")
+        self.assertTrue(any(item["description"] == "interfaz web"
+                            and item["source"] == "clarified"
+                            for item in ready["constraints"]))
+        self.assertEqual(ready["clarification_questions"], [])
+        self.assertEqual(analyst.metrics["model_calls"], 1)
+
+    def test_generic_coordinated_actions_are_preserved_without_added_scope(self):
+        prompt = "Crea una herramienta que importe CSV, filtre filas y exporte JSON."
+        candidate = _analyst_response(deterministic_task_spec(prompt))
+
+        def request(method, url, payload, timeout):
+            return {"message": {"content": json.dumps(candidate, ensure_ascii=False)}}
+
+        analyst = TaskSpecAnalyst(model="scope-test", request=request)
+        spec = analyst.analyze_spec(prompt)
+        requirements = " ".join(item["description"] for item in spec["requirements"]).casefold()
+        for phrase in ("importe csv", "filtre filas", "exporte json"):
+            self.assertIn(phrase, requirements)
+        self.assertEqual(spec["status"], "READY_FOR_PLANNING")
+        self.assertEqual(spec["assumptions"], [])
+        self.assertFalse(any(item in json.dumps(spec, ensure_ascii=False).casefold()
+                             for item in ("database", "gui", "api", "cloud", "security", "testing")))
+
+    def test_system_task_analyst_is_independent_of_agent_records(self):
+        prompt = "Crea una calculadora que sume reste multiplique y divida"
+        floor = deterministic_task_spec(prompt)
+        scenarios = [
+            ("fresh database without agents", []),
+            ("deleted preset", []),
+            ("disabled legacy agent", [{
+                "name": "Disabled Analyst", "enabled": False,
+                "config": {"orchestration_role": "task_analyst", "model": "agent-model"},
+            }]),
+            ("user-created agent with the same name", [{
+                "name": "Task Analyst", "role": "Worker",
+                "config": {"orchestration_role": "worker", "model": "agent-model"},
+            }]),
+        ]
+        for label, agents in scenarios:
+            with self.subTest(scenario=label), TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "state.sqlite3")
+                for agent in agents:
+                    store.create_agent(normalize_agent(agent))
+                run = store.create_orchestration(prompt)
+                store.list_agents = lambda: self.fail("Task Analyst must not query persisted agents")
+                calls = []
+
+                def request(method, url, payload, timeout):
+                    calls.append(payload)
+                    return {"message": {"content": json.dumps(
+                        _analyst_response(floor), ensure_ascii=False)}}
+
+                analyst = TaskSpecAnalyst(model="system-model", request=request)
+                orchestrator = Orchestrator(
+                    store, None, planner=Planner(offline=True), task_analyst=analyst,
+                )
+                spec, metrics = orchestrator._analyze_task_spec(run["id"], run, {})
+                self.assertEqual(spec["status"], "NEEDS_CLARIFICATION")
+                self.assertEqual(metrics["component"], "task_analyst")
+                self.assertEqual(metrics["mode"], "llm")
+                self.assertEqual(metrics["model"], "system-model")
+                self.assertEqual(metrics["model_calls"], 1)
+                self.assertTrue(metrics["system_component"])
+                self.assertEqual(calls[0]["model"], "system-model")
+                started = store.get_orchestration(run["id"])["events"][0]
+                payload = json.loads(started["payload_json"])
+                self.assertIsNone(payload["agent_id"])
+                self.assertEqual(payload["actor_type"], "task_analyst")
+                self.assertEqual(payload["actor_name"], "Task Analyst")
+                self.assertEqual(payload["actor_role"], "Task Analyst")
+                self.assertTrue(payload["system_component"])
+
+
     def test_enum_case_alias_null_containers_and_question_ids_normalize_without_repair(self):
         valid = _analyst_response(deterministic_task_spec("haz una calculadora"),
                                   status="needs_clarification")
@@ -303,28 +503,17 @@ class TaskSpecTests(unittest.TestCase):
                             for event in analyst.diagnostic_events))
 
     def test_source_alias_is_explicit_and_normalizes_to_assumed(self):
-        valid = _analyst_response(deterministic_task_spec(
+        candidate = _analyst_response(deterministic_task_spec(
             "crea una calculadora de consola en Python que sume"))
-        valid["requirements"][0]["source"] = " INFERRED "
-        calls = []
-
-        def request(method, url, payload, timeout):
-            calls.append(payload)
-            return {"message": {"content": json.dumps(valid)}}
-
-        analyst = TaskSpecAnalyst(request=request)
-        result = analyst.analyze_spec(
-            "crea una calculadora de consola en Python que sume",
-            {"config": {"model": "test-model", "endpoint": "http://127.0.0.1:11434"}},
-        )
-        self.assertEqual(result["requirements"][0]["source"], "assumed")
-        self.assertEqual(analyst.metrics["model_calls"], 1)
-        self.assertFalse(analyst.metrics["repair_attempted"])
+        candidate["requirements"][0]["source"] = " INFERRED "
+        normalized, changes = normalize_task_spec_candidate(candidate)
+        self.assertEqual(normalized["requirements"][0]["source"], "assumed")
+        self.assertIn("requirements[0].source:enum_case_or_alias", changes)
 
     def test_two_invalid_outputs_use_fallback_with_exact_field_diagnostics(self):
         invalid = _analyst_response(deterministic_task_spec(
             "crea una calculadora de consola en Python que sume"))
-        invalid["requirements"] = []
+        invalid["requirements"][0]["source"] = "assumed"
         calls = []
 
         def request(method, url, payload, timeout):
@@ -353,7 +542,7 @@ class TaskSpecTests(unittest.TestCase):
     def test_orchestrator_persists_task_analyst_contract_events(self):
         invalid = _analyst_response(deterministic_task_spec(
             "crea una calculadora de consola en Python que sume"))
-        invalid["requirements"] = []
+        invalid["requirements"][0]["source"] = "assumed"
 
         def request(method, url, payload, timeout):
             return {"message": {"content": json.dumps(invalid)}}
@@ -416,8 +605,7 @@ class TaskSpecTests(unittest.TestCase):
         ]
         for prompt, expected, questions_expected in cases:
             with self.subTest(prompt=prompt):
-                candidate = _analyst_response(deterministic_task_spec(
-                    "crea una calculadora de consola en Python que sume dos números"))
+                candidate = _analyst_response(deterministic_task_spec(prompt))
 
                 def request(method, url, payload, timeout):
                     return {"message": {"content": json.dumps(candidate)}}
@@ -634,7 +822,7 @@ class TaskSpecTests(unittest.TestCase):
         self.assertEqual(qa["success_criteria"], [
             "The bounded command outputs '8' and exits successfully."])
         behavior_id = next(item["id"] for item in result["criterion_links"]["global"]
-                           if "La calculadora produce" in item["criterion"])
+                           if "prints 8" in item["criterion"])
         qa_link = next(item for item in result["criterion_links"]["local"]
                        if item["task_id"] == qa["id"])
         self.assertIn(behavior_id, qa_link["supports_global_criteria"])
@@ -747,8 +935,7 @@ class TaskSpecTests(unittest.TestCase):
 class ClarificationIntegrationTests(unittest.TestCase):
     def test_model_calculator_web_answer_discards_extra_features_and_plans_once(self):
         prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
-        ready_basis = deterministic_task_spec(
-            "crea una calculadora web que pueda sumar restar multiplicar y dividir")
+        ready_basis = deterministic_task_spec(prompt)
         calls = []
         def request(method, url, payload, timeout):
             calls.append(payload)
@@ -779,6 +966,14 @@ class ClarificationIntegrationTests(unittest.TestCase):
             store.record_clarification_answers(run["id"], {"CQ-1": "Web"})
             orchestrator._run(run["id"], {"CQ-1": "Web"})
             final = store.get_orchestration(run["id"])
+            analyst_events = [event for event in final["events"]
+                              if event["event_type"].startswith(
+                                  ("task_analysis.", "freya.task_analysis.")
+                              )]
+            for event in analyst_events:
+                payload = json.loads(event["payload_json"])
+                self.assertTrue(payload["system_component"])
+                self.assertIsNone(payload["agent_id"])
             self.assertEqual(final["task_spec"]["status"], "READY_FOR_PLANNING")
             self.assertEqual(final["task_spec"]["user_decisions"]["interface"], "Web")
             self.assertEqual(len(final["task_spec"]["clarification_history"]), 1)
@@ -793,7 +988,7 @@ class ClarificationIntegrationTests(unittest.TestCase):
 
     def test_legitimate_second_question_gets_cq2_and_old_answer_replay_is_idempotent(self):
         prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
-        basis = deterministic_task_spec("crea una calculadora web que sume")
+        basis = deterministic_task_spec(prompt)
         calls = []
         def request(method, url, payload, timeout):
             calls.append(payload)
@@ -843,7 +1038,7 @@ class ClarificationIntegrationTests(unittest.TestCase):
 
     def test_clarification_cycle_fails_after_three_rounds_with_event(self):
         prompt = "Hace una calculadora que pueda sumar restar multiplicar y dividir"
-        basis = deterministic_task_spec("crea una calculadora web que sume")
+        basis = deterministic_task_spec(prompt)
         fields = ["interface", "precision_mode", "data_mode", "deployment_region"]
         def request(method, url, payload, timeout):
             previous = json.loads(payload["messages"][1]["content"])["previous_task_spec"]

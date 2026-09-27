@@ -2,8 +2,10 @@
 
 Freya includes a first-class orchestration layer. New production runs enter
 `control_center/orchestrator.py` and pass through the tool-free
-`control_center/task_spec.py` Task Analyst. It records one versioned
-`CanonicalTaskSpec`: the objective, deliverables, sourced requirements,
+`control_center/task_spec.py` Task Analyst. `TaskSpecAnalyst` is a built-in
+system component with its own model, loopback endpoint, timeout and offline
+fallback settings; persisted agents and presets do not select it. It records one
+versioned `CanonicalTaskSpec`: the objective, deliverables, sourced requirements,
 constraints, decisions, assumptions and validation expectations. Missing
 high-impact choices put the existing run in `NeedsClarification`; the Planner
 and workers do not start. Answers are stored against structured questions and
@@ -112,11 +114,12 @@ and `ephemeral=true`. Runtime task snapshots preserve their exact policy, Tools,
 Skills and provenance. Terminal success, failure, cancellation and startup
 recovery soft-archive every dynamic agent belonging to the orchestration; manual
 agents and their direct-task API remain unchanged.
-The Programmer, QA Tester, Code Auditor and Task Analyst JSON definitions remain
-available as manual/legacy presets for direct tasks and compatibility. Modern
-orchestration only needs a persistent Task Analyst when model-backed analysis is
-desired; implementation, QA and audit roles are created dynamically when the
-plan actually requires them.
+The Programmer, QA Tester and Code Auditor presets remain available for manual
+or direct-task workflows. The versioned Task Analyst JSON file is retained as a
+clearly marked legacy compatibility export, but it is not a creatable API preset
+and modern orchestration never loads it. The built-in Task Analyst always runs
+before planning; implementation, QA and audit roles are created dynamically
+when the plan requires them.
 Every Agent Selector decision, including `no_eligible_agent`, is stored in
 `orchestration_selections` with the planned task ID, selected agent when any,
 classification status, score, selector version, creation time and complete
@@ -158,6 +161,14 @@ Events receive a monotonic integer ID. `step.started` and `step.finished`
 events build the reconstructable timeline while every attempt remains in `log_events`; successful file writes and edits additionally emit a bounded `workspace.diff` event so the created code is inspectable without relying on Git availability. The worker also persists every successful or denied runtime action in the structured result. A successful `run_command` whose output directly satisfies a quoted-output, exit-code, or JSON completion criterion becomes `command_execution` verification evidence; the final verification flags are derived from that evidence rather than from the model's prose. The persistence layer normalizes every runtime and orchestration event with `who`, `actor_name`, `actor_role`, `actor_type`, `where`, `workspace`, `when`, `phase`, `action`, `what`, `how` and a stable `trace_id`. This is derived centrally from the assigned agent, task snapshot and orchestration, so Task Analyst, Planner, Programmer, Code Auditor and other selected agents cannot disappear from the audit trail when an emitter omits a display field. `GET /logs?orchestration_id=...` merges runtime rows with the durable orchestration timeline, including Task Analyst and failure-analysis events, and labels their source. SSE accepts `Last-Event-ID`/`after`, replays later events and then
 streams updates. On startup, abandoned Queued, Running, WaitingForApproval or Paused records become
 Failed, pending approvals are denied as cancelled, and unfinished steps are closed.
+
+When `write_file` returns `ALREADY_SATISFIED`, the action ledger records
+`changed=false` and `already_satisfied=true`. The Worker may end execution when
+that exact write was already changed in the current run, the same satisfied
+write repeats, or it is the last tool call in the current model response. This
+is execution completion only: the result, artifacts, workspace diffs and
+verification evidence are preserved, no semantic criterion is marked satisfied
+from the no-op, and the Evaluator remains responsible for task acceptance.
 
 Production runs transition `Queued → Analyzing → NeedsClarification` when
 the Analyst must ask the user. Each response returns that same run to
@@ -245,10 +256,13 @@ enums. The Ollama response schema and prompt use those same values. A declared
 null list/map containers, omitted optional collections and runtime clarification
 IDs are assigned after question reduction, before validation. Existing IDs are
 preserved by validation; it never renumbers them. These transformations
-do not supply missing user intent. The model returns intent fields only;
-source prompt, schema/revision metadata, clarification history and revision
-changes remain runtime-owned. Unknown fields and invalid cross-field readiness
-combinations fail validation. One bounded repair receives the original candidate,
+do not invent product scope. If the model omits a deliverable or requirement
+collection, source-grounded deterministic entries can restore it before the
+scope guard checks every recognized explicit action, previous requirement and
+clarification answer. The model returns intent fields only; source prompt,
+schema/revision metadata, clarification history and revision changes remain
+runtime-owned. Unknown fields and invalid cross-field readiness combinations
+fail validation. One bounded repair receives the original candidate,
 the exact validation path/message and the expected schema; a still-invalid
 candidate uses the conservative deterministic fallback.
 
@@ -260,8 +274,10 @@ values, validation message, bounded response excerpt and normalization flag.
 corresponding transitions. Task Analyst metrics include `model_calls`,
 `fallback_used`, `fallback_reason`, `initial_validation_error`,
 `repair_validation_error` and `repair_attempted`. A model response that passes
-after safe normalization completes after one call. The legacy version-3
-`task_analyst.py` contract remains for injected compatibility adapters.
+after safe normalization or source-grounded completion completes after one call.
+The deterministic Task Analyst fallback preserves recognized multi-part actions
+and does not infer an unspecified language or interface. The legacy version-3
+`task_analyst.py` contract remains for injected compatibility adapters only.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec. Its model
 output describes semantic task keys, dependencies, semantic needs, required

@@ -202,7 +202,10 @@ class AgentSelector:
         if agent.get("usable") is False:
             hard_warnings.append("Agent is explicitly marked as not usable.")
         if is_task_analyst(agent):
-            hard_warnings.append("Task Analyst is reserved for prompt rewriting and cannot execute work.")
+            hard_warnings.append(
+                "Legacy Task Analyst agents cannot perform orchestration work; "
+                "prompt interpretation is system-owned."
+            )
         compatibility = context.get("workspace_compatibility", {})
         if agent.get("workspace_compatible") is False or (
                 isinstance(compatibility, dict) and agent_id in compatibility

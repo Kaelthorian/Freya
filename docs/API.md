@@ -355,7 +355,6 @@ integration adapters are loopback-only and tool-free.
 | POST | `/api/agents/{id}/tasks` | assign a task with optional workspace override |
 | GET | `/api/agent-presets` | list safe built-in presets |
 | POST | `/api/agent-presets/programmer` | create a generic Programmer agent |
-| POST | `/api/agent-presets/task-analyst` | create a tool-free prompt-rewrite agent |
 | POST | `/api/agent-presets/qa-tester` | create a non-writing QA agent with controlled Python execution |
 | POST | `/api/agent-presets/code-auditor` | create a read-only Code Auditor |
 | GET | `/api/tools` | actual and explicitly unavailable tools (advanced mapping) |
@@ -382,8 +381,7 @@ and `config`. Configuration includes `model`, loopback `endpoint`, `temperature`
 `context_window`, step/time/token/model/tool limits, `retries`, `system_prompt`,
 `permissions`, relative `allowed_directories`, `forbidden_commands`, and an
 optional `secret_env` name. `config.orchestration_role` may be `worker`,
-`task_analyst`, `planner`, `qa`, or `auditor`; `task_analyst` runs before planning and
-does not grant any capability. The `capability_policy` belongs inside `config`
+`task_analyst`, `planner`, `qa`, or `auditor`; `task_analyst` remains accepted as a legacy config value but does not select or configure the built-in Task Analyst; that component uses separate `--task-analyst-*` server options and grants no capability. The `capability_policy` belongs inside `config`
 and is also accepted as a top-level compatibility alias. Agent `workspace_path` is either empty for a
 generated workspace per task or an absolute existing directory used by default.
 Freya-generated agents additionally expose validated `config.provenance` with

@@ -9,6 +9,7 @@ from .security import sanitize
 
 _DETAIL_FIELDS = (
     "phase", "actor_type", "actor_name", "actor_role", "agent_id", "agent_name",
+    "component", "system_component",
     "task_id", "runtime_task_id", "plan_task_id", "planned_task_id", "attempt",
     "model", "mode", "model_calls", "prompt_tokens", "generated_tokens", "total_tokens",
     "tokens_per_second", "first_token_latency", "first_token_latency_seconds",

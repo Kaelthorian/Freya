@@ -732,6 +732,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     last_success_signature = ""
     repeated_success_count = 0
     auto_completed = False
+    successful_write_signatures: set[str] = set()
+    already_satisfied_write_signatures: set[str] = set()
     action_history: list[str] = []
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     mutation_failure = ""
@@ -811,7 +813,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 message["tool_calls"] = calls
             messages.append(message)
             processed_calls: list[dict[str, Any]] = []
-            for call in calls:
+            for call_index, call in enumerate(calls):
                 guard()
                 if metrics["steps"] >= config.get("max_steps", 20):
                     raise TaskStopped("Maximum steps reached.")
@@ -870,6 +872,13 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             existing_before = box.safe_path(str(safe_args.get("path", ""))).exists()
                         except (OSError, ValueError):
                             existing_before = False
+                    write_signature = ""
+                    if name == "write_file" and not argument_error:
+                        write_signature = hashlib.sha256(json.dumps(
+                            {"path": safe_args.get("path"), "content": safe_args.get("content")},
+                            sort_keys=True, ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")).hexdigest()
                     resolved_capability = common.get("capability", "unknown")
                     denial_signature = _policy_denial_signature(name, resolved_capability, safe_args)
                     repeated_denial = False
@@ -1012,6 +1021,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "tool": name,
                             })
                         modified = True
+                        if name == "write_file" and result.changed is True and write_signature:
+                            successful_write_signatures.add(write_signature)
                     if result.already_satisfied:
                         if verification_state["requested"]:
                             verification_state["attempted"] = True
@@ -1024,23 +1035,39 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 ).hexdigest(),
                                 "supports_acceptance_criteria": [],
                             })
-                        criteria = [str(item).strip() for item in verification.get("completion_criteria", []) if str(item).strip()]
-                        supported = {
-                            criterion for row in command_evidence
-                            for criterion in row.get("supports_acceptance_criteria", [])
-                        }
-                        criteria_satisfied = bool(criteria) and all(item in supported for item in criteria)
-                        path = safe_args.get("path")
-                        verified_artifact = isinstance(path, str) and path in modified_paths
-                        if runtime_artifacts and (criteria_satisfied or (not criteria and verified_artifact)):
-                            success = True
-                            auto_completed = True
-                            final = "Completed from the recorded artifact and verification evidence."
-                            publish("event", event={
-                                "event_type": "task.auto_completed", "level": "info", "status": "Success",
-                                "reason": "The duplicate write was skipped because acceptance criteria or verified artifact evidence already satisfies the requested work.",
-                                "path": path,
-                            })
+                        if name == "write_file" and result.success and write_signature:
+                            was_written_this_run = write_signature in successful_write_signatures
+                            was_already_satisfied = write_signature in already_satisfied_write_signatures
+                            is_last_action = call_index == len(calls) - 1
+                            already_satisfied_write_signatures.add(write_signature)
+                            if was_written_this_run or was_already_satisfied or is_last_action:
+                                success = True
+                                auto_completed = True
+                                final = json.dumps({
+                                    "summary": "Execution completed; requested workspace state is already satisfied.",
+                                    "actions": [], "artifacts": [], "verification": {}, "limitations": [],
+                                })
+                                if was_written_this_run:
+                                    reason = (
+                                        "The duplicate write was stopped after runtime objectively confirmed that "
+                                        "the requested state was already satisfied; "
+                                        "semantic acceptance remains for the Evaluator."
+                                    )
+                                elif was_already_satisfied:
+                                    reason = (
+                                        "The Worker stopped after the same already-satisfied write repeated; "
+                                        "semantic acceptance remains for the Evaluator."
+                                    )
+                                else:
+                                    reason = (
+                                        "The requested write already matches the workspace state; "
+                                        "semantic acceptance remains for the Evaluator."
+                                    )
+                                publish("event", event={
+                                    "event_type": "task.auto_completed", "level": "info", "status": "Success",
+                                    "reason": reason,
+                                    "path": safe_args.get("path", ""),
+                                })
                     if result.success and name == "read_file":
                         path = safe_args.get("path")
                         if isinstance(path, str) and path in modified_paths:
@@ -1211,10 +1238,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 and action.get("success") is True
                 and action.get("changed") is True
             )
-            mutation_observed = bool(
-                changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
+            already_satisfied_write_actions = sum(
+                1 for action in runtime_actions
+                if action.get("tool") == "write_file"
+                and action.get("success") is True
+                and action.get("already_satisfied") is True
+                and action.get("changed") is False
             )
-            if not mutation_observed:
+            workspace_state_observed = bool(
+                changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
+                or already_satisfied_write_actions
+            )
+            if not workspace_state_observed:
                 mutation_failure = (
                     "ExpectedWorkspaceMutationNotObserved: this task requires a workspace "
                     "mutation, but no successful write action or resulting artifact was recorded."
@@ -1230,6 +1265,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     "output": {
                         "task_execution_successful": False,
                         "successful_write_actions": changed_write_actions,
+                        "already_satisfied_write_actions": already_satisfied_write_actions,
                         "workspace_changes": telemetry["workspace_changes"],
                         "artifact_count": len(runtime_artifacts),
                     },

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
@@ -15,6 +16,10 @@ from .transport import model_profile, model_request, request_json
 
 
 TASK_SPEC_SCHEMA_VERSION = 1
+DEFAULT_TASK_ANALYST_MODEL = "qwen2.5-coder:7b"
+DEFAULT_TASK_ANALYST_ENDPOINT = "http://127.0.0.1:11434"
+DEFAULT_TASK_ANALYST_TIMEOUT_SECONDS = 120.0
+DEFAULT_TASK_ANALYST_CONTEXT_WINDOW = 8192
 
 
 class TaskSpecStatus(str, Enum):
@@ -50,6 +55,170 @@ RESERVED_QUESTION_FIELDS = frozenset({
     "clarification_questions", "clarification_history", "revision_changes",
     "readiness_reason",
 })
+
+_SEMANTIC_FIELD_ALIASES = {
+    "platform": "interface",
+    "ui": "interface",
+    "user_interface": "interface",
+    "userinterface": "interface",
+    "display_mode": "interface",
+    "programming_language": "language",
+    "language_choice": "language",
+    "operation": "operations",
+}
+_ACTION_SURFACES = {
+    "sum": ("sumar", "suma", "sume", "sumen", "sumo", "sum", "sums", "summed",
+            "adding", "add", "adds", "added", "addition"),
+    "subtract": ("restar", "resta", "reste", "resten", "resto", "subtract",
+                 "subtracts", "subtracted", "subtracting", "subtraction"),
+    "multiply": ("multiplicar", "multiplica", "multiplique", "multipliquen",
+                 "multiplico", "multiply", "multiplies", "multiplied",
+                 "multiplying", "multiplication"),
+    "divide": ("dividir", "divide", "divida", "dividan", "divido", "dividing",
+               "divided", "division", "divides"),
+    "import": ("importar", "importa", "importe", "importen", "import", "imports",
+               "imported", "importing", "importation"),
+    "filter": ("filtrar", "filtra", "filtre", "filtren", "filtro", "filter",
+               "filters", "filtered", "filtering", "filtration"),
+    "export": ("exportar", "exporta", "exporte", "exporten", "export", "exports",
+               "exported", "exporting", "exportation"),
+}
+_ACTION_LABELS = {
+    "sum": "sumar",
+    "subtract": "restar",
+    "multiply": "multiplicar",
+    "divide": "dividir",
+    "import": "importar",
+    "filter": "filtrar",
+    "export": "exportar",
+}
+_GROUNDING_WORDS = frozenset({
+    "a", "about", "accurate", "an", "and", "as", "at", "be", "basic", "by",
+    "correct", "correctly", "create", "created", "crear", "crea", "creado", "con",
+    "de", "del", "el", "en", "expected", "for", "from", "funcione", "hacer",
+    "haz", "is", "it", "la", "language", "lenguaje", "las", "le", "los", "must", "of", "or", "para",
+    "perform", "performs", "permit", "permita", "permite", "produce", "produces",
+    "producing", "que", "requested", "request", "result", "results", "se",
+    "should", "support", "supports", "the", "to", "una", "un", "user",
+    "usuario", "with", "work", "working", "operation", "operations", "operacion",
+    "operaciones", "all", "four", "each", "every", "requirement", "requisito",
+    "resultado", "resultados", "solicitado", "solicitada", "correcta", "correcto",
+    "cumple", "comportamiento", "interface", "interfaz", "platform", "requested",
+})
+_SCOPE_TOKEN_ALIASES = {
+    "calculadora": "calculator",
+    "herramienta": "tool",
+    "herramientas": "tool",
+    "fila": "row",
+    "filas": "row",
+    "rows": "row",
+    "consola": "console",
+    "escritorio": "desktop",
+}
+_SCOPE_FIELD_WORDS = {
+    "interface": "interface",
+    "platform": "interface",
+    "console": "interface",
+    "cli": "interface",
+    "gui": "interface",
+    "desktop": "interface",
+    "web": "interface",
+    "language": "language",
+    "python": "language",
+    "javascript": "language",
+    "typescript": "language",
+    "framework": "framework",
+    "database": "database",
+    "hosting": "hosting",
+    "deployment": "deployment",
+    "backend": "backend",
+    "security": "security",
+    "responsive": "responsive",
+}
+
+
+def _semantic_field(field: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(field or "").casefold()).strip("_")
+    return _SEMANTIC_FIELD_ALIASES.get(normalized, normalized)
+
+
+def _question_semantic_field(question: dict[str, Any]) -> str:
+    field = _semantic_field(question.get("field"))
+    if field in {"interface", "language", "operations"}:
+        return field
+    wording = _fold_text(f"{question.get('question', '')} {question.get('reason', '')}")
+    if re.search(r"\b(?:cli|gui|console|desktop|web|interface|consola|escritorio|interfaz)\b", wording):
+        return "interface"
+    if re.search(r"\b(?:programming language|language|lenguaje|python|javascript|typescript)\b", wording):
+        return "language"
+    if re.search(r"\b(?:operations?|operaciones|sumar|restar|multiplicar|dividir)\b", wording):
+        return "operations"
+    return field
+
+
+def _fold_text(value: Any) -> str:
+    decomposed = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def _action_matches(text: str) -> list[tuple[int, int, str]]:
+    matches = []
+    for group, surfaces in _ACTION_SURFACES.items():
+        pattern = r"(?<!\w)(?:" + "|".join(
+            re.escape(item) for item in sorted(surfaces, key=len, reverse=True)
+        ) + r")(?!\w)"
+        matches.extend((item.start(), item.end(), group)
+                       for item in re.finditer(pattern, str(text), flags=re.IGNORECASE))
+    return sorted(matches, key=lambda item: (item[0], item[1]))
+
+
+def _action_facts(text: str, source: str) -> list[dict[str, str]]:
+    matches = _action_matches(text)
+    facts = []
+    for index, (start, _end, group) in enumerate(matches):
+        finish = matches[index + 1][0] if index + 1 < len(matches) else len(text)
+        description = re.sub(r"^(?:y|e|and|or)\s+", "", text[start:finish], flags=re.IGNORECASE)
+        description = description.strip(" \t\r\n,;:.!?")
+        description = re.sub(r"\s+(?:y|e|and|or)$", "", description, flags=re.IGNORECASE)
+        if description:
+            facts.append({"description": description, "source": source, "action": group})
+    return facts
+
+
+def _scope_tokens(text: Any) -> list[str]:
+    normalized = _fold_text(text)
+    action_matches = _action_matches(normalized)
+    pieces = []
+    cursor = 0
+    for start, end, group in action_matches:
+        pieces.append(normalized[cursor:start])
+        pieces.append(" ACTION_" + group + " ")
+        cursor = end
+    pieces.append(normalized[cursor:])
+    tokens = []
+    for token in re.findall(r"[a-z][a-z0-9+#.-]*", "".join(pieces)):
+        token = token.strip(".-")
+        token = _SCOPE_TOKEN_ALIASES.get(token, token)
+        if token in _GROUNDING_WORDS:
+            continue
+        if len(token) > 4 and token.endswith("s"):
+            token = token[:-1]
+        tokens.append(token)
+    return tokens
+
+
+def _unsupported_scope_terms(description: Any, evidence: str, supported_actions: set[str]) -> list[str]:
+    evidence_tokens = set(_scope_tokens(evidence))
+    unsupported = []
+    for token in _scope_tokens(description):
+        if token.startswith("action_"):
+            if token.removeprefix("action_") not in supported_actions:
+                unsupported.append(token.removeprefix("action_"))
+        elif token not in evidence_tokens and not any(
+                len(token) >= 5 and (token.startswith(item) or item.startswith(token))
+                for item in evidence_tokens if len(item) >= 5):
+            unsupported.append(token)
+    return list(dict.fromkeys(unsupported))
 
 
 def _source_entry_schema() -> dict[str, Any]:
@@ -203,12 +372,12 @@ def _next_question_id(previous: dict[str, Any]) -> int:
 
 
 def _assign_question_ids(previous: dict[str, Any], questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    old = {item["field"]: item for item in previous["clarification_questions"]}
+    old = {_question_semantic_field(item): item for item in previous["clarification_questions"]}
     next_id = _next_question_id(previous)
     assigned = []
     for question in questions:
-        field = _question_field(question.get("field"), "clarification_questions.field")
-        prior = old.get(field)
+        _question_field(question.get("field"), "clarification_questions.field")
+        prior = old.get(_question_semantic_field(question))
         assigned.append({**question, "id": prior["id"] if prior else f"CQ-{next_id}"})
         if prior is None:
             next_id += 1
@@ -388,9 +557,12 @@ def validate_task_spec(value: Any) -> dict[str, Any]:
                           "reason": _text(item.get("reason"), f"clarification_questions[{index - 1}].reason"),
                           "field": _question_field(item.get("field"), f"clarification_questions[{index - 1}].field"),
                           "required": required})
-    if len({item["id"] for item in questions}) != len(questions) or len({item["field"] for item in questions}) != len(questions):
-        raise TaskSpecError("Pending clarification questions must have unique IDs and fields.",
-                            path="clarification_questions", expected="unique IDs and fields",
+    semantic_question_fields = {_question_semantic_field(item) for item in questions}
+    if (len({item["id"] for item in questions}) != len(questions)
+            or len(semantic_question_fields) != len(questions)):
+        raise TaskSpecError("Pending clarification questions must resolve distinct semantic fields.",
+                            path="clarification_questions",
+                            expected="unique IDs and semantically unique fields",
                             error_type="duplicate_question")
     changes = []
     for item in _list(value.get("revision_changes", []), "revision_changes"):
@@ -465,21 +637,21 @@ def initial_task_spec(prompt: str) -> dict[str, Any]:
                                "objective": "", "user_intent": ""})
 
 
-def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
-                            answers: dict[str, str] | None = None) -> dict[str, Any]:
-    """Conservative local fallback; never turns vague input into invented work."""
-    previous = validate_task_spec(previous) if previous else initial_task_spec(prompt)
-    answers = answers or {}
-    history, decisions = _apply_clarification_answers(previous, answers)
-    combined = " ".join([prompt, *[item["answer"] for item in history]])
-    lower = combined.casefold()
-    calculator = bool(re.search(r"\b(?:calculadora|calculator)\b", lower))
-    interface = "console" if re.search(r"\b(?:consola|console|cli)\b|calculator\.py\b", lower) else (
-        "web" if re.search(r"\bweb\b", lower) else (
-        "desktop_gui" if re.search(r"\b(?:escritorio|gui|gr[aá]fica)\b", lower) else ""))
-    language = ""
-    for pattern, name in (
-        (r"\bpython\b|\.py\b", "Python"),
+def _detected_interface(text: str) -> str:
+    folded = _fold_text(text)
+    if re.search(r"\b(?:consola|console|cli|command[- ]line)\b", folded):
+        return "console"
+    if re.search(r"\b(?:web|website|sitio web)\b", folded):
+        return "web"
+    if re.search(r"\b(?:escritorio|desktop|gui|grafica|gr[aá]fica)\b", folded):
+        return "desktop_gui"
+    return ""
+
+
+def _detected_language(text: str) -> str:
+    folded = _fold_text(text)
+    for pattern, language in (
+        (r"\bpython(?:\s*3(?:\.\d+)?)?\b|\.py\b", "Python"),
         (r"\b(?:javascript|node\.?js)\b|\.js\b", "JavaScript"),
         (r"\btypescript\b|\.ts\b", "TypeScript"),
         (r"\bjava\b", "Java"),
@@ -487,82 +659,469 @@ def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
         (r"\bgolang\b|\b(?:in|using|en)\s+go\b", "Go"),
         (r"\bpowershell\b|\.ps1\b", "PowerShell"),
     ):
-        if re.search(pattern, lower):
-            language = name
-            break
-    default_python = calculator and interface == "console" and not language
-    if default_python:
-        language = "Python 3.10+"
-    operation = "sum" if re.search(r"\b(?:sumar|suma|sume|sum|add)\b", lower) else ""
+        if re.search(pattern, folded):
+            return language
+    return ""
+
+
+def _supported_actions(prompt: str, previous: dict[str, Any],
+                       history: list[dict[str, str]]) -> list[dict[str, str]]:
+    facts = _action_facts(prompt, RequirementSource.EXPLICIT.value)
+    for entry in previous["requirements"]:
+        for fact in _action_facts(entry["description"], entry["source"]):
+            facts.append(fact)
+    for entry in history:
+        facts.extend(_action_facts(entry["answer"], RequirementSource.CLARIFIED.value))
+    unique = []
+    seen = set()
+    for fact in facts:
+        key = (fact["source"], _fold_text(fact["description"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(fact)
+    return unique
+
+
+def _interface_source(prompt: str, answers: list[str], history: list[dict[str, str]],
+                      decisions: dict[str, str]) -> tuple[str, str]:
+    explicit = _detected_interface(prompt)
+    if explicit:
+        return explicit, RequirementSource.EXPLICIT.value
+    for item in history:
+        if _semantic_field(item["field"]) == "interface":
+            value = _detected_interface(item["answer"])
+            if value:
+                return value, RequirementSource.CLARIFIED.value
+    for value in decisions.values():
+        detected = _detected_interface(value)
+        if detected:
+            return detected, RequirementSource.CLARIFIED.value
+    for answer in answers:
+        detected = _detected_interface(answer)
+        if detected:
+            return detected, RequirementSource.CLARIFIED.value
+    return "", ""
+
+
+def _language_source(prompt: str, answers: list[str], history: list[dict[str, str]],
+                     decisions: dict[str, str]) -> tuple[str, str]:
+    explicit = _detected_language(prompt)
+    if explicit:
+        return explicit, RequirementSource.EXPLICIT.value
+    for item in history:
+        if _semantic_field(item["field"]) == "language":
+            value = _detected_language(item["answer"])
+            if value:
+                return value, RequirementSource.CLARIFIED.value
+    for value in decisions.values():
+        detected = _detected_language(value)
+        if detected:
+            return detected, RequirementSource.CLARIFIED.value
+    for answer in answers:
+        detected = _detected_language(answer)
+        if detected:
+            return detected, RequirementSource.CLARIFIED.value
+    return "", ""
+
+
+def deterministic_task_spec(prompt: str, previous: dict[str, Any] | None = None,
+                            answers: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build a source-faithful fallback and preserve every coordinated action."""
+    previous = validate_task_spec(previous) if previous else initial_task_spec(prompt)
+    answers = answers or {}
+    history, decisions = _apply_clarification_answers(previous, answers)
+    answer_texts = [item["answer"] for item in history]
+    answer_texts.extend(str(value) for value in answers.values() if str(value).strip())
+    combined = " ".join([prompt, *answer_texts])
+    folded = _fold_text(combined)
+    calculator = bool(re.search(r"\b(?:calculadora|calculator)\b", folded))
+    interface, interface_source = _interface_source(prompt, answer_texts, history, decisions)
+    language, language_source = _language_source(prompt, answer_texts, history, decisions)
+    facts = _supported_actions(prompt, previous, history)
+    action_groups = {fact["action"] for fact in facts}
+
     questions = []
     if calculator:
         if not interface:
-            questions.append({"question": "¿La calculadora debe ser de consola, escritorio o web?",
-                              "reason": "La interfaz cambia materialmente el producto.",
-                              "field": "interface", "required": True})
-        if not operation:
-            questions.append({"question": "¿Qué operaciones debe realizar la calculadora?",
-                              "reason": "Las operaciones determinan su comportamiento principal.",
-                              "field": "operations", "required": True})
-    elif (re.search(r"\b(?:zomboid|project zomboid)\b", lower)
-          and re.search(r"\bservidor\b", lower)
-          and not re.search(r"\b(?:local|remoto|remote|vps|hosting|este equipo|mi pc)\b", lower)):
-        questions.append({"question": "¿El servidor de Zomboid debe correr en este equipo o en un host remoto?",
-                          "reason": "El destino cambia la configuración y los accesos necesarios.",
-                          "field": "deployment_target", "required": True})
-    elif re.search(r"\b(?:automatiza|automate) esto\b", lower) and len(lower.split()) < 6:
-        questions.append({"question": "¿Qué proceso concreto quieres automatizar?",
-                          "reason": "El proceso referido como 'esto' no está identificado.",
-                          "field": "workflow", "required": True})
-    elif not re.search(r"\b(?:crea|crear|haz|hacer|monta|revisa|automatiza|build|create|review|fix|implement)\b", lower):
-        questions.append({"question": "¿Qué resultado concreto necesitas que produzca Freya?",
-                          "reason": "No se identifica un objetivo verificable.",
-                          "field": "desired_outcome", "required": True})
-    elif re.search(r"\b(?:app|aplicaci[oó]n)\b", lower) and len(lower.split()) < 7:
-        questions.append({"question": "¿Qué función principal debe cumplir la aplicación?",
-                          "reason": "La función principal no está especificada.",
-                          "field": "main_function", "required": True})
+            questions.append({
+                "question": "¿La calculadora debe ser de consola, escritorio o web?",
+                "reason": "La interfaz puede cambiar materialmente el producto.",
+                "field": "interface", "required": True,
+            })
+        if not action_groups:
+            questions.append({
+                "question": "¿Qué operaciones debe realizar la calculadora?",
+                "reason": "Las operaciones determinan el comportamiento principal.",
+                "field": "operations", "required": True,
+            })
+    elif (re.search(r"\b(?:zomboid|project zomboid)\b", folded)
+          and re.search(r"\bservidor\b", folded)
+          and not re.search(r"\b(?:local|remoto|remote|vps|hosting|este equipo|mi pc)\b", folded)):
+        questions.append({
+            "question": "¿El servidor de Zomboid debe correr en este equipo o en un host remoto?",
+            "reason": "El destino cambia la configuración y los accesos necesarios.",
+            "field": "deployment_target", "required": True,
+        })
+    elif re.search(r"\b(?:automatiza|automate) esto\b", folded) and len(folded.split()) < 6:
+        questions.append({
+            "question": "¿Qué proceso concreto quieres automatizar?",
+            "reason": "El proceso referido como 'esto' no está identificado.",
+            "field": "workflow", "required": True,
+        })
+    elif not re.search(r"\b(?:crea|crear|haz|hacer|monta|revisa|automatiza|build|create|review|fix|implement)\b", folded):
+        questions.append({
+            "question": "¿Qué resultado concreto necesitas que produzca Freya?",
+            "reason": "No se identifica un objetivo verificable.",
+            "field": "desired_outcome", "required": True,
+        })
+    elif re.search(r"\b(?:app|aplicacion)\b", folded) and len(folded.split()) < 7:
+        questions.append({
+            "question": "¿Qué función principal debe cumplir la aplicación?",
+            "reason": "La función principal no está especificada.",
+            "field": "main_function", "required": True,
+        })
+
+    labels = list(dict.fromkeys(_ACTION_LABELS[fact["action"]] for fact in facts))
+    if calculator:
+        objective = "Crear una calculadora"
+        if labels:
+            objective += " que permita " + (", ".join(labels[:-1]) + " y " + labels[-1]
+                                            if len(labels) > 1 else labels[0])
+        if interface:
+            objective += {
+                "console": " de consola",
+                "web": " con interfaz web",
+                "desktop_gui": " de escritorio",
+            }.get(interface, "")
+        if language:
+            objective += f" en {language}"
+        objective += "."
+    else:
+        objective = previous["objective"] or prompt.strip()
+
+    requirements = list(previous["requirements"])
+    existing_descriptions = {_fold_text(item["description"]) for item in requirements}
+    for fact in facts:
+        normalized = _fold_text(fact["description"])
+        if normalized not in existing_descriptions:
+            requirements.append({
+                "description": fact["description"],
+                "source": fact["source"],
+            })
+            existing_descriptions.add(normalized)
+    if not requirements:
+        requirements.append({
+            "description": prompt.strip(),
+            "source": RequirementSource.EXPLICIT.value,
+        })
+
+    for item in history:
+        if _semantic_field(item["field"]) == "operations":
+            answer_facts = _action_facts(item["answer"], RequirementSource.CLARIFIED.value)
+            if not answer_facts and item["answer"].casefold() not in {"no", "none"}:
+                if _fold_text(item["answer"]) not in existing_descriptions:
+                    requirements.append({
+                        "description": item["answer"],
+                        "source": RequirementSource.CLARIFIED.value,
+                    })
+                    existing_descriptions.add(_fold_text(item["answer"]))
+            for fact in answer_facts:
+                normalized = _fold_text(fact["description"])
+                if normalized not in existing_descriptions:
+                    requirements.append({
+                        "description": fact["description"],
+                        "source": RequirementSource.CLARIFIED.value,
+                    })
+                    existing_descriptions.add(normalized)
+
+    deliverables = list(previous["deliverables"])
+    if not deliverables:
+        product = "Calculadora" if calculator else (
+            "Herramienta" if re.search(r"\b(?:herramienta|tool)\b", folded) else prompt.strip()
+        )
+        deliverables = [{
+            "description": product,
+            "source": RequirementSource.EXPLICIT.value,
+        }]
+
+    constraints = list(previous["constraints"])
+    decisions_by_semantic_field = {_semantic_field(key): (key, value)
+                                   for key, value in decisions.items()}
+    explicit_interface = _detected_interface(prompt)
+    if interface:
+        key, prior_value = decisions_by_semantic_field.get("interface", ("interface", ""))
+        if explicit_interface or not _detected_interface(prior_value):
+            decisions[key] = interface
+        description = {
+            "console": "interfaz de consola",
+            "web": "interfaz web",
+            "desktop_gui": "interfaz de escritorio",
+        }.get(interface, interface)
+        source = interface_source or (
+            RequirementSource.EXPLICIT.value if explicit_interface
+            else RequirementSource.CLARIFIED.value
+        )
+        if not any(_fold_text(item["description"]) == _fold_text(description)
+                   for item in constraints):
+            constraints.append({"description": description, "source": source})
+    explicit_language = _detected_language(prompt)
+    if language:
+        key, prior_value = decisions_by_semantic_field.get("language", ("language", ""))
+        if explicit_language or not _detected_language(prior_value):
+            decisions[key] = language
+        source = language_source or (
+            RequirementSource.EXPLICIT.value if explicit_language
+            else RequirementSource.CLARIFIED.value
+        )
+        if not any(_fold_text(item["description"]) == _fold_text(language)
+                   for item in constraints):
+            constraints.append({"description": language, "source": source})
+
+    supported_actions = action_groups
+    evidence = " ".join([prompt, *answer_texts,
+                         *[item["description"] for item in requirements],
+                         *[item["description"] for item in constraints]])
+    assumptions = [
+        item for item in previous["assumptions"]
+        if not _unsupported_scope_terms(
+            item["description"] + " " + item["reason"], evidence, supported_actions,
+        )
+    ]
+    context = {
+        key: value for key, value in previous["context"].items()
+        if not _unsupported_scope_terms(str(key) + " " + str(value), evidence, supported_actions)
+    }
+    questions = _assign_question_ids(previous, questions)
     status = (TaskSpecStatus.NEEDS_CLARIFICATION.value if questions
               else TaskSpecStatus.READY_FOR_PLANNING.value)
-    objective = (f"Crear una calculadora {('de consola' if interface == 'console' else 'web' if interface == 'web' else 'de escritorio')} "
-                 f"en {language or 'un lenguaje elegido por Planner'} que {'sume' if operation == 'sum' else 'realice las operaciones solicitadas'}."
-                 if calculator and not questions else previous["objective"] or prompt)
-    assumptions = list(previous["assumptions"])
-    if status == TaskSpecStatus.READY_FOR_PLANNING.value and calculator and "calculator.py" in lower and not any(
-            "consola" in item["description"].casefold() for item in assumptions):
-        assumptions.append({"description": "Usar interfaz de consola para el archivo Python solicitado.",
-                            "reason": "Un script calculator.py sin interfaz indicada tiene un default local de bajo impacto."})
-    if status == TaskSpecStatus.READY_FOR_PLANNING.value and default_python:
-        assumptions.append({"description": "Usar Python 3.10+ para el programa de consola.",
-                            "reason": "Es el default del proyecto para programas independientes sin lenguaje indicado."})
-    requirements = list(previous["requirements"])
-    if not requirements:
-        requirements = [{"description": prompt, "source": RequirementSource.EXPLICIT.value}]
-    for item in history[len(previous["clarification_history"]):]:
-        requirements.append({"description": item["answer"], "source": RequirementSource.CLARIFIED.value})
-    deliverables = ([{"description": "Programa de calculadora ejecutable",
-                      "source": RequirementSource.ASSUMED.value}]
-                    if calculator else [{"description": objective,
-                                         "source": RequirementSource.EXPLICIT.value}]) if status == TaskSpecStatus.READY_FOR_PLANNING.value else []
-    constraints = list(previous["constraints"])
-    for field, val in (("interface", interface), ("language", language)):
-        if val and not any(item["description"].casefold() == val.casefold() for item in constraints):
-            constraints.append({
-                "description": val,
-                "source": RequirementSource.ASSUMED.value if field == "language" and default_python
-                else RequirementSource.CLARIFIED.value if answers else RequirementSource.EXPLICIT.value,
-            })
-    questions = _assign_question_ids(previous, questions)
-    return validate_task_spec({**previous, "version": previous["version"] + (1 if answers else 0),
-        "status": status, "objective": objective, "user_intent": prompt,
-        "deliverables": deliverables, "requirements": requirements, "constraints": constraints,
-        "assumptions": assumptions, "user_decisions": decisions,
-        "clarification_questions": questions, "clarification_history": history,
-        "validation_expectations": (["La calculadora produce la suma correcta para dos números."]
-                                    if calculator and status == TaskSpecStatus.READY_FOR_PLANNING.value else []),
-        "readiness_reason": ("Objetivo, entregable y decisiones de alto impacto están resueltos."
-                             if status == TaskSpecStatus.READY_FOR_PLANNING.value else "Faltan decisiones de alto impacto.")})
+    return validate_task_spec({
+        **previous,
+        "version": previous["version"] + (1 if answers else 0),
+        "status": status,
+        "objective": objective,
+        "user_intent": prompt.strip(),
+        "deliverables": deliverables,
+        "requirements": requirements,
+        "constraints": constraints,
+        "assumptions": assumptions,
+        "user_decisions": decisions,
+        "context": context,
+        "clarification_questions": questions,
+        "clarification_history": history,
+        "validation_expectations": [],
+        "readiness_reason": (
+            "El objetivo y los comportamientos expresos están identificados."
+            if status == TaskSpecStatus.READY_FOR_PLANNING.value
+            else "Falta una decisión material sobre el producto solicitado."
+        ),
+    })
 
+
+def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
+                              previous: dict[str, Any], answers: dict[str, str],
+                              history: list[dict[str, str]]) -> None:
+    question_context = " ".join(
+        [value for item in previous["clarification_questions"]
+         for value in (item["field"], item["question"])]
+        + [value for item in history for value in (item["field"], item["question"])]
+    )
+    answer_evidence = " ".join(
+        [item["answer"] for item in previous["clarification_history"]]
+        + [item["answer"] for item in history]
+        + [str(value) for value in answers.values()]
+    )
+    full_evidence = " ".join([prompt, answer_evidence,
+                              *[item["description"] for item in previous["requirements"]],
+                              *[item["description"] for item in previous["constraints"]]])
+    source_actions = {item["action"] for item in _action_facts(
+        prompt, RequirementSource.EXPLICIT.value,
+    )}
+    clarified_actions = {item["action"] for item in _action_facts(
+        answer_evidence, RequirementSource.CLARIFIED.value,
+    )}
+    prior_actions = set()
+    for item in previous["requirements"]:
+        prior_actions.update(fact["action"] for fact in _action_facts(
+            item["description"], item["source"],
+        ))
+    all_actions = source_actions | clarified_actions | prior_actions
+    pending_semantic_fields = {
+        _question_semantic_field(item) for item in spec["clarification_questions"]
+    }
+
+    for index, item in enumerate(spec["assumptions"]):
+        description = item["description"] + " " + item["reason"]
+        folded = _fold_text(description)
+        for marker, field in _SCOPE_FIELD_WORDS.items():
+            if field in pending_semantic_fields and re.search(
+                    r"(?<!\w)" + re.escape(marker) + r"(?!\w)", folded):
+                raise TaskSpecError(
+                    "An assumption conflicts with a pending clarification.",
+                    path=f"assumptions[{index}]",
+                    expected="no assumption for a field being clarified",
+                    received=field,
+                    error_type="assumption_question_conflict",
+                )
+
+    for field in ("deliverables", "requirements", "constraints"):
+        for index, item in enumerate(spec[field]):
+            if item["source"] == RequirementSource.EXPLICIT.value:
+                evidence = prompt
+                supported = source_actions | prior_actions
+            elif item["source"] == RequirementSource.CLARIFIED.value:
+                evidence = answer_evidence
+                supported = clarified_actions | prior_actions
+            else:
+                evidence = full_evidence
+                supported = all_actions
+            unsupported = _unsupported_scope_terms(
+                item["description"], evidence, supported,
+            )
+            if unsupported:
+                raise TaskSpecError(
+                    "A Task Analyst entry contains wording unsupported by its source.",
+                    path=f"{field}[{index}].description",
+                    expected="content grounded in the source prompt or clarification answers",
+                    received=", ".join(unsupported[:8]),
+                    error_type="unsupported_scope",
+                )
+
+    for index, item in enumerate(spec["assumptions"]):
+        unsupported = _unsupported_scope_terms(
+            item["description"] + " " + item["reason"], full_evidence, all_actions,
+        )
+        if unsupported:
+            raise TaskSpecError(
+                "A Task Analyst assumption adds unsupported scope.",
+                path=f"assumptions[{index}]",
+                expected="assumptions grounded in user-provided information",
+                received=", ".join(unsupported[:8]),
+                error_type="unsupported_assumption",
+            )
+
+    for key, value in spec["context"].items():
+        unsupported = _unsupported_scope_terms(str(key) + " " + str(value), full_evidence, all_actions)
+        if unsupported:
+            raise TaskSpecError(
+                "Task Analyst context adds unsupported scope.",
+                path=f"context.{key}",
+                expected="context grounded in the source prompt or clarification answers",
+                received=", ".join(unsupported[:8]),
+                error_type="unsupported_context",
+            )
+
+    for index, expectation in enumerate(spec["validation_expectations"]):
+        unsupported = _unsupported_scope_terms(expectation, full_evidence, all_actions)
+        if unsupported:
+            raise TaskSpecError(
+                "A validation expectation adds behavior the user did not request.",
+                path=f"validation_expectations[{index}]",
+                expected="observable behavior derived from explicit or clarified intent",
+                received=", ".join(unsupported[:8]),
+                error_type="unsupported_validation",
+            )
+
+    decision_evidence = " ".join([full_evidence, question_context])
+    if not spec["requirements"]:
+        raise TaskSpecError(
+            "The Task Analyst omitted all requirement entries.",
+            path="requirements",
+            expected="preserve the user's requested behavior",
+            received="empty list",
+            error_type="lost_explicit_requirement",
+        )
+    if not spec["deliverables"]:
+        raise TaskSpecError(
+            "The Task Analyst omitted the requested deliverable.",
+            path="deliverables",
+            expected="at least one user-requested deliverable",
+            received="empty list",
+            error_type="lost_explicit_deliverable",
+        )
+
+    for key, value in spec["user_decisions"].items():
+        unsupported = _unsupported_scope_terms(key + " " + value, decision_evidence, all_actions)
+        if unsupported:
+            raise TaskSpecError(
+                "A user decision is not supported by the source prompt or clarification answers.",
+                path=f"user_decisions.{key}",
+                expected="a decision directly stated by the user",
+                received=", ".join(unsupported[:8]),
+                error_type="unsupported_decision",
+            )
+
+    objective_unsupported = _unsupported_scope_terms(
+        spec["objective"], full_evidence, all_actions,
+    )
+    if objective_unsupported:
+        raise TaskSpecError(
+            "The objective adds scope unsupported by the user.",
+            path="objective",
+            expected="an objective grounded in explicit or clarified intent",
+            received=", ".join(objective_unsupported[:8]),
+            error_type="unsupported_scope",
+        )
+
+    combined_requirements = " ".join(item["description"] for item in spec["requirements"])
+    for fact in _action_facts(prompt, RequirementSource.EXPLICIT.value):
+        if not any(item["source"] == RequirementSource.EXPLICIT.value
+                   and fact["action"] in {entry["action"] for entry in _action_facts(
+                       item["description"], item["source"],
+                   )} for item in spec["requirements"]):
+            raise TaskSpecError(
+                "An explicit action is missing or mislabeled in requirements.",
+                path="requirements",
+                expected="every source-prompt action labeled explicit",
+                received=fact["action"],
+                error_type="lost_explicit_requirement",
+            )
+    for fact in _action_facts(answer_evidence, RequirementSource.CLARIFIED.value):
+        if not any(item["source"] == RequirementSource.CLARIFIED.value
+                   and fact["action"] in {entry["action"] for entry in _action_facts(
+                       item["description"], item["source"],
+                   )} for item in spec["requirements"]):
+            raise TaskSpecError(
+                "A clarified action is missing or mislabeled in requirements.",
+                path="requirements",
+                expected="every clarified action labeled clarified",
+                received=fact["action"],
+                error_type="lost_clarified_requirement",
+            )
+    for action in source_actions | prior_actions:
+        if not _action_matches(combined_requirements) or not any(
+                fact["action"] == action for fact in _action_facts(
+                    combined_requirements, RequirementSource.EXPLICIT.value,
+                )):
+            raise TaskSpecError(
+                "An explicit or previously confirmed action is missing from requirements.",
+                path="requirements",
+                expected="preserve every explicit and previously confirmed action",
+                received=action,
+                error_type="lost_explicit_requirement",
+            )
+    for action in clarified_actions:
+        if not any(fact["action"] == action for fact in _action_facts(
+                combined_requirements, RequirementSource.CLARIFIED.value)):
+            raise TaskSpecError(
+                "A clarified action is missing from requirements.",
+                path="requirements",
+                expected="preserve every clarified action",
+                received=action,
+                error_type="lost_clarified_requirement",
+            )
+
+    # Previously confirmed requirements must survive clarification revisions.
+    requirement_tokens = set(_scope_tokens(combined_requirements))
+    for index, item in enumerate(previous["requirements"]):
+        required_tokens = set(_scope_tokens(item["description"]))
+        if not required_tokens.issubset(requirement_tokens):
+            raise TaskSpecError(
+                "A previously confirmed requirement disappeared from the new Task Spec.",
+                path=f"requirements[{index}]",
+                expected="preserve all previous explicit and clarified requirements",
+                received=item["description"],
+                error_type="lost_previous_requirement",
+            )
 
 def revise_ready_task_spec(spec: dict[str, Any], *, field: str, value: str,
                            user_message: str) -> dict[str, Any]:
@@ -600,12 +1159,80 @@ def revise_ready_task_spec(spec: dict[str, Any], *, field: str, value: str,
     return validate_task_spec(updated)
 
 
-class TaskSpecAnalyst:
-    """Model-backed incremental intent analysis with conservative fallback."""
+TASK_ANALYST_SCOPE_PRESERVATION_PROMPT = """SCOPE PRESERVATION
 
-    def __init__(self, *, offline: bool = False,
+Your job is to faithfully structure the user's intent, not improve it.
+
+Never add, infer, expand, upgrade, or silently complete requirements,
+constraints, deliverables, preferences, product features, behaviors,
+architecture, validation obligations, or user decisions that are not
+supported by the user's source prompt or clarification answers.
+
+"explicit" means directly stated by the user in the source prompt.
+
+"clarified" means directly stated by the user in response to a
+clarification question.
+
+Never label inferred, conventional, recommended, typical, or assumed
+information as explicit or clarified.
+
+Do not infer requirements from:
+- common practice;
+- best practices;
+- typical implementations;
+- conventional architecture;
+- what would make the product better;
+- what similar products normally contain.
+
+Do not turn implementation decisions into user requirements.
+
+If missing information materially changes WHAT product the user wants,
+ask one focused clarification question.
+
+If the missing information only affects HOW the request will be
+implemented, leave it unspecified for the Planner.
+
+Never create an assumption for a field that you are simultaneously
+asking the user to clarify.
+
+Assumptions must never expand the requested scope.
+
+When uncertain whether something is a user requirement or an
+implementation choice, leave it unspecified rather than inventing it.
+
+Preserve every explicit user requirement. Never narrow a multi-part
+request.
+
+A request containing A, B, C and D must never become only A.
+
+Clarification answers modify or enrich the existing TaskSpec.
+They must not cause unrelated explicit requirements to disappear.
+
+Ask the minimum number of clarification questions required to establish
+the product the user actually wants. Do not ask two questions that
+resolve the same semantic decision."""
+
+
+class TaskSpecAnalyst:
+    """Built-in system component for incremental, tool-free intent analysis."""
+
+    def __init__(self, *, model: str = DEFAULT_TASK_ANALYST_MODEL,
+                 endpoint: str = DEFAULT_TASK_ANALYST_ENDPOINT,
+                 timeout: float = DEFAULT_TASK_ANALYST_TIMEOUT_SECONDS,
+                 context_window: int = DEFAULT_TASK_ANALYST_CONTEXT_WINDOW,
+                 offline: bool = False,
                  request: Callable[..., dict[str, Any]] = request_json):
-        self.offline, self.request = offline, request
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Task Analyst model must be a non-empty string.")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.1 <= timeout <= 120:
+            raise ValueError("Task Analyst timeout must be between 0.1 and 120 seconds.")
+        if isinstance(context_window, bool) or not isinstance(context_window, int) or not 512 <= context_window <= 131072:
+            raise ValueError("Task Analyst context window must be between 512 and 131072 tokens.")
+        self.model = model.strip()
+        self.endpoint = validate_endpoint(endpoint)
+        self.timeout = float(timeout)
+        self.context_window = context_window
+        self.offline, self.request = bool(offline), request
         self.metrics: dict[str, Any] = {}
         self.diagnostic_events: list[dict[str, Any]] = []
 
@@ -617,6 +1244,8 @@ class TaskSpecAnalyst:
         self.diagnostic_events.append(sanitize({
             "event_type": event_type, "timestamp": self._now(), "status": status,
             "phase": "task_analysis", "actor_type": "task_analyst",
+            "actor_name": "Task Analyst", "actor_role": "Task Analyst",
+            "agent_id": None, "system_component": True,
             "message": message, **fields,
         }))
 
@@ -723,41 +1352,47 @@ class TaskSpecAnalyst:
         answers = answers or {}
         self.diagnostic_events = []
         self.metrics = {
-            "model_calls": 0, "mode": "deterministic", "fallback_used": False,
-            "fallback_reason": None, "initial_validation_error": None,
+            "component": "task_analyst", "system_component": True,
+            "model": self.model, "model_calls": 0, "mode": "llm",
+            "fallback_used": False, "fallback_reason": None,
+            "initial_validation_error": None,
             "repair_validation_error": None, "repair_attempted": False,
             "normalization_attempted": False, "normalization_changes": [],
             "prompt_tokens": 0, "generated_tokens": 0, "total_tokens": 0,
             "llm_duration_seconds": 0.0,
         }
-        if self.offline or not agent:
+        if self.offline:
             started = time.monotonic()
             result = deterministic_task_spec(prompt, previous, answers)
             self._record_clarification_lifecycle(previous, result, [], [])
-            self.metrics.update(mode="deterministic", model_calls=0,
+            reason = "Task Analyst deterministic mode was explicitly enabled."
+            self.metrics.update(mode="deterministic_fallback", fallback_used=True,
+                                fallback_reason=reason, model_calls=0,
                                 duration_seconds=round(time.monotonic() - started, 4))
+            self._event(
+                "task_analysis.fallback_used", "Warning",
+                "Task Analyst used deterministic analysis because offline mode was explicitly enabled.",
+                reason=reason, model_calls=0, fallback_used=True,
+            )
             return result
-        config = agent.get("config") if isinstance(agent.get("config"), dict) else {}
-        model = str(config.get("model") or "").strip()
-        self.metrics["model"] = model
-        endpoint = validate_endpoint(str(config.get("endpoint") or "http://127.0.0.1:11434"))
-        timeout = config.get("max_seconds", 60.0)
-        timeout = min(120.0, max(0.1, float(timeout))) if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else 60.0
+        # The legacy agent argument is accepted for call compatibility only.
+        # Its existence, status and configuration never select this component.
+        model, endpoint, timeout = self.model, self.endpoint, self.timeout
         schema_text = json.dumps(TASK_SPEC_RESPONSE_FORMAT, ensure_ascii=False, separators=(",", ":"))
         system = (
-            "You are Freya's Task Analyst. Determine WHAT the user wants, not HOW to execute it. "
-            "Return one JSON object matching the supplied schema. This response contains user intent only. "
-            "Do not return source_prompt, schema_version, version, clarification_history or revision_changes; "
-            "Freya supplies those audit/runtime fields. For each ready response, provide at least one "
-            "deliverable and one requirement, no pending questions, and a non-empty readiness_reason. "
-            "For NEEDS_CLARIFICATION, provide at least one focused question. Entries in deliverables, "
-            "requirements and constraints use only explicit, clarified, or assumed. Assumptions have "
-            "description and reason. Question IDs are assigned by Freya. Use NEEDS_CLARIFICATION only "
-            "for material ambiguity without a safe default; ask few high-impact questions. Never invent "
-            "a user answer. Do not choose agents, tools, capabilities, Skills, task IDs, plans, execution "
-            "steps, dependencies, or worker assignments. Preserve earlier decisions and apply new answers "
-            "incrementally. The canonical requirement source values are "
-            + ", ".join(REQUIREMENT_SOURCES) + ". The JSON Schema is: " + schema_text
+            "You are Freya's built-in system Task Analyst. Determine WHAT the user wants, not HOW to "
+            "execute it. Return one JSON object matching the supplied schema. This response contains only "
+            "user intent. Do not choose agents, tools, capabilities, Skills, task IDs, plans, execution "
+            "steps, dependencies, or worker assignments. Do not return source_prompt, schema_version, "
+            "version, clarification_history or revision_changes; Freya supplies those runtime fields. "
+            "Question IDs are assigned by Freya. Preserve earlier decisions and apply answers incrementally. "
+            "For each ready response provide at least one deliverable and one requirement, no pending "
+            "questions, and a non-empty readiness_reason. For NEEDS_CLARIFICATION provide focused material "
+            "questions. Entries in deliverables, requirements and constraints use only explicit, clarified, "
+            "or assumed; assumptions have description and reason. The canonical sources are "
+            + ", ".join(REQUIREMENT_SOURCES) + ".\n\n"
+            + TASK_ANALYST_SCOPE_PRESERVATION_PROMPT
+            + "\n\nThe JSON Schema is: " + schema_text
         )
         payload = {"source_prompt": prompt, "previous_task_spec": previous,
                    "answers_to_pending_questions": answers}
@@ -771,7 +1406,7 @@ class TaskSpecAnalyst:
                  {"role": "user", "content": content}], "tools": [],
                  "format": deepcopy(TASK_SPEC_RESPONSE_FORMAT),
                  "stream": False, "think": False,
-                 "options": {"temperature": 0, "num_ctx": int(config.get("context_window", 8192)),
+                 "options": {"temperature": 0, "num_ctx": self.context_window,
                              "num_predict": model_profile("task_analyst").repair_output_tokens if repair else model_profile("task_analyst").max_output_tokens}},
                 timeout=timeout)
             for target, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
@@ -827,25 +1462,29 @@ class TaskSpecAnalyst:
                                     expected="NEEDS_CLARIFICATION or READY_FOR_PLANNING",
                                     received=proposed_status, error_type="invalid_state")
             floor = deterministic_task_spec(prompt, previous, answers)
+            for field in ("deliverables", "requirements"):
+                if not candidate.get(field) and floor[field]:
+                    candidate[field] = deepcopy(floor[field])
+                    changes.append(f"{field}:source_grounded_completion")
             history, decisions = _apply_clarification_answers(previous, answers)
             proposed = candidate.get("clarification_questions", [])
             if not isinstance(proposed, list):
                 raise TaskSpecError("Clarification questions must be a list.",
                                     path="clarification_questions", expected="list", received=proposed,
                                     error_type="type_mismatch")
-            resolved_fields = set(decisions) | {item["field"] for item in history}
-            if re.search(r"\b(?:calculadora|calculator)\b", prompt, flags=re.I):
-                if "platform" in resolved_fields:
+            resolved_fields = {_semantic_field(field) for field in decisions}
+            resolved_fields.update(_semantic_field(item["field"]) for item in history)
+            if _detected_interface(prompt) or _detected_language(prompt):
+                if _detected_interface(prompt):
                     resolved_fields.add("interface")
-                if "interface" in resolved_fields:
-                    resolved_fields.add("platform")
-                # The deterministic calculator floor only reaches READY after
-                # resolving its interface and operations, including safe defaults.
-                if floor["status"] == TaskSpecStatus.READY_FOR_PLANNING.value:
-                    resolved_fields.update({"platform", "interface", "operations", "language"})
+                if _detected_language(prompt):
+                    resolved_fields.add("language")
+            if _action_matches(" ".join(item["description"] for item in floor["requirements"])):
+                resolved_fields.add("operations")
             seen_fields: set[str] = set()
             seen_questions: set[str] = set()
             historical_questions = {_question_fingerprint(item["question"]) for item in history}
+            historical_semantic_fields = {_question_semantic_field(item) for item in history}
             pending = []
             repeated_fields = []
             repeated_ids = []
@@ -860,27 +1499,36 @@ class TaskSpecAnalyst:
                 except TaskSpecError:
                     rejected_fields.append(str(question.get("field") or "")[:64])
                     continue
+                semantic_field = _question_semantic_field(question)
                 fingerprint = _question_fingerprint(str(question.get("question") or ""))
-                if (field in resolved_fields or field in seen_fields or
+                if (semantic_field in resolved_fields or semantic_field in seen_fields or
+                        semantic_field in historical_semantic_fields or
                         fingerprint in historical_questions or fingerprint in seen_questions):
                     repeated_fields.append(field)
-                    repeated_ids.extend(item["question_id"] for item in history if item["field"] == field)
+                    repeated_ids.extend(item["question_id"] for item in history
+                                        if _question_semantic_field(item) == semantic_field)
                     continue
                 if _optional_question(question):
                     rejected_fields.append(field)
                     continue
                 prior = next((item for item in previous["clarification_questions"]
-                              if item["field"] == field and field not in resolved_fields), None)
+                              if _question_semantic_field(item) == semantic_field
+                              and semantic_field not in resolved_fields), None)
                 pending.append(prior or question)
-                seen_fields.add(field)
+                seen_fields.add(semantic_field)
                 seen_questions.add(fingerprint)
             pending = _assign_question_ids(previous, pending)
+            candidate_decisions = candidate.get("user_decisions", {})
+            if not isinstance(candidate_decisions, dict):
+                candidate_decisions = {}
+            candidate_decisions = {**candidate_decisions, **decisions}
             candidate.update({
                 "source_prompt": prompt,
+                "user_intent": prompt.strip(),
                 "schema_version": TASK_SPEC_SCHEMA_VERSION,
                 "version": previous["version"] + (1 if answers else 0),
                 "clarification_history": history,
-                "user_decisions": decisions,
+                "user_decisions": candidate_decisions,
                 "clarification_questions": pending,
                 "status": (TaskSpecStatus.NEEDS_CLARIFICATION.value if pending
                            else TaskSpecStatus.READY_FOR_PLANNING.value),
@@ -894,6 +1542,7 @@ class TaskSpecAnalyst:
                     if not candidate.get(field):
                         candidate[field] = floor[field]
             result = validate_task_spec(candidate)
+            _validate_scope_candidate(result, prompt, previous, answers, history)
             if floor["status"] == TaskSpecStatus.NEEDS_CLARIFICATION.value:
                 self.metrics["semantic_gate"] = "material_ambiguity"
             self._record_clarification_lifecycle(previous, result,
@@ -908,7 +1557,7 @@ class TaskSpecAnalyst:
             ))
             self._event(
                 "task_analysis.normalization_succeeded", "Success",
-                "Task Analyst output passed after safe deterministic normalization.",
+                "Task Analyst output passed after safe normalization or source-grounded completion.",
                 stage=stage, normalization_changes=changes,
                 normalization_attempted=True,
             )
