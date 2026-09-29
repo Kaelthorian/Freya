@@ -493,8 +493,9 @@ payload alongside `planning_metrics`.
 Execution-graph tests cover pure DAG transitions, sequential and parallel
 scheduling, joins, branch-local failure propagation, approval waits, paused
 agents, per-agent serialization, concurrency limits, cancellation and migration.
-Evaluator tests cover hard evidence precedence, prompt injection, strict schema,
-one repair, per-criterion coverage, immutable persistence, API exposure, graph
+Evaluator tests cover criterion-specific objective evidence, prompt injection,
+the reduced semantic schema, one repair per call and one bounded retry,
+Python aggregation, immutable persistence, API exposure, graph
 gating, duplicate prevention, technical failure, cancellation, timeout and
 restart recovery.
 Integration tests cover deterministic preconditions, exact global criteria,

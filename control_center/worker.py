@@ -72,6 +72,10 @@ Tool usage rules:
   with name, kind, signature, path and purpose when you create them.
 - Read an existing artifact before changing it. If a write reports
   STALE_ARTIFACT, read the latest version and reconsider the change before retrying.
+- If a cross-task write reports CROSS_TASK_MODIFICATION_DETAILS_REQUIRED, no file was
+  changed. Retry with all four fields: requested_change (a specific outcome, no code),
+  reason, needed_for, and blocking (a JSON boolean). Follow the listed missing fields;
+  never repeat the same incomplete request unchanged.
 - A missing-file read is a missing input, not a permission grant. Do not repeat
   the same missing-file read; report it or choose a different permitted strategy.
 - Use only the tools listed in AVAILABLE TOOLS. Do not call, request or invent any other tool.
@@ -376,6 +380,15 @@ class PolicyToolbox(Toolbox):
         self.task_foreign_write_targets = {
             owned_path_key(item["path"]): str(item["owner_plan_task_id"])
             for item in raw_foreign}
+        raw_planned = config.get("task_planned_write_targets", [])
+        if not isinstance(raw_planned, list) or any(
+                not isinstance(item, dict) or set(item) != {"path", "owner_plan_task_id"}
+                or not all(isinstance(value, str) for value in item.values())
+                for item in raw_planned):
+            raise ValueError("Task planned_write_targets must be a list of path-owner pairs.")
+        self.task_planned_write_targets = {
+            owned_path_key(item["path"]): str(item["owner_plan_task_id"])
+            for item in raw_planned}
         raw_owners = config.get("task_write_owners", {})
         if not isinstance(raw_owners, dict):
             raise ValueError("Task write ownership index must be an object.")
@@ -383,6 +396,11 @@ class PolicyToolbox(Toolbox):
             owned_path_key(path): str(owner)
             for path, owner in raw_owners.items()
         }
+        if any(owner == self.task_id
+               or self.task_foreign_write_targets.get(key) != owner
+               or self.task_write_owners.get(key) != owner
+               for key, owner in self.task_planned_write_targets.items()):
+            raise ValueError("Planned foreign writes must match this task's foreign target and permanent owner.")
         self.task_write_scope_enforced = config.get("task_write_scope_enforced") is True
         self.once_grants: set[str] = set()
         self.task_grants: set[str] = set()
@@ -503,6 +521,8 @@ class PolicyToolbox(Toolbox):
         scoped_owner = key in self.task_owned_path_keys and owner == self.task_id
         scoped_foreign = bool(owner and owner != self.task_id and
                               self.task_foreign_write_targets.get(key) == owner)
+        scoped_planned = bool(scoped_foreign and
+                              self.task_planned_write_targets.get(key) == owner)
         if target.is_file() and (scoped_owner or scoped_foreign):
             observation = self.observed_artifact_hashes.get(key)
             digest = self._artifact_digest(target)
@@ -531,22 +551,42 @@ class PolicyToolbox(Toolbox):
         # owner agent that must change only one file from a larger owned set.
         if key in self.task_owned_path_keys and owner == self.task_id:
             return None
+        if scoped_planned:
+            return None
         if owner and owner != self.task_id and self.task_foreign_write_targets.get(key) == owner:
-            try:
-                for field in ("requested_change", "reason", "needed_for"):
+            missing_fields = []
+            field_errors = []
+            for field in ("requested_change", "reason", "needed_for"):
+                try:
                     normalize_intent_text(arguments.get(field), field)
-                if not isinstance(arguments.get("blocking"), bool):
-                    raise CrossTaskRequestError("blocking must be a boolean.")
-            except CrossTaskRequestError as exc:
+                except CrossTaskRequestError as exc:
+                    missing_fields.append(field)
+                    field_errors.append(str(exc))
+            if not isinstance(arguments.get("blocking"), bool):
+                missing_fields.append("blocking")
+                field_errors.append("blocking must be a JSON boolean.")
+            if missing_fields:
+                contract = (
+                    "Required cross-task request fields (all four): "
+                    "requested_change = a specific requested outcome, without code; "
+                    "reason = why the change is needed; needed_for = what this task needs it for; "
+                    "blocking = a JSON boolean. Example: "
+                    '{"requested_change":"Add an explicit cache expiry setting",'
+                    '"reason":"Prevent stale cache entries from persisting",'
+                    '"needed_for":"The consumer configuration requires bounded retention",'
+                    '"blocking":true}. '
+                    "Fields needing correction: " + ", ".join(missing_fields) + "."
+                )
                 return ToolResult(
                     name,
                     "CROSS_TASK_MODIFICATION_DETAILS_REQUIRED\n"
-                    "No file was modified. Retry with a concrete requested_change, reason, needed_for, "
-                    "and blocking boolean. Do not put implementation code in these fields.\n" + str(exc),
+                    "No file was modified. Retry with all four required fields. Do not put implementation code "
+                    "in requested_change, reason, or needed_for.\n" + contract + "\n" + " ".join(field_errors),
                     False, 0, capability=action, policy_decision="deferred",
                     policy_reason="Freya requires an auditable cross-task modification request.",
                     executed=False, error_class="cross_task_modification_incomplete",
                     owner_task_id=owner, target_path=relative,
+                    missing_fields=tuple(missing_fields),
                 )
             return ToolResult(
                 name, "CROSS_TASK_MODIFICATION_REQUIRED\n"
@@ -941,7 +981,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         "runtime_exception": False,
     }
 
-    def publish_workspace_diff(name: str, arguments: dict[str, Any], existing_before: bool = False) -> None:
+    def publish_workspace_diff(name: str, arguments: dict[str, Any], existing_before: bool = False,
+                               *, event_id: str = "", capability: str = "") -> None:
         """Persist a bounded unified diff for every successful file mutation."""
         path = arguments.get("path")
         if not isinstance(path, str) or not path.strip():
@@ -974,7 +1015,9 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             diff = "(no textual difference)"
         if len(diff) > 64_000:
             diff = diff[:64_000] + "\n[… diff clipped at 64,000 characters …]"
-        payload = {"path": path, "change_type": change_type, "diff": diff}
+        payload = {"path": path, "change_type": change_type, "diff": diff,
+                   "event_id": event_id, "tool": name, "capability": capability,
+                   "source": "workspace_diff"}
         workspace_diffs.append(payload)
         publish("event", event={
             "event_type": "workspace.diff", "level": "info", "status": "Success",
@@ -982,7 +1025,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             "reason": "Generated a unified diff preview from the successful file change.",
             "output": payload,
         })
-    observed_files: dict[str, tuple[bool, str]] = {}
+    observed_files: dict[str, tuple[bool, str, str, str]] = {}
     verification = effective["verification"]
     verification_state: dict[str, Any] = {
         "requested": bool(verification["enabled"]), "attempted": False,
@@ -1005,6 +1048,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     successful_write_signatures: set[str] = set()
     already_satisfied_write_signatures: set[str] = set()
     action_history: list[str] = []
+    deferred_action_repeats: dict[str, int] = {}
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     mutation_failure = ""
     already_satisfied_candidate: dict[str, Any] | None = None
@@ -1134,6 +1178,24 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     update()
                     box.timeout_seconds = max(1, min(30, int(remaining)))
                     safe_args = dict(args)
+                    if name in WRITE_TOOLS and isinstance(safe_args.get("path"), str):
+                        provenance = config.get("provenance") if isinstance(config.get("provenance"), dict) else {}
+                        current_plan_task_id = str(provenance.get("plan_task_id") or "")
+                        try:
+                            target_key = owned_path_key(safe_args["path"])
+                        except (CrossTaskRequestError, TypeError):
+                            target_key = ""
+                        foreign_owner = getattr(box, "task_foreign_write_targets", {}).get(target_key)
+                        if (target_key and current_plan_task_id
+                                and current_plan_task_id == getattr(box, "task_id", current_plan_task_id)
+                                and foreign_owner and foreign_owner != current_plan_task_id
+                                and target_key not in getattr(box, "task_planned_write_targets", {})):
+                            try:
+                                normalize_intent_text(safe_args.get("needed_for"), "needed_for")
+                            except CrossTaskRequestError:
+                                safe_args["needed_for"] = (
+                                    f"Completing plan task {current_plan_task_id} requires this declared file change."
+                                )
                     if name == "run_command":
                         requested = safe_args.get("timeout_seconds", 30)
                         if isinstance(requested, int) and not isinstance(requested, bool) and 1 <= requested <= 120:
@@ -1244,6 +1306,37 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         })
                         raise CrossTaskWait(request)
                     no_progress_reason = ""
+                    if result.error_class == "cross_task_modification_incomplete":
+                        deferred_signature = hashlib.sha256(json.dumps({
+                            "tool": name,
+                            "capability": result.capability or common.get("capability", "unknown"),
+                            "arguments": {key: value for key, value in safe_args.items()
+                                          if key != "timeout_seconds"},
+                            "error_class": result.error_class,
+                            "missing_fields": sorted(result.missing_fields),
+                        }, sort_keys=True, ensure_ascii=False, default=str,
+                        separators=(",", ":")).encode("utf-8")).hexdigest()
+                        repeat_count = deferred_action_repeats.get(deferred_signature, 0) + 1
+                        deferred_action_repeats[deferred_signature] = repeat_count
+                        telemetry["no_progress_actions"] += 1
+                        if repeat_count >= 2:
+                            no_progress_reason = (
+                                "NoProgressDetected: the same incomplete cross-task request was repeated "
+                                "without correcting its required fields ({} attempts, {} steps)."
+                            ).format(repeat_count, metrics["steps"])
+                            telemetry["no_progress_detected"] = True
+                            telemetry["stop_reason"] = no_progress_reason
+                            publish("event", event={
+                                "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                "step_id": step_id, "tool": name,
+                                "reason": "The worker stopped after the same incomplete cross-task request was repeated.",
+                                "output": {"pattern": "repeated_incomplete_cross_task_request",
+                                           "repeat_count": repeat_count,
+                                           "missing_fields": list(result.missing_fields),
+                                           "steps": metrics["steps"],
+                                           "workspace_changes": telemetry["workspace_changes"]},
+                                "error_class": "no_progress",
+                            })
                     if (result.policy_decision == "deny" and result.error_class not in {
                             "unknown_tool", "tool_unavailable"} and not argument_error):
                         request_kind = "request_new_capabilities" if result.capability in {"", "unknown"} else "request_missing_capabilities"
@@ -1286,6 +1379,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         "tool": name,
                         "arguments": argument_summary(safe_args),
                         "capability": result.capability or resolved_capability,
+                            "event_id": common.get("step_id", ""),
                         "policy_decision": result.policy_decision or "allow",
                         "policy_reason": result.policy_reason or "",
                         "success": bool(result.success),
@@ -1303,9 +1397,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         if supported:
                             evidence = {
                                 "type": "command_execution",
+                                "source": "runtime_command_result",
+                                "event_id": common.get("step_id", ""),
                                 "check": "command_output:" + " ".join(str(item) for item in safe_args.get("argv", [])),
                                 "status": "passed",
                                 "tool": "run_command",
+                                "capability": result.capability or resolved_capability,
                                 "command": list(safe_args.get("argv", [])),
                                 "exit_code": result.exit_code,
                                 "output": str(result.output or "")[:4000],
@@ -1334,7 +1431,11 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                         "reason": "The single-case QA task stopped after one successful command satisfied every configured acceptance criterion.",
                                     })
                     if result.success and name in WRITE_TOOLS and result.error_class != "already_satisfied":
-                        publish_workspace_diff(name, safe_args, existing_before)
+                        publish_workspace_diff(
+                            name, safe_args, existing_before,
+                            event_id=common.get("step_id", ""),
+                            capability=result.capability or resolved_capability,
+                        )
                         telemetry["workspace_changes"] += 1
                         successful_validation_streak = 0
                         repeated_success_count = 0
@@ -1349,6 +1450,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "path": path,
                                 "change_type": "overwritten" if existing_before else "created",
                                 "tool": name,
+                                "event_id": common.get("step_id", ""),
+                                "capability": result.capability or resolved_capability,
                             })
                         modified = True
                         if name == "write_file" and result.changed is True and write_signature:
@@ -1359,16 +1462,30 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             "status": "Success", "path": safe_args.get("path", ""),
                             "message": "The requested state already exists; no write was performed.",
                         })
-                        if verification_state["requested"]:
+                        if (verification_state["requested"] and name == "write_file"
+                                and isinstance(safe_args.get("content"), str)):
+                            path = str(safe_args.get("path", ""))
+                            matched_content = safe_args["content"]
+                            criteria = [str(item).strip() for item in
+                                        verification.get("completion_criteria", [])
+                                        if str(item).strip()]
                             verification_state["attempted"] = True
                             verification_state["evidence"].append({
                                 "type": "file_content_match",
-                                "check": "filesystem:content_match:" + str(safe_args.get("path", "")),
-                                "status": "passed", "path": safe_args.get("path", ""),
+                                "source": "runtime_write_result",
+                                "tool": name,
+                                "capability": result.capability or resolved_capability,
+                                "event_id": common.get("step_id", ""),
+                                "check": "filesystem:content_match:" + path,
+                                "status": "passed", "result": "success", "path": path,
+                                "condition": "existing file content exactly matched the requested write content",
+                                "match": True,
                                 "content_sha256": hashlib.sha256(
-                                    str(safe_args.get("content", "")).encode("utf-8")
+                                    matched_content.encode("utf-8")
                                 ).hexdigest(),
-                                "supports_acceptance_criteria": [],
+                                "supports_acceptance_criteria": _readback_evidence_criteria(
+                                    criteria, path, matched_content, matched_content,
+                                ),
                             })
                         if name == "write_file" and result.success and write_signature:
                             was_written_this_run = write_signature in successful_write_signatures
@@ -1414,11 +1531,17 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                     "sha256": observations[0]["sha256"],
                                 })
                             if path not in modified_paths and path not in observed_files:
-                                observed_files[path] = (True, result.output)
+                                observed_files[path] = (
+                                    True, result.output, common.get("step_id", ""),
+                                    result.capability or resolved_capability,
+                                )
                         if isinstance(path, str) and path in modified_paths:
                             expected = modified_paths[path]
                             matches = expected is None or result.output == expected
-                            observed_files[path] = (matches, result.output)
+                            observed_files[path] = (
+                                matches, result.output, common.get("step_id", ""),
+                                result.capability or resolved_capability,
+                            )
                             criteria = [str(item).strip() for item in verification.get("completion_criteria", [])
                                         if str(item).strip()]
                             supported = _readback_evidence_criteria(criteria, path, result.output, expected)
@@ -1582,6 +1705,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 if legacy else {"role": "tool", "tool_name": name, "content": result.output})
                 if result.error_class == "ParentPathIsFile":
                     break
+                if result.error_class == "cross_task_modification_incomplete":
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "The last cross-task write did not change any file. Retry it only after correcting "
+                            "the request contract. Supply all four fields: requested_change (specific requested "
+                            "outcome, no implementation code), reason (why it is needed), needed_for (what this "
+                            "task requires the change for), and blocking (JSON true or false). "
+                            "Fields needing correction: " + ", ".join(result.missing_fields) + ". "
+                            "Do not repeat the same incomplete request."
+                        ),
+                    })
                 if auto_completed:
                     break
             if auto_completed:
@@ -1689,19 +1824,40 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                          "policy_decision": result.policy_decision or "deny",
                                          "policy_reason": result.policy_reason,
                                          "error_class": result.error_class})
+                try:
+                    result.event_id = step_id
+                except (AttributeError, TypeError):
+                    pass
                 return result
 
-            def record_verification(result: ToolResult, label: str) -> None:
+            def record_verification(result: ToolResult, label: str,
+                                    supports: list[str] | None = None, *,
+                                    event_id: str = "", capability: str = "") -> None:
                 verification_state["attempted"] = True
+                resolved_capability = (result.capability or capability or
+                                       ("filesystem.read" if result.name == "read_file" else ""))
+                check = {"check": label,
+                         "status": "passed" if result.success else "failed",
+                         "output": result.output[:4000],
+                         "source": "runtime_verification",
+                         "tool": result.name,
+                         "capability": resolved_capability,
+                         "event_id": getattr(result, "event_id", "") or event_id}
+                if label.startswith("filesystem:read_file:"):
+                    check.update(type="file_readback", path=label[len("filesystem:read_file:"):])
+                elif label.startswith("tests:"):
+                    check["type"] = "test_result"
+                elif label == "inspect_changes":
+                    check["type"] = "git_diff"
+                if supports:
+                    check["supports_acceptance_criteria"] = list(supports)
                 if result.success:
                     verification_state["passed"] = True
-                    verification_state["evidence"].append({"check": label, "status": "passed",
-                                                           "output": result.output[:4000]})
+                    verification_state["evidence"].append(check)
                 else:
                     verification_state["failed"] = True
                     verification_state["passed"] = False
-                    verification_state["evidence"].append({"check": label, "status": "failed",
-                                                           "output": result.output[:4000]})
+                    verification_state["evidence"].append(check)
             if modified and verification["inspect_changes"]:
                 if "git_diff" in getattr(box, "enabled", set()):
                     record_verification(verify_tool("git_diff", {}, "Inspect the resulting workspace changes."),
@@ -1734,14 +1890,21 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                 readback_passed = bool(modified_paths)
                 for path, expected in modified_paths.items():
                     if path in observed_files:
-                        matches, output = observed_files[path]
+                        matches, output, read_event_id, read_capability = observed_files[path]
                         if matches:
-                            record_verification(ToolResult("read_file", output, True, 0),
-                                                "filesystem:read_file:" + path)
+                            record_verification(
+                                ToolResult("read_file", output, True, 0),
+                                "filesystem:read_file:" + path,
+                                _readback_evidence_criteria(
+                                    verification.get("completion_criteria", []), path, output, expected,
+                                ),
+                                event_id=read_event_id, capability=read_capability,
+                            )
                         else:
                             record_verification(
                                 ToolResult("read_file", "Read-back content did not match the requested file content.", False, 0),
                                 "filesystem:read_file:" + path,
+                                event_id=read_event_id, capability=read_capability,
                             )
                             readback_passed = False
                         continue
@@ -1765,7 +1928,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         continue
                     matches = expected is None or result.output == expected
                     if matches:
-                        record_verification(result, "filesystem:read_file:" + path)
+                        record_verification(
+                            result, "filesystem:read_file:" + path,
+                            _readback_evidence_criteria(
+                                verification.get("completion_criteria", []), path, result.output, expected,
+                            ),
+                        )
                     else:
                         record_verification(
                             ToolResult("read_file", "Read-back content did not match the requested file content.", False, 0),

@@ -211,6 +211,8 @@ class WorkerOwnershipTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reserved for Freya"):
             normalize_agent({"name": "Manual", "config": {
                 "task_owned_paths": ["owner.txt"],
+                "task_planned_write_targets": [
+                    {"path": "owner.txt", "owner_plan_task_id": "owner"}],
                 "task_write_owners": {"owner.txt": "owner"},
                 "task_write_scope_enforced": True,
             }})
@@ -229,6 +231,7 @@ class WorkerOwnershipTests(unittest.TestCase):
             "permissions": "workspace", "allowed_directories": ["."],
             "provenance": {"plan_task_id": "requester"},
             "task_owned_paths": ["requester.txt"],
+            "task_planned_write_targets": [],
             "task_write_owners": {"requester.txt": "requester", "owner.txt": "owner"},
             "task_foreign_write_targets": [
                 {"path": "owner.txt", "owner_plan_task_id": "owner"}],
@@ -261,6 +264,49 @@ class WorkerOwnershipTests(unittest.TestCase):
         result = self.toolbox.invoke("edit_file", arguments)
         self.assertEqual(result.error_class, "cross_task_modification_required")
         self.assertFalse(result.executed)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_foreign_write_reports_missing_requested_change_explicitly(self):
+        self.assertTrue(self.toolbox.invoke("read_file", {"path": "owner.txt"}).success)
+        result = self.toolbox.invoke("edit_file", {
+            "path": "owner.txt", "old": "before", "new": "after",
+            "reason": "Prevent stale cache entries from persisting",
+            "needed_for": "The consumer configuration requires bounded retention",
+            "blocking": True,
+        })
+        self.assertEqual(result.error_class, "cross_task_modification_incomplete")
+        self.assertEqual(result.missing_fields, ("requested_change",))
+        self.assertIn("requested_change = a specific requested outcome", result.output)
+        self.assertIn("blocking = a JSON boolean", result.output)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_planned_foreign_target_is_allowed_after_read(self):
+        self.config["task_planned_write_targets"] = [
+            {"path": "owner.txt", "owner_plan_task_id": "owner"}]
+        toolbox = PolicyToolbox(
+            self.root, self.workspace, self.config,
+            ["read_file", "write_file", "edit_file"],
+        )
+        arguments = {"path": "owner.txt", "old": "before", "new": "after"}
+        unread = toolbox.invoke("edit_file", arguments)
+        self.assertEqual(unread.error_class, "read_before_write_required")
+        self.assertTrue(toolbox.invoke("read_file", {"path": "owner.txt"}).success)
+        result = toolbox.invoke("edit_file", arguments)
+        self.assertTrue(result.success, result.output)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "after")
+
+    def test_planned_foreign_target_does_not_bypass_hard_policy_deny(self):
+        self.config["task_planned_write_targets"] = [
+            {"path": "owner.txt", "owner_plan_task_id": "owner"}]
+        toolbox = PolicyToolbox(
+            self.root, self.workspace, self.config,
+            ["read_file", "write_file", "edit_file"],
+        )
+        toolbox.policy.evaluate = lambda *_: SimpleNamespace(
+            outcome="deny", reason="Hard filesystem policy denial.",
+        )
+        result = toolbox.invoke("edit_file", {"path": "owner.txt", "old": "before", "new": "after"})
+        self.assertEqual(result.error_class, "policy_denied")
         self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
 
     def test_undeclared_foreign_target_fails_closed(self):

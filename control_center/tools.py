@@ -48,6 +48,7 @@ class ToolResult:
     blocking_path: str = ""
     owner_task_id: str = ""
     target_path: str = ""
+    missing_fields: tuple[str, ...] = ()
 
 
 class ParentPathIsFile(Exception):
@@ -116,30 +117,33 @@ class Toolbox:
                 "write_file",
                 "Create or overwrite an owned UTF-8 text file in the task workspace; "
                 "this tool never creates directories, and parent directories "
-                "are created automatically. If another task owns the file, include requested_change, "
-                "reason and needed_for so Freya can coordinate the change; the file is not written by this task.",
+                "are created automatically. A compiled exact dependent write target may be changed under normal "
+                "capability policy. Otherwise, if another task owns the file, Freya requires requested_change, "
+                "reason, needed_for and blocking before coordinating the change.",
                 {
                     "path": {"type": "string", "description": "Workspace-relative file path."},
                     "content": {"type": "string", "description": "Complete file contents."},
-                    "requested_change": {"type": "string", "description": "Required only when Freya reports a cross-task ownership conflict."},
-                    "reason": {"type": "string", "description": "Why the owner needs to make this change."},
-                    "needed_for": {"type": "string", "description": "What requester task depends on this change."},
-                    "blocking": {"type": "boolean", "description": "Whether the requester task is blocked until the change is made."},
+                    "requested_change": {"type": "string", "description": "For a cross-task conflict, required: specific requested outcome, without implementation code."},
+                    "reason": {"type": "string", "description": "For a cross-task conflict, required: why this change is needed."},
+                    "needed_for": {"type": "string", "description": "For a cross-task conflict, required: what this requester task depends on the change for."},
+                    "blocking": {"type": "boolean", "description": "For a cross-task conflict, required boolean: whether the requester task is blocked until the change is made."},
                 },
                 ["path", "content"],
             ),
             cls._schema(
                 "edit_file",
                 "Replace one exact, unique text fragment in an owned workspace file. If another task owns it, "
-                "include requested_change, reason and needed_for so Freya can coordinate the change; no write occurs.",
+                "an exact dependent write target in the compiled plan follows normal capability and "
+                "read-before-write policy. Otherwise include requested_change, reason, needed_for and blocking "
+                "so Freya can coordinate the change.",
                 {
                     "path": {"type": "string"},
                     "old": {"type": "string", "description": "Exact existing text; must occur once."},
                     "new": {"type": "string", "description": "Replacement text."},
-                    "requested_change": {"type": "string", "description": "Required only when Freya reports a cross-task ownership conflict."},
-                    "reason": {"type": "string", "description": "Why the owner needs to make this change."},
-                    "needed_for": {"type": "string", "description": "What requester task depends on this change."},
-                    "blocking": {"type": "boolean", "description": "Whether the requester task is blocked until the change is made."},
+                    "requested_change": {"type": "string", "description": "For a cross-task conflict, required: specific requested outcome, without implementation code."},
+                    "reason": {"type": "string", "description": "For a cross-task conflict, required: why this change is needed."},
+                    "needed_for": {"type": "string", "description": "For a cross-task conflict, required: what this requester task depends on the change for."},
+                    "blocking": {"type": "boolean", "description": "For a cross-task conflict, required boolean: whether the requester task is blocked until the change is made."},
                 },
                 ["path", "old", "new"],
             ),

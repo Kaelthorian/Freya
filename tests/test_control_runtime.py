@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+from control_center.agent_factory import AgentFactory
 from control_center.config import DEFAULT_CONFIG, normalize_agent
 from control_center.evaluator import Evaluator
 from control_center.execution_graph import ExecutionGraph
@@ -134,6 +135,90 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(diffs[0]["output"]["path"], "calculator.bat")
         self.assertEqual(diffs[0]["output"]["change_type"], "created")
         self.assertIn("+@echo off", diffs[0]["output"]["diff"])
+        self.assertEqual(diffs[0]["output"]["source"], "workspace_diff")
+        self.assertEqual(diffs[0]["output"]["tool"], "write_file")
+        self.assertEqual(diffs[0]["output"]["capability"], "filesystem.create")
+        self.assertTrue(diffs[0]["output"]["event_id"])
+
+    def test_cross_task_retry_supplies_contract_and_enters_approval(self):
+        (self.workspace / "owner.txt").write_text("before", encoding="utf-8")
+        config = {
+            "capability_policy": AgentFactory.capability_policy([
+                "filesystem.read", "filesystem.modify",
+            ]),
+            "permissions": "workspace", "allowed_directories": ["."],
+            "provenance": {"generated_by_freya": True,
+                           "orchestration_id": "orchestration-1",
+                           "plan_task_id": "requester"},
+            "task_owned_paths": [],
+            "task_foreign_write_targets": [
+                {"path": "owner.txt", "owner_plan_task_id": "owner"}],
+            "task_planned_write_targets": [],
+            "task_write_owners": {"owner.txt": "owner"},
+            "task_write_scope_enforced": True,
+        }
+        incomplete = {
+            "path": "owner.txt", "old": "before", "new": "after",
+            "reason": "Prevent stale cache entries from persisting", "blocking": True,
+        }
+        corrected = {
+            "path": "owner.txt", "old": "before", "new": "after",
+            "requested_change": "Add an explicit cache expiry setting",
+            "reason": "Prevent stale cache entries from persisting", "blocking": True,
+        }
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "owner.txt"}),
+                          ("edit_file", incomplete)]),
+            answer(calls=[("edit_file", corrected)]),
+        ], config=config, tools=["read_file", "edit_file"], prompt="Update the owned cache file")
+        self.assertEqual(result["status"], "WaitingForApproval")
+        request = next(item["event"] for item in self.events
+                       if item.get("event", {}).get("event_type") == "cross_task_modification.requested")
+        self.assertEqual(request["requested_change"], "Add an explicit cache expiry setting")
+        self.assertEqual(request["needed_for"],
+                         "Completing plan task requester requires this declared file change.")
+        retry_prompt = next(item["content"] for item in self.payloads[1]["messages"]
+                            if item.get("role") == "user"
+                            and "Fields needing correction" in item.get("content", ""))
+        self.assertIn("requested_change", retry_prompt)
+        self.assertIn("needed_for", retry_prompt)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
+
+    def test_identical_incomplete_cross_task_action_stops_as_no_progress(self):
+        (self.workspace / "owner.txt").write_text("before", encoding="utf-8")
+        config = {
+            "capability_policy": AgentFactory.capability_policy([
+                "filesystem.read", "filesystem.modify",
+            ]),
+            "permissions": "workspace", "allowed_directories": ["."],
+            "provenance": {"generated_by_freya": True,
+                           "orchestration_id": "orchestration-1",
+                           "plan_task_id": "requester"},
+            "task_owned_paths": [],
+            "task_foreign_write_targets": [
+                {"path": "owner.txt", "owner_plan_task_id": "owner"}],
+            "task_planned_write_targets": [],
+            "task_write_owners": {"owner.txt": "owner"},
+            "task_write_scope_enforced": True,
+        }
+        incomplete = {
+            "path": "owner.txt", "old": "before", "new": "after",
+            "reason": "Prevent stale cache entries from persisting", "blocking": True,
+        }
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "owner.txt"}),
+                          ("edit_file", incomplete)]),
+            answer(calls=[("edit_file", incomplete)]),
+        ], config=config, tools=["read_file", "edit_file"], prompt="Update the owned cache file")
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertTrue(result["no_progress_detected"])
+        self.assertLess(result["steps"], config.get("max_steps", 20))
+        events = [item["event"] for item in self.events
+                  if item.get("event", {}).get("event_type") == "task.no_progress"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["output"]["repeat_count"], 2)
+        self.assertEqual((self.workspace / "owner.txt").read_text(encoding="utf-8"), "before")
 
     def test_successful_command_output_becomes_acceptance_evidence(self):
         result = self.run_worker([
@@ -404,8 +489,14 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(result["verification"]["attempted"])
         self.assertTrue(result["verification"]["passed"])
         self.assertFalse(result["verification"]["unavailable"])
-        self.assertTrue(any(item.get("check") == "filesystem:read_file:hola_mundo.txt"
-                            for item in result["verification"]["evidence"]))
+        readback = next(item for item in result["verification"]["evidence"]
+                        if item.get("check") == "filesystem:read_file:hola_mundo.txt")
+        self.assertEqual(readback["type"], "file_readback")
+        self.assertEqual(readback["source"], "runtime_verification")
+        self.assertEqual(readback["tool"], "read_file")
+        self.assertEqual(readback["capability"], "filesystem.read")
+        self.assertTrue(readback["event_id"])
+        self.assertEqual(readback["output"], "hola mundo")
 
     def test_duplicate_write_after_verified_read_is_completed_without_overwrite(self):
         result = self.run_worker([
@@ -453,6 +544,15 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(any(action.get("policy_decision") == "deny" for action in actions))
         self.assertTrue(any(event.get("event", {}).get("event_type") == "worker.write_already_satisfied"
                             for event in self.events))
+        content_match = next(item for item in result["verification"]["evidence"]
+                             if item.get("type") == "file_content_match")
+        self.assertEqual(content_match["path"], "calculator.py")
+        self.assertEqual(content_match["source"], "runtime_write_result")
+        self.assertEqual(content_match["tool"], "write_file")
+        self.assertEqual(content_match["capability"], "filesystem.create")
+        self.assertTrue(content_match["event_id"])
+        self.assertTrue(content_match["match"])
+        self.assertEqual(content_match["status"], "passed")
         self.assertEqual(
             result["result"]["summary"],
             "Execution completed; requested workspace state is already satisfied.",
@@ -474,17 +574,11 @@ class WorkerTests(unittest.TestCase):
 
         def reject_incomplete_calculator(_prompt, context):
             evaluator_input.update(context)
-            return {
-                "status": "needs_revision", "confidence": 1.0,
-                "summary": "The requested calculator operations are not present.",
-                "criteria": [{
-                    "criterion": criterion, "status": "unsatisfied",
-                    "reason": "The source only prints a greeting and does not implement the four operations.",
-                    "evidence": ["workspace diff for calculator.py"],
-                }],
-                "issues": ["The calculator behavior is missing."],
-                "missing_evidence": [], "recommended_action": "revise",
-            }
+            return {"criteria": [{
+                "criterion": criterion, "status": "partial",
+                "reason": "The source only prints a greeting and does not implement the four operations.",
+                "evidence": ["workspace diff for calculator.py"], "confidence": 1.0,
+            }]}
 
         planned_task = {
             "id": "T-1", "objective": "Create a calculator",
@@ -911,12 +1005,9 @@ class WorkerTests(unittest.TestCase):
         def decision(_prompt, context):
             observed = json.loads(context["runtime_task"]["result"])
             self.assertIn(source.strip(), observed["actions"][0]["output"])
-            return {"status": "accepted", "confidence": 1.0,
-                    "summary": "The current function satisfies the criterion.",
-                    "criteria": [{"criterion": criterion, "status": "satisfied",
+            return {"criteria": [{"criterion": criterion, "status": "satisfied",
                                   "reason": "The read source contains the implementation.",
-                                  "evidence": ["read_file calculator.py"]}],
-                    "issues": [], "missing_evidence": [], "recommended_action": "accept"}
+                                  "evidence": ["read_file calculator.py"], "confidence": 1.0}]}
         evaluation = Evaluator(model=decision).evaluate(
             planned_task=planned, runtime_task=result,
             execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime", "attempt": 1})

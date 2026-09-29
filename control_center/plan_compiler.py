@@ -164,6 +164,67 @@ def extend_compiled_write_ownership(plan: dict[str, Any],
     return result
 
 
+def planned_write_target_grants(plan: dict[str, Any], task_id: str) -> list[dict[str, str]]:
+    """Derive exact foreign-write grants for targets owned by dependencies."""
+    if not isinstance(plan, dict) or not isinstance(task_id, str):
+        return []
+    tasks = plan.get("tasks")
+    owners = plan.get("write_owners")
+    if not isinstance(tasks, list) or not isinstance(owners, dict):
+        return []
+    tasks_by_id = {
+        item.get("id"): item for item in tasks
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    task = tasks_by_id.get(task_id)
+    if task is None:
+        return []
+
+    ancestors: set[str] = set()
+    pending = list(task.get("depends_on", [])) if isinstance(task.get("depends_on"), list) else []
+    while pending:
+        dependency = pending.pop()
+        if not isinstance(dependency, str) or dependency in ancestors:
+            continue
+        dependency_task = tasks_by_id.get(dependency)
+        if dependency_task is None:
+            continue
+        ancestors.add(dependency)
+        dependencies = dependency_task.get("depends_on", [])
+        if isinstance(dependencies, list):
+            pending.extend(dependencies)
+
+    try:
+        targets = normalize_owned_paths(task.get("write_targets", []))
+    except CrossTaskRequestError:
+        return []
+    foreign = {}
+    for item in task.get("foreign_write_targets", []):
+        if not isinstance(item, dict) or set(item) != {"path", "owner_plan_task_id"}:
+            continue
+        try:
+            foreign[owned_path_key(item["path"])] = item["owner_plan_task_id"]
+        except (CrossTaskRequestError, TypeError):
+            continue
+
+    grants: list[dict[str, str]] = []
+    for path in targets:
+        key = owned_path_key(path)
+        owner_id = owners.get(key)
+        owner_task = tasks_by_id.get(owner_id)
+        if (not isinstance(owner_id, str) or owner_id == task_id
+                or owner_id not in ancestors or foreign.get(key) != owner_id
+                or owner_task is None):
+            continue
+        try:
+            owner_paths = {owned_path_key(value) for value in owner_task.get("owned_paths", [])}
+        except (CrossTaskRequestError, TypeError):
+            continue
+        if key in owner_paths:
+            grants.append({"path": path, "owner_plan_task_id": owner_id})
+    return grants
+
+
 def _compiler_event(catalog: RuntimeResourceCatalog, name: str, **details: Any) -> None:
     catalog.compiler_events.append(sanitize({"event_type": name, **details}))
 

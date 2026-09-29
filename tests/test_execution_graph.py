@@ -40,15 +40,13 @@ def execution_plan(tasks):
 
 def evaluation_decision(criteria, status="accepted"):
     return {
-        "status": status, "confidence": 0.9, "summary": status + " by test evaluator.",
         "criteria": [{
             "criterion": item,
-            "status": "satisfied" if status == "accepted" else "unsatisfied",
+            "status": "satisfied" if status == "accepted" else
+                      "partial" if status == "needs_revision" else "unsatisfied",
             "reason": "Test evidence was evaluated.", "evidence": ["fixture"],
+            "confidence": 0.9,
         } for item in criteria],
-        "issues": [] if status == "accepted" else ["Contradictory evidence."],
-        "missing_evidence": [],
-        "recommended_action": "accept" if status == "accepted" else "reject",
     }
 
 
@@ -660,9 +658,11 @@ class SchedulerTests(unittest.TestCase):
         agent = self.agent("Accepted")
         runtime = ControlledRuntime(self.store)
         calls = []
+        criterion_links = []
 
         def model(prompt, context):
             calls.append(context["planned_task"]["id"])
+            criterion_links.append(context["planned_task"]["acceptance_criteria"])
             return evaluation_decision(context["planned_task"]["success_criteria"])
 
         final = self.run_graph(
@@ -672,6 +672,10 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(final["status"], "Success")
         self.assertEqual(calls, ["a", "b"])
+        self.assertEqual(criterion_links, [
+            [{"id": "LC-1", "criterion": "a completes"}],
+            [{"id": "LC-2", "criterion": "b completes"}],
+        ])
         self.assertEqual(len(final["evaluations"]), 2)
         event_types = [item["event_type"] for item in final["events"]]
         self.assertEqual(event_types.count("freya.evaluation.started"), 2)
@@ -796,8 +800,6 @@ class SchedulerTests(unittest.TestCase):
         def model(prompt, context):
             criteria = context["planned_task"]["success_criteria"]
             value = evaluation_decision(criteria)
-            value.update(status="needs_revision", recommended_action="revise",
-                         summary="A small part is missing.")
             value["criteria"][0]["status"] = "partial"
             return value
 

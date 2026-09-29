@@ -1998,7 +1998,9 @@ class Store(IntegrationStoreMixin):
                 result.append(step)
             return result
 
-    def list_events(self, task_id: str | None = None, after: int = 0, limit: int = 200, **filters: Any) -> list[dict]:
+    def list_events(self, task_id: str | None = None, after: int = 0,
+                    limit: int | None = 200, **filters: Any) -> list[dict]:
+        bounded_limit = None if limit is None else max(1, min(int(limit), 10000))
         where, params = ["e.id > ?"], [max(0, int(after))]
         for column, value in (("e.task_id", task_id), ("e.agent_id", filters.get("agent_id")),
                               ("e.level", filters.get("level")), ("e.tool", filters.get("tool")),
@@ -2021,14 +2023,23 @@ class Store(IntegrationStoreMixin):
             params.append(end)
         with self._connection() as connection:
             order = "DESC" if filters.get("newest") else "ASC"
-            rows = connection.execute("SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,t.agent_role AS task_agent_role,t.workspace AS task_workspace,a.name AS current_agent_name,a.role AS current_agent_role, " +
-                                      "d.orchestration_id,o.prompt AS orchestration_prompt,o.status AS orchestration_status, " +
-                                      "o.created_at AS orchestration_created_at " +
-                                      "FROM log_events e LEFT JOIN tasks t ON t.id=e.task_id " +
-                                      "LEFT JOIN agents a ON a.id=e.agent_id " +
-                                      "LEFT JOIN orchestration_delegations d ON d.task_id=e.task_id " +
-                                      "LEFT JOIN orchestration_runs o ON o.id=d.orchestration_id WHERE " + " AND ".join(where)
-                                      + " ORDER BY e.id " + order + " LIMIT ?", [*params, max(1, min(int(limit), 10000))])
+            query = (
+                "SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,t.agent_role AS task_agent_role,"
+                "t.workspace AS task_workspace,a.name AS current_agent_name,a.role AS current_agent_role,"
+                "d.orchestration_id,o.prompt AS orchestration_prompt,o.status AS orchestration_status,"
+                "o.created_at AS orchestration_created_at FROM log_events e "
+                "LEFT JOIN tasks t ON t.id=e.task_id "
+                "LEFT JOIN agents a ON a.id=e.agent_id "
+                "LEFT JOIN orchestration_delegations d ON d.task_id=e.task_id "
+                "LEFT JOIN orchestration_runs o ON o.id=d.orchestration_id WHERE "
+                + " AND ".join(where)
+                + " ORDER BY e.id " + order
+            )
+            query_params = list(params)
+            if bounded_limit is not None:
+                query += " LIMIT ?"
+                query_params.append(bounded_limit)
+            rows = connection.execute(query, query_params)
             result = []
             for row in rows:
                 payload = dict(_load(row["payload_json"]), id=row["id"])
@@ -2128,7 +2139,7 @@ class Store(IntegrationStoreMixin):
                     result.append(payload)
             result.sort(key=lambda item: (str(item.get("timestamp") or ""), str(item.get("id") or "")),
                         reverse=bool(filters.get("newest")))
-            return result[:max(1, min(int(limit), 10000))]
+            return result if bounded_limit is None else result[:bounded_limit]
 
     def metrics(self, agent_id: str | None = None) -> dict:
         where, params = (" WHERE t.agent_id=?", [agent_id]) if agent_id else ("", [])

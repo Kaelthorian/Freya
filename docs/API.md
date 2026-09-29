@@ -323,6 +323,15 @@ failure blocks descendants without stopping independent work. Node states are
 `superseded`. Runtime `Success` enters `evaluating`; only an `accepted`
 evaluation becomes node `success`. Other semantic outcomes enter
 `recovery_pending` and receive exactly one bounded decision for that attempt.
+Evaluator resolves objective criteria first and sends only unresolved criteria
+to the tool-free semantic model. The model returns only per-criterion
+`criterion`, `status`, `reason`, `evidence`, and `confidence`; Python computes the
+public status, action, issues, and missing evidence. The persisted public
+criterion shape remains `criterion`, `status`, `reason`, and `evidence`.
+One response repair and one bounded semantic retry (with its own repair) use at
+most four model calls on the same Runtime evidence. Metrics include
+`criteria_total`, `criteria_deterministic`, `criteria_semantic`, `model_calls`,
+`repairs`, `evaluator_retries`, and `final_status`.
 Evaluator infrastructure failures persist as `status=error` with
 `evaluation_status=error`, `failure_class=evaluator_infrastructure`, and
 `recommended_runtime_action=retry_evaluation`; they have no semantic
@@ -514,6 +523,7 @@ recoverable read does not count as an additional blocked decision.
 | POST | `/api/tasks/{id}/cancel` | terminate a live task |
 | POST | `/api/tasks/{id}/retry` | create a new task from a terminal prompt |
 | GET | `/api/logs` | filter by agent, task, orchestration, level, tool, error and date |
+| GET | `/api/orchestrations/{id}/logs` | export every persisted runtime and orchestration event for one Freya run |
 | GET | `/api/metrics?agent_id=` | global or per-agent aggregates |
 | GET | `/api/health` | API, runtime and optional host telemetry |
 | GET | `/api/events?after=N` | replay/global SSE stream |
@@ -538,6 +548,13 @@ and relevant status/tool/input/output/error/duration fields. Approval events inc
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
 
+`GET /api/orchestrations/{id}/logs` returns the complete persisted event stream
+for the specified Freya run, combining all delegated runtime logs and
+orchestration events in chronological order. Unlike the filtered Logs view, this
+export does not apply the 10,000-event display limit; the Freya page uses it for
+the one-click **Copy all logs** action. Standard event sanitization still
+applies, so this export cannot restore content redacted or bounded when logged.
+
 Planning audit events separate semantic proposals from compiler decisions:
 `freya.planner.semantic_plan_proposed` records operations and ownership,
 `freya.plan.resources_resolved` records derived capability/tool pairs,
@@ -549,8 +566,12 @@ execution outcomes; semantic task acceptance is recorded only by Evaluator.
 Related events include `artifact.read_observed`,
 `artifact.read_before_write_required`, `artifact.stale_read_detected`,
 `task.already_satisfied_candidate`, `task.responsibility_context_generated`,
-`worker.write_already_satisfied`, `evaluation.deterministic_evidence_matched`,
-`evaluation.semantic_review_required`, `evaluation.infrastructure_failed`,
+`worker.write_already_satisfied`, `evaluation.infrastructure_failed`,
+`evaluation.criterion.deterministic`, `evaluation.criterion.semantic_started`,
+`evaluation.criterion.semantic_completed`, `evaluation.aggregate.completed`,
+`evaluation.semantic_contract_repaired`, `evaluation.semantic_retry_started`,
+`evaluation.semantic_retry_completed`,
+`evaluator.evidence_prepared` and `evaluation.insufficient_evidence`,
 `project_context.symbol_reported` and `project_context.symbol_verified`.
 
 For structured worker output, `task.result_contract` records the required
@@ -567,15 +588,32 @@ including `changed` and `already_satisfied` for no-op writes; `artifacts` contai
 successful file changes, and `verification.evidence` may contain
 `command_execution` records with `command`, `exit_code`, `output` and
 `supports_acceptance_criteria`. A passed command record linked to every exact
-planned criterion produces deterministic acceptance.
+planned criterion produces deterministic acceptance. The Evaluator normalizes
+verification records, tool results, artifacts and workspace diffs into a
+bounded evidence catalog before making a decision. Its context includes
+`evidence_by_criterion` keyed by stable local criterion IDs and
+`global_evidence_ids` for records without a grounded association. Existing
+text links resolve to matching criterion IDs; explicit criterion metadata can
+recover a missing link. Each record retains available path, diff/read-back/
+output, status, source, tool, capability and event/timestamp provenance.
+Identical records are deduplicated.
 For a purely factual file creation/presence criterion, the Evaluator matches
 exact paths from planned `write_targets` or `owned_paths` against successful
-`filesystem.create` actions, created artifacts, created workspace diffs, or
-successful read-back. Every relevant target needs evidence. Later denied writes
+`filesystem.create` actions, created artifacts, created workspace diffs,
+successful read-back, or a matching file-content check. Every relevant target
+needs evidence. Later denied writes
 cannot undo an earlier creation; successful removal evidence prevents acceptance
 from stale creation records. Mixed criteria keep proven facts and send remaining
-semantic questions to the LLM. The bounded evaluation snapshot carries action,
-artifact, diff and plan-target metadata separately without full diff contents.
+semantic questions to the LLM. Diff and read-back contents appear in the
+bounded evidence catalog separately from action, artifact and plan-target
+metadata. Clipping evidence sets `context_truncated=true`. File creation proves
+presence only; semantic criteria require relevant content, verification or test
+evidence and remain subject to semantic
+evaluation. Criterion-scoped test results and exact typed checks take
+deterministic precedence. `evaluator.evidence_prepared` logs criterion IDs,
+evidence IDs, types, sources and inferred associations; an
+`evaluation.insufficient_evidence` event records why an unknown decision
+still requires evidence.
 Runtime exceptions build
 this contract from the action ledger and skip model repair. An identical denied
 action is fingerprinted and answered locally with

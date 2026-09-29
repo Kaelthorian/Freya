@@ -530,12 +530,11 @@ class GroundedLifecycleTests(unittest.TestCase):
         def evaluator_model(prompt, context):
             task = context["planned_task"]
             status = "needs_revision" if task["id"] == "c" and context["execution"]["attempt"] == 1 else "accepted"
-            return {"status": status, "confidence": 1, "summary": status,
-                    "criteria": [{"criterion": item, "status": "satisfied" if status == "accepted" else "unsatisfied",
-                                  "reason": "Fixture check", "evidence": ["Fixture verification"]}
-                                 for item in task["success_criteria"]],
-                    "issues": [] if status == "accepted" else ["Complete the missing connection"],
-                    "missing_evidence": [], "recommended_action": "accept" if status == "accepted" else "revise"}
+            return {"criteria": [{"criterion": item,
+                                  "status": "satisfied" if status == "accepted" else "partial",
+                                  "reason": "Fixture check", "evidence": ["Fixture verification"],
+                                  "confidence": 1.0}
+                                 for item in task["success_criteria"]]}
         run, _, orchestrator = self.make(evaluator=Evaluator(evaluator_model))
         orchestrator._run(run["id"])
         final = self.store.get_orchestration(run["id"])
@@ -646,13 +645,13 @@ class GroundedLifecycleTests(unittest.TestCase):
         self.assertEqual(task["tools"], ["write_file"])
         self.assertEqual(final["selections"][-1]["status"], "selected")
     def test_45_consumes_shared_revision_budget_before_global_recovery(self):
-        from tests.test_recovery import evaluation, recovery_decision
+        from tests.test_recovery import semantic_evaluation, recovery_decision
         initial = fixtures.plan([fixtures.task("a")], [GOAL])
         revised = fixtures.plan([fixtures.task("a"), fixtures.task("replacement")], [GOAL])
         def evaluate(prompt, context):
-            result = evaluation("needs_revision" if context["planned_task"]["id"] == "a" else "accepted")
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation(
+                "needs_revision" if context["planned_task"]["id"] == "a" else "accepted",
+                context["planned_task"]["success_criteria"][0])
         integration_calls = []
         run, runtime, orchestrator = self.make(
             initial=initial, evaluator=Evaluator(evaluate),

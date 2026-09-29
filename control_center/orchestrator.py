@@ -23,6 +23,7 @@ from .recovery import (FAILURE_ANALYSIS_VERSION, RECOVERY_VERSION,
 from .security import sanitize
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
+from .plan_compiler import planned_write_target_grants
 from .runtime_resources import planner_resource_context
 from .skills import skill_summary
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
@@ -1114,6 +1115,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 else:
                     factory_task = dict(task)
                     plan_snapshot = current_run.get("effective_plan") or current_run.get("plan") or {}
+                    factory_task["_planned_write_targets"] = planned_write_target_grants(
+                        plan_snapshot, planned_task_id,
+                    )
                     factory_task["_write_owners"] = dict(plan_snapshot.get("write_owners") or {
                         owned_path_key(path): owner["id"]
                         for owner in plan_snapshot.get("tasks", [])
@@ -1285,9 +1289,21 @@ class Orchestrator(IntegrationOrchestrationMixin):
             })
         technical_error = None
         try:
+            evaluation_task = dict(planned_task)
+            criterion_links = plan.get("criterion_links")
+            local_links = criterion_links.get("local", []) if isinstance(criterion_links, dict) else []
+            if isinstance(local_links, list):
+                evaluation_task["acceptance_criteria"] = [
+                    {"id": item["id"], "criterion": item["criterion"]}
+                    for item in local_links if isinstance(item, dict)
+                    and item.get("task_id") == task_id
+                    and isinstance(item.get("id"), str)
+                    and isinstance(item.get("criterion"), str)
+                    and item.get("criterion") in planned_task.get("success_criteria", [])
+                ]
             with self.evaluator_lock:
                 outcome = self.evaluator.evaluate(
-                    planned_task=planned_task, runtime_task=runtime_task,
+                    planned_task=evaluation_task, runtime_task=runtime_task,
                     execution_node=target,
                 )
         except Exception as exc:
@@ -1302,6 +1318,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 ),
                 deterministic=False,
                 context_snapshot=dict(getattr(self.evaluator, "last_context", {}) or {}),
+                events=list(getattr(self.evaluator, "events", []) or []),
             )
         if self.clock() >= deadline:
             self._timeout(oid)
@@ -1319,6 +1336,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "evaluator_version": EVALUATOR_VERSION,
             "input": outcome.get("context_snapshot") or {},
             "evaluation": evaluation,
+            "criterion_details": outcome.get("criterion_details") or [],
         }
         with self.lock:
             run = self.store.get_orchestration(oid)
@@ -1367,27 +1385,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "task_id": task_id, "evaluation_id": evaluation_id,
                     "evaluation_status": "error", "message": evaluation["summary"],
                 })
-            else:
-                facts = (outcome.get("context_snapshot") or {}).get("criterion_facts") or []
-                for fact in facts:
-                    if fact.get("status") == "PROVEN SATISFIED":
-                        for proof in fact.get("proof", []):
-                            for evidence_type in proof.get("evidence_type", []):
-                                self.store.add_orchestration_event(oid, {
-                                    "event_type": "evaluation.deterministic_evidence_matched",
-                                    "status": "Success", "task_id": task_id,
-                                    "evaluation_id": evaluation_id,
-                                    "criterion": fact.get("criterion"),
-                                    "path": proof.get("path"),
-                                    "evidence_type": evidence_type,
-                                })
-                    elif not outcome.get("deterministic"):
-                        self.store.add_orchestration_event(oid, {
-                            "event_type": "evaluation.semantic_review_required",
-                            "status": "Success", "task_id": task_id,
-                            "evaluation_id": evaluation_id,
-                            "criterion": fact.get("criterion"),
-                        })
+            for evaluator_event in outcome.get("events") or []:
+                self.store.add_orchestration_event(oid, {
+                    **evaluator_event, "status": evaluator_event.get("status", "Success"),
+                    "task_id": task_id, "evaluation_id": evaluation_id,
+                })
             self.store.add_orchestration_event(oid, {
                 "event_type": event_type,
                 "status": "Failed" if evaluation["status"] != "accepted" else "Success",

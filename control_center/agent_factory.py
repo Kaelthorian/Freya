@@ -285,6 +285,7 @@ class AgentFactory:
             # capability policy. Reads remain unaffected by this write scope.
             "task_owned_paths": list(task.get("owned_paths", [])),
             "task_foreign_write_targets": list(task.get("foreign_write_targets", [])),
+            "task_planned_write_targets": list(task.get("_planned_write_targets", [])),
             "task_write_owners": dict(task.get("_write_owners", {})),
             # Generated plan agents always have an explicit write boundary.
             # Legacy plans without path metadata therefore fail closed.

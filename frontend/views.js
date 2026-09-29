@@ -131,6 +131,7 @@ function freyaRunRow(item) {
   const startedAt = run.created_at, elapsed = active && startedAt ? Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000) : Number(run.duration_seconds) || 0;
   const failed = run.status === 'Failed', failure = failed ? taskTitle(uiText(run.error || run.response || 'Failure cause unavailable.'), 120) : '';
   const action = run.status === 'NeedsClarification' ? '<a class="text-link" href="#freya-clarification-' + esc(run.id) + '">Responder</a>' : active ? button('Stop', 'cancel-orchestration', 'stop', 'data-id="' + esc(run.id) + '"', 'small-button danger-quiet') : '<a class="text-link" href="#/logs?orchestration_id=' + encodeURIComponent(run.id || '') + '">' + (failed ? 'Diagnosis' : 'Logs') + ' ' + icon('arrow') + '</a>';
+  const copyLogsAction = button('Copy all logs', 'copy-orchestration-logs', 'copy', 'type="button" data-id="' + esc(run.id) + '"', 'small-button');
   const activityAction = '<button type="button" class="text-link freya-view-activity" data-action="show-freya-activity" data-id="' + esc(run.id) + '">Activity</button>';
   return [
     '<tr>',
@@ -141,7 +142,7 @@ function freyaRunRow(item) {
     '<td class="mono nowrap">' + duration(elapsed) + '</td>',
     '<td class="mono">—</td>',
     '<td class="mono">—</td>',
-    '<td><div class="freya-row-actions">' + action + activityAction + '</div></td>',
+    '<td><div class="freya-row-actions">' + action + copyLogsAction + activityAction + '</div></td>',
     '</tr>'
   ].join('');
 }

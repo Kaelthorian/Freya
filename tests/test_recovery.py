@@ -49,6 +49,14 @@ def evaluation(status="needs_revision"):
     }
 
 
+def semantic_evaluation(status="needs_revision", criterion="a completes"):
+    criterion_status = ("satisfied" if status == "accepted" else
+                        "partial" if status == "needs_revision" else "unsatisfied")
+    return {"criteria": [{"criterion": criterion, "status": criterion_status,
+                          "reason": "Fixture evidence.", "evidence": ["fixture"],
+                          "confidence": 0.9}]}
+
+
 def recovery_decision(action="retry_same_agent", *, task_id="a", excluded=None):
     return {
         "action": action, "reason": "A bounded retry can address the evaluation.",
@@ -1058,7 +1066,7 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             evaluation_calls.append(context["execution"]["attempt"])
-            return evaluation("needs_revision" if len(evaluation_calls) == 1 else "accepted")
+            return semantic_evaluation("needs_revision" if len(evaluation_calls) == 1 else "accepted")
 
         recovery = RecoveryController(lambda prompt, context: recovery_decision())
         run = self.store.create_orchestration("Retry")
@@ -1094,7 +1102,7 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             calls.append(context["execution"]["attempt"])
-            return evaluation("rejected" if len(calls) == 1 else "accepted")
+            return semantic_evaluation("rejected" if len(calls) == 1 else "accepted")
 
         def recovery_model(prompt, context):
             previous = context["execution"]["selected_agent_id"]
@@ -1123,7 +1131,7 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             evaluation_calls.append(context["execution"]["attempt"])
-            return evaluation("rejected" if len(evaluation_calls) < 3 else "accepted")
+            return semantic_evaluation("rejected" if len(evaluation_calls) < 3 else "accepted")
 
         def recovery_model(prompt, context):
             previous = context["execution"]["selected_agent_id"]
@@ -1153,11 +1161,9 @@ class RecoverySchedulerTests(unittest.TestCase):
         revised["goal"] = operational_goal
 
         def evaluator_model(prompt, context):
-            result = evaluation(
-                "needs_revision" if context["planned_task"]["id"] == "a" else "accepted"
-            )
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation(
+                "needs_revision" if context["planned_task"]["id"] == "a" else "accepted",
+                context["planned_task"]["success_criteria"][0])
 
         recovery = RecoveryController(
             lambda prompt, context: recovery_decision("replan_subgraph")
@@ -1234,9 +1240,7 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             status = "needs_revision" if context["planned_task"]["id"] == "a" else "accepted"
-            result = evaluation(status)
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation(status, context["planned_task"]["success_criteria"][0])
 
         run = self.store.create_orchestration("Preserve active snapshot")
         orchestrator = Orchestrator(
@@ -1280,7 +1284,7 @@ class RecoverySchedulerTests(unittest.TestCase):
             self.store, runtime,
             planner=Planner(lambda prompt, context: json.dumps(plan)),
             selector=MappingSelector({"a": agent["id"], "b": agent["id"]}),
-            evaluator=Evaluator(lambda prompt, context: evaluation("needs_revision")),
+            evaluator=Evaluator(lambda prompt, context: semantic_evaluation("needs_revision")),
             recovery=RecoveryController(offline=True),
             wait=lambda seconds: runtime.finish_active(),
             config={"max_wallclock_seconds": 10, "max_recovery_actions": 1},
@@ -1305,9 +1309,8 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             evaluation_calls.append(True)
-            result = evaluation("needs_revision" if len(evaluation_calls) == 1 else "accepted")
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation("needs_revision" if len(evaluation_calls) == 1 else "accepted",
+                                       context["planned_task"]["success_criteria"][0])
 
         def recovery_model(prompt, context):
             entered.set()
@@ -1346,9 +1349,7 @@ class RecoverySchedulerTests(unittest.TestCase):
 
         def evaluator_model(prompt, context):
             status = "needs_revision" if context["planned_task"]["id"] == "a" else "accepted"
-            result = evaluation(status)
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation(status, context["planned_task"]["success_criteria"][0])
 
         run = self.store.create_orchestration("Independent branch")
         orchestrator = Orchestrator(
@@ -1382,7 +1383,7 @@ class RecoverySchedulerTests(unittest.TestCase):
             self.store, runtime,
             planner=Planner(lambda prompt, context: json.dumps(execution_plan([planned_task("a")]))),
             selector=MappingSelector({"a": agent["id"]}),
-            evaluator=Evaluator(lambda prompt, context: evaluation("needs_revision")),
+            evaluator=Evaluator(lambda prompt, context: semantic_evaluation("needs_revision")),
             recovery=RecoveryController(recovery_model), clock=lambda: now[0],
             wait=lambda seconds: runtime.finish_active(), config={"max_wallclock_seconds": 1},
         )
@@ -1408,7 +1409,7 @@ class RecoverySchedulerTests(unittest.TestCase):
             self.store, runtime,
             planner=Planner(lambda prompt, context: json.dumps(execution_plan([planned_task("a")]))),
             selector=MappingSelector({"a": agent["id"], "replacement": agent["id"]}),
-            evaluator=Evaluator(lambda prompt, context: evaluation("needs_revision")),
+            evaluator=Evaluator(lambda prompt, context: semantic_evaluation("needs_revision")),
             recovery=RecoveryController(
                 lambda prompt, context: recovery_decision("replan_subgraph")
             ), replanner=Replanner(replanner_model), clock=lambda: now[0],
@@ -1427,9 +1428,7 @@ class RecoverySchedulerTests(unittest.TestCase):
         revision_calls = []
 
         def evaluator_model(prompt, context):
-            result = evaluation("needs_revision")
-            result["criteria"][0]["criterion"] = context["planned_task"]["success_criteria"][0]
-            return result
+            return semantic_evaluation("needs_revision", context["planned_task"]["success_criteria"][0])
 
         def recovery_model(prompt, context):
             return recovery_decision(
@@ -1481,7 +1480,7 @@ class RecoverySchedulerTests(unittest.TestCase):
             self.store, runtime,
             planner=Planner(lambda prompt, context: json.dumps(execution_plan([planned_task("a")]))),
             selector=MappingSelector({"a": agent["id"]}),
-            evaluator=Evaluator(lambda prompt, context: evaluation("needs_revision")),
+            evaluator=Evaluator(lambda prompt, context: semantic_evaluation("needs_revision")),
             recovery=RecoveryController(recovery_model),
             wait=lambda seconds: runtime.finish_active(), config={"max_wallclock_seconds": 10},
         )

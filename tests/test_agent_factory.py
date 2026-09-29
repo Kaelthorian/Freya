@@ -143,6 +143,22 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertIn("read_file", created["agent"]["tools"])
         self.assertIn("write_file", created["agent"]["tools"])
 
+    def test_factory_propagates_compiled_planned_write_target_scope(self):
+        grant = {"path": "src/app.py", "owner_plan_task_id": "task-owner"}
+        created = self.create(planned_task(
+            objective="Modify the created Python file",
+            description="Make the declared change after its creator task succeeds.",
+            task_kind="code_change",
+            required_capabilities=["filesystem.read", "filesystem.modify"],
+            owned_paths=[],
+            write_targets=["src/app.py"],
+            foreign_write_targets=[grant],
+            _planned_write_targets=[grant],
+            _write_owners={"src/app.py": "task-owner"},
+            depends_on=["task-owner"],
+        ))
+        self.assertEqual(created["agent"]["config"]["task_planned_write_targets"], [grant])
+
     def test_trivial_program_filters_irrelevant_preferred_skills(self):
         created = self.create(planned_task(
             objective="Create a Python program that prints Hello World",
@@ -555,14 +571,13 @@ class AgentFactoryTests(unittest.TestCase):
         def evaluate(prompt, context):
             status = statuses[min(len(calls), len(statuses) - 1)]
             calls.append(status)
-            result = evaluation(status)
-            result["criteria"] = [{
+            return {"criteria": [{
                 "criterion": criterion,
-                "status": "satisfied" if status == "accepted" else "unsatisfied",
+                "status": "satisfied" if status == "accepted" else "partial",
                 "reason": "Controlled fixture evidence.",
                 "evidence": ["fixture"],
-            } for criterion in context["planned_task"]["success_criteria"]]
-            return result
+                "confidence": 0.9,
+            } for criterion in context["planned_task"]["success_criteria"]]}
 
         orchestrator = Orchestrator(
             self.store, ImmediateRuntime(self.store),

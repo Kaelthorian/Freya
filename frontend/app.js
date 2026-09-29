@@ -8,6 +8,96 @@ const main = document.querySelector('#main-content');
 const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
 document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 4 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 6 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
+const freyaTerminalStatuses = new Set(['Success', 'Failed', 'Cancelled']);
+const freyaObservedStatuses = new Map();
+const freyaObservedApprovalIds = new Set();
+let freyaStatusSnapshotReady = false, freyaApprovalSnapshotReady = false;
+let freyaAudioContext = null, freyaSoundQueueEnd = 0;
+const pendingFreyaSounds = [];
+
+function scheduleFreyaSound(kind, startAt) {
+  const context = freyaAudioContext;
+  if (!context || context.state !== 'running') return;
+  const notes = kind === 'clarification'
+    ? [{ frequency: 880, offset: 0, duration: 0.14 }, { frequency: 880, offset: 0.22, duration: 0.14 }]
+    : [{ frequency: 523.25, offset: 0, duration: 0.18 }, { frequency: 659.25, offset: 0.2, duration: 0.18 }, { frequency: 783.99, offset: 0.4, duration: 0.24 }];
+  for (const note of notes) {
+    const start = startAt + note.offset;
+    const oscillator = context.createOscillator(), volume = context.createGain();
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(note.frequency, start);
+    volume.gain.setValueAtTime(0.0001, start);
+    volume.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+    volume.gain.exponentialRampToValueAtTime(0.0001, start + note.duration);
+    oscillator.connect(volume);
+    volume.connect(context.destination);
+    oscillator.start(start);
+    oscillator.stop(start + note.duration + 0.02);
+  }
+}
+
+function flushFreyaSounds() {
+  if (!freyaAudioContext || freyaAudioContext.state !== 'running') return;
+  let startAt = Math.max(freyaAudioContext.currentTime, freyaSoundQueueEnd);
+  for (const kind of pendingFreyaSounds.splice(0)) {
+    scheduleFreyaSound(kind, startAt);
+    startAt += kind === 'clarification' ? 0.5 : 0.8;
+  }
+  freyaSoundQueueEnd = startAt;
+}
+
+function unlockFreyaAudio() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return;
+  try {
+    freyaAudioContext ||= new AudioContext();
+    if (freyaAudioContext.state === 'running') flushFreyaSounds();
+    else freyaAudioContext.resume().then(flushFreyaSounds).catch(() => {});
+  } catch { /* Audio is optional when the browser does not support Web Audio. */ }
+}
+
+function playFreyaSound(kind) {
+  pendingFreyaSounds.push(kind);
+  if (freyaAudioContext?.state === 'running') {
+    flushFreyaSounds();
+    return;
+  }
+  if (freyaAudioContext && freyaAudioContext.state !== 'running') {
+    freyaAudioContext.resume().then(flushFreyaSounds).catch(() => {});
+  }
+}
+
+function observeFreyaStatuses(orchestrations, approvals) {
+  let needsResponse = false, taskFinished = false;
+  if (!freyaStatusSnapshotReady) {
+    for (const run of orchestrations) if (run.id) freyaObservedStatuses.set(run.id, run.status);
+    freyaStatusSnapshotReady = true;
+  } else {
+    for (const run of orchestrations) {
+      if (!run.id) continue;
+      const previous = freyaObservedStatuses.get(run.id);
+      if (run.status === 'NeedsClarification' && previous !== 'NeedsClarification') needsResponse = true;
+      if (freyaTerminalStatuses.has(run.status) && !freyaTerminalStatuses.has(previous)) taskFinished = true;
+      freyaObservedStatuses.set(run.id, run.status);
+    }
+  }
+  if (!freyaApprovalSnapshotReady) {
+    for (const approval of approvals) if (approval.id) freyaObservedApprovalIds.add(approval.id);
+    freyaApprovalSnapshotReady = true;
+  } else {
+    for (const approval of approvals) {
+      if (!approval.id) continue;
+      if (!freyaObservedApprovalIds.has(approval.id)) needsResponse = true;
+      freyaObservedApprovalIds.add(approval.id);
+    }
+  }
+  if (needsResponse) playFreyaSound('clarification');
+  if (taskFinished) playFreyaSound('complete');
+}
+
+document.addEventListener('pointerdown', unlockFreyaAudio, { passive: true });
+document.addEventListener('keydown', unlockFreyaAudio);
+
 function agentExportPayload(agent) {
   const config = agent.config && typeof agent.config === 'object' ? JSON.parse(JSON.stringify(agent.config)) : {};
   if (!config.capability_policy && agent.capability_policy) config.capability_policy = agent.capability_policy;
@@ -88,6 +178,59 @@ function downloadJson(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
+async function allRuntimeTaskLogs(taskId) {
+  const events = [], pageSize = 1000;
+  let after = 0;
+  while (true) {
+    const params = new URLSearchParams({ task_id: taskId, after: String(after), limit: String(pageSize) });
+    const page = await api(`/logs?${params}`);
+    if (!Array.isArray(page)) throw new Error('The server returned an invalid task log page.');
+    events.push(...page);
+    if (page.length < pageSize) return events;
+    const lastId = Number(page[page.length - 1]?.id);
+    if (!Number.isSafeInteger(lastId) || lastId <= after) throw new Error('Could not continue reading this task log.');
+    after = lastId;
+  }
+}
+
+async function orchestrationLogExport(id) {
+  try {
+    const events = await api(`/orchestrations/${encodeURIComponent(id)}/logs`);
+    if (!Array.isArray(events)) throw new Error('The server returned an invalid task log export.');
+    return events;
+  } catch (error) {
+    if (!/route not found/i.test(error.message || '')) throw error;
+  }
+
+  const encodedId = encodeURIComponent(id);
+  const run = await api(`/orchestrations/${encodedId}`);
+  const orchestrationEvents = run.events;
+  if (!Array.isArray(run.delegations) || !Array.isArray(orchestrationEvents)) {
+    throw new Error('The server does not expose all persisted logs for this task.');
+  }
+
+  const taskIds = [...new Set(run.delegations.map(item => item.task_id).filter(Boolean))];
+  const runtimePages = await Promise.all(taskIds.map(taskId => allRuntimeTaskLogs(taskId)));
+  const runtimeEvents = runtimePages.flat();
+  const systemEvents = orchestrationEvents.map(event => {
+    let payload = {};
+    try {
+      payload = typeof event.payload_json === 'string' ? JSON.parse(event.payload_json) : event.payload_json || {};
+    } catch { /* Keep the stored payload_json below if it cannot be parsed. */ }
+    return {
+      ...payload,
+      ...event,
+      id: `orchestration:${event.id}`,
+      log_id: `orchestration:${event.id}`,
+      source: 'orchestration',
+      orchestration_id: event.orchestration_id || id,
+    };
+  });
+  return [...runtimeEvents, ...systemEvents].sort((left, right) =>
+    String(left.timestamp || '').localeCompare(String(right.timestamp || '')) ||
+    String(left.id || '').localeCompare(String(right.id || '')));
+}
+
 function importSkillsFromFile() {
   const input = document.createElement('input');
   input.type = 'file'; input.accept = '.json,application/json'; input.hidden = true;
@@ -161,6 +304,7 @@ async function refresh(navigation = false) {
   refreshing = true;
   try {
     const [health, agents, skills, tasks, approvals, metrics, orchestrations] = await Promise.all([api('/health'), api('/agents'), api('/skills'), api('/tasks'), api('/approvals?status=pending'), api('/metrics'), api('/orchestrations')]);
+    observeFreyaStatuses(orchestrations, approvals);
     Object.assign(state, { health, agents, skills, tasks, approvals, metrics, orchestrations });
     await render(navigation);
   } catch (error) {
@@ -215,6 +359,13 @@ document.addEventListener('click', async event => {
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
     if (action === 'show-freya-activity') { state.freyaRunId = id; return render(); }
     if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} Agent ${e.agent_name || e.agent_id || '—'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
+    if (action === 'copy-orchestration-logs') {
+      target.disabled = true;
+      const events = await orchestrationLogExport(id);
+      await navigator.clipboard.writeText(serialize({ orchestration_id: id, event_count: events.length, events }));
+      toast(`${events.length} task logs copied for all agents.`);
+      return;
+    }
     if (action === 'copy-task-logs') { event.preventDefault(); const filter = orchestrationId ? `orchestration_id=${encodeURIComponent(orchestrationId)}` : `task_id=${encodeURIComponent(id)}`; const events = await api(`/logs?${filter}&limit=10000`); await navigator.clipboard.writeText(serialize(events)); toast('All details for this task were copied to the clipboard.'); return; }
     if (action === 'copy-task-details') { const task = await api(`/tasks/${encodeURIComponent(id)}`); await navigator.clipboard.writeText(serialize(task)); toast('Task details copied to the clipboard.'); return; }
     if (action === 'delete-agent') return confirmAction({ title: 'Delete agent', description: 'This agent will be removed from the workspace. Agents with active tasks cannot be deleted.', label: 'Delete agent', danger: true, action: async () => { await api(`/agents/${id}`, 'DELETE', {}); location.hash = '#/agents'; toast('Agent deleted.'); } });

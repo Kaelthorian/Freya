@@ -503,15 +503,24 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` is read-only and receives planned task fields including exact write
-targets, bounded structured Runtime actions/artifacts/workspace-diff metadata,
-result/error/verification, and selected agent/runtime/attempt IDs. Full diff
-contents are excluded from the structured evidence fields. Sanitization runs
-before model input and persistence. Result and
-verification output, evidence counts and item lengths are bounded; any clipping
-sets durable `context_truncated=true`. Agent output and verification text are
-explicitly untrusted data and cannot alter the system prompt, schema or
-configuration.
+`Evaluator` is read-only. Before checks or model inference,
+`normalize_execution_evidence` builds a bounded catalog from verification
+records, tool outcomes, artifact changes and workspace diffs. It retains
+available content/output, path, operation, status, source, tool, capability,
+event ID, timestamp, hash and check condition. Deterministic evidence IDs
+deduplicate identical records. The Orchestrator supplies each task's stable
+local criterion IDs from `criterion_links.local`; legacy criterion-text links
+are normalized to those IDs. Explicit verification links and criterion IDs are
+authoritative, while path or file-kind associations are marked as inferred.
+Evidence with no grounded link remains global.
+
+The model context contains the evidence catalog, per-criterion references and
+global evidence IDs, so it can inspect a relevant diff/read-back without
+reconstructing runtime provenance from agent prose. Sanitization runs before
+model input and persistence. Result, verification output, evidence counts and
+item lengths are bounded; clipping sets durable `context_truncated=true`.
+Agent output and verification text are untrusted data and cannot alter the
+system prompt, schema or configuration.
 
 Deterministic checks run before any model call and apply per criterion. A pure
 file creation/presence criterion is proven by a successful scoped create,
@@ -520,24 +529,36 @@ planned target. Denied later writes do not undo that evidence; later successful
 removal does. Relevant failed tests reject their criterion, while a missing
 required test/lint/build result blocks it. Mixed tasks retain proven facts and
 send only semantic questions to the LLM. Agent claims cannot override these
-facts.
+facts. File creation, action success or a path association alone cannot satisfy
+a semantic criterion. A matching file_content_match only proves the exact
+check that generated it; it does not prove unrelated behavior. A directly
+linked passing test or exact typed verification is evaluated before semantic
+inference. Unmatched evidence can still be considered globally when its path
+or content is relevant, but an unrelated diff is not attached to a criterion.
 For filesystem-only tasks, when Git diff and a permitted test suite are not
 available, the Worker can use a policy-allowed `read_file` read-back for every
 modified path as objective evidence. `write_file` content is compared exactly;
 all modified paths must pass, otherwise the verification remains unavailable or
 failed and the evaluator still fails closed. Otherwise the tool-free
-`OllamaEvaluator` requests a strict JSON schema containing `accepted`,
-`needs_revision`, `rejected`, or `blocked`,
-with every planned success criterion represented exactly once. Invalid output
-gets one repair attempt and then persists evaluator infrastructure `error`
-without a semantic rejection or Worker retry.
+`OllamaEvaluator` receives only unresolved semantic criteria with their
+grouped evidence references and returns one
+strict `criteria` array. Each entry contains `criterion`, `status`, `reason`,
+`evidence`, and `confidence`; global status and actions are forbidden in model
+output. Python combines canonical criterion records with this precedence:
+evidenced `unsatisfied` → `rejected`, otherwise `unknown` → `blocked`, otherwise
+`partial` → `needs_revision`, otherwise all satisfied → `accepted`. Python sets
+`recommended_action`, `issues`, and `missing_evidence`. One invalid response
+gets one repair. If both calls fail, the Evaluator retries once from the same
+immutable bounded Runtime evidence, with one repair available on that retry.
+Four model calls are the maximum. Exhaustion persists evaluator infrastructure
+`error` without a semantic rejection or Worker retry.
 
 Evaluator calls are serialized to one model call at a time. Defaults are the
 separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
 `http://127.0.0.1:11434`, and 120-second timeout. Explicit
 `--evaluator-offline` uses deterministic evidence-only behavior for tests and
-offline operation. It accepts directly proven objective criteria or configured
-verification that was requested, attempted and passed. Runtime result text is
+offline operation. It accepts only criteria with direct, criterion-specific
+objective proof. Runtime result text is
 untrusted agent output, not objective verification: a non-empty result, success
 claim, or embedded instruction cannot produce acceptance. Without sufficient
 objective evidence, offline evaluation returns `blocked`; already proven
@@ -801,12 +822,17 @@ Every write task declares exact workspace-relative `write_targets`. A path's
 permanent plan-task owner is recorded in `owned_paths` and `write_owners`; other
 writers carry a `foreign_write_targets` entry with the owner ID. Plan validation
 rejects inconsistent mappings, and generated agents check both their exact
-scope and the owner index before mutation. Reads
-remain governed by the normal capability policy. A write to a file owned by another task is
-stopped before the tool handler runs and emits a structured request containing
-the target path, requested change, reason, need and blocking flag. The Worker
-finishes as `WaitingForApproval`; it does not wait for an agent or send a direct
-agent-to-agent message.
+scope and the owner index before mutation. The compiler derives a task-scoped
+write grant only when the exact foreign path is in that task's declared
+`write_targets` and its permanent owner is a dependency ancestor. The grant does
+not change ownership or capability policy; existing files still require a
+successful current read before modification. Other foreign writes stop before
+the tool handler and require `requested_change`, `reason`, `needed_for` and a
+boolean `blocking` field before Freya creates a structured request. An
+incomplete request changes no file, receives an explicit retry contract, and an
+identical incomplete retry stops as no-progress. The Worker finishes valid
+cross-task requests as `WaitingForApproval`; it does not wait for an agent or
+send a direct agent-to-agent message.
 
 Freya resolves the owner only inside the same orchestration and checks the
 dependency graph for cycles. Reusable human grants are scoped to that

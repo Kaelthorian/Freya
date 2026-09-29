@@ -10,9 +10,11 @@ from control_center.api import Application
 from control_center.config import normalize_agent
 from control_center.evaluator import (
     EVALUATOR_VERSION,
+    EVALUATION_RESPONSE_FORMAT,
     EvaluationGenerationError,
     EvaluationValidationError,
     Evaluator,
+    EvaluatorInfrastructureError,
     OllamaEvaluator,
     technical_failure_evaluation,
     validate_evaluation,
@@ -61,6 +63,12 @@ def decision(criteria, status="accepted"):
     }
 
 
+def semantic(criteria, status="satisfied"):
+    return {"criteria": [{"criterion": item, "status": status,
+                           "reason": "Evidence was reviewed.", "evidence": ["runtime result"],
+                           "confidence": 0.8} for item in criteria]}
+
+
 class EvaluatorTests(unittest.TestCase):
     @staticmethod
     def created_result(path="calculator.js", *, denied=False):
@@ -98,6 +106,11 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(context["planned_task"]["write_targets"], ["calculator.js"])
         self.assertEqual(context["runtime_task"]["artifacts"][0]["change_type"], "created")
         self.assertNotIn("diff", context["runtime_task"]["workspace_diffs"][0])
+        self.assertIn(
+            "+private source should stay out of structured evidence",
+            next(item["diff"] for item in context["evidence_catalog"]
+                 if item["type"] == "workspace_diff"),
+        )
 
     def test_create_action_without_readback_proves_presence(self):
         criterion = "The file x.js should be created"
@@ -110,6 +123,219 @@ class EvaluatorTests(unittest.TestCase):
         )
         self.assertEqual(outcome["status"], "accepted")
         self.assertIn("filesystem.create", outcome["criteria"][0]["evidence"][0])
+
+    def test_html_workspace_diff_is_grouped_and_reaches_semantic_evaluator(self):
+        criterion = "HTML contains the required calculator interface elements."
+        plan = {**planned([criterion]), "write_targets": ["calculator.html"],
+                "acceptance_criteria": [{"id": "LC-1", "criterion": criterion}]}
+        diff = ("+<input id='left'>\n+<input id='right'>\n"
+                "+<button data-op='add'>Add</button>\n"
+                "+<button data-op='subtract'>Subtract</button>\n"
+                "+<button data-op='multiply'>Multiply</button>\n"
+                "+<button data-op='divide'>Divide</button>")
+        result = {
+            "actions": [{"tool": "write_file", "arguments": {"path": "calculator.html"},
+                         "capability": "filesystem.create", "success": True, "changed": True}],
+            "artifacts": [{"path": "calculator.html", "change_type": "created"}],
+            "workspace_diffs": [{"path": "calculator.html", "change_type": "created", "diff": diff}],
+        }
+        seen = []
+
+        def model(_prompt, context):
+            seen.append(context)
+            record = next(item for item in context["evidence_catalog"]
+                          if item["type"] == "workspace_diff")
+            self.assertIn("data-op='divide'", record["diff"])
+            self.assertEqual(record["supports_acceptance_criteria"], ["LC-1"])
+            self.assertEqual(context["evidence_by_criterion"][0]["criterion_id"], "LC-1")
+            self.assertEqual(context["evidence_by_criterion"][0]["evidence"][0]["id"], record["id"])
+            return semantic([criterion])
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["recommended_action"], "accept")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertEqual(len(seen), 1)
+
+    def test_file_creation_and_incorrect_javascript_cannot_auto_pass_semantics(self):
+        criterion = "JavaScript implements addition, subtraction, multiplication and division."
+        plan = {**planned([criterion]), "write_targets": ["calculator.js"],
+                "acceptance_criteria": [{"id": "LC-1", "criterion": criterion}]}
+        result = {
+            "actions": [{"tool": "write_file", "arguments": {"path": "calculator.js"},
+                         "capability": "filesystem.create", "success": True, "changed": True}],
+            "artifacts": [{"path": "calculator.js", "change_type": "created"}],
+            "workspace_diffs": [{"path": "calculator.js", "change_type": "created",
+                                 "diff": '+console.log("hello");'}],
+        }
+
+        def model(_prompt, context):
+            diff = next(item["diff"] for item in context["evidence_catalog"]
+                        if item["type"] == "workspace_diff")
+            self.assertIn('console.log("hello")', diff)
+            return semantic([criterion], "unsatisfied")
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "rejected")
+        self.assertEqual(outcome["criteria"][0]["status"], "unsatisfied")
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
+
+    def test_readback_content_is_first_class_evidence_for_semantic_review(self):
+        criterion = "The generated page contains 'Hello World'."
+        plan = {**planned([criterion]), "acceptance_criteria": [
+            {"id": "LC-1", "criterion": criterion},
+        ]}
+        verification = {"evidence": [{
+            "type": "file_readback", "source": "runtime_verification",
+            "tool": "read_file", "capability": "filesystem.read", "event_id": "read-event-1",
+            "path": "calculator.html", "check": "filesystem:read_file:calculator.html",
+            "status": "passed", "output": "<main>Hello World</main>",
+            "supports_acceptance_criteria": [],
+        }]}
+
+        def model(_prompt, context):
+            record = next(item for item in context["evidence_catalog"]
+                          if item["type"] == "file_readback")
+            self.assertEqual(record["output"], "<main>Hello World</main>")
+            self.assertEqual(record["capability"], "filesystem.read")
+            self.assertEqual(context["evidence_by_criterion"][0]["evidence"][0]["association"],
+                             "observed_literal")
+            return semantic([criterion])
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+
+    def test_file_content_match_with_stable_criterion_id_is_direct_evidence(self):
+        criterion = "calculator.html content matches the exact checked implementation."
+        plan = {**planned([criterion]), "acceptance_criteria": [
+            {"id": "LC-2", "criterion": criterion},
+        ]}
+        verification = {"evidence": [{
+            "type": "file_content_match", "source": "runtime_verification",
+            "tool": "write_file", "capability": "filesystem.create", "event_id": "write-event-2",
+            "path": "calculator.html", "check": "filesystem:content_match:calculator.html",
+            "condition": "content equals expected pattern", "pattern": "sha256 match",
+            "match": True, "status": "passed", "content_sha256": "a" * 64,
+            "supports_acceptance_criteria": ["LC-2"],
+        }]}
+        outcome = Evaluator(lambda *_: self.fail("Direct verification must be evaluated first.")).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification), execution_node=node(),
+        )
+        normalized = outcome["context_snapshot"]["evidence_catalog"][0]
+        self.assertEqual(normalized["supports_acceptance_criteria"], ["LC-2"])
+        self.assertEqual(normalized["event_id"], "write-event-2")
+        self.assertEqual(normalized["capability"], "filesystem.create")
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+
+    def test_empty_supports_are_recovered_from_verification_context(self):
+        criterion = "The calculator output matches the verified expression."
+        plan = {**planned([criterion]), "acceptance_criteria": [
+            {"id": "LC-2", "criterion": criterion},
+        ]}
+        verification = {"evidence": [{
+            "type": "file_content_match", "source": "runtime_verification",
+            "tool": "read_file", "path": "calculator.html", "status": "passed", "match": True,
+            "supports_acceptance_criteria": [],
+            "metadata": {"criterion_id": "LC-2", "condition": "verified for the requested criterion"},
+        }]}
+        outcome = Evaluator(lambda *_: self.fail("Recovered criterion association is objective.")).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification), execution_node=node(),
+        )
+        evidence = outcome["context_snapshot"]["evidence_catalog"][0]
+        self.assertEqual(evidence["supports_acceptance_criteria"], ["LC-2"])
+        self.assertEqual(evidence["association_methods"]["LC-2"], "recovered_context")
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+
+    def test_absent_evidence_still_requests_gather_evidence(self):
+        criterion = "The application safely handles division by zero."
+        outcome = Evaluator(lambda _prompt, _context: semantic([criterion], "unknown")).evaluate(
+            planned_task={**planned([criterion]), "acceptance_criteria": [
+                {"id": "LC-3", "criterion": criterion},
+            ]},
+            runtime_task=runtime(), execution_node=node(),
+        )
+        self.assertEqual(outcome["criteria"][0]["status"], "unknown")
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["recommended_action"], "gather_evidence")
+        diagnostic = next(item for item in outcome["events"]
+                          if item["event_type"] == "evaluation.insufficient_evidence")
+        self.assertEqual(diagnostic["criterion_id"], "LC-3")
+        self.assertIn("evidence", diagnostic["reason"].casefold())
+
+    def test_unrelated_css_diff_stays_global_for_division_by_zero_criterion(self):
+        criterion = "Division by zero is handled safely."
+        plan = {**planned([criterion]), "write_targets": ["styles.css"],
+                "acceptance_criteria": [{"id": "LC-1", "criterion": criterion}]}
+        result = {"workspace_diffs": [{
+            "path": "styles.css", "change_type": "modified", "diff": "+.calculator { display: grid; }",
+        }]}
+        seen = []
+
+        def model(_prompt, context):
+            seen.append(context)
+            self.assertEqual(context["evidence_by_criterion"][0]["evidence"], [])
+            self.assertEqual(len(context["global_evidence_ids"]), 1)
+            return semantic([criterion], "unknown")
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["recommended_action"], "gather_evidence")
+        self.assertEqual(len(seen), 1)
+
+    def test_one_diff_can_be_referenced_by_multiple_related_criteria_without_duplication(self):
+        criteria = ["JavaScript supports addition.", "JavaScript handles division by zero."]
+        plan = {**planned(criteria), "write_targets": ["calculator.js"], "acceptance_criteria": [
+            {"id": "LC-1", "criterion": criteria[0]},
+            {"id": "LC-2", "criterion": criteria[1]},
+        ]}
+        result = {"workspace_diffs": [{
+            "path": "calculator.js", "change_type": "created",
+            "diff": "+function add(a, b) { return a + b; }\n"
+                    "+function divide(a, b) { return b === 0 ? 0 : a / b; }",
+        }]}
+        seen = []
+
+        def model(_prompt, context):
+            seen.append(context)
+            groups = context["evidence_by_criterion"]
+            self.assertEqual([item["criterion_id"] for item in groups], ["LC-1", "LC-2"])
+            self.assertEqual(groups[0]["evidence"][0]["id"], groups[1]["evidence"][0]["id"])
+            self.assertEqual(len(context["evidence_catalog"]), 1)
+            return semantic(criteria)
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(len(seen), 1)
+
+    def test_linked_test_result_is_used_before_semantic_model(self):
+        criterion = "Addition returns the expected result for 2 and 3."
+        plan = {**planned([criterion]), "acceptance_criteria": [
+            {"id": "LC-1", "criterion": criterion},
+        ]}
+        verification = {"evidence": [{
+            "type": "test_result", "source": "runtime_verification",
+            "check": "test_case:addition", "tool": "run_command",
+            "capability": "execution.unittest", "status": "passed", "exit_code": 0,
+            "output": "test_addition passed", "supports_acceptance_criteria": ["LC-1"],
+        }]}
+        outcome = Evaluator(lambda *_: self.fail("A linked passing test has priority.")).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification), execution_node=node(),
+        )
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 1)
+        self.assertEqual(outcome["criteria"][0]["evidence"], ["test_case:addition"])
 
     def test_named_artifact_creation_without_file_word_is_factual(self):
         criterion = "x.js should be created"
@@ -175,11 +401,8 @@ class EvaluatorTests(unittest.TestCase):
         criteria = ["The file x.js exists.", "The implementation handles ambiguous input correctly."]
         seen = []
         def model(prompt, context):
-            seen.append(context["criterion_facts"])
-            answer = decision(criteria, "needs_revision")
-            answer["criteria"][0]["status"] = "unsatisfied"
-            answer["criteria"][1]["status"] = "unsatisfied"
-            return answer
+            seen.append(context["planned_task"]["success_criteria"])
+            return semantic(criteria[1:], "unsatisfied")
         outcome = Evaluator(model).evaluate(
             planned_task={**planned(criteria), "write_targets": ["x.js"]},
             runtime_task=runtime(result=self.created_result("x.js", denied=True)),
@@ -189,8 +412,8 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["metrics"]["model_calls"], 1)
         self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
         self.assertEqual(outcome["criteria"][1]["status"], "unsatisfied")
-        self.assertEqual(seen[0][0]["status"], "PROVEN SATISFIED")
-        self.assertEqual(seen[0][1]["status"], "REQUIRES SEMANTIC REVIEW")
+        self.assertEqual(seen[0], criteria[1:])
+        self.assertEqual(outcome["status"], "rejected")
         offline = Evaluator(offline=True).evaluate(
             planned_task={**planned(criteria), "write_targets": ["x.js"]},
             runtime_task=runtime(result=self.created_result("x.js")),
@@ -243,7 +466,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_model_accepts_verified_auth_fix(self):
         criteria = ["Authentication succeeds.", "All tests pass."]
-        evaluator = Evaluator(lambda prompt, context: decision(criteria, "accepted"))
+        evaluator = Evaluator(lambda prompt, context: semantic(context["planned_task"]["success_criteria"]))
         outcome = evaluator.evaluate(
             planned_task=planned(criteria),
             runtime_task=runtime(verification={
@@ -296,7 +519,7 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "blocked")
         self.assertEqual(outcome["metrics"]["model_calls"], 0)
 
-    def test_offline_accepts_when_objective_verification_passed(self):
+    def test_offline_does_not_generalize_objective_verification(self):
         criteria = ["Endpoint exists.", "Tests pass."]
         outcome = Evaluator(offline=True).evaluate(
             planned_task=planned(criteria),
@@ -307,10 +530,9 @@ class EvaluatorTests(unittest.TestCase):
                               "output": "25 passed"}],
             }), execution_node=node(),
         )
-        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["status"], "blocked")
         self.assertEqual([item["status"] for item in outcome["criteria"]],
-                         ["satisfied", "satisfied"])
-        self.assertIn("pytest: passed", outcome["criteria"][0]["evidence"])
+                         ["unknown", "satisfied"])
     def test_offline_accepts_direct_file_readback_for_existence(self):
         criteria = ["The file script.bat exists."]
         calls = []
@@ -436,7 +658,7 @@ class EvaluatorTests(unittest.TestCase):
 
         def model(prompt, context):
             calls.append((prompt, context))
-            return decision(criteria)
+            return semantic(criteria)
 
         outcome = Evaluator(model).evaluate(
             planned_task=planned(criteria), runtime_task=runtime_task,
@@ -447,8 +669,8 @@ class EvaluatorTests(unittest.TestCase):
         self.assertFalse(outcome["deterministic"])
         self.assertEqual(outcome["metrics"]["decision_source"], "llm_semantic")
         prompt, model_context = calls[0]
-        self.assertIn("Absence of deterministic verification evidence is not by itself evidence", prompt)
-        self.assertIn("Do not infer that tests, builds, or commands passed", prompt)
+        self.assertIn("Absence of deterministic verification evidence is not by itself failure", prompt)
+        self.assertIn("Do not infer tests, builds or commands passed", prompt)
         self.assertTrue({"objective", "description", "success_criteria"} <=
                         set(model_context["planned_task"]))
         self.assertTrue({"status", "result", "error", "verification"} <=
@@ -464,7 +686,7 @@ class EvaluatorTests(unittest.TestCase):
         calls = []
         outcome = Evaluator(
             lambda prompt, context: (calls.append(context)
-                                     or decision(criteria, "needs_revision")),
+                                     or semantic(criteria, "partial")),
         ).evaluate(
             planned_task=planned(criteria),
             runtime_task=runtime(verification={
@@ -521,7 +743,7 @@ class EvaluatorTests(unittest.TestCase):
     def test_nonzero_controlled_test_exit_code_is_terminal_failure(self):
         calls = []
         outcome = Evaluator(
-            lambda prompt, context: (calls.append(context) or decision(["All pytest tests pass."]))
+            lambda prompt, context: (calls.append(context) or semantic(["All pytest tests pass."]))
         ).evaluate(
             planned_task=planned(["All pytest tests pass."]),
             runtime_task=runtime(verification={
@@ -565,7 +787,7 @@ class EvaluatorTests(unittest.TestCase):
             visible_result = json.loads(context["runtime_task"]["result"])
             for operation in ("addition", "subtraction", "multiplication", "division"):
                 self.assertIn(operation, visible_result["artifacts"][0]["content"].casefold())
-            return decision(criteria)
+            return semantic(criteria)
 
         outcome = Evaluator(model).evaluate(
             planned_task=planned(criteria), runtime_task=runtime(result=result),
@@ -581,7 +803,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_model_can_request_revision(self):
         criteria = ["The public behavior matches the request."]
-        evaluator = Evaluator(lambda prompt, context: decision(criteria, "needs_revision"))
+        evaluator = Evaluator(lambda prompt, context: semantic(criteria, "partial"))
         outcome = evaluator.evaluate(
             planned_task=planned(criteria), runtime_task=runtime(), execution_node=node(),
         )
@@ -590,7 +812,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_invalid_model_output_gets_exactly_one_repair(self):
         criteria = ["The change is complete."]
-        outputs = ["not json", json.dumps(decision(criteria))]
+        outputs = ["not json", json.dumps(semantic(criteria))]
         calls = []
 
         def model(prompt, context):
@@ -611,11 +833,152 @@ class EvaluatorTests(unittest.TestCase):
             calls.append(prompt)
             return "still invalid"
 
-        with self.assertRaisesRegex(EvaluationGenerationError, "one repair"):
-            Evaluator(model).evaluate(
+        evaluator = Evaluator(model)
+        with self.assertRaisesRegex(EvaluatorInfrastructureError, "one repair"):
+            evaluator.evaluate(
                 planned_task=planned(), runtime_task=runtime(), execution_node=node(),
             )
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(evaluator.metrics["repairs"], 2)
+        self.assertEqual(evaluator.metrics["evaluator_retries"], 1)
+        self.assertEqual(evaluator.metrics["final_status"], "error")
+
+    def test_semantic_retry_uses_original_immutable_runtime_evidence(self):
+        criterion = "The page behaves correctly."
+        calls = []
+        def model(prompt, context):
+            calls.append(context)
+            if len(calls) == 1:
+                context["runtime_task"]["result"] = "mutated by model"
+                return "invalid"
+            if len(calls) == 2:
+                return "invalid again"
+            return semantic([criterion])
+        outcome = Evaluator(model).evaluate(
+            planned_task=planned([criterion]), runtime_task=runtime(result="original evidence"),
+            execution_node=node())
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 3)
+        self.assertEqual(outcome["metrics"]["repairs"], 1)
+        self.assertEqual(outcome["metrics"]["evaluator_retries"], 1)
+        self.assertEqual(calls[2]["runtime_task"]["result"], "original evidence")
+        self.assertEqual(outcome["context_snapshot"]["runtime_task"]["result"], "original evidence")
+        self.assertIn("evaluation.semantic_retry_completed",
+                      [event["event_type"] for event in outcome["events"]])
+
+    def test_semantic_contract_rejects_global_control_fields(self):
+        criteria = ["One."]
+        for field, value in (("status", "accepted"), ("recommended_action", "accept"),
+                             ("issues", []), ("missing_evidence", [])):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(EvaluationValidationError, "only criteria"):
+                    Evaluator._parse(semantic(criteria) | {field: value}, criteria)
+        self.assertEqual(set(EVALUATION_RESPONSE_FORMAT["properties"]), {"criteria"})
+        self.assertEqual(EVALUATION_RESPONSE_FORMAT["required"], ["criteria"])
+
+    def test_python_aggregation_matrix_and_public_contract(self):
+        for statuses, expected in ((["satisfied", "satisfied"], "accepted"),
+                                   (["satisfied", "partial"], "needs_revision"),
+                                   (["unsatisfied", "unknown"], "rejected"),
+                                   (["partial", "unknown"], "blocked")):
+            with self.subTest(statuses=statuses):
+                criteria = ["One.", "Two."]
+                answer = semantic(criteria)
+                for item, status in zip(answer["criteria"], statuses):
+                    item["status"] = status
+                outcome = Evaluator(lambda *_: answer).evaluate(
+                    planned_task=planned(criteria), runtime_task=runtime(), execution_node=node())
+                self.assertEqual(outcome["status"], expected)
+                self.assertEqual(outcome["recommended_action"], {
+                    "accepted": "accept", "needs_revision": "revise",
+                    "rejected": "reject", "blocked": "gather_evidence"}[expected])
+                self.assertEqual(set(outcome["criteria"][0]),
+                                 {"criterion", "status", "reason", "evidence"})
+                self.assertEqual(outcome["metrics"]["criteria_semantic"], 2)
+                self.assertEqual(outcome["metrics"]["final_status"], expected)
+
+    def test_typed_content_and_symbol_checks_require_exact_links(self):
+        criteria = ["HTML contains the result panel.", "JavaScript defines calculate()."]
+        checks = [{"type": kind, "check": label, "status": "passed",
+                   "supports_acceptance_criteria": [criterion]}
+                  for kind, label, criterion in zip(
+                      ("content_match", "symbol_presence"),
+                      ("html:result-panel", "symbol:calculate"), criteria)]
+        outcome = Evaluator(lambda *_: self.fail("LLM must not run")).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(verification={"evidence": checks}), execution_node=node())
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 2)
+        self.assertEqual(outcome["metrics"]["model_calls"], 0)
+        checks[1]["supports_acceptance_criteria"] = ["Unrelated criterion."]
+        self.assertEqual(Evaluator(offline=True).evaluate(
+            planned_task=planned(criteria), runtime_task=runtime(verification={"evidence": checks}),
+            execution_node=node())["status"], "blocked")
+
+    def test_declared_file_modification_needs_matching_diff(self):
+        criterion = "The file app.js is modified."
+        plan = {**planned([criterion]), "write_targets": ["app.js"]}
+        outcome = Evaluator(lambda *_: self.fail("LLM must not run")).evaluate(
+            planned_task=plan,
+            runtime_task=runtime(result={"workspace_diffs": [
+                {"path": "app.js", "change_type": "modified"}]}), execution_node=node())
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 1)
+        missing = Evaluator(offline=True).evaluate(
+            planned_task=plan, runtime_task=runtime(result={"workspace_diffs": [
+                {"path": "other.js", "change_type": "modified"}]}), execution_node=node())
+        self.assertEqual(missing["status"], "blocked")
+
+    def test_semantic_html_css_js_criteria_are_reviewed_separately(self):
+        criteria = ["HTML contains calculator controls.", "CSS lays out the controls.",
+                    "JavaScript handles the four operations."]
+        seen = []
+        def model(prompt, context):
+            seen.extend(context["planned_task"]["success_criteria"])
+            return semantic(context["planned_task"]["success_criteria"])
+        outcome = Evaluator(model).evaluate(
+            planned_task=planned(criteria),
+            runtime_task=runtime(result={"artifacts": [
+                {"path": "index.html", "content": "<button>Calculate</button>"},
+                {"path": "styles.css", "content": "button { display: grid; }"},
+                {"path": "app.js", "content": "function calculate() {}"}]}),
+            execution_node=node())
+        self.assertEqual(seen, criteria)
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        completed = [event for event in outcome["events"] if event["event_type"] ==
+                     "evaluation.criterion.semantic_completed"]
+        self.assertEqual(len(completed), 3)
+        self.assertTrue(all(set(event) == {"event_type", "criterion_id", "criterion", "status",
+                                            "decision_source", "confidence"}
+                            for event in completed))
+
+    def test_split_html_css_js_tasks_keep_separate_semantic_decisions(self):
+        tasks = [
+            ("task-1", "HTML contains calculator controls.", "index.html",
+             "<button>Calculate</button>"),
+            ("task-2", "CSS lays out the controls.", "styles.css",
+             "button { display: grid; }"),
+            ("task-3", "JavaScript handles the four operations.", "app.js",
+             "function calculate() {}"),
+        ]
+        seen = []
+        def model(prompt, context):
+            seen.append((context["planned_task"]["id"],
+                         list(context["planned_task"]["success_criteria"])))
+            return semantic(context["planned_task"]["success_criteria"])
+        evaluator = Evaluator(model)
+        for task_id, criterion, path, content in tasks:
+            with self.subTest(task_id=task_id):
+                outcome = evaluator.evaluate(
+                    planned_task={**planned([criterion]), "id": task_id},
+                    runtime_task=runtime(result={"artifacts": [
+                        {"path": path, "change_type": "created", "content": content}]}),
+                    execution_node={**node(), "plan_task_id": task_id})
+                self.assertEqual(outcome["status"], "accepted")
+                self.assertEqual(outcome["metrics"]["criteria_semantic"], 1)
+                self.assertEqual(outcome["metrics"]["model_calls"], 1)
+        self.assertEqual(seen, [(task_id, [criterion]) for task_id, criterion, _, _ in tasks])
 
     def test_strict_schema_and_exact_criterion_coverage(self):
         criteria = ["One.", "Two."]
@@ -646,12 +1009,13 @@ class EvaluatorTests(unittest.TestCase):
 
         def request(method, url, payload, timeout):
             captured.update(method=method, url=url, payload=payload, timeout=timeout)
-            return {"message": {"content": json.dumps(decision(["The change is complete."]))},
+            return {"message": {"content": json.dumps(semantic(["The change is complete."]))},
                     "prompt_eval_count": 7, "eval_count": 3}
 
         adapter = OllamaEvaluator(request=request)
         raw = adapter("evaluate", {"untrusted": "data"})
-        self.assertEqual(json.loads(raw)["status"], "accepted")
+        self.assertEqual(json.loads(raw)["criteria"][0]["status"], "satisfied")
+        self.assertEqual(set(captured["payload"]["format"]["properties"]), {"criteria"})
         self.assertEqual(captured["payload"]["tools"], [])
         self.assertFalse(captured["payload"]["stream"])
         self.assertFalse(captured["payload"]["format"]["additionalProperties"])

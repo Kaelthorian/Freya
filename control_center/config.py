@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "provenance": {},
     "task_owned_paths": [],
     "task_foreign_write_targets": [],
+    "task_planned_write_targets": [],
     "task_write_owners": {},
     "task_write_scope_enforced": False,
     "capability_policy": None,
@@ -188,6 +189,7 @@ def normalize_agent(data: dict, existing: dict | None = None, *,
             and incoming.get("provenance") not in (None, {})):
         raise ValueError("provenance is reserved for Freya-generated agents.")
     scope_fields = {"task_owned_paths", "task_foreign_write_targets",
+                    "task_planned_write_targets",
                     "task_write_owners", "task_write_scope_enforced"}
     if not allow_provenance and scope_fields & set(incoming):
         raise ValueError("Task write scope is reserved for Freya-generated agents.")
@@ -199,6 +201,11 @@ def normalize_agent(data: dict, existing: dict | None = None, *,
                    or set(item) != {"path", "owner_plan_task_id"}
                    or not all(isinstance(value, str) for value in item.values())
                    for item in config["task_foreign_write_targets"])
+            or not isinstance(config["task_planned_write_targets"], list)
+            or any(not isinstance(item, dict)
+                   or set(item) != {"path", "owner_plan_task_id"}
+                   or not all(isinstance(value, str) for value in item.values())
+                   for item in config["task_planned_write_targets"])
             or not isinstance(config["task_write_owners"], dict)
             or any(not isinstance(path, str) or not isinstance(owner, str)
                    for path, owner in config["task_write_owners"].items())

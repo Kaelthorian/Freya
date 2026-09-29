@@ -3,7 +3,9 @@ import json
 import unittest
 from unittest.mock import patch
 
-from control_center.plan_compiler import OwnershipAmbiguous, compile_semantic_plan
+from control_center.plan_compiler import (
+    OwnershipAmbiguous, compile_semantic_plan, planned_write_target_grants,
+)
 from control_center.planner import Planner, PlanGenerationError, semantic_plan_response_format
 from control_center.runtime_resources import RuntimeResourceCatalog, UnsupportedResourceRequirement
 from control_center.task_spec import (
@@ -115,8 +117,22 @@ class SemanticPipelineTests(unittest.TestCase):
         self.assertEqual(compiled["write_owners"], {"calculator.js": "task-1"})
         self.assertEqual(compiled["tasks"][1]["foreign_write_targets"],
                          [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
+        self.assertEqual(planned_write_target_grants(compiled, "task-2"),
+                         [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
         self.assertNotIn("plan_compiler.tasks_coalesced",
                       [event["event_type"] for event in catalog.compiler_events])
+
+    def test_dependency_without_exact_foreign_write_target_does_not_grant(self):
+        creator = task("create", "create_file", path="calculator.js")
+        dependent = task("implement", "modify_file", path="other.js", dependencies=["create"])
+        dependent["owned_paths"] = []
+        dependent["write_targets"] = ["other.js"]
+        compiled = compile_semantic_plan({
+            "summary": "Create and implement", "success_criteria": [],
+            "unsupported_requirements": [], "tasks": [creator, dependent],
+        }, web_spec())
+        self.assertEqual(compiled["tasks"][1]["depends_on"], ["task-1"])
+        self.assertEqual(planned_write_target_grants(compiled, "task-2"), [])
 
     def test_single_writer_without_explicit_owner_becomes_permanent_owner(self):
         writer = task("implement", "modify_file")
