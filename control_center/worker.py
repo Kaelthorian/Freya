@@ -841,7 +841,7 @@ class PolicyToolbox(Toolbox):
         if name == "read_file" and result.success and isinstance(args.get("path"), str):
             if read_hash is not None and not result.output.endswith("\n[output truncated]"):
                 self.record_file_observation(args["path"], read_hash)
-        if name in WRITE_TOOLS and result.success:
+        if name in WRITE_TOOLS and result.success and result.changed is None:
             result.changed = True
         return result
 
@@ -1012,7 +1012,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             fromfile=from_name, tofile="b/" + path, lineterm="\n",
         ))
         if not diff:
-            diff = "(no textual difference)"
+            return
         if len(diff) > 64_000:
             diff = diff[:64_000] + "\n[… diff clipped at 64,000 characters …]"
         payload = {"path": path, "change_type": change_type, "diff": diff,
@@ -1048,6 +1048,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
     successful_write_signatures: set[str] = set()
     already_satisfied_write_signatures: set[str] = set()
     action_history: list[str] = []
+    noop_edit_counts: dict[str, int] = {}
+    read_evidence_paths: set[str] = set()
     deferred_action_repeats: dict[str, int] = {}
     repeated_failure_limit = effective["behavior"]["persistence"]["repeated_failure_limit"]
     mutation_failure = ""
@@ -1395,6 +1397,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             safe_args.get("argv", []), result,
                         )
                         if supported:
+                            previously_supported = {
+                                criterion for row in command_evidence
+                                for criterion in row.get("supports_acceptance_criteria", [])
+                            }
+                            if any(criterion not in previously_supported for criterion in supported):
+                                noop_edit_counts.clear()
                             evidence = {
                                 "type": "command_execution",
                                 "source": "runtime_command_result",
@@ -1430,7 +1438,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                         "status": "Success",
                                         "reason": "The single-case QA task stopped after one successful command satisfied every configured acceptance criterion.",
                                     })
-                    if result.success and name in WRITE_TOOLS and result.error_class != "already_satisfied":
+                    if result.success and name in WRITE_TOOLS and result.changed is True:
                         publish_workspace_diff(
                             name, safe_args, existing_before,
                             event_id=common.get("step_id", ""),
@@ -1454,12 +1462,15 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 "capability": result.capability or resolved_capability,
                             })
                         modified = True
+                        noop_edit_counts.clear()
+                        read_evidence_paths.clear()
                         if name == "write_file" and result.changed is True and write_signature:
                             successful_write_signatures.add(write_signature)
                     if result.already_satisfied:
                         publish("event", event={
                             "event_type": "worker.write_already_satisfied", "level": "info",
                             "status": "Success", "path": safe_args.get("path", ""),
+                            "tool": name, "changed": False, "already_satisfied": True,
                             "message": "The requested state already exists; no write was performed.",
                         })
                         if (verification_state["requested"] and name == "write_file"
@@ -1523,6 +1534,10 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                     if result.success and name == "read_file":
                         path = safe_args.get("path")
                         if isinstance(path, str):
+                            evidence_key = owned_path_key(path)
+                            if evidence_key not in read_evidence_paths:
+                                read_evidence_paths.add(evidence_key)
+                                noop_edit_counts.clear()
                             observations = box.current_observations([path]) if hasattr(box, "current_observations") else []
                             if observations:
                                 publish("event", event={
@@ -1646,6 +1661,28 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                             publish("event", event={"event_type": "task.auto_completed", "level": "info",
                                                      "status": "Success",
                                                      "reason": "The workspace change was followed by ten successful validation actions."})
+                    if result.success and name == "edit_file" and result.already_satisfied:
+                        path = safe_args.get("path")
+                        if isinstance(path, str):
+                            path_key = owned_path_key(path)
+                            noop_edit_counts[path_key] = noop_edit_counts.get(path_key, 0) + 1
+                            telemetry["no_progress_actions"] += 1
+                            if noop_edit_counts[path_key] >= 3:
+                                no_progress_reason = (
+                                    "NoProgressDetected: edit_file returned no change three times for {} "
+                                    "without new evidence or workspace progress ({} steps)."
+                                ).format(path, metrics["steps"])
+                                telemetry["no_progress_detected"] = True
+                                telemetry["stop_reason"] = no_progress_reason
+                                publish("event", event={
+                                    "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                    "step_id": step_id, "tool": name, "path": path,
+                                    "reason": "Repeated no-op edits produced no workspace progress.",
+                                    "output": {"pattern": "repeated_noop_edit", "repeat_count": noop_edit_counts[path_key],
+                                               "steps": metrics["steps"],
+                                               "workspace_changes": telemetry["workspace_changes"]},
+                                    "error_class": "no_progress",
+                                })
                     legacy_tool_block = result.policy_decision == "deny" and "disabled" in result.policy_reason.lower()
                     policy_blocked = result.policy_decision in {"deny", "approval_required"} and not legacy_tool_block
                     blocked_reason = ""
@@ -1730,7 +1767,7 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             )
             already_satisfied_write_actions = sum(
                 1 for action in runtime_actions
-                if action.get("tool") == "write_file"
+                if action.get("tool") in WRITE_TOOLS
                 and action.get("success") is True
                 and action.get("already_satisfied") is True
                 and action.get("changed") is False

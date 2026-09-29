@@ -14,6 +14,7 @@ const freyaObservedApprovalIds = new Set();
 let freyaStatusSnapshotReady = false, freyaApprovalSnapshotReady = false;
 let freyaAudioContext = null, freyaSoundQueueEnd = 0;
 const pendingFreyaSounds = [];
+const FREYA_SOUND_PEAK_GAIN = 0.72;
 
 function scheduleFreyaSound(kind, startAt) {
   const context = freyaAudioContext;
@@ -27,7 +28,7 @@ function scheduleFreyaSound(kind, startAt) {
     oscillator.type = 'sine';
     oscillator.frequency.setValueAtTime(note.frequency, start);
     volume.gain.setValueAtTime(0.0001, start);
-    volume.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+    volume.gain.exponentialRampToValueAtTime(FREYA_SOUND_PEAK_GAIN, start + 0.02);
     volume.gain.exponentialRampToValueAtTime(0.0001, start + note.duration);
     oscillator.connect(volume);
     volume.connect(context.destination);

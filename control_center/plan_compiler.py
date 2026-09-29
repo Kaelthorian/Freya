@@ -10,6 +10,10 @@ from .plan_scope import reconcile_plan_scope, semantic_categories
 from .runtime_resources import RuntimeResourceCatalog, UnsupportedResourceRequirement
 from .task_spec import validate_task_spec, _action_matches, _scope_tokens
 from .cross_task import CrossTaskRequestError, normalize_owned_paths, owned_path_key
+from .plan_evidence import (
+    COMPILATION_RESULT, RUNTIME_BEHAVIOR, TEST_RESULT, classify_criterion,
+    evidence_is_supported,
+)
 from .security import sanitize
 
 
@@ -18,6 +22,201 @@ WRITE_CAPABILITIES = {"filesystem.create", "filesystem.modify", "filesystem.over
 
 class OwnershipAmbiguous(PlanValidationError):
     """More than one modifier claims a path without a unique creator."""
+
+
+class WriteScopeOverlap(PlanValidationError):
+    """Unordered tasks can write the same artifact and race or duplicate work."""
+
+
+class CriterionEvidenceMismatch(PlanValidationError):
+    """A task cannot produce the minimum evidence required by its criterion."""
+
+
+def _dependency_indexes(tasks: list[dict[str, Any]], keys: list[str]) -> list[set[int]]:
+    """Resolve semantic dependency keys once for structural compiler checks."""
+    result: list[set[int]] = []
+    for task in tasks:
+        dependencies = task.get("depends_on", [])
+        if not isinstance(dependencies, list):
+            raise PlanValidationError("Semantic dependencies must be a list.")
+        resolved: set[int] = set()
+        for dependency in dependencies:
+            key = _slug(str(dependency))
+            if key not in keys:
+                raise PlanValidationError(f"Unknown semantic dependency: {dependency}.")
+            resolved.add(keys.index(key))
+        result.append(resolved)
+    return result
+
+
+def _dependency_ancestors(dependencies: list[set[int]]) -> list[set[int]]:
+    ancestors = [set(items) for items in dependencies]
+    changed = True
+    while changed:
+        changed = False
+        for index, direct in enumerate(list(ancestors)):
+            expanded = set(direct)
+            for dependency in direct:
+                expanded.update(ancestors[dependency])
+            if expanded != ancestors[index]:
+                ancestors[index] = expanded
+                changed = True
+    return ancestors
+
+
+def _responsibility_similarity(first: dict[str, Any], second: dict[str, Any]) -> float:
+    def tokens(task: dict[str, Any]) -> set[str]:
+        fields = [task.get("objective", ""), task.get("description", "")]
+        for name in ("semantic_needs", "success_criteria"):
+            values = task.get(name, [])
+            if isinstance(values, list):
+                fields.extend(values)
+        return set(_scope_tokens(" ".join(str(item) for item in fields)))
+    left, right = tokens(first), tokens(second)
+    return round(len(left & right) / len(left | right), 3) if left or right else 0.0
+
+
+def _validate_write_scope_overlaps(tasks: list[dict[str, Any]], keys: list[str],
+                                   resources: list[dict[str, Any]],
+                                   dependencies: list[set[int]],
+                                   catalog: RuntimeResourceCatalog) -> None:
+    """Reject shared writable paths unless task dependencies impose an order."""
+    ancestors = _dependency_ancestors(dependencies)
+    writers: dict[str, list[tuple[int, str]]] = {}
+    for index, runtime in enumerate(resources):
+        for path in normalize_owned_paths([
+                *runtime.get("owned_paths", []), *runtime.get("write_targets", [])]):
+            writers.setdefault(owned_path_key(path), []).append((index, path))
+    for entries in writers.values():
+        for position, (left, path) in enumerate(entries):
+            for right, _ in entries[position + 1:]:
+                left_operations = set(resources[left].get("semantic_operations", []))
+                right_operations = set(resources[right].get("semantic_operations", []))
+                creators = [index for index, operations in (
+                    (left, left_operations), (right, right_operations)
+                ) if "create_file" in operations]
+                if len(creators) == 1:
+                    creator = creators[0]
+                    modifier = right if creator == left else left
+                    ordered = creator in ancestors[modifier]
+                else:
+                    ordered = left in ancestors[right] or right in ancestors[left]
+                similarity = _responsibility_similarity(tasks[left], tasks[right])
+                details = {
+                    "path": path,
+                    "task_keys": [keys[left], keys[right]],
+                    "task_ids": [f"task-{left + 1}", f"task-{right + 1}"],
+                    "dependency_ordered": ordered,
+                    "responsibility_similarity": similarity,
+                }
+                if len(creators) == 2:
+                    _compiler_event(catalog, "plan_compiler.overlap_detected",
+                                    reason="multiple_creators_share_write_target", **details)
+                    raise PlanValidationError(
+                        f"Two creators claim {path}: task-{left + 1}, task-{right + 1}")
+                if ordered:
+                    _compiler_event(catalog, "plan_compiler.overlap_validated",
+                                    reason="dependency_ordered_write_handoff", **details)
+                    continue
+                _compiler_event(catalog, "plan_compiler.overlap_detected",
+                                reason="unordered_tasks_share_write_target", **details)
+                raise WriteScopeOverlap(
+                    "WriteScopeOverlap: {} and {} both write {} without a dependency order; "
+                    "narrow their responsibilities/write targets or add the real semantic dependency."
+                    .format(details["task_ids"][0], details["task_ids"][1], path)
+                )
+
+
+def _default_task_criterion(task: dict[str, Any], runtime: dict[str, Any]) -> str:
+    capabilities = set(runtime.get("required_capabilities", []))
+    if capabilities & WRITE_CAPABILITIES:
+        return "The declared workspace artifacts exist and their resulting content can be inspected."
+    if any(item.startswith("execution.") for item in capabilities):
+        return "The planned command completes with recorded output and exit status."
+    if capabilities & {"filesystem.read", "filesystem.list", "filesystem.search", "git.diff", "git.status"}:
+        return "The requested workspace content is inspected and recorded."
+    return "The task result is reported."
+
+
+def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
+                                  resources: list[dict[str, Any]],
+                                  dependencies: list[set[int]],
+                                  catalog: RuntimeResourceCatalog) -> None:
+    """Move a criterion to one clear verifier or reject it before execution."""
+    ancestors = _dependency_ancestors(dependencies)
+    original_criteria: list[list[str]] = []
+    for task in tasks:
+        criteria = task.get("success_criteria") or []
+        if not isinstance(criteria, list) or any(
+                not isinstance(item, str) or not item.strip() for item in criteria):
+            raise PlanValidationError("Semantic task checks must be text.")
+        original_criteria.append(list(dict.fromkeys(item.strip() for item in criteria)))
+    retained: list[list[str]] = [[] for _ in tasks]
+    reassigned: list[list[str]] = [[] for _ in tasks]
+    execution_evidence = {RUNTIME_BEHAVIOR, TEST_RESULT, COMPILATION_RESULT}
+    for index, criteria in enumerate(original_criteria):
+        capabilities = resources[index]["required_capabilities"]
+        task_kind = str(resources[index].get("task_kind") or "")
+        for criterion in criteria:
+            evidence_type = classify_criterion(criterion)
+            supported, reason = evidence_is_supported(
+                evidence_type, capabilities, task_kind=task_kind)
+            _compiler_event(
+                catalog, "plan_compiler.criterion_classified",
+                task_key=keys[index], task_id=f"task-{index + 1}",
+                criterion=criterion[:300], evidence_type=evidence_type,
+                required_capabilities=list(capabilities), verifiable=supported,
+                reason=reason,
+            )
+            if supported:
+                retained[index].append(criterion)
+                continue
+            candidates = []
+            for candidate, runtime in enumerate(resources):
+                if index not in ancestors[candidate]:
+                    continue
+                candidate_kind = str(runtime.get("task_kind") or "")
+                if evidence_type in execution_evidence and candidate_kind != "testing":
+                    continue
+                can_verify, _ = evidence_is_supported(
+                    evidence_type, runtime["required_capabilities"], task_kind=candidate_kind)
+                if can_verify:
+                    candidates.append(candidate)
+            if len(candidates) == 1:
+                target = candidates[0]
+                reassigned[target].append(criterion)
+                _compiler_event(
+                    catalog, "plan_compiler.criterion_reassigned",
+                    criterion=criterion[:300], evidence_type=evidence_type,
+                    source_task_key=keys[index], source_task_id=f"task-{index + 1}",
+                    target_task_key=keys[target], target_task_id=f"task-{target + 1}",
+                    reason="one compatible dependent verifier exists",
+                )
+                continue
+            _compiler_event(
+                catalog, "plan_compiler.plan_repair_required",
+                task_key=keys[index], task_id=f"task-{index + 1}",
+                criterion=criterion[:300], evidence_type=evidence_type,
+                required_capabilities=list(capabilities), compatible_verifiers=len(candidates),
+                reason=reason,
+            )
+            raise CriterionEvidenceMismatch(
+                "CriterionEvidenceMismatch for task-{}: criterion {!r} requires {} evidence, "
+                "but the task capabilities cannot produce it and no unique dependent verifier exists."
+                .format(index + 1, criterion[:200], evidence_type)
+            )
+    for index, task in enumerate(tasks):
+        criteria = list(dict.fromkeys([*retained[index], *reassigned[index]]))
+        if not criteria:
+            replacement = _default_task_criterion(task, resources[index])
+            criteria = [replacement]
+            _compiler_event(
+                catalog, "plan_compiler.criterion_rewritten",
+                task_key=keys[index], task_id=f"task-{index + 1}",
+                criterion=replacement, evidence_type=classify_criterion(replacement),
+                reason="all original criteria were reassigned to their verifier",
+            )
+        task["success_criteria"] = criteria
 
 
 def _assign_write_owners(tasks: list[dict[str, Any]],
@@ -370,18 +569,21 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
         if key in keys:
             raise PlanValidationError("Semantic task references are ambiguous.")
         keys.append(key)
+    dependency_indexes = _dependency_indexes(raw_tasks, keys)
+    preliminary_resources = [
+        compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
+        for item in raw_tasks
+    ]
+    _validate_write_scope_overlaps(
+        raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog)
+    _reconcile_criterion_evidence(
+        raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog)
     write_owners = _assign_write_owners(raw_tasks, resource_catalog)
     tasks = []
     for index, item in enumerate(raw_tasks, 1):
-        dependencies = item.get("depends_on", [])
-        if not isinstance(dependencies, list):
-            raise PlanValidationError("Semantic dependencies must be a list.")
         resolved = []
-        for dependency in dependencies:
-            key = _slug(str(dependency))
-            if key not in keys:
-                raise PlanValidationError(f"Unknown semantic dependency: {dependency}.")
-            identifier = f"task-{keys.index(key) + 1}"
+        for dependency in item.get("depends_on", []):
+            identifier = f"task-{keys.index(_slug(str(dependency))) + 1}"
             if identifier not in resolved:
                 resolved.append(identifier)
         criteria = item.get("success_criteria") or []

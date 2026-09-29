@@ -388,9 +388,12 @@ Semantic Plan, structured compiler diagnostics and preservation rules.
 The Compiler preserves every distinct plan task. It assigns one permanent owner
 per normalized path: the unique creator, otherwise one explicit owner, otherwise
 the sole writer. A duplicate ownership claim from a noncreator is converted to
-a foreign write when the creator is unique. Two creators invalidate the plan;
-two modifier owners without a creator raise `OwnershipAmbiguous` for one bounded
-Planner repair. It validates every operation against the catalog and derives
+a foreign write when the creator is unique. Before ownership assignment,
+unordered tasks that share a write target fail with `WriteScopeOverlap`; shared
+targets are accepted only when the dependency graph establishes a sequential
+handoff. Two creators invalidate the plan. The overlap diagnostic records the
+path, both task IDs, dependency ordering and bounded responsibility similarity
+for one Planner repair. It validates every operation against the catalog and derives
 the complete runtime requirement set. For example, `modify_file` maps to
 `filesystem.modify` and `edit_file`; `create_file` maps to
 `filesystem.create` and `write_file`; `run_python_script` maps to
@@ -402,8 +405,15 @@ assigns task and criterion IDs, resolves dependencies, rejects cycles and
 invalid ownership, and produces compiled plan schema version 4. The compiled
 plan persists `write_owners`; each task records `foreign_write_targets`.
 Global success criteria remain on the plan for Global Verification. Local task
-criteria remain on their own tasks for the Evaluator; the Compiler links an exact
-match but never appends a global criterion to the final task by position.
+criteria pass through `plan_evidence.py`, which classifies the minimum evidence
+as artifact existence, static content/structure, runtime/test, compilation,
+visual, external state or task output. The Compiler compares that requirement
+with derived capabilities. It moves an incompatible criterion only when one
+dependent verifier can prove it, otherwise it raises
+`CriterionEvidenceMismatch` for bounded Planner repair. Every classification,
+reassignment and rejection is recorded without storing model prompts. The
+Compiler links an exact global/local match but never appends a global criterion
+to the final task by position.
 Unknown resources and genuinely unsupported actions do not trigger repair.
 
 The Agent Factory consumes the compiled plan and cannot add capabilities or
@@ -503,7 +513,7 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` is read-only. Before checks or model inference,
+`Evaluator` version 7 is read-only. Before checks or model inference,
 `normalize_execution_evidence` builds a bounded catalog from verification
 records, tool outcomes, artifact changes and workspace diffs. It retains
 available content/output, path, operation, status, source, tool, capability,
@@ -514,11 +524,17 @@ are normalized to those IDs. Explicit verification links and criterion IDs are
 authoritative, while path or file-kind associations are marked as inferred.
 Evidence with no grounded link remains global.
 
-The model context contains the evidence catalog, per-criterion references and
-global evidence IDs, so it can inspect a relevant diff/read-back without
-reconstructing runtime provenance from agent prose. Sanitization runs before
-model input and persistence. Result, verification output, evidence counts and
-item lengths are bounded; clipping sets durable `context_truncated=true`.
+The durable evaluation snapshot contains the evidence catalog, per-criterion
+references and global evidence IDs. The semantic model receives a separate
+context with a 20,000-character evidence budget: each unresolved criterion has
+its linked objective records inline, with path, provenance, status and bounded
+diff/read-back/test content; unrelated records remain in `global_evidence`. Each record has at most
+4,000 content characters and marks `content_truncated` when an excerpt omits
+text. Required criterion text is retained even if it consumes that budget.
+The full Runtime result is excluded from this model context to avoid
+crowding objective content out of Ollama's context window. Sanitization runs
+before model input and persistence. The durable snapshot still bounds result,
+verification output, evidence counts and item lengths, and marks truncation.
 Agent output and verification text are untrusted data and cannot alter the
 system prompt, schema or configuration.
 
@@ -530,8 +546,9 @@ removal does. Relevant failed tests reject their criterion, while a missing
 required test/lint/build result blocks it. Mixed tasks retain proven facts and
 send only semantic questions to the LLM. Agent claims cannot override these
 facts. File creation, action success or a path association alone cannot satisfy
-a semantic criterion. A matching file_content_match only proves the exact
-check that generated it; it does not prove unrelated behavior. A directly
+a semantic criterion. A matching file_content_match can directly prove only
+an exact file-content equality criterion; it does not prove unrelated behavior.
+A directly
 linked passing test or exact typed verification is evaluated before semantic
 inference. Unmatched evidence can still be considered globally when its path
 or content is relevant, but an unrelated diff is not attached to a criterion.
@@ -541,7 +558,7 @@ modified path as objective evidence. `write_file` content is compared exactly;
 all modified paths must pass, otherwise the verification remains unavailable or
 failed and the evaluator still fails closed. Otherwise the tool-free
 `OllamaEvaluator` receives only unresolved semantic criteria with their
-grouped evidence references and returns one
+grouped evidence content and returns one
 strict `criteria` array. Each entry contains `criterion`, `status`, `reason`,
 `evidence`, and `confidence`; global status and actions are forbidden in model
 output. Python combines canonical criterion records with this precedence:
@@ -552,6 +569,8 @@ gets one repair. If both calls fail, the Evaluator retries once from the same
 immutable bounded Runtime evidence, with one repair available on that retry.
 Four model calls are the maximum. Exhaustion persists evaluator infrastructure
 `error` without a semantic rejection or Worker retry.
+An `unknown` model answer that claims an untruncated, linked diff or read-back
+was absent is an invalid decision and uses the same bounded repair/retry path.
 
 Evaluator calls are serialized to one model call at a time. Defaults are the
 separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
@@ -876,7 +895,10 @@ denials, non-applicable tools and forbidden paths do not retry. If the worker ha
 not changed the workspace and repeats the same read-only action three times,
 or alternates the same two read-only actions for three cycles, it emits
 `task.no_progress` and fails early with `NoProgressDetected`; increasing the
-step budget is not treated as a fix. Writes and process execution are never
+step budget is not treated as a fix. Three successful no-op `edit_file` calls
+on the same artifact also stop early, even when their replacement arguments
+differ. A new file read, newly supported acceptance criterion, or material
+write resets that edit counter. Writes and process execution are never
 automatically retried.
 
 Git inspection is applicability-aware. Only a checkout rooted in the assigned
@@ -931,8 +953,12 @@ for exact UTF-8 byte equality before policy classification. A match returns an
 `already_satisfied` no-op with `changed=false`, no overwrite capability, and no
 workspace mutation; different bytes remain `filesystem.overwrite` and use normal
 policy. Parent directories are created automatically; a file occupying a parent
-path is returned as `ParentPathIsFile` before filesystem mutation. `run_command`
-maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
+path is returned as `ParentPathIsFile` before filesystem mutation.
+`edit_file` checks its exact candidate bytes against the original after the
+normal unique-match and `filesystem.modify` policy checks. An identical result
+returns `already_satisfied=true`, `changed=false`, and no file write or workspace
+diff. The Worker records artifacts and workspace changes only for `changed=true`.
+`run_command` maps only to supported Python, pytest, unittest, py_compile, Ruff, or Git
 actions. `policy.py` validates the per-agent JSON policy and returns explicit
 `allow`, `deny`, or `approval_required` decisions. Allow and ask rules are the only source used to derive the model-visible tool list; stale legacy tool selections cannot expose a capability. Deny and approval results never invoke the underlying tool. Filesystem rules support paths, extensions and max_bytes for every filesystem action. Agents with
 legacy `permissions` are converted to the same engine, and the effective

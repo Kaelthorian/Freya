@@ -138,6 +138,25 @@ class EnforcementTests(unittest.TestCase):
         self.assertEqual(changed.error_class, "policy_denied")
         self.assertEqual(target.read_bytes(), b"same")
 
+    def test_noop_edit_still_requires_modify_permission(self):
+        target = self.workspace / "calculator.html"
+        target.write_text("<button>7</button>", encoding="utf-8")
+        args = {"path": "calculator.html", "old": "7", "new": "7"}
+        allowed = self.box.invoke("edit_file", args)
+        self.assertTrue(allowed.success, allowed.output)
+        self.assertTrue(allowed.executed)
+        self.assertEqual(allowed.capability, "filesystem.modify")
+        self.assertEqual(allowed.policy_decision, "allow")
+        self.assertFalse(allowed.changed)
+        self.assertTrue(allowed.already_satisfied)
+        self.config["capability_policy"]["capabilities"]["filesystem"]["modify"] = {"mode": "deny"}
+        denied = PolicyToolbox(self.root, self.workspace, self.config, ["edit_file"]).invoke("edit_file", args)
+        self.assertFalse(denied.success)
+        self.assertFalse(denied.executed)
+        self.assertFalse(denied.already_satisfied)
+        self.assertIn(denied.policy_decision, {"deny", "unavailable"})
+        self.assertEqual(target.read_text(encoding="utf-8"), "<button>7</button>")
+
     def test_different_second_write_remains_a_real_overwrite(self):
         first = self.box.invoke("write_file", {"path": "x.js", "content": "abc"})
         self.assertTrue(first.success)

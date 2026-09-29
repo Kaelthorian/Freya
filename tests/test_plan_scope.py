@@ -37,7 +37,7 @@ def web_plan():
                 "owned_paths": ["index.html"],
                 "required_tools": ["write_file", "read_file"],
                 "preferred_skills": [],
-                "success_criteria": ["The web calculator performs four operations."],
+                "success_criteria": ["index.html contains controls for four arithmetic operations."],
             }, {
                 "key": "deploy_calculator", "objective": "Deploy calculator to production",
                 "task_kind": "external_action",
@@ -79,6 +79,7 @@ class PlanScopeTests(unittest.TestCase):
             types = [event["event_type"] for event in events]
             self.assertIn("freya.plan.scope_adjusted", types)
             self.assertIn("freya.plan_compiler.completed", types)
+            self.assertIn("plan_compiler.criterion_classified", types)
             started = next(json.loads(event["payload_json"]) for event in events
                            if event["event_type"] == "freya.plan_compiler.started")
             self.assertEqual(started["planner_semantic_plan"]["tasks"][1]["key"],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,7 +35,45 @@ class ToolboxTests(unittest.TestCase):
         self.assertEqual(read.output, "VALUE = 1\n")
         edited = self.toolbox.invoke("edit_file", {"path": "src/calc.py", "old": "VALUE = 1", "new": "VALUE = 2"})
         self.assertTrue(edited.success)
+        self.assertTrue(edited.changed)
+        self.assertFalse(edited.already_satisfied)
         self.assertEqual((self.workspace / "src/calc.py").read_text(encoding="utf-8"), "VALUE = 2\n")
+
+    def test_identical_edit_preserves_bytes_hash_and_mtime(self) -> None:
+        target = self.workspace / "calculator.html"
+        self.workspace.mkdir(exist_ok=True)
+        before = b"<button>7</button>\r\n"
+        target.write_bytes(before)
+        before_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        before_mtime = target.stat().st_mtime_ns
+        result = self.toolbox.invoke("edit_file", {
+            "path": "calculator.html", "old": "<button>7</button>", "new": "<button>7</button>",
+        })
+        self.assertTrue(result.success, result.output)
+        self.assertFalse(result.changed)
+        self.assertTrue(result.already_satisfied)
+        self.assertEqual(result.error_class, "already_satisfied")
+        self.assertIn("replacement_is_identical", result.output)
+        self.assertNotIn("Updated", result.output)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), before_hash)
+        self.assertEqual(target.stat().st_mtime_ns, before_mtime)
+
+    def test_distinct_edit_arguments_can_produce_identical_bytes(self) -> None:
+        self.workspace.mkdir(exist_ok=True)
+        target = self.workspace / "calculator.html"
+        before = b"<button>7</button>\r\n"
+        target.write_bytes(before)
+        before_mtime = target.stat().st_mtime_ns
+        result = self.toolbox.invoke("edit_file", {
+            "path": "calculator.html", "old": "\n", "new": "\r\n",
+        })
+        self.assertTrue(result.success, result.output)
+        self.assertFalse(result.changed)
+        self.assertTrue(result.already_satisfied)
+        self.assertIn("result_is_identical", result.output)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(target.stat().st_mtime_ns, before_mtime)
 
     def test_write_file_creates_parent_directories_for_nested_files(self) -> None:
         result = self.toolbox.invoke("write_file", {"path": "project/index.html", "content": "<h1>Hi</h1>"})

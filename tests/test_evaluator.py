@@ -11,11 +11,13 @@ from control_center.config import normalize_agent
 from control_center.evaluator import (
     EVALUATOR_VERSION,
     EVALUATION_RESPONSE_FORMAT,
+    MAX_SEMANTIC_CONTEXT_CHARS,
     EvaluationGenerationError,
     EvaluationValidationError,
     Evaluator,
     EvaluatorInfrastructureError,
     OllamaEvaluator,
+    normalize_execution_evidence,
     technical_failure_evaluation,
     validate_evaluation,
 )
@@ -143,10 +145,9 @@ class EvaluatorTests(unittest.TestCase):
 
         def model(_prompt, context):
             seen.append(context)
-            record = next(item for item in context["evidence_catalog"]
+            record = next(item for item in context["evidence_by_criterion"][0]["evidence"]
                           if item["type"] == "workspace_diff")
             self.assertIn("data-op='divide'", record["diff"])
-            self.assertEqual(record["supports_acceptance_criteria"], ["LC-1"])
             self.assertEqual(context["evidence_by_criterion"][0]["criterion_id"], "LC-1")
             self.assertEqual(context["evidence_by_criterion"][0]["evidence"][0]["id"], record["id"])
             return semantic([criterion])
@@ -158,6 +159,123 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["recommended_action"], "accept")
         self.assertEqual(outcome["metrics"]["model_calls"], 1)
         self.assertEqual(len(seen), 1)
+
+    def test_short_python_diff_reaches_ollama_and_missing_diff_claim_is_repaired(self):
+        criterion = ("The Python script is created and contains the necessary functions "
+                     "for multiplication, addition, subtraction, and division.")
+        plan = {**planned([criterion]), "write_targets": ["calculator.py"],
+                "acceptance_criteria": [{"id": "lc-1", "criterion": criterion}]}
+        diff = ("--- /dev/null\n+++ b/calculator.py\n@@ -0,0 +1,18 @@\n"
+                "+def add(a, b):\n+    return a + b\n"
+                "+def subtract(a, b):\n+    return a - b\n"
+                "+def multiply(a, b):\n+    return a * b\n"
+                "+def divide(a, b):\n+    return a / b\n")
+        result = {"workspace_diffs": [{"path": "calculator.py", "change_type": "created",
+                                      "event_id": "write-1", "diff": diff}]}
+        normalized = normalize_execution_evidence(result, {}, plan)
+        record = next(item for item in normalized["records"] if item["type"] == "workspace_diff")
+        self.assertEqual(record["path"], "calculator.py")
+        self.assertEqual(record["diff"], diff)
+        self.assertEqual(record["supports_acceptance_criteria"], ["lc-1"])
+        requests = []
+
+        def request(_method, _url, payload, *, timeout):
+            requests.append(payload)
+            content = payload["messages"][1]["content"]
+            for name in ("add", "subtract", "multiply", "divide"):
+                self.assertIn("+def " + name + "(a, b):", content)
+            if len(requests) == 1:
+                response = semantic([criterion], "unknown")
+                response["criteria"][0]["reason"] = (
+                    "The evidence provided does not include a direct read-back or diff of the file content."
+                )
+            else:
+                response = semantic([criterion])
+            return {"message": {"content": json.dumps(response)}}
+
+        outcome = Evaluator(OllamaEvaluator(request=request)).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node())
+        self.assertEqual(outcome["status"], "accepted")
+        self.assertEqual(outcome["metrics"]["repairs"], 1)
+        self.assertEqual(len(requests), 2)
+        self.assertLess(len(requests[0]["messages"][1]["content"]), 20_000)
+        prompt_data = json.loads(requests[0]["messages"][1]["content"].split(
+            "Bounded evaluation data:\n", 1)[1])
+        diff_record = next(item for item in prompt_data["evidence_by_criterion"][0]["evidence"]
+                           if item["type"] == "workspace_diff")
+        self.assertEqual(diff_record["path"], "calculator.py")
+        self.assertEqual(diff_record["diff"], diff)
+        self.assertFalse(diff_record.get("content_truncated", False))
+
+    def test_middle_of_large_diff_can_remain_unknown_when_excerpt_omits_facts(self):
+        criterion = "The Python script contains four required functions."
+        plan = {**planned([criterion]), "write_targets": ["module.py"]}
+        diff = "+" + "x" * 5_000 + "\n+def required_function():\n" + "y" * 5_000
+        result = {"workspace_diffs": [{"path": "module.py", "diff": diff}]}
+
+        def model(_prompt, context):
+            record = context["evidence_by_criterion"][0]["evidence"][0]
+            self.assertTrue(record["content_truncated"])
+            self.assertNotIn("def required_function", record["diff"])
+            return semantic([criterion], "unknown")
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(result=result), execution_node=node())
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertTrue(outcome["context_truncated"])
+
+    def test_many_diffs_keep_semantic_context_bounded(self):
+        criterion = "The Python script implements the requested behavior."
+        plan = {**planned([criterion]), "write_targets": ["module.py"]}
+        result = {"workspace_diffs": [
+            {"path": "module.py", "event_id": f"write-{index}",
+             "diff": f"+def version_{index}():\n" + "x" * 3_000}
+            for index in range(8)
+        ]}
+        bounded, _ = Evaluator._bounded_context(plan, runtime(result=result), node())
+        context = Evaluator._semantic_context(bounded, [criterion])
+        self.assertLessEqual(len(json.dumps(context, ensure_ascii=False, separators=(",", ":"))),
+                             MAX_SEMANTIC_CONTEXT_CHARS)
+        self.assertTrue(context["context_truncated"])
+        self.assertIn("+def version_0", context["evidence_by_criterion"][0]["evidence"][0]["diff"])
+
+    def test_content_match_without_semantic_content_does_not_prove_complex_criterion(self):
+        criterion = "The Python script implements all requested arithmetic operations."
+        plan = {**planned([criterion]), "acceptance_criteria": [
+            {"id": "lc-1", "criterion": criterion}]}
+        verification = {"evidence": [{"type": "file_content_match", "path": "calculator.py",
+                                     "status": "passed", "match": True,
+                                     "supports_acceptance_criteria": ["lc-1"]}]}
+        seen = []
+
+        def model(_prompt, context):
+            seen.append(context)
+            self.assertEqual(context["evidence_by_criterion"][0]["evidence"][0]["type"],
+                             "file_content_match")
+            return semantic([criterion], "unknown")
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification),
+            execution_node=node())
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(len(seen), 1)
+
+    def test_related_test_result_output_is_visible_for_semantic_review(self):
+        criterion = "The Python script handles boundary cases correctly."
+        plan = {**planned([criterion]), "write_targets": ["module.py"]}
+        verification = {"evidence": [{"type": "test_result", "path": "module.py",
+                                     "check": "boundary_cases", "status": "passed",
+                                     "output": "zero case passed; negative case passed"}]}
+
+        def model(_prompt, context):
+            evidence = context["evidence_by_criterion"][0]["evidence"]
+            self.assertEqual(evidence[0]["output"], "zero case passed; negative case passed")
+            return semantic([criterion])
+
+        outcome = Evaluator(model).evaluate(
+            planned_task=plan, runtime_task=runtime(verification=verification),
+            execution_node=node())
+        self.assertEqual(outcome["status"], "accepted")
 
     def test_file_creation_and_incorrect_javascript_cannot_auto_pass_semantics(self):
         criterion = "JavaScript implements addition, subtraction, multiplication and division."
@@ -172,7 +290,7 @@ class EvaluatorTests(unittest.TestCase):
         }
 
         def model(_prompt, context):
-            diff = next(item["diff"] for item in context["evidence_catalog"]
+            diff = next(item["diff"] for item in context["evidence_by_criterion"][0]["evidence"]
                         if item["type"] == "workspace_diff")
             self.assertIn('console.log("hello")', diff)
             return semantic([criterion], "unsatisfied")
@@ -198,7 +316,7 @@ class EvaluatorTests(unittest.TestCase):
         }]}
 
         def model(_prompt, context):
-            record = next(item for item in context["evidence_catalog"]
+            record = next(item for item in context["evidence_by_criterion"][0]["evidence"]
                           if item["type"] == "file_readback")
             self.assertEqual(record["output"], "<main>Hello World</main>")
             self.assertEqual(record["capability"], "filesystem.read")
@@ -236,7 +354,7 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["metrics"]["model_calls"], 0)
 
     def test_empty_supports_are_recovered_from_verification_context(self):
-        criterion = "The calculator output matches the verified expression."
+        criterion = "The calculator.html file content exactly matches the verified content."
         plan = {**planned([criterion]), "acceptance_criteria": [
             {"id": "LC-2", "criterion": criterion},
         ]}
@@ -282,7 +400,7 @@ class EvaluatorTests(unittest.TestCase):
         def model(_prompt, context):
             seen.append(context)
             self.assertEqual(context["evidence_by_criterion"][0]["evidence"], [])
-            self.assertEqual(len(context["global_evidence_ids"]), 1)
+            self.assertEqual(len(context["global_evidence"]), 1)
             return semantic([criterion], "unknown")
 
         outcome = Evaluator(model).evaluate(
@@ -310,7 +428,7 @@ class EvaluatorTests(unittest.TestCase):
             groups = context["evidence_by_criterion"]
             self.assertEqual([item["criterion_id"] for item in groups], ["LC-1", "LC-2"])
             self.assertEqual(groups[0]["evidence"][0]["id"], groups[1]["evidence"][0]["id"])
-            self.assertEqual(len(context["evidence_catalog"]), 1)
+            self.assertEqual(len(groups[0]["evidence"]), 1)
             return semantic(criteria)
 
         outcome = Evaluator(model).evaluate(
@@ -673,13 +791,10 @@ class EvaluatorTests(unittest.TestCase):
         self.assertIn("Do not infer tests, builds or commands passed", prompt)
         self.assertTrue({"objective", "description", "success_criteria"} <=
                         set(model_context["planned_task"]))
-        self.assertTrue({"status", "result", "error", "verification"} <=
-                        set(model_context["runtime_task"]))
-        visible_result = json.loads(model_context["runtime_task"]["result"])
-        self.assertEqual(visible_result["actions"], result["actions"])
-        self.assertEqual(visible_result["artifacts"], result["artifacts"])
-        self.assertEqual(visible_result["workspace_diffs"], result["workspace_diffs"])
-        self.assertEqual(visible_result["limitations"], [])
+        self.assertTrue({"status", "verification"} <= set(model_context["runtime_task"]))
+        self.assertNotIn("result", model_context["runtime_task"])
+        self.assertEqual(model_context["global_evidence"][0]["path"],
+                         "calculator-project/index.html")
 
     def test_nonpassing_verification_without_failure_delegates_to_model(self):
         criteria = ["The public behavior matches the request."]
@@ -784,9 +899,11 @@ class EvaluatorTests(unittest.TestCase):
 
         def model(prompt, context):
             seen.append(context)
-            visible_result = json.loads(context["runtime_task"]["result"])
+            visible_result = (context["global_evidence"] +
+                              context["evidence_by_criterion"][0]["evidence"])
             for operation in ("addition", "subtraction", "multiplication", "division"):
-                self.assertIn(operation, visible_result["artifacts"][0]["content"].casefold())
+                self.assertTrue(any(operation in item.get("content", "").casefold()
+                                    for item in visible_result))
             return semantic(criteria)
 
         outcome = Evaluator(model).evaluate(
@@ -849,7 +966,7 @@ class EvaluatorTests(unittest.TestCase):
         def model(prompt, context):
             calls.append(context)
             if len(calls) == 1:
-                context["runtime_task"]["result"] = "mutated by model"
+                context["planned_task"]["objective"] = "mutated by model"
                 return "invalid"
             if len(calls) == 2:
                 return "invalid again"
@@ -861,7 +978,7 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["metrics"]["model_calls"], 3)
         self.assertEqual(outcome["metrics"]["repairs"], 1)
         self.assertEqual(outcome["metrics"]["evaluator_retries"], 1)
-        self.assertEqual(calls[2]["runtime_task"]["result"], "original evidence")
+        self.assertEqual(calls[2]["planned_task"]["objective"], "Implement the requested change.")
         self.assertEqual(outcome["context_snapshot"]["runtime_task"]["result"], "original evidence")
         self.assertIn("evaluation.semantic_retry_completed",
                       [event["event_type"] for event in outcome["events"]])
@@ -898,7 +1015,8 @@ class EvaluatorTests(unittest.TestCase):
                 self.assertEqual(outcome["metrics"]["final_status"], expected)
 
     def test_typed_content_and_symbol_checks_require_exact_links(self):
-        criteria = ["HTML contains the result panel.", "JavaScript defines calculate()."]
+        criteria = ["The HTML file content exactly matches the checked result panel.",
+                    "JavaScript defines calculate()."]
         checks = [{"type": kind, "check": label, "status": "passed",
                    "supports_acceptance_criteria": [criterion]}
                   for kind, label, criterion in zip(

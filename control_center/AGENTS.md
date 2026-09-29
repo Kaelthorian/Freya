@@ -65,12 +65,19 @@ archival event reports archival `Success` separately from the run's final
   queue and must not write the database.
 - Recheck tool permission and path policy inside `worker.py`; API validation is
   not the worker trust boundary.
+- Keep `ToolResult.changed` tied to material workspace writes. An allowed
+  `edit_file` with identical candidate bytes is successful and already
+  satisfied, but must not write or register a workspace mutation.
 - Keep `capabilities.py` as the tool-to-action registry and `policy.py` as the
   single decision point. Store effective policies in task snapshots.
 - Keep a versioned Semantic Plan separate from the compiled runtime plan.
   Task Analyst supplies canonical intent. Planner supplies task kind, semantic
   operations, dependencies, outcomes, criteria and logical file owners only; it
   never selects capabilities, tools, Skills, or runtime IDs.
+- Keep criterion evidence classification in `plan_evidence.py` and enforcement
+  in `plan_compiler.py`. A local criterion must be provable by its compiled
+  capabilities or reassigned to one compatible dependent verifier. Unordered
+  tasks must not share an exact write target.
 - Rebuild `RuntimeResourceCatalog` for each orchestration from the global
   capability and Toolbox registries. Keep one canonical semantic-operation to
   capability to tool mapping. `PlanCompiler` alone applies that mapping and
@@ -87,6 +94,10 @@ archival event reports archival `Success` separately from the run's final
   operation to capability to tool mapping produced by the compiler.
 - Worker completion is technical only. It reports execution completion or
   failure; only Evaluator acceptance unlocks dependencies and semantic success.
+- Keep the Evaluator's durable evidence catalog separate from its compact model
+  input. Put bounded diff, read-back and test content beside each unresolved
+  criterion in the semantic input; preserve path, provenance and truncation
+  markers. A linked content hash alone cannot prove complex file semantics.
 - Compare model-proposed external work with explicit or clarified Task Spec
   intent before resolving tools. Do not infer deployment, publication, remote
   hosting or network side effects from web artifact creation. Preserve Task
@@ -123,8 +134,9 @@ archival event reports archival `Success` separately from the run's final
 - Keep context assembly in `agent_context.py`; do not add role-specific global
   prompts to the worker. Repeated non-recoverable tool failures must be
   bounded before consuming the task step budget.
-- `worker.py` must stop repeated successful read-only actions when no workspace
-  progress is observed and bound consecutive denied/repeatedly blocked actions.
+- `worker.py` must stop repeated successful read-only actions and no-op edits
+  on one artifact when no new evidence or workspace progress is observed, and
+  bound consecutive denied/repeatedly blocked actions.
   It may complete a single-file task after exact matching read-back supports all
   file-presence criteria, or stop a single-case QA task after one controlled
   command supports every configured output and exit-status criterion.

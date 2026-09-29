@@ -16,8 +16,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── task_analyst.py       legacy version-3 rewrite compatibility
 │   ├── planner.py            semantic strategy and legacy plan schema compatibility
 │   ├── plan_scope.py         semantic scope guard and bounded pre-resolution plan snapshot
+│   ├── plan_evidence.py      criterion evidence classification and capability compatibility
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
-│   ├── plan_compiler.py      scope reconciliation, permanent ownership, exact dependent-write grants, resource derivation, IDs and DAG validation
+│   ├── plan_compiler.py      scope/evidence reconciliation, write-overlap guard, ownership, resource derivation, IDs and DAG validation
 │   ├── cross_task.py         exact file ownership validation and bounded reusable-intent matching
 │   ├── agent_factory.py      dynamic agents, freya-core assignment, task policy and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
@@ -118,7 +119,9 @@ selects them.
    closed. The policy engine still decides each invocation.
    The Worker records current file hashes before existing-file writes and
    returns zero-write candidates to Evaluator only when declared targets were
-   read. `orchestrator.py` adds bounded direct plan responsibilities to each
+   read. `tools.py` compares `edit_file` candidate bytes before writing;
+   `worker.py` records diffs and mutations only for material changes and stops
+   repeated no-op edits on one artifact. `orchestrator.py` adds bounded direct plan responsibilities to each
    execution prompt; ProjectState verifies reported symbols after acceptance.
    `tools.py` resolves filesystem paths inside the assigned workspace. For
    Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
@@ -146,8 +149,10 @@ selects them.
    the action ledger without model repair. `task.result_contract` logs sanitized
    diagnostics, while `freya.evaluation.completed` logs Python-aggregated
    criterion decisions and bounded input evidence for non-accepted outcomes.
-   Evaluator sends only unresolved semantic criteria to Ollama and bounds
-   contract repair plus one retry to four calls on the same Runtime evidence.
+   Evaluator sends only unresolved semantic criteria to Ollama with bounded
+   objective diff/read-back/test content inline per criterion. It omits the
+   duplicate full Runtime result and bounds contract repair plus one retry to
+   four calls on the same Runtime evidence.
    The worker also stops byte-identical duplicate writes without requiring read-back and reports
    missing-file reads without repeating them unchanged; semantic recovery then
    fails deterministic absent-artifact inputs instead of rotating agents.
@@ -194,9 +199,11 @@ selects them.
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
+| No-op file edits, mutation accounting or repeated edit loops | `tools.py` (`tool_edit_file`), `worker.py` (`PolicyToolbox.invoke`, `run_task`), `tests/test_tools.py`, `tests/test_capabilities.py`, `tests/test_control_runtime.py` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Planner scope, resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `plan_scope.py`, `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_plan_scope.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |
+| Task responsibility overlap, shared write targets or criterion verifiability | `planner.py`, `plan_evidence.py`, `plan_compiler.py`, `runtime_resources.py`, `tests/test_semantic_pipeline.py` |
 | Agent identity, behavior or context | `agent_context.py`, `config.py`, `worker.py`, `tests/test_agent_context.py` |
 | Universal Skill definition, startup tool validation or automatic assignment | `skills.py`, `storage.py`, `runtime_resources.py`, `agent_factory.py`, `agent_context.py`, `tests/test_core_sandbox.py` |
 | Structured plans and lifecycle | `planner.py`, `orchestrator.py`, `storage.py`, `schema.sql`, `__main__.py`, `tests/test_planner.py` |

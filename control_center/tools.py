@@ -231,7 +231,12 @@ class Toolbox:
             handler = getattr(self, "tool_" + name, None)
             if handler is None:
                 raise ValueError("Unknown tool: {}".format(name))
-            output, success, exit_code = handler(**args)
+            handled = handler(**args)
+            if isinstance(handled, ToolResult):
+                handled.output = _clip(str(handled.output))
+                handled.duration_seconds = time.perf_counter() - start
+                return handled
+            output, success, exit_code = handled
         except ParentPathIsFile as exc:
             output, success, exit_code = "ParentPathIsFile: {}".format(exc), False, None
             blocking_path = exc.blocking_path
@@ -322,21 +327,38 @@ class Toolbox:
         target.write_text(content, encoding="utf-8", newline="")
         return "Wrote {} ({} bytes).".format(path, target.stat().st_size), True, 0
 
-    def tool_edit_file(self, path: str, old: str, new: str) -> tuple[str, bool, int | None]:
+    def tool_edit_file(self, path: str, old: str, new: str) -> ToolResult:
         target = self.safe_path(path)
         if not target.is_file():
             raise ValueError("File does not exist: {}".format(path))
         if not old:
             raise ValueError("old must not be empty.")
-        text = target.read_text(encoding="utf-8")
+        before_bytes = target.read_bytes()
+        # Preserve the existing universal-newline matching behavior, but compare
+        # the exact bytes that would be written with the original file.
+        text = before_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         occurrences = text.count(old)
         if occurrences != 1:
             raise ValueError("Expected the old text exactly once; found {} occurrences.".format(occurrences))
         updated = text.replace(old, new, 1)
-        if len(updated.encode("utf-8")) > MAX_WRITE_BYTES:
+        candidate_bytes = updated.encode("utf-8")
+        if len(candidate_bytes) > MAX_WRITE_BYTES:
             raise ValueError("Updated file exceeds the 1 MB write limit.")
-        target.write_text(updated, encoding="utf-8", newline="")
-        return "Updated {}.".format(path), True, 0
+        if old == new or candidate_bytes == before_bytes:
+            reason = "replacement_is_identical" if old == new else "result_is_identical"
+            return ToolResult(
+                "edit_file",
+                "ALREADY_SATISFIED\n" + json.dumps({
+                    "success": True, "changed": False, "already_satisfied": True,
+                    "path": path, "reason": reason,
+                    "message": "No change required: {} already contains the requested content.".format(path),
+                }, ensure_ascii=False, sort_keys=True),
+                True, 0, exit_code=0, error_class="already_satisfied",
+                changed=False, already_satisfied=True,
+            )
+        target.write_bytes(candidate_bytes)
+        return ToolResult("edit_file", "Updated {}.".format(path), True, 0,
+                          exit_code=0, changed=True)
 
     def tool_search_code(
         self,

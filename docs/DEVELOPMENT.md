@@ -102,11 +102,25 @@ The Compiler owns the single scope reconciliation and semantic-plan validation
 pass. It verifies Planner `unsupported_requirements` against requested intent
 and the runtime catalog before resource resolution. Task nodes are never merged.
 The unique creator owns a path; one writer or one explicit owner also resolves
-deterministically. Two modifiers claiming ownership without a creator produce
-`OwnershipAmbiguous` and one bounded repair; two creators invalidate the plan.
+deterministically. Unordered tasks cannot share a write target; use a real
+dependency for a sequential create/modify or modify/modify handoff. Such
+conflicts produce `WriteScopeOverlap` and one bounded repair; two creators still
+invalidate the plan.
 A bounded repair receives the complete
 rejected Semantic Plan and structured diagnostics. Local task checks and global
 plan checks are kept separate.
+
+`plan_evidence.py` classifies each local success criterion by the minimum proof
+it requires. File read/search/diff/write capabilities support artifact and
+static-source criteria; execution capabilities support runtime behavior and
+test results; `execution.py_compile` supports compilation. Visual and external
+state criteria require registered capabilities of those types. The Compiler
+moves an incompatible criterion only to one compatible dependent verifier. With
+none or multiple candidates it raises `CriterionEvidenceMismatch` before any
+worker starts. Inspect `plan_compiler.criterion_classified`,
+`plan_compiler.criterion_reassigned`, `plan_compiler.overlap_detected` and
+`plan_compiler.plan_repair_required` in orchestration logs. Focused validation:
+`python -m unittest tests.test_semantic_pipeline tests.test_runtime_resources -v`.
 
 `Planner.create_plan` is a compatibility-only API for injected pre-Semantic-Plan
 adapters and historical callers. The built-in Task Spec orchestration requires
@@ -255,6 +269,25 @@ fallback status. A failed format repair is diagnostic and does not itself
 invalidate objective evidence. Exact criterion links from successful controlled
 commands are accepted deterministically.
 
+The semantic Evaluator input is assembled in `Evaluator._semantic_context`:
+linked `workspace_diff`, `file_readback`, `file_content_match` and test records
+carry bounded content beside the unresolved criterion. A short diff remains
+complete; large excerpts set `content_truncated`. The snapshot returned by
+`Evaluator.evaluate` still contains the separate full bounded evidence catalog.
+
+Known Recovery retry failure (diagnosed, not repaired here): a byte-identical
+`write_file` can emit `worker.write_already_satisfied` and `task.auto_completed`
+with no workspace mutation. `worker.py` then enters its
+`workspace_mutation_required` contract check. It calls
+`PolicyToolbox.current_observations` for all declared owned/foreign targets;
+that method returns no candidate unless every target was previously observed
+by a successful read in this attempt and its hash still matches. An identical
+write alone does not populate that observation map. The check can therefore
+emit `ExpectedWorkspaceMutationNotObserved` after the success events. A future
+fix must verify the already-matching target as objective read evidence and let
+Evaluator judge semantic completion, while retaining the failure for unsupported
+no-write success claims.
+
 Semantic recovery has its own local, tool-free model and hard budgets:
 
 ```powershell
@@ -294,7 +327,8 @@ orchestration timeline, so Task Analyst interpretation, plan/selection events,
 and every selected agent's normalized `who`/`where`/`when`/`what`/`how` trace,
 `task.no_progress`, terminal `failure_class` and the final failure diagnosis
 are visible together. A `NoProgressDetected` report means the worker repeated
-successful read-only actions without changing the workspace; raising
+successful read-only actions or no-op edits on one artifact without new evidence
+or a material workspace change; raising
 `max_steps` alone is not a corrective action.
 `BlockedActionCycle` stops a worker after it repeats a policy-denied action
 under unchanged state, or after the existing bounded guard sees three blocked
@@ -323,6 +357,16 @@ diff and does not count as workspace progress. The action ledger records this
 state for the model. A created artifact plus successful command evidence linked
 to every configured completion criterion can satisfy a task and stop further
 model actions. A no-op alone does not satisfy unrelated configured criteria.
+`edit_file` still requires `filesystem.modify` permission and one exact `old`
+match. It compares the candidate UTF-8 bytes with the original before writing;
+identical bytes, including `old == new`, return the same already-satisfied state
+without changing hash or mtime. The worker stops after three no-op edits on
+one artifact when no new read or criterion evidence or material write intervenes
+(`NoProgressDetected`). Run the
+tool and policy regressions with `python -m unittest tests.test_tools
+tests.test_capabilities -v`; the Worker regressions are in
+`tests/test_control_runtime.py` under `WorkerTests.test_noop_edit_*` and
+`WorkerTests.test_different_noop_edits_on_same_file_stop_before_step_limit`.
 Orchestration timeouts also emit failure analysis.
 
 Docker receives an ephemeral workspace copy for every Python, pytest, unittest,

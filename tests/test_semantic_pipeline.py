@@ -4,7 +4,8 @@ import unittest
 from unittest.mock import patch
 
 from control_center.plan_compiler import (
-    OwnershipAmbiguous, compile_semantic_plan, planned_write_target_grants,
+    CriterionEvidenceMismatch, WriteScopeOverlap,
+    compile_semantic_plan, planned_write_target_grants,
 )
 from control_center.planner import Planner, PlanGenerationError, semantic_plan_response_format
 from control_center.runtime_resources import RuntimeResourceCatalog, UnsupportedResourceRequirement
@@ -42,7 +43,8 @@ class SemanticPipelineTests(unittest.TestCase):
                     "unsupported_requirements": [], "tasks": [
                         task("create", "create_file", path="calculator.js"),
                         task("implement", "modify_file", path="calculator.js",
-                             dependencies=["create"], criterion="Four operations work.")]}
+                             dependencies=["create"],
+                             criterion="calculator.js contains handlers for four operations.")]}
         planner = Planner(lambda planner_prompt, context: semantic)
         compiled = planner.create_plan_for_spec(spec)
         self.assertFalse(analyst.metrics["fallback_used"])
@@ -107,7 +109,7 @@ class SemanticPipelineTests(unittest.TestCase):
                     "unsupported_requirements": [], "tasks": [
                         task("create", "create_file"),
                         task("implement", "modify_file", dependencies=["create"],
-                             criterion="All requested operations work.")]}
+                             criterion="calculator.js contains all requested operation handlers.")]}
         catalog = RuntimeResourceCatalog.build()
         compiled = compile_semantic_plan(semantic, web_spec(), resource_catalog=catalog)
         self.assertEqual(len(compiled["tasks"]), 2)
@@ -150,13 +152,14 @@ class SemanticPipelineTests(unittest.TestCase):
         original = {"summary": "Implement", "success_criteria": [],
                     "unsupported_requirements": [], "tasks": [first, second]}
         repaired = {**original, "tasks": [first, {**second, "owned_paths": [],
-                                                   "write_targets": ["calculator.js"]}]}
+                                                   "write_targets": ["calculator.js"],
+                                                   "depends_on": ["first"]}]}
         calls = []
         planner = Planner(lambda prompt, context:
                           (calls.append(prompt), original if len(calls) == 1 else repaired)[1])
         result = planner.create_plan_for_spec(web_spec())
         self.assertEqual(len(calls), 2)
-        self.assertEqual(json.loads(calls[1])["compiler_error"]["type"], "OwnershipAmbiguous")
+        self.assertEqual(json.loads(calls[1])["compiler_error"]["type"], "WriteScopeOverlap")
         self.assertEqual(result["write_owners"], {"calculator.js": "task-1"})
         self.assertEqual(result["tasks"][1]["foreign_write_targets"],
                          [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
@@ -169,7 +172,7 @@ class SemanticPipelineTests(unittest.TestCase):
             compile_semantic_plan(semantic, web_spec())
 
     def test_unique_creator_resolves_duplicate_ownership_without_repair(self):
-        first = task("create", "create_file", criterion="Independent result works.")
+        first = task("create", "create_file", criterion="The requested file exists.")
         second = task("implement", "modify_file", dependencies=["create"])
         unaffected = {"key": "review", "task_kind": "review", "objective": "Review result",
                       "description": "Inspect the result", "depends_on": ["implement"],
@@ -289,6 +292,189 @@ class SemanticPipelineTests(unittest.TestCase):
         self.assertFalse(schema["additionalProperties"])
         self.assertNotIn("required_capabilities", schema["properties"])
         self.assertNotIn("required_tools", schema["properties"])
+
+
+class PlanResponsibilityAndEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def plan(*tasks):
+        return {"summary": "Implement and verify", "success_criteria": [],
+                "unsupported_requirements": [], "tasks": list(tasks)}
+
+    @staticmethod
+    def _testing_task(*, key="test", dependencies=("implement",),
+                      criterion="Application performs calculation correctly."):
+        return {"key": key, "task_kind": "testing", "objective": "Test behavior",
+                "description": "Run the registered test suite and record results.",
+                "depends_on": list(dependencies),
+                "semantic_needs": ["Run tests and capture output."],
+                "operations": ["run_pytest"], "owned_paths": [], "write_targets": [],
+                "success_criteria": [criterion]}
+
+    def test_static_implementation_and_runtime_testing_criteria_are_valid(self):
+        implementation = task(
+            "implement", "modify_file", path="app.py",
+            criterion="app.py contains handlers for addition and subtraction.")
+        testing = self._testing_task()
+        catalog = RuntimeResourceCatalog.build()
+        compiled = compile_semantic_plan(
+            self.plan(implementation, testing), web_spec(), resource_catalog=catalog)
+        self.assertEqual(compiled["tasks"][0]["success_criteria"],
+                         ["app.py contains handlers for addition and subtraction."])
+        self.assertEqual(compiled["tasks"][1]["success_criteria"],
+                         ["Application performs calculation correctly."])
+        classifications = [event for event in catalog.compiler_events
+                           if event["event_type"] == "plan_compiler.criterion_classified"]
+        self.assertEqual([item["evidence_type"] for item in classifications],
+                         ["static_structure", "runtime_behavior"])
+        self.assertTrue(all(item["verifiable"] for item in classifications))
+
+    def test_runtime_criterion_without_runtime_capability_is_rejected(self):
+        implementation = task(
+            "implement", "modify_file", path="app.py",
+            criterion="Application performs calculation correctly.")
+        catalog = RuntimeResourceCatalog.build()
+        with self.assertRaises(CriterionEvidenceMismatch):
+            compile_semantic_plan(
+                self.plan(implementation), web_spec(), resource_catalog=catalog)
+        required = next(event for event in catalog.compiler_events
+                        if event["event_type"] == "plan_compiler.plan_repair_required")
+        self.assertEqual(required["evidence_type"], "runtime_behavior")
+        self.assertEqual(required["task_id"], "task-1")
+
+    def test_planner_gets_one_bounded_repair_for_unverifiable_criterion(self):
+        invalid = self.plan(task(
+            "implement", "modify_file", path="app.py",
+            criterion="Application performs calculation correctly."))
+        repaired = self.plan(task(
+            "implement", "modify_file", path="app.py",
+            criterion="app.py contains the requested calculation handlers."))
+        calls = []
+        planner = Planner(lambda prompt, context:
+                          (calls.append(prompt), invalid if len(calls) == 1 else repaired)[1])
+        compiled = planner.create_plan_for_spec(web_spec())
+        self.assertEqual(len(calls), 2)
+        payload = json.loads(calls[1])
+        self.assertEqual(payload["compiler_error"]["type"], "CriterionEvidenceMismatch")
+        self.assertEqual(payload["compiler_error"]["affected_tasks"], ["task-1"])
+        self.assertEqual(compiled["tasks"][0]["success_criteria"],
+                         ["app.py contains the requested calculation handlers."])
+
+    def test_equivalent_sibling_writers_are_rejected(self):
+        scaffold = task("scaffold", "create_file", path="script.js",
+                        criterion="The script.js file exists.")
+        first = task("interface", "modify_file", path="script.js", dependencies=("scaffold",),
+                     criterion="script.js contains calculator event handlers.")
+        second = task("logic", "modify_file", path="script.js", dependencies=("scaffold",),
+                      criterion="script.js contains calculator operation handlers.")
+        for writer in (first, second):
+            writer["owned_paths"] = []
+            writer["write_targets"] = ["script.js"]
+        catalog = RuntimeResourceCatalog.build()
+        with self.assertRaises(WriteScopeOverlap):
+            compile_semantic_plan(
+                self.plan(scaffold, first, second), web_spec(), resource_catalog=catalog)
+        event = next(item for item in catalog.compiler_events
+                     if item["event_type"] == "plan_compiler.overlap_detected"
+                     and item["task_ids"] == ["task-2", "task-3"])
+        self.assertEqual(event["path"], "script.js")
+        self.assertFalse(event["dependency_ordered"])
+
+    def test_sequential_distinct_modifiers_may_share_a_target(self):
+        first = task("functions", "modify_file", path="a.js",
+                     criterion="a.js contains the core functions.")
+        second = task("errors", "modify_file", path="a.js", dependencies=("functions",),
+                      criterion="a.js contains explicit error handlers.")
+        second["owned_paths"] = []
+        second["write_targets"] = ["a.js"]
+        catalog = RuntimeResourceCatalog.build()
+        compiled = compile_semantic_plan(
+            self.plan(first, second), web_spec(), resource_catalog=catalog)
+        self.assertEqual(compiled["tasks"][1]["depends_on"], ["task-1"])
+        self.assertEqual(compiled["tasks"][1]["foreign_write_targets"],
+                         [{"path": "a.js", "owner_plan_task_id": "task-1"}])
+        self.assertIn("plan_compiler.overlap_validated",
+                      [item["event_type"] for item in catalog.compiler_events])
+
+    def test_create_then_modify_same_target_remains_valid(self):
+        creator = task("scaffold", "create_file", path="a.js",
+                       criterion="The a.js file exists.")
+        modifier = task("implement", "modify_file", path="a.js", dependencies=("scaffold",),
+                        criterion="a.js contains the requested functions.")
+        modifier["owned_paths"] = []
+        modifier["write_targets"] = ["a.js"]
+        compiled = compile_semantic_plan(self.plan(creator, modifier), web_spec())
+        self.assertEqual(compiled["write_owners"], {"a.js": "task-1"})
+        self.assertEqual(compiled["tasks"][1]["depends_on"], ["task-1"])
+
+    def test_runtime_criterion_moves_to_one_dependent_testing_task(self):
+        implementation = task(
+            "implement", "modify_file", path="app.py",
+            criterion="Application performs calculation correctly.")
+        testing = self._testing_task(criterion="The test suite passes successfully.")
+        catalog = RuntimeResourceCatalog.build()
+        compiled = compile_semantic_plan(
+            self.plan(implementation, testing), web_spec(), resource_catalog=catalog)
+        self.assertNotIn("Application performs calculation correctly.",
+                         compiled["tasks"][0]["success_criteria"])
+        self.assertIn("Application performs calculation correctly.",
+                      compiled["tasks"][1]["success_criteria"])
+        reassigned = next(item for item in catalog.compiler_events
+                          if item["event_type"] == "plan_compiler.criterion_reassigned")
+        self.assertEqual(reassigned["source_task_id"], "task-1")
+        self.assertEqual(reassigned["target_task_id"], "task-2")
+
+    def test_static_source_criterion_is_supported_by_read_capability(self):
+        review = {"key": "inspect", "task_kind": "review", "objective": "Inspect source",
+                  "description": "Read source files.", "depends_on": [],
+                  "semantic_needs": ["Read app.py."], "operations": ["read_file"],
+                  "owned_paths": [], "write_targets": [],
+                  "success_criteria": ["app.py contains functions X, Y and Z."]}
+        compiled = compile_semantic_plan(self.plan(review), web_spec())
+        self.assertEqual(compiled["tasks"][0]["required_capabilities"], ["filesystem.read"])
+
+    def test_visual_criterion_without_visual_capability_is_rejected(self):
+        review = {"key": "inspect", "task_kind": "review", "objective": "Inspect UI source",
+                  "description": "Read the UI source.", "depends_on": [],
+                  "semantic_needs": ["Read index.html."], "operations": ["read_file"],
+                  "owned_paths": [], "write_targets": [],
+                  "success_criteria": ["The UI looks visually correct and aligned."]}
+        with self.assertRaises(CriterionEvidenceMismatch):
+            compile_semantic_plan(self.plan(review), web_spec())
+
+    def test_external_state_criterion_without_external_capability_is_rejected(self):
+        spec = web_spec()
+        spec["objective"] += " and deploy it to production"
+        spec["user_intent"] += " and deploy it to production"
+        spec["requirements"].append({
+            "description": "Deploy the application to production.", "source": "explicit",
+        })
+        review = {"key": "inspect", "task_kind": "review", "objective": "Inspect release files",
+                  "description": "Read the local release manifest.", "depends_on": [],
+                  "semantic_needs": ["Read release.txt."], "operations": ["read_file"],
+                  "owned_paths": [], "write_targets": [],
+                  "success_criteria": ["The application is deployed and publicly accessible."]}
+        with self.assertRaises(CriterionEvidenceMismatch):
+            compile_semantic_plan(self.plan(review), spec)
+
+    def test_sibling_tasks_with_distinct_paths_are_valid(self):
+        scaffold = task("scaffold", "create_file", path="project.txt",
+                        criterion="The project.txt file exists.")
+        html = task("html", "create_file", path="index.html", dependencies=("scaffold",),
+                    criterion="index.html contains calculator controls.")
+        css = task("css", "create_file", path="styles.css", dependencies=("scaffold",),
+                   criterion="styles.css contains calculator layout styles.")
+        compiled = compile_semantic_plan(self.plan(scaffold, html, css), web_spec())
+        self.assertEqual(len(compiled["write_owners"]), 3)
+
+    def test_semantic_planner_prompt_requires_scoped_evidence_and_ordered_writes(self):
+        captured = []
+        semantic = self.plan(task("implement", "create_file", path="app.py",
+                                  criterion="The app.py file exists."))
+        Planner(lambda prompt, context: (captured.append(prompt), semantic)[1]).create_plan_for_spec(
+            web_spec())
+        self.assertIn("one primary responsibility", captured[0])
+        self.assertIn("sibling writers of one path are rejected", captured[0])
+        self.assertIn("execution/test operations can prove runtime behavior", captured[0])
 
 
 if __name__ == "__main__":

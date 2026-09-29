@@ -107,6 +107,103 @@ class WorkerTests(unittest.TestCase):
         return run_task(task, self.root, self.events.append, lambda: None,
                         transport=transport, toolbox=toolbox, token=token)
 
+    @staticmethod
+    def _structured_output():
+        return {"format": "structured", "include": [
+            "summary", "actions", "artifacts", "verification", "limitations",
+        ]}
+
+    def test_noop_edit_is_observable_without_workspace_mutation_or_empty_diff(self):
+        target = self.workspace / "calculator.html"
+        target.write_text("<button>7</button>", encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("edit_file", {"path": "calculator.html", "old": "7", "new": "7"})]),
+            answer("The requested content is already present."),
+        ], tools=["edit_file"], config={"permissions": "workspace", "verification": {"enabled": False},
+                                       "output": self._structured_output()},
+            prompt="Inspect calculator.html")
+        action = result["result"]["actions"][0]
+        self.assertTrue(action["success"])
+        self.assertFalse(action["changed"])
+        self.assertTrue(action["already_satisfied"])
+        self.assertIn("ALREADY_SATISFIED", action["output"])
+        self.assertEqual(result["workspace_changes"], 0)
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertNotIn("workspace_diffs", result["result"])
+        event_types = [item.get("event", {}).get("event_type") for item in self.events]
+        self.assertNotIn("workspace.diff", event_types)
+        satisfied = next(item["event"] for item in self.events
+                         if item.get("event", {}).get("event_type") == "worker.write_already_satisfied")
+        self.assertEqual(satisfied["tool"], "edit_file")
+        self.assertFalse(satisfied["changed"])
+        self.assertTrue(satisfied["already_satisfied"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "<button>7</button>")
+
+    def test_different_noop_edits_on_same_file_stop_before_step_limit(self):
+        target = self.workspace / "calculator.html"
+        target.write_text("<button>7</button><button>8</button><button>9</button>", encoding="utf-8")
+        calls = [("edit_file", {"path": "calculator.html", "old": str(value), "new": str(value)})
+                 for value in (7, 8, 9, 7, 8)]
+        result = self.run_worker([answer(calls=[call]) for call in calls],
+                                 tools=["edit_file"],
+                                 config={"permissions": "workspace", "verification": {"enabled": False},
+                                         "output": self._structured_output(), "max_steps": 20},
+                                 prompt="Update calculator.html")
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertTrue(result["no_progress_detected"])
+        self.assertLess(result["steps"], 20)
+        self.assertEqual(result["workspace_changes"], 0)
+        self.assertEqual(len(result["result"]["actions"]), 3)
+        self.assertTrue(all(action["already_satisfied"] and not action["changed"]
+                            for action in result["result"]["actions"]))
+        self.assertEqual(target.read_text(encoding="utf-8"),
+                         "<button>7</button><button>8</button><button>9</button>")
+        self.assertTrue(any(item.get("event", {}).get("event_type") == "task.no_progress"
+                            and item["event"].get("output", {}).get("pattern") == "repeated_noop_edit"
+                            for item in self.events))
+
+    def test_noop_edit_then_new_read_evidence_then_real_edit_progresses(self):
+        target = self.workspace / "calculator.html"
+        target.write_text("<button>7</button>", encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("edit_file", {"path": "calculator.html", "old": "7", "new": "7"})]),
+            answer(calls=[("read_file", {"path": "calculator.html"})]),
+            answer(calls=[("edit_file", {"path": "calculator.html", "old": "7", "new": "8"})]),
+            answer("Updated calculator.html."),
+        ], tools=["edit_file", "read_file"],
+            config={"permissions": "workspace", "verification": {"enabled": False},
+                    "output": self._structured_output()},
+            prompt="Update calculator.html")
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertFalse(result["no_progress_detected"])
+        self.assertEqual(result["workspace_changes"], 1)
+        self.assertEqual([action["changed"] for action in result["result"]["actions"]],
+                         [False, None, True])
+        self.assertEqual(len(result["result"]["artifacts"]), 1)
+        self.assertEqual(len(result["result"]["workspace_diffs"]), 1)
+        self.assertNotEqual(result["result"]["workspace_diffs"][0]["diff"], "(no textual difference)")
+        self.assertEqual(target.read_text(encoding="utf-8"), "<button>8</button>")
+
+    def test_read_then_noop_edit_is_only_a_candidate_for_evaluator(self):
+        target = self.workspace / "calculator.html"
+        target.write_text("<button>7</button>", encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "calculator.html"})]),
+            answer(calls=[("edit_file", {"path": "calculator.html", "old": "7", "new": "7"})]),
+            answer("The requested content is already present."),
+        ], tools=["read_file", "edit_file"],
+            config={"permissions": "workspace", "verification": {"enabled": False},
+                    "output": self._structured_output()},
+            task_characteristics={"requires_filesystem_write": True},
+            prompt="Update calculator.html")
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["already_satisfied_candidate"])
+        self.assertEqual(result["workspace_changes"], 0)
+        self.assertEqual(result["result"]["artifacts"], [])
+        self.assertEqual(result["result"]["already_satisfied_candidate"]["artifact_observations"][0]["path"],
+                         "calculator.html")
+
     def test_native_tools_metrics_and_no_private_reasoning(self):
         response = answer("<think>PRIVATE_INTERNAL</think>", [("write_file", {"path": "hello.py", "content": "print('hello')"})])
         response["message"]["thinking"] = "PRIVATE_INTERNAL"
@@ -592,10 +689,13 @@ class WorkerTests(unittest.TestCase):
                             "runtime_task_id": "calculator-runtime", "attempt": 1},
         )
         self.assertEqual(evaluation["status"], "needs_revision")
-        evaluator_result = json.loads(evaluator_input["runtime_task"]["result"])
-        self.assertEqual(len(evaluator_result["actions"]), 2)
-        self.assertEqual(len(evaluator_result["artifacts"]), 1)
-        self.assertTrue(evaluator_result["workspace_diffs"])
+        evaluator_evidence = (evaluator_input["global_evidence"] +
+                              [item for group in evaluator_input["evidence_by_criterion"]
+                               for item in group["evidence"]])
+        self.assertTrue(any(item.get("type") == "workspace_diff" and item.get("diff")
+                            for item in evaluator_evidence))
+        self.assertEqual(len(result["result"]["actions"]), 2)
+        self.assertEqual(len(result["result"]["artifacts"]), 1)
 
     def test_created_javascript_duplicate_write_evaluates_and_unlocks_dependent_task(self):
         source = "export const add = (a, b) => a + b;\n"
@@ -1003,8 +1103,10 @@ class WorkerTests(unittest.TestCase):
         planned = {"id": "writer", "objective": "Implement add()",
                    "success_criteria": [criterion], "required_capabilities": ["filesystem.modify"]}
         def decision(_prompt, context):
-            observed = json.loads(context["runtime_task"]["result"])
-            self.assertIn(source.strip(), observed["actions"][0]["output"])
+            evidence = context["global_evidence"] + [
+                item for group in context["evidence_by_criterion"] for item in group["evidence"]
+            ]
+            self.assertTrue(any(source.strip() in item.get("output", "") for item in evidence))
             return {"criteria": [{"criterion": criterion, "status": "satisfied",
                                   "reason": "The read source contains the implementation.",
                                   "evidence": ["read_file calculator.py"], "confidence": 1.0}]}
