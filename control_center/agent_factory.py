@@ -130,21 +130,34 @@ class AgentFactory:
 
     @staticmethod
     def _identity(task: dict[str, Any], role: str,
-                  attempt: int) -> tuple[str, str, dict[str, Any]]:
+                  attempt: int,
+                  worker_assignment: dict[str, Any] | None = None
+                  ) -> tuple[str, str, dict[str, Any]]:
         labels = {
             "worker": ("Dynamic Task Agent", "Task Implementation Agent"),
             "qa": ("Dynamic QA Agent", "Independent QA Agent"),
             "auditor": ("Dynamic Code Audit Agent", "Independent Code Auditor"),
         }
-        name_label, role_label = labels[role]
         task_id = str(task.get("id") or "task")
-        name = f"{name_label} [{task_id}]"
-        if attempt > 1:
-            name += f" attempt {attempt}"
-        objective = str(
-            task.get("objective") or "Complete the planned task."
-        ).strip()
-        description = str(task.get("description") or objective).strip()
+        if worker_assignment is not None:
+            worker_id = str(worker_assignment["worker_id"])
+            assigned_task_ids = list(worker_assignment["task_ids"])
+            name = f"Dynamic Worker [{worker_id}]"
+            role_label = "Assigned Plan Worker"
+            objective = "Execute the ordered plan tasks assigned to " + worker_id + "."
+            description = (
+                f"Stable Worker identity for {worker_id}; assigned plan tasks: "
+                + ", ".join(assigned_task_ids)
+            )
+        else:
+            name_label, role_label = labels[role]
+            name = f"{name_label} [{task_id}]"
+            if attempt > 1:
+                name += f" attempt {attempt}"
+            objective = str(
+                task.get("objective") or "Complete the planned task."
+            ).strip()
+            description = str(task.get("description") or objective).strip()
         identity = {
             "name": name[:100],
             "role": role_label,
@@ -168,11 +181,30 @@ class AgentFactory:
 
     def build(self, task: dict[str, Any], *, orchestration_id: str,
               attempt: int = 1, variant: int = 0,
-              skills: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+              skills: Iterable[dict[str, Any]] | None = None,
+              worker_assignment: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError("Planned task must be an object.")
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise ValueError("attempt must be a positive integer.")
+        if worker_assignment is not None:
+            if not isinstance(worker_assignment, dict):
+                raise ValueError("worker_assignment must be an object.")
+            worker_id = worker_assignment.get("worker_id")
+            task_ids = worker_assignment.get("task_ids")
+            if (not isinstance(worker_id, str) or not worker_id.strip()
+                    or not isinstance(task_ids, list) or not task_ids
+                    or any(not isinstance(item, str) or not item for item in task_ids)
+                    or str(task.get("id") or "") not in task_ids):
+                raise ValueError("worker_assignment must include this task and a stable worker_id.")
+            generation = worker_assignment.get("generation", 1)
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                raise ValueError("worker_assignment generation must be a positive integer.")
+            worker_assignment = {
+                "worker_id": worker_id,
+                "task_ids": list(dict.fromkeys(task_ids)),
+                "generation": generation,
+            }
         required = task.get("required_capabilities", [])
         if (not isinstance(required, list)
                 or any(not isinstance(item, str) for item in required)):
@@ -257,7 +289,9 @@ class AgentFactory:
         assignments, warnings, skill_omissions = self.select_skills(
             skill_task, records, variant=variant
         )
-        name, role_label, identity = self._identity(task, role, attempt)
+        name, role_label, identity = self._identity(
+            task, role, attempt, worker_assignment,
+        )
         required_set = set(required)
         has_execution = any(
             item.startswith("execution.") or item == "git.status"
@@ -291,6 +325,10 @@ class AgentFactory:
             # Legacy plans without path metadata therefore fail closed.
             "task_write_scope_enforced": True,
         })
+        if worker_assignment is not None:
+            agent_config["worker_assignment"] = copy.deepcopy(worker_assignment)
+        agent_config["active_task_capabilities"] = list(dict.fromkeys(policy_capabilities))
+        agent_config["active_task_tools"] = list(policy_tools)
         payload = normalize_agent({
             "name": name,
             "role": role_label,
@@ -331,6 +369,7 @@ class AgentFactory:
             "skill_omissions": skill_omissions,
             "skill_ids": [item["skill_id"] for item in assignments],
             "required_capabilities": list(dict.fromkeys(required)),
+            "active_capabilities": list(dict.fromkeys(policy_capabilities)),
             "effective_tools": policy_tools,
             "declared_tools": tools,
             "role": role,
@@ -338,10 +377,44 @@ class AgentFactory:
         }
 
     def create(self, task: dict[str, Any], *, orchestration_id: str,
-               attempt: int = 1, variant: int = 0) -> dict[str, Any]:
+               attempt: int = 1, variant: int = 0,
+               worker_assignment: dict[str, Any] | None = None) -> dict[str, Any]:
         built = self.build(
             task, orchestration_id=orchestration_id, attempt=attempt,
-            variant=variant,
+            variant=variant, worker_assignment=worker_assignment,
         )
         agent = self.store.create_agent(built["payload"])
         return {**built, "agent": agent}
+
+    def activate_task(self, agent_id: str, task: dict[str, Any], *,
+                      orchestration_id: str, worker_assignment: dict[str, Any],
+                      attempt: int = 1, variant: int = 0) -> dict[str, Any]:
+        """Rebind one stable Worker identity to a new task-scoped policy."""
+        previous = self.store.get_agent(agent_id)
+        provenance = previous.get("config", {}).get("provenance", {})
+        assignment = previous.get("config", {}).get("worker_assignment", {})
+        previous_task_ids = list(assignment.get("task_ids") or [])
+        current_task_ids = list(worker_assignment.get("task_ids") or [])
+        if (provenance.get("generated_by_freya") is not True
+                or provenance.get("orchestration_id") != orchestration_id
+                or assignment.get("worker_id") != worker_assignment.get("worker_id")
+                or not previous_task_ids
+                or current_task_ids[:len(previous_task_ids)] != previous_task_ids
+                or assignment.get("generation") != worker_assignment.get("generation")):
+            raise ValueError("The selected agent does not own this compiled Worker assignment lineage.")
+        if previous.get("current_task") is not None:
+            raise ValueError("Cannot switch a Worker while its previous Runtime task is active.")
+        built = self.build(
+            task, orchestration_id=orchestration_id, attempt=attempt,
+            variant=variant, worker_assignment=worker_assignment,
+        )
+        # The record name and structured identity identify the Worker for its
+        # full assignment lifetime. Only active task policy/scope is replaced.
+        built["payload"]["name"] = previous["name"]
+        built["payload"]["role"] = previous["role"]
+        built["payload"]["description"] = previous.get("description", "")
+        built["payload"]["identity"] = previous["config"].get("identity", {})
+        built["payload"]["instructions"] = previous.get("instructions", "")
+        agent = self.store.update_agent(agent_id, built["payload"])
+        return {**built, "agent": agent,
+                "previous_task_id": str(provenance.get("plan_task_id") or "")}

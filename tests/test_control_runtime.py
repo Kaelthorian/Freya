@@ -204,6 +204,99 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["result"]["already_satisfied_candidate"]["artifact_observations"][0]["path"],
                          "calculator.html")
 
+    def _assigned_worker_context(self, source_task_id):
+        from control_center.agent_factory import AgentFactory
+
+        return {
+            "permissions": "read_only",
+            "capability_policy": AgentFactory.capability_policy(["filesystem.read"]),
+            "provenance": {
+                "generated_by_freya": True, "ephemeral": True,
+                "orchestration_id": "orchestration-1", "plan_task_id": "task-2",
+                "attempt": 1, "factory_version": 1,
+            },
+            "worker_assignment": {
+                "worker_id": "worker-1", "task_ids": ["task-1", "task-2"],
+                "generation": 1,
+            },
+            "task_foreign_write_targets": [
+                {"path": "calculator.html", "owner_plan_task_id": "task-1"},
+            ],
+            "task_planned_write_targets": [
+                {"path": "calculator.html", "owner_plan_task_id": "task-1"},
+            ],
+            "task_write_owners": {"calculator.html": "task-1"},
+            "task_write_scope_enforced": True,
+            "active_task_capabilities": ["filesystem.read"],
+            "active_task_tools": ["read_file"],
+            "runtime_context": {
+                "active_task_context": {
+                    "worker_id": "worker-1",
+                    "previous_completed_task_ids": ["task-1"],
+                    "current_task": {"task_id": "task-2"},
+                },
+                "project_state_snapshot": {
+                    "artifacts": [{
+                        "path": "calculator.html", "revision": 3,
+                        "last_modified_by_task": source_task_id,
+                    }],
+                },
+            },
+            "verification": {
+                "enabled": False, "inspect_changes": False,
+                "run_available_tests": False, "require_tool_evidence": False,
+                "completion_criteria": ["calculator.html implements the requested calculator."],
+            },
+            "output": self._structured_output(),
+        }
+
+    def test_anticipated_artifact_can_satisfy_only_the_same_worker_assignment(self):
+        (self.workspace / "calculator.html").write_text(
+            "<main>Calculator with addition and subtraction</main>", encoding="utf-8",
+        )
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "calculator.html"})]),
+            answer('{"summary":"The calculator is already complete.","actions":[],"artifacts":[],"verification":{},"limitations":[]}'),
+        ], tools=["read_file"], config=self._assigned_worker_context("task-1"),
+            task_characteristics={"requires_filesystem_write": True},
+            prompt="Complete the future calculator task")
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["already_satisfied_candidate"])
+        observation = result["result"]["already_satisfied_candidate"]["artifact_observations"][0]
+        self.assertEqual(observation["source_task_id"], "task-1")
+        self.assertEqual(result["workspace_changes"], 0)
+        evaluation = Evaluator(offline=True).evaluate(
+            planned_task={
+                "id": "task-2", "objective": "Confirm the existing calculator file.",
+                "description": "Read calculator.html and confirm it exists.",
+                "success_criteria": ["calculator.html exists"],
+                "owned_paths": [], "write_targets": ["calculator.html"],
+                "required_capabilities": ["filesystem.read"], "preferred_skills": [],
+            },
+            runtime_task=result,
+            execution_node={"selected_agent_id": "worker", "runtime_task_id": "runtime", "attempt": 1},
+        )
+        self.assertEqual(evaluation["status"], "blocked")
+        evaluated_candidate = evaluation["context_snapshot"]["runtime_task"][
+            "already_satisfied_candidate"
+        ]["artifact_observations"][0]
+        self.assertEqual(evaluated_candidate["source_task_id"], "task-1")
+
+    def test_anticipated_artifact_from_another_worker_does_not_bypass_mutation_contract(self):
+        (self.workspace / "calculator.html").write_text(
+            "<main>Calculator with addition and subtraction</main>", encoding="utf-8",
+        )
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "calculator.html"})]),
+            answer('{"summary":"The calculator is already complete.","actions":[],"artifacts":[],"verification":{},"limitations":[]}'),
+        ], tools=["read_file"], config=self._assigned_worker_context("task-3"),
+            task_characteristics={"requires_filesystem_write": True},
+            prompt="Complete the future calculator task")
+        self.assertEqual(result["status"], "Failed")
+        self.assertEqual(result["failure_class"], "ExpectedWorkspaceMutationNotObserved")
+        self.assertFalse(result["already_satisfied_candidate"])
+        self.assertEqual(result["workspace_changes"], 0)
+
     def test_repeated_reads_of_existing_presence_only_target_complete_for_evaluator(self):
         (self.workspace / "a.js").write_text("// existing scaffold\n", encoding="utf-8")
         result = self.run_worker([

@@ -211,8 +211,11 @@ snapshot and must inspect and read the current file before editing.
 When a mutating task has no successful write, a current read of every declared
 target permits an `already_satisfied_candidate` result with artifact hash and
 revision evidence. This is technical completion only; Evaluator judges each
-planned criterion. Without current target reads, the Worker retains
-`ExpectedWorkspaceMutationNotObserved`. When repeated reads have already
+planned criterion. For compiled assignments, current bytes attributed to an
+accepted earlier task in the same Worker assignment may also be cited after
+read-back; evidence from another assignment is ineligible. Without eligible
+current observations, the Worker retains `ExpectedWorkspaceMutationNotObserved`.
+When repeated reads have already
 observed every declared target and every current criterion is a simple
 file-presence check, the Worker stops successfully with an
 `already_satisfied_candidate` for Evaluator instead of entering a read loop;
@@ -283,6 +286,11 @@ Graph execution emits `freya.graph.initialized`, `freya.task.ready`,
 `freya.task.dispatched`, `freya.task.waiting_for_approval`, terminal task events,
 and `freya.graph.completed`. Together with selection and delegation snapshots,
 these events reconstruct Plan Task → Selection → Agent → Runtime Task → Result.
+Assigned Workers additionally emit `worker.created`, `worker.reused`,
+`worker.task_switched`, `worker.task_started`, `worker.task_completed`, and
+`worker.completed` with bounded Worker, agent, orchestration, task, strategy,
+active-tool and active-capability metadata. Explicit Recovery replacement or
+recreation emits `worker.recreated`.
 The Worker emits `worker.execution.completed` or
 `worker.execution.failed` for technical execution only; Evaluator acceptance
 is persisted separately. Recovery and Integration revision events include the
@@ -414,8 +422,16 @@ The compiled plan persists `execution_strategy`, `task_count`, `worker_count`
 and `worker_assignments` (`worker_id` plus ordered `task_ids`).
 `plan_compiler.worker_assignment_created` records those counts and groups.
 Assignments are recomputed from validated tasks when a plan transform adds or
-removes a task. They grant no capabilities; Agent Factory still creates a
-task-scoped policy for each dispatch.
+removes a task. The runtime validates that declared assignments cover every
+task exactly once and does not infer missing groups. They grant no capabilities:
+AgentFactory creates one stable agent record per Worker assignment, then
+`activate_task` replaces its effective policy, tools, write scope, and
+verification criteria before each dispatch. Runtime task snapshots freeze that
+per-task policy while keeping the Worker `agent_id` stable across its assigned
+Tasks. If a later Integration revision appends work to an assignment, the
+runtime reuses that Worker only when the same Worker ID retains its prior
+ordered task IDs as a prefix; a reordered or unrelated assignment is a new
+lineage. Only an explicit Recovery action can create a replacement generation.
 For accepted graphs it assigns one permanent owner
 per normalized path: the unique creator, otherwise one explicit owner, otherwise
 the sole writer. A duplicate ownership claim from a noncreator is converted to
@@ -500,7 +516,7 @@ branches continue. Join nodes wait for every dependency.
 Ready-node fairness follows the immutable plan order. Selection occurs exactly
 once when a node first becomes ready and its durable snapshot is reused while
 waiting. The scheduler admits at most `max_parallel_tasks` active graph nodes
-(default 4), never submits two tasks concurrently to one agent, and also honors
+(default 4), never submits two tasks concurrently to one Worker assignment, and also honors
 Runtime's agent/workspace serialization. A selected Paused, Offline, or busy
 agent leaves the node ready with a `waiting_reason`; it is not submitted
 repeatedly or silently reselected. Disabled and deleted agents fail as described
@@ -510,6 +526,9 @@ scheduler reserves and attempts to dispatch it before selecting the next task.
 The next Agent Selector call receives workload from active Runtime tasks,
 active graph nodes, and selected ready-node reservations, so parallel branches
 do not share stale workload information.
+Dependency readiness remains authoritative within one Worker assignment;
+assigning two tasks to the same Worker never releases a task early. Distinct
+assignments remain independently schedulable and can execute in parallel.
 
 Paused and Offline are temporary scheduling waits: the selected node remains
 ready with one stable `waiting_reason` and dispatches once after availability
@@ -770,11 +789,15 @@ memory.
 ## Agent selection
 
 Normal Freya orchestration does not depend on a preconfigured pool of Programmer,
-QA Tester or Code Auditor agents. `AgentFactory` creates one candidate per ready
-task, assigns `freya-core`, ignores Planner Skill preferences with a warning,
-and never turns its tool declarations into capability grants. Manual agents
-remain available for direct task submission and
-compatibility tests.
+QA Tester or Code Auditor agents. For plans with `worker_assignments`,
+`AgentFactory` creates one candidate per logical Worker and `Orchestrator`
+reactivates that same `agent_id` for each assigned task. Every activation
+recomputes policy from the current compiled task; Skills and Worker identity do
+not widen capabilities. Legacy plans without assignments retain task-specific
+agents. The factory assigns `freya-core`, ignores Planner Skill preferences
+with a warning, and never turns Skill tool declarations into capability grants.
+Manual agents remain available for direct task submission and compatibility
+tests.
 `AgentSelector.select_agent(task, agents, context=None)` is local,
 deterministic and model-free. It deep-copies its inputs, resolves each agent's
 effective structured configuration, evaluates every required capability through
@@ -846,14 +869,22 @@ agent construction remains the factory's separate responsibility.
 
 ## Runtime and control semantics
 
-The scheduler supports bounded concurrency and serializes tasks per agent and
-per resolved workspace. An agent can set an existing absolute default directory;
+The scheduler supports bounded concurrency and serializes tasks per Worker
+assignment and per resolved workspace. An agent can set an existing absolute default directory;
 task submission can override that path for one run, and an explicit empty
 override creates a fresh directory under `data/workspaces/`. Every task records
 the resolved workspace in its immutable snapshot and runs in a spawned process. A Freya orchestration allocates an empty-selection workspace once, persists it in the orchestration config, and passes that same path to every dependent node so implementation, verification, and the read-only Code Auditor observe the same files.
 On Windows the worker is assigned to a kill-on-close Job Object before tool
 execution; POSIX uses a process session. Cancel, restart and shutdown terminate
 the worker tree and persist a terminal event.
+
+Worker identity and Runtime process lifetime are separate: the same generated
+agent record can serve several plan tasks, while each Runtime task still runs in
+its own spawned process and receives an immutable task snapshot. Ollama's current
+chat transport is stateless across calls, so context continues through a bounded
+deterministic prompt containing the active task, prior accepted summaries,
+relevant same-assignment artifacts, predecessor summaries, and plan context;
+obsolete task instructions are not reused as the active task.
 
 Pause is cooperative: an in-flight model or tool call can finish, then the
 worker pauses between actions. When a capability or autonomy rule is ask, the

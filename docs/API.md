@@ -64,8 +64,11 @@ For generated tasks, `modify_file` and `overwrite_file` compile with
 only after a current read in the same attempt; `READ_BEFORE_WRITE_REQUIRED`
 and `STALE_ARTIFACT` are recoverable tool results. A zero-write mutating task
 can return `already_satisfied_candidate` with observed path, SHA-256 and
-revision when its declared targets were read and remain current. Evaluator
-accepts or rejects the task against its criteria; otherwise the worker reports
+revision when its declared targets were read and remain current. With compiled
+Worker assignments, the source artifact must belong to an earlier accepted
+task in that same assignment (or the current task's recovery attempt); another
+Worker's artifact cannot satisfy the mutation contract. Evaluator accepts or
+rejects the task against its criteria; otherwise the worker reports
 `ExpectedWorkspaceMutationNotObserved`.
 `GET /api/orchestrations/{id}/activity` returns a backend-derived chronological
 timeline and performance read model. Its `events` include system actors even
@@ -271,8 +274,11 @@ injected adapter may still return resource hints, but those hints are discarded
 before runtime compilation. Newly appended or recovered tasks require a
 registered `task_kind`; their resources are derived through the same catalog and
 Recovery cannot exceed the superseded task resource budget.
-For every ready plan task, Freya creates a validated ephemeral agent. Its
-complete policy allows only compiled requirements (`ask` for dangerous
+For plans with assignments, Freya creates one validated agent per logical
+Worker. The `agent_id` remains stable across its assigned tasks; each dispatch
+replaces the effective policy, tools, write targets, and criteria with those of
+the active compiled task. Plans without `worker_assignments` retain the legacy
+per-task agent behavior. Each task's complete policy allows only compiled requirements (`ask` for dangerous
 capabilities) and denies the rest. The factory assigns `freya-core` and cannot
 add capabilities or tools. The effective Tool list remains the policy
 projection; the Skill never adds capability authority. Unknown tool IDs and
@@ -285,7 +291,14 @@ attempt and factory version; `freya.agent_policy.validated` records required
 capabilities and effective Tools. `freya.agent_factory.failed` records a bounded
 construction error. The compiler's completion event can include an ignored
 Planner Skill preference warning before the graph is
-created. The generated candidate then passes through
+created. A reused Worker emits `worker.reused` and, when it advances to a
+different task, `worker.task_switched`; `worker.task_started` and
+`worker.task_completed` record each Runtime task with the same `worker_id` and
+`agent_id`. `worker.completed` records final cleanup. `worker.recreated` is
+emitted only when explicit Recovery creates a replacement generation. Worker
+events carry `orchestration_id`, `execution_strategy`, active tools, and active
+capabilities; reuse events also carry `previous_task_id` and `current_task_id`.
+The generated candidate then passes through
 `freya.agent_selection.started`; `freya.agent_selected` records the planned task
 ID, generated agent ID, score, classification and selector version, while
 `freya.agent_selection.failed` records validation failure. The
@@ -583,10 +596,15 @@ Planning audit events separate semantic proposals from compiler decisions:
 Integration replan events include resource resolutions for newly added tasks.
 `worker.execution.completed` and `worker.execution.failed` report technical
 execution outcomes; semantic task acceptance is recorded only by Evaluator.
+The activity endpoint includes Worker lifecycle identity and task-scoped tools
+and capabilities in event details.
 Related events include `artifact.read_observed`,
 `artifact.read_before_write_required`, `artifact.stale_read_detected`,
 `task.already_satisfied_candidate`, `worker.plan_context_prepared`,
-`worker.write_already_satisfied`, `evaluation.infrastructure_failed`,
+`worker.created`, `worker.reused`, `worker.task_switched`,
+`worker.task_started`, `worker.task_completed`, `worker.completed`,
+`worker.recreated`, `worker.write_already_satisfied`,
+`evaluation.infrastructure_failed`,
 `evaluation.criterion.deterministic`, `evaluation.criterion.semantic_started`,
 `evaluation.criterion.semantic_completed`, `evaluation.aggregate.completed`,
 `evaluation.semantic_contract_repaired`, `evaluation.semantic_retry_started`,

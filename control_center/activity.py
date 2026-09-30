@@ -21,7 +21,10 @@ _DETAIL_FIELDS = (
     "selected_capabilities", "selected_tools", "selected_skills", "required_capabilities",
     "required_tools", "preferred_skills", "semantic_need", "integration_status",
     "evaluation_status", "duration_seconds", "model_call_details", "semantic_compiler",
-    "task_ids", "global_criteria",
+    "task_ids", "global_criteria", "worker_id", "worker_generation",
+    "worker_creation_reason", "assigned_task_ids", "previous_task_id",
+    "current_task_id", "active_tools", "active_capabilities", "execution_strategy",
+    "orchestration_id",
 )
 
 
@@ -116,7 +119,8 @@ def _component(event: dict[str, Any]) -> tuple[str, str]:
         return "orchestration", "Orchestration"
     if event_type.startswith("approval."):
         return "approval", "Approval"
-    if event_type.startswith("task.") or event_type.startswith("model.") or event_type.startswith("step."):
+    if (event_type.startswith("task.") or event_type.startswith("model.")
+            or event_type.startswith("step.") or event_type.startswith("worker.")):
         if "qa" in role or "quality" in role or "qa" in name.casefold():
             return "qa", name or "QA"
         return "worker", name or role or "Worker execution"
@@ -253,7 +257,8 @@ def _phase_status(event: dict[str, Any]) -> str:
         return "Needs clarification"
     if event_type in {"task_analysis.updated", "freya.plan.created", "freya.agent_created",
                       "task.success", "freya.evaluation.completed", "freya.graph.completed",
-                      "freya.integration.completed", "freya.final_response.created", "freya.completed"}:
+                      "freya.integration.completed", "freya.final_response.created", "freya.completed",
+                      "worker.completed"}:
         return "Success"
     return str(event.get("status") or "Running")
 

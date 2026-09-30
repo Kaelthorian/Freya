@@ -110,6 +110,14 @@ A bounded repair receives the complete
 rejected Semantic Plan and structured diagnostics. Local task checks and global
 plan checks are kept separate.
 
+To validate runtime consumption of compiled Worker assignments, including
+stable identity, per-task tools, DAG gating, parallel Workers, recovery and
+seven-task single-Worker scheduling, run:
+
+```powershell
+python -m unittest tests.test_worker_assignments -v
+```
+
 `plan_evidence.py` classifies each local success criterion by the minimum proof
 it requires. File read/search/diff/write capabilities support artifact and
 static-source criteria; execution capabilities support runtime behavior and
@@ -166,10 +174,13 @@ read is recoverable after `read_file`.
 
 For zero-write mutating tasks, the Worker checks current reads of declared
 targets and returns an `already_satisfied_candidate` with hashes and revisions.
-Only Evaluator can accept it against the task criteria. No current target read
-retains `ExpectedWorkspaceMutationNotObserved`. The execution prompt shows a
-bounded set of direct plan responsibilities and tells agents to leave explicitly
-assigned later work to its task unless a coherent base artifact requires it.
+With compiled Worker assignments, it may also cite current bytes attributed to
+an earlier completed task in the same assignment; bytes attributed to another
+Worker cannot satisfy the mutation contract. Only Evaluator can accept a
+candidate against the active task criteria. No eligible current observation
+retains `ExpectedWorkspaceMutationNotObserved`. The execution prompt shows the
+full bounded plan and active task scope; it does not authorize work reserved to
+another task.
 
 Workers may return `project_context_update` candidates with artifact purpose,
 symbol and dependency metadata. The parent ignores them until the Evaluator
@@ -203,12 +214,27 @@ and collapses accidental audit nodes for simple file/program work. A language
 mention in a debugging task does not turn that task into Python program
 creation.
 
-After planning, Freya creates one ephemeral least-privilege agent for each ready
-plan task. No Programmer, QA Tester or Code Auditor preset needs to exist first.
-The factory assigns `freya-core` to every dynamic worker, QA and auditor. Its
+After planning, Freya creates one stable logical Worker agent per compiled
+`worker_assignment`; without assignments, it retains the legacy agent-per-task
+path. The Worker `agent_id` stays stable across its assigned tasks. Each task
+activation refreshes its least-privilege policy, effective tools, write scope,
+criteria, dependencies, evidence requirements, and non-goals, then freezes that
+snapshot for Runtime. No Programmer, QA Tester or Code Auditor preset needs to
+exist first. The factory assigns `freya-core` to each dynamic Worker. Its
 seven declared tools come from the Skill, while Policy selects the effective
 worker schemas and evaluates every invocation. Planner Skill preferences do
-not affect assignment. Provenance is persisted for audit and terminal cleanup.
+not affect assignment. Existing provenance fields remain reserved for origin
+audit; Worker assignment metadata is stored separately in generated-agent
+configuration. The scheduler still enforces dependencies and permits parallel
+execution only across distinct Worker assignments.
+
+Each Runtime task runs in its own spawned process even when it reuses a logical
+Worker. Ollama calls are stateless between tasks; continuity comes from a
+deterministic prompt with the active task, prior accepted Worker-task summaries,
+relevant same-assignment artifacts, predecessor summaries, and full plan view.
+Recovery retries reuse the assigned Worker when requested; a different or
+missing Worker is created only by an explicit recovery action and gets a new
+generation.
 
 For a generic file, Planner requests `create_file` plus `read_file`; the Plan
 Compiler derives `filesystem.create`/`write_file` and read-back
@@ -275,18 +301,15 @@ carry bounded content beside the unresolved criterion. A short diff remains
 complete; large excerpts set `content_truncated`. The snapshot returned by
 `Evaluator.evaluate` still contains the separate full bounded evidence catalog.
 
-Known Recovery retry failure (diagnosed, not repaired here): a byte-identical
-`write_file` can emit `worker.write_already_satisfied` and `task.auto_completed`
-with no workspace mutation. `worker.py` then enters its
-`workspace_mutation_required` contract check. It calls
-`PolicyToolbox.current_observations` for all declared owned/foreign targets;
-that method returns no candidate unless every target was previously observed
-by a successful read in this attempt and its hash still matches. An identical
-write alone does not populate that observation map. The check can therefore
-emit `ExpectedWorkspaceMutationNotObserved` after the success events. A future
-fix must verify the already-matching target as objective read evidence and let
-Evaluator judge semantic completion, while retaining the failure for unsupported
-no-write success claims.
+An identical write alone still does not populate the current-attempt read map
+and cannot satisfy an unrelated criterion. For compiled Worker assignments,
+`worker.py` additionally permits a zero-mutation candidate when current bytes
+are read and ProjectState attributes them to a completed task in the same
+assignment (or the current task's recovery attempt). It never borrows this
+evidence across Worker assignments. Evaluator remains the only semantic
+acceptance authority. Regression coverage is in
+`WorkerTests.test_anticipated_artifact_can_satisfy_only_the_same_worker_assignment`
+and `WorkerTests.test_anticipated_artifact_from_another_worker_does_not_bypass_mutation_contract`.
 
 Semantic recovery has its own local, tool-free model and hard budgets:
 

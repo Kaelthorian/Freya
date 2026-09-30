@@ -368,6 +368,14 @@ class PolicyToolbox(Toolbox):
         self.task_id = str((config.get("provenance") or {}).get("plan_task_id") or "")
         provenance = config.get("provenance") if isinstance(config.get("provenance"), dict) else {}
         runtime_context = config.get("runtime_context") if isinstance(config.get("runtime_context"), dict) else {}
+        self.active_task_context = (
+            runtime_context.get("active_task_context")
+            if isinstance(runtime_context.get("active_task_context"), dict) else {}
+        )
+        self.worker_assignment = (
+            config.get("worker_assignment")
+            if isinstance(config.get("worker_assignment"), dict) else {}
+        )
         snapshot = runtime_context.get("project_state_snapshot")
         self.project_context_snapshot = (
             snapshot if provenance.get("generated_by_freya") is True and isinstance(snapshot, dict)
@@ -707,6 +715,55 @@ class PolicyToolbox(Toolbox):
             except (OSError, ValueError, CrossTaskRequestError):
                 return []
         return evidence
+
+    def intra_worker_satisfaction_observations(self, paths: list[str]) -> list[dict[str, Any]]:
+        """Accept read-back only for artifacts accepted from this same Worker."""
+        worker_id = str(self.worker_assignment.get("worker_id") or "")
+        context_worker_id = str(self.active_task_context.get("worker_id") or "")
+        current_task_id = str(self.active_task_context.get("current_task", {}).get("task_id") or "")
+        assigned_ids = self.worker_assignment.get("task_ids")
+        if (not worker_id or context_worker_id != worker_id or current_task_id != self.task_id
+                or not isinstance(assigned_ids, list) or self.task_id not in assigned_ids):
+            return []
+        completed = self.active_task_context.get("previous_completed_task_ids")
+        if not isinstance(completed, list):
+            completed = [
+                item.get("task_id") for item in self.active_task_context.get(
+                    "previous_completed_tasks", [],
+                ) if isinstance(item, dict)
+            ]
+        allowed_sources = {item for item in completed if isinstance(item, str)}
+        # A same-task recovery attempt may observe its own earlier accepted bytes;
+        # it still cannot borrow artifacts attributed to another Worker.
+        allowed_sources.add(self.task_id)
+        if not allowed_sources <= set(assigned_ids):
+            allowed_sources &= set(assigned_ids)
+        artifacts = self.project_context_snapshot.get("artifacts", []) if self.project_context_snapshot else []
+        source_by_path: dict[str, str] = {}
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+                continue
+            source_task = artifact.get("last_modified_by_task")
+            if source_task not in allowed_sources:
+                continue
+            try:
+                source_by_path[owned_path_key(artifact["path"])] = str(source_task)
+            except (TypeError, ValueError, CrossTaskRequestError):
+                continue
+        observations = self.current_observations(paths)
+        if not observations:
+            return []
+        result = []
+        for observation in observations:
+            try:
+                key = owned_path_key(observation.get("path", ""))
+            except (TypeError, ValueError, CrossTaskRequestError):
+                return []
+            source_task = source_by_path.get(key)
+            if not source_task:
+                return []
+            result.append({**observation, "source_task_id": source_task})
+        return result
 
     def _resource_context(self, name: str, resource: str, args: dict[str, Any]) -> dict[str, Any]:
         context: dict[str, Any] = {}
@@ -1866,7 +1923,11 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                         for action in runtime_actions if action.get("already_satisfied") is True
                         and isinstance((action.get("arguments") or {}).get("path"), str)
                     ))
-                observations = box.current_observations(targets) if targets and hasattr(box, "current_observations") else []
+                if targets and getattr(box, "worker_assignment", None):
+                    observations = box.intra_worker_satisfaction_observations(targets)
+                else:
+                    observations = (box.current_observations(targets)
+                                    if targets and hasattr(box, "current_observations") else [])
                 if observations:
                     already_satisfied_candidate = {"artifact_observations": observations,
                                                    "successful_writes": 0,
@@ -1874,7 +1935,11 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                     publish("event", event={
                         "event_type": "task.already_satisfied_candidate", "level": "info",
                         "status": "ExecutionComplete", "paths": [item["path"] for item in observations],
-                        "message": "Current artifacts were read; Evaluator must decide whether the objective is met.",
+                        "message": (
+                            "Current artifacts from this Worker assignment were read; Evaluator must decide whether the objective is met."
+                            if getattr(box, "worker_assignment", None) else
+                            "Current artifacts were read; Evaluator must decide whether the objective is met."
+                        ),
                     })
             if not (changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
                     or already_satisfied_candidate):

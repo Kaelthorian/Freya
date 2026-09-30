@@ -107,17 +107,21 @@ selects them.
    Python execution. QA runs the exact bounded stdin case `3` and `5` once.
    File-only implementation stops on a matching read-back; single-case QA stops
    when that one command supplies evidence for every planned criterion.
-   For each ready task,
-   `agent_factory.py` creates one validated ephemeral agent whose planned
-   capabilities come from the compiled plan. It also installs the internal,
+   `worker_assignment.py` validates the compiler's authoritative assignment
+   map. `agent_factory.py` creates one stable logical Worker per assignment;
+   each task activation replaces its policy, tools, write scope, and criteria
+   with that task's compiled requirements. Legacy plans without assignments
+   keep the task-specific agent path. The factory also installs the internal,
    read-only `project_context` capability for generated agents. Modification
    and overwrite tasks derive `filesystem.read` and `read_file` through the
    catalog, including visibility of foreign-owned workspace artifacts;
    ownership still scopes writes. Pure creation does not imply read. Every dynamic agent receives
    `freya-core`; its seven declared tools are checked against `Toolbox` at
-   startup. Planner Skill preferences are ignored with a warning. Tool
-   availability never grants a capability: Policy limits the worker schemas
-   and evaluates each invocation.
+   startup. Planner Skill preferences are ignored with a warning. The scheduler
+   still gates each task on DAG dependencies and runs at most one task in an
+   assignment at once, while distinct Workers can run in parallel. Tool
+   availability never grants a capability: Policy limits the active task's
+   schemas and evaluates each invocation.
    The Runtime Resource Catalog provides one canonical semantic-operation to
    capability to tool mapping. Unknown operations and unsupported actions fail
    closed. The policy engine still decides each invocation.
@@ -126,9 +130,15 @@ selects them.
    read. `tools.py` compares `edit_file` candidate bytes before writing;
    `worker.py` records diffs and mutations only for material changes and stops
    repeated no-op edits on one artifact. `orchestrator.py` adds a bounded
-   snapshot of every effective plan task, current graph status, direct
-   predecessor outcome summary, and current-task non-goals to each execution
-   prompt. `agent_context.py` includes `agent.md` for generated agents;
+   snapshot of every effective plan task, current graph status, the active task
+   scope, accepted summaries and relevant artifacts from the same assignment,
+   direct predecessor outcome summaries, and current-task non-goals to each
+   execution prompt. Ollama calls do not hold a persistent conversation
+   session; this deterministic context is the continuity mechanism. A plan
+   revision can extend the same Worker lineage when prior ordered task IDs
+   remain a prefix. `tests/test_worker_assignments.py` covers identity, policy
+   refresh, dependency gating, parallel assignments, recovery and extension.
+   `agent_context.py` includes `agent.md` for generated agents;
    ProjectState verifies reported symbols after acceptance.
    `tools.py` resolves filesystem paths inside the assigned workspace. For
    Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an

@@ -55,6 +55,41 @@ class ActivityProjectionTests(unittest.TestCase):
         self.assertEqual(planner["duration_seconds"], 5.5)
         self.assertEqual(planner["status"], "Success")
 
+    def test_worker_events_keep_identity_and_task_scope_in_activity_projection(self):
+        activity = self.project([
+            {"id": "w1", "timestamp": "2026-09-24T10:00:01+00:00",
+             "event_type": "worker.created", "status": "Running",
+             "worker_id": "worker-1", "agent_id": "agent-1", "task_id": "task-1",
+             "orchestration_id": "run-1", "execution_strategy": "single_worker",
+             "active_tools": ["write_file"], "active_capabilities": ["filesystem.create"]},
+            {"id": "w2", "timestamp": "2026-09-24T10:00:02+00:00",
+             "event_type": "worker.reused", "status": "Running",
+             "worker_id": "worker-1", "agent_id": "agent-1", "task_id": "task-2",
+             "orchestration_id": "run-1", "execution_strategy": "single_worker",
+             "previous_task_id": "task-1", "current_task_id": "task-2",
+             "active_tools": ["read_file", "edit_file"],
+             "active_capabilities": ["filesystem.read", "filesystem.modify"]},
+            {"id": "w3", "timestamp": "2026-09-24T10:00:03+00:00",
+             "event_type": "worker.completed", "status": "Success",
+             "worker_id": "worker-1", "agent_id": "agent-1", "task_id": "task-2",
+             "orchestration_id": "run-1", "execution_strategy": "single_worker",
+             "active_tools": ["read_file", "edit_file"],
+             "active_capabilities": ["filesystem.read", "filesystem.modify"]},
+        ])
+        by_type = {item["event_type"]: item for item in activity["events"]}
+        created = by_type["worker.created"]
+        reused = by_type["worker.reused"]
+        completed = by_type["worker.completed"]
+        self.assertEqual(created["component"], "Worker execution")
+        self.assertEqual(created["details"]["worker_id"], "worker-1")
+        self.assertEqual(created["details"]["agent_id"], "agent-1")
+        self.assertEqual(created["details"]["orchestration_id"], "run-1")
+        self.assertEqual(created["details"]["active_tools"], ["write_file"])
+        self.assertEqual(reused["details"]["previous_task_id"], "task-1")
+        self.assertEqual(reused["details"]["current_task_id"], "task-2")
+        self.assertEqual(reused["details"]["active_tools"], ["read_file", "edit_file"])
+        self.assertEqual(completed["status"], "Success")
+
     def test_clarification_and_approval_waits_are_separate_from_processing(self):
         activity = self.project([
             {"timestamp": "2026-09-24T10:00:02+00:00",

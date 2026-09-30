@@ -656,7 +656,8 @@ class Evaluator:
         candidate = candidate if isinstance(candidate, dict) else {}
         bounded_candidate = {
             "artifact_observations": bounded_records(
-                candidate.get("artifact_observations"), ("path", "change_type"),
+                candidate.get("artifact_observations"),
+                ("path", "change_type", "source_task_id", "sha256", "revision"),
             ),
         } if candidate else None
         context = {

@@ -415,6 +415,8 @@ class Store(IntegrationStoreMixin):
                 archived.append({
                     "agent_id": row["id"], "name": row["name"], "role": row["role"],
                     "plan_task_id": provenance.get("plan_task_id"),
+                    "worker_id": config.get("worker_assignment", {}).get("worker_id"),
+                    "worker_generation": config.get("worker_assignment", {}).get("generation"),
                     "attempt": provenance.get("attempt"),
                     "factory_version": provenance.get("factory_version"),
                 })

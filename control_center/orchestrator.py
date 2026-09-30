@@ -32,7 +32,9 @@ from .cross_task import owned_path_key
 from .cross_task import CrossTaskIntentMatcher
 from .project_state import ProjectStateManager
 from .plan_context import render_plan_context
-from .worker_assignment import occupied_workers, worker_id_for_task
+from .worker_assignment import (
+    occupied_workers, worker_assignment_map, worker_id_for_task,
+)
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -226,7 +228,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
     def _execution_prompt(operational_prompt: str, planned_task: dict,
                           attempt_prompt: str = "",
                           project_context: str = "",
-                          responsibility_context: str = "") -> str:
+                          responsibility_context: str = "",
+                          worker_context: dict[str, Any] | None = None) -> str:
         """Send the Task Analyst's operational brief to every delegated worker."""
         spec_text = str(operational_prompt or "").strip()
         canonical = spec_text.startswith("{") and '"deliverables":' in spec_text
@@ -248,9 +251,93 @@ class Orchestrator(IntegrationOrchestrationMixin):
             sections.append("RECOVERY INSTRUCTIONS:\n" + attempt_prompt.strip())
         if project_context.strip():
             sections.append(project_context.strip())
+        if worker_context:
+            rendered_worker_context = json.dumps(
+                sanitize(worker_context), ensure_ascii=False, separators=(",", ":"),
+            )
+            if len(rendered_worker_context) > 12_000:
+                rendered_worker_context = rendered_worker_context[:11_960] + "...[truncated]"
+            sections.append(
+                "ACTIVE WORKER TASK CONTEXT (history is factual context; the current task scope is authoritative):\n"
+                + rendered_worker_context
+            )
         sections.append("Complete this step without inventing requirements outside the " +
                         ("Canonical Task Spec." if canonical else "Task Analyst operational brief."))
         return "\n\n".join(section for section in sections if section.strip())
+
+    def _worker_task_context(self, plan: dict[str, Any], task: dict[str, Any],
+                             assignment: dict[str, Any] | None,
+                             nodes: list[dict[str, Any]], agent: dict[str, Any],
+                             *, active_tools: list[str] | None = None,
+                             active_capabilities: list[str] | None = None
+                             ) -> dict[str, Any] | None:
+        if not assignment:
+            return None
+        task_id = str(task.get("id") or "")
+        node_by_id = {item.get("plan_task_id"): item for item in nodes}
+        plan_by_id = {item.get("id"): item for item in plan.get("tasks", [])
+                      if isinstance(item, dict)}
+        previous_completed = []
+        relevant_artifacts = []
+        for previous_id in assignment["task_ids"]:
+            if previous_id == task_id:
+                break
+            previous_node = node_by_id.get(previous_id, {})
+            if previous_node.get("state") != "success":
+                continue
+            previous_task = plan_by_id.get(previous_id, {})
+            runtime_id = previous_node.get("runtime_task_id")
+            runtime_task = self.store.get_task(runtime_id) if runtime_id else {}
+            result = runtime_task.get("result") if isinstance(runtime_task, dict) else {}
+            result = result if isinstance(result, dict) else {}
+            summary = str(result.get("summary") or result.get("final") or "").strip()
+            if not summary:
+                summary = str(runtime_task.get("result") or "").strip()
+            previous_completed.append({
+                "task_id": previous_id,
+                "objective": str(previous_task.get("objective") or "")[:500],
+                "summary": sanitize(summary)[:1_000],
+            })
+            for item in result.get("artifacts", [])[:40] if isinstance(result.get("artifacts"), list) else []:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    relevant_artifacts.append({
+                        "path": item["path"][:500],
+                        "change_type": str(item.get("change_type") or "")[:80],
+                        "task_id": previous_id,
+                    })
+        predecessor_summaries = [item for item in previous_completed
+                                 if item["task_id"] in (task.get("depends_on") or [])]
+        config = agent.get("config", {}) if isinstance(agent.get("config"), dict) else {}
+        effective_tools = (active_tools if active_tools is not None else
+                           config.get("active_task_tools", []))
+        effective_capabilities = (
+            active_capabilities if active_capabilities is not None else
+            config.get("active_task_capabilities", task.get("required_capabilities") or [])
+        )
+        return sanitize({
+            "worker_id": assignment["worker_id"],
+            "assigned_task_ids": list(assignment["task_ids"]),
+            "current_task": {
+                "task_id": task_id,
+                "objective": str(task.get("objective") or "")[:1_000],
+                "dependencies": list(task.get("depends_on") or []),
+                "required_capabilities": list(task.get("required_capabilities") or []),
+                "active_capabilities": list(effective_capabilities),
+                "active_tools": list(effective_tools),
+                "success_criteria": list(task.get("success_criteria") or []),
+                "write_targets": list(task.get("write_targets") or []),
+                "evidence_requirements": list(task.get("evidence_requirements") or []),
+                "non_goals": list(task.get("non_goals") or []),
+            },
+            "previous_completed_tasks": previous_completed[-20:],
+            "previous_completed_task_ids": [item["task_id"] for item in previous_completed],
+            "relevant_artifacts": relevant_artifacts[-80:],
+            "relevant_predecessor_summaries": predecessor_summaries[-20:],
+            "conversation_context_note": (
+                "Ollama calls do not have a server-side conversation session; summaries and verified "
+                "artifact references from accepted tasks are supplied here."
+            ),
+        })
 
     @staticmethod
     def _responsibility_context(plan: dict[str, Any], task: dict[str, Any],
@@ -601,18 +688,29 @@ class Orchestrator(IntegrationOrchestrationMixin):
         }
 
     def _create_dynamic_agent(self, oid: str, task: dict, attempt: int,
-                              *, variant: int = 0) -> dict:
+                              *, variant: int = 0,
+                              worker_assignment: dict[str, Any] | None = None,
+                              worker_creation_reason: str = "assignment_started") -> dict:
         planned_task_id = str(task.get("id") or "")
         self.store.add_orchestration_event(oid, {
             "event_type": "freya.agent_factory.started", "status": "Running",
             "task_id": planned_task_id, "attempt": attempt,
+            "worker_id": worker_assignment.get("worker_id") if worker_assignment else None,
+            "execution_strategy": self._execution_strategy(oid),
             "required_capabilities": list(task.get("required_capabilities", [])),
-            "message": "Freya is building a least-privilege agent for the planned task.",
+            "message": (
+                "Freya is creating one stable Worker for its compiled assignment."
+                if worker_assignment else
+                "Freya is building a least-privilege agent for the planned task."
+            ),
         })
         try:
-            created = self.agent_factory.create(
-                task, orchestration_id=oid, attempt=attempt, variant=variant,
-            )
+            arguments = {
+                "orchestration_id": oid, "attempt": attempt, "variant": variant,
+            }
+            if worker_assignment is not None:
+                arguments["worker_assignment"] = worker_assignment
+            created = self.agent_factory.create(task, **arguments)
         except Exception as exc:
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.agent_factory.failed", "status": "Failed",
@@ -637,10 +735,19 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "planner_preferred_skills": list(task.get("preferred_skills", [])),
             "resolved_skills": created["skill_ids"],
             "required_capabilities": created["required_capabilities"],
+            "active_capabilities": created.get(
+                "active_capabilities", created["required_capabilities"],
+            ),
             "effective_tools": created["effective_tools"],
+            "worker_id": worker_assignment.get("worker_id") if worker_assignment else None,
+            "worker_generation": worker_assignment.get("generation") if worker_assignment else None,
             "attempt": attempt, "factory_version": created["factory_version"],
             "warnings": created["warnings"],
-            "message": "Freya created a task-specific ephemeral agent.",
+            "message": (
+                "Freya created the stable Worker identity assigned to this compiled task group."
+                if worker_assignment else
+                "Freya created a task-specific ephemeral agent."
+            ),
         }
         self.store.add_orchestration_event(oid, event)
         self.store.add_orchestration_event(oid, {
@@ -648,12 +755,184 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "event_type": "freya.agent_policy.validated",
             "message": "The dynamic agent policy and derived tool surface were validated.",
         })
+        if worker_assignment is not None:
+            worker_event = {
+                "event_type": "worker.created", "status": "Running",
+                "worker_id": worker_assignment["worker_id"],
+                "agent_id": agent["id"], "task_id": planned_task_id,
+                "orchestration_id": oid,
+                "execution_strategy": self._execution_strategy(oid),
+                "active_tools": list(created["effective_tools"]),
+                "active_capabilities": list(created.get(
+                    "active_capabilities", created["required_capabilities"],
+                )),
+                "worker_generation": worker_assignment.get("generation", 1),
+                "worker_creation_reason": worker_creation_reason,
+                "message": "Created one logical Worker for its compiled assignment.",
+            }
+            self.store.add_orchestration_event(oid, worker_event)
+            if worker_creation_reason.startswith("explicit_recovery_"):
+                self.store.add_orchestration_event(oid, {
+                    **worker_event,
+                    "event_type": "worker.recreated",
+                    "message": "Recovery explicitly recreated the assigned Worker identity.",
+                })
         return created
+
+    def _execution_strategy(self, oid: str) -> str | None:
+        try:
+            run = self.store.get_orchestration(oid)
+            plan = run.get("effective_plan") or run.get("plan") or {}
+            return plan.get("execution_strategy")
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _assignment_matches(agent: dict[str, Any], oid: str,
+                            assignment: dict[str, Any]) -> bool:
+        config = agent.get("config") if isinstance(agent.get("config"), dict) else {}
+        provenance = config.get("provenance") if isinstance(config.get("provenance"), dict) else {}
+        stored = config.get("worker_assignment") if isinstance(config.get("worker_assignment"), dict) else {}
+        stored_task_ids = list(stored.get("task_ids") or [])
+        current_task_ids = list(assignment.get("task_ids") or [])
+        return (
+            provenance.get("generated_by_freya") is True
+            and provenance.get("orchestration_id") == oid
+            and stored.get("worker_id") == assignment.get("worker_id")
+            and bool(stored_task_ids)
+            and current_task_ids[:len(stored_task_ids)] == stored_task_ids
+        )
+
+    def _worker_agent_for_assignment(self, oid: str, assignment: dict[str, Any]
+                                     ) -> tuple[dict[str, Any] | None, str | None]:
+        agents = [agent for agent in self.store.list_agents()
+                  if self._assignment_matches(agent, oid, assignment)]
+        if not agents:
+            return None, None
+        agents.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
+        attempts = [item for item in self.store.list_execution_attempts(oid)
+                    if item.get("plan_task_id") in assignment["task_ids"]]
+        attempts.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
+        latest = attempts[-1] if attempts else None
+        if latest:
+            matching = next((agent for agent in agents
+                             if agent.get("id") == latest.get("selected_agent_id")), None)
+            if matching is not None:
+                return matching, str(latest.get("plan_task_id") or "")
+        latest_agent = agents[-1]
+        provenance = latest_agent.get("config", {}).get("provenance", {})
+        return latest_agent, str(provenance.get("plan_task_id") or "")
+
+    @staticmethod
+    def _event_payloads(run: dict[str, Any]) -> list[dict[str, Any]]:
+        payloads = []
+        for event in run.get("events", []):
+            raw = event.get("payload_json") if isinstance(event, dict) else None
+            if not isinstance(raw, str):
+                continue
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        return payloads
+
+    def _worker_generation(self, oid: str, assignment: dict[str, Any]) -> int:
+        generations = [
+            int(agent.get("config", {}).get("worker_assignment", {}).get("generation", 0))
+            for agent in self.store.list_agents()
+            if self._assignment_matches(agent, oid, assignment)
+            and isinstance(agent.get("config", {}).get("worker_assignment", {}).get(
+                "generation", 0), int)
+        ]
+        run = self.store.get_orchestration(oid)
+        generations.extend(
+            int(event.get("worker_generation", 0))
+            for event in self._event_payloads(run)
+            if event.get("event_type") in {"worker.created", "worker.recreated"}
+            and event.get("worker_id") == assignment.get("worker_id")
+            and isinstance(event.get("worker_generation"), int)
+        )
+        return max(generations, default=0) + 1
+
+    @staticmethod
+    def _factory_task_scope(task: dict[str, Any], plan: dict[str, Any],
+                            recovery_workspace_state: dict[str, Any] | None = None,
+                            recovery_reason: str = "", recovery_failure_class: str = "",
+                            recovery_cause: str = "") -> dict[str, Any]:
+        scoped = dict(task)
+        task_id = str(task.get("id") or "")
+        scoped["_planned_write_targets"] = planned_write_target_grants(plan, task_id)
+        scoped["_write_owners"] = dict(plan.get("write_owners") or {
+            owned_path_key(path): owner["id"]
+            for owner in plan.get("tasks", []) if isinstance(owner, dict)
+            for path in owner.get("owned_paths", [])
+        })
+        if recovery_workspace_state:
+            scoped["_recovery_workspace_state"] = recovery_workspace_state
+        if recovery_reason:
+            scoped["_recovery_reason"] = recovery_reason
+        if recovery_failure_class:
+            scoped["_recovery_failure_class"] = recovery_failure_class
+        if recovery_cause:
+            scoped["_recovery_cause"] = recovery_cause
+        return scoped
 
     def _archive_dynamic_agents(self, oid: str) -> list[dict]:
         archiver = getattr(self.store, "archive_dynamic_agents", None)
         if not callable(archiver):
             return []
+        try:
+            run = self.store.get_orchestration(oid)
+            plan = run.get("effective_plan") or run.get("plan") or {}
+            strategy = plan.get("execution_strategy")
+            agents = [agent for agent in self.store.list_agents()
+                      if self._assignment_matches(agent, oid,
+                          agent.get("config", {}).get("worker_assignment", {}))]
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for agent in agents:
+                assignment = agent.get("config", {}).get("worker_assignment", {})
+                worker_id = assignment.get("worker_id")
+                if isinstance(worker_id, str) and worker_id:
+                    grouped.setdefault(worker_id, []).append(agent)
+            existing_completed = {
+                str(event.get("worker_id")) for event in self._event_payloads(run)
+                if event.get("event_type") == "worker.completed"
+            }
+            attempts = self.store.list_execution_attempts(oid)
+            for worker_id, candidates in grouped.items():
+                if worker_id in existing_completed:
+                    continue
+                candidates.sort(key=lambda item: (str(item.get("created_at") or ""),
+                                                  str(item.get("id") or "")))
+                agent = candidates[-1]
+                assignment = agent.get("config", {}).get("worker_assignment", {})
+                task_ids = list(assignment.get("task_ids") or [])
+                worker_attempts = [item for item in attempts
+                                   if item.get("plan_task_id") in task_ids]
+                worker_attempts.sort(key=lambda item: (str(item.get("created_at") or ""),
+                                                       str(item.get("id") or "")))
+                current_task_id = (str(worker_attempts[-1].get("plan_task_id") or "")
+                                   if worker_attempts else "")
+                config = agent.get("config", {})
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.completed",
+                    "status": "Success" if run.get("status") == "Success" else run.get("status"),
+                    "worker_id": worker_id, "agent_id": agent["id"],
+                    "task_id": current_task_id or config.get("provenance", {}).get("plan_task_id"),
+                    "orchestration_id": oid, "execution_strategy": strategy,
+                    "active_tools": list(config.get("active_task_tools") or agent.get("tools") or []),
+                    "active_capabilities": list(config.get("active_task_capabilities") or []),
+                    "assigned_task_ids": task_ids,
+                    "message": "All orchestration work is terminal; the logical Worker is being destroyed.",
+                })
+        except Exception as exc:
+            self.store.add_orchestration_event(oid, {
+                "event_type": "worker.completed", "status": "Warning",
+                "orchestration_id": oid,
+                "message": "Worker completion telemetry was incomplete: " + str(exc),
+            })
         try:
             archived = archiver(oid)
         except Exception as exc:
@@ -669,6 +948,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "event_type": "freya.dynamic_agent.archived", "status": "Success",
                 "orchestration_status": status,
                 "agent_id": agent["agent_id"],
+                "worker_id": agent.get("worker_id"),
+                "worker_generation": agent.get("worker_generation"),
                 "task_id": agent.get("plan_task_id"),
                 "plan_task_id": agent.get("plan_task_id"),
                 "attempt": agent.get("attempt"),
@@ -1067,8 +1348,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
             recovery_reason = ""
             recovery_cause = ""
             recovery_failure_class = ""
+            recovery_action = None
+            recovery_action_kind = None
+            reused_worker = False
+            worker_previous_task_id = ""
+            worker_creation_reason = "assignment_started"
+            plan_snapshot = current_run.get("effective_plan") or current_run.get("plan") or {}
+            assignments_by_task = worker_assignment_map(plan_snapshot)
+            raw_assignment = assignments_by_task.get(planned_task_id)
+            worker_assignment = dict(raw_assignment) if raw_assignment else None
             if node.get("recovery_action_id"):
                 recovery_action = self.store.get_recovery(node["recovery_action_id"])
+                recovery_action_kind = recovery_action.get("action")
                 recovery_reason = str(recovery_action.get("reason") or "").strip()
                 recovery_workspace_state = dict(
                     (recovery_action.get("snapshot") or {}).get("workspace_state") or {}
@@ -1110,27 +1401,115 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     context["excluded_agent_ids"] = excluded_agent_ids
 
             try:
-                if required_agent_id:
+                if worker_assignment is not None:
+                    factory_task = self._factory_task_scope(
+                        task, plan_snapshot, recovery_workspace_state,
+                        recovery_reason, recovery_failure_class, recovery_cause,
+                    )
+                    if recovery_action_kind == "retry_different_agent":
+                        worker_assignment["generation"] = self._worker_generation(
+                            oid, worker_assignment,
+                        )
+                        created = self._create_dynamic_agent(
+                            oid, factory_task, selection_attempt,
+                            variant=max(0, selection_attempt - 1),
+                            worker_assignment=worker_assignment,
+                            worker_creation_reason="explicit_recovery_replacement",
+                        )
+                        worker_creation_reason = "explicit_recovery_replacement"
+                    else:
+                        existing_worker = None
+                        if required_agent_id:
+                            try:
+                                existing_worker = self.store.get_agent(required_agent_id)
+                            except KeyError:
+                                existing_worker = None
+                            if existing_worker is None:
+                                worker_creation_reason = "explicit_recovery_recreation"
+                                required_agent_id = None
+                        else:
+                            existing_worker, worker_previous_task_id = (
+                                self._worker_agent_for_assignment(oid, worker_assignment)
+                            )
+                            if existing_worker is not None:
+                                worker_previous_task_id = (
+                                    worker_previous_task_id
+                                    or str(existing_worker.get("config", {}).get(
+                                        "provenance", {}).get("plan_task_id") or "")
+                                )
+                        if existing_worker is None:
+                            previous_attempts = [
+                                item for item in self.store.list_execution_attempts(oid)
+                                if item.get("plan_task_id") in worker_assignment["task_ids"]
+                            ]
+                            if (previous_attempts and not required_agent_id
+                                    and not worker_creation_reason.startswith("explicit_recovery_")):
+                                raise RuntimeError(
+                                    "The assigned Worker is unavailable; Recovery must explicitly recreate it."
+                                )
+                            worker_assignment["generation"] = self._worker_generation(
+                                oid, worker_assignment,
+                            )
+                            created = self._create_dynamic_agent(
+                                oid, factory_task, selection_attempt,
+                                variant=max(0, selection_attempt - 1),
+                                worker_assignment=worker_assignment,
+                                worker_creation_reason=worker_creation_reason,
+                            )
+                        else:
+                            previous_provenance = existing_worker.get("config", {}).get(
+                                "provenance", {},
+                            )
+                            stored_assignment = existing_worker.get("config", {}).get(
+                                "worker_assignment", {},
+                            )
+                            worker_assignment["generation"] = int(
+                                stored_assignment.get("generation") or 1
+                            )
+                            worker_previous_task_id = (
+                                worker_previous_task_id
+                                or str(previous_provenance.get("plan_task_id") or "")
+                            )
+                            activate = getattr(self.agent_factory, "activate_task", None)
+                            if not callable(activate):
+                                raise RuntimeError(
+                                    "AgentFactory cannot activate task scope on a stable Worker."
+                                )
+                            created = activate(
+                                existing_worker["id"], factory_task,
+                                orchestration_id=oid,
+                                worker_assignment=worker_assignment,
+                                attempt=selection_attempt,
+                                variant=max(0, selection_attempt - 1),
+                            )
+                            reused_worker = True
+                            if required_agent_id:
+                                worker_previous_task_id = str(
+                                    previous_provenance.get("plan_task_id") or planned_task_id
+                                )
+                    agents = [created["agent"]]
+                    if worker_assignment:
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "freya.agent_policy.validated",
+                            "status": "Running", "task_id": planned_task_id,
+                            "plan_task_id": planned_task_id,
+                            "worker_id": worker_assignment["worker_id"],
+                            "agent_id": created["agent"]["id"],
+                            "role": created["role"],
+                            "required_capabilities": created["required_capabilities"],
+                            "active_capabilities": created.get(
+                                "active_capabilities", created["required_capabilities"],
+                            ),
+                            "effective_tools": created["effective_tools"],
+                            "message": "The reused Worker now has only this task's validated policy and tools.",
+                        })
+                elif required_agent_id:
                     agents = [self.store.get_agent(required_agent_id)]
                 else:
-                    factory_task = dict(task)
-                    plan_snapshot = current_run.get("effective_plan") or current_run.get("plan") or {}
-                    factory_task["_planned_write_targets"] = planned_write_target_grants(
-                        plan_snapshot, planned_task_id,
+                    factory_task = self._factory_task_scope(
+                        task, plan_snapshot, recovery_workspace_state,
+                        recovery_reason, recovery_failure_class, recovery_cause,
                     )
-                    factory_task["_write_owners"] = dict(plan_snapshot.get("write_owners") or {
-                        owned_path_key(path): owner["id"]
-                        for owner in plan_snapshot.get("tasks", [])
-                        for path in owner.get("owned_paths", [])
-                    })
-                    if recovery_workspace_state:
-                        factory_task["_recovery_workspace_state"] = recovery_workspace_state
-                    if recovery_reason:
-                        factory_task["_recovery_reason"] = recovery_reason
-                    if recovery_failure_class:
-                        factory_task["_recovery_failure_class"] = recovery_failure_class
-                    if recovery_cause:
-                        factory_task["_recovery_cause"] = recovery_cause
                     created = self._create_dynamic_agent(
                         oid, factory_task, selection_attempt,
                         variant=max(0, selection_attempt - 1),
@@ -1143,8 +1522,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "event_type": "freya.agent_selection.started", "status": "Running",
                 "task_id": planned_task_id,
                 "agent_id": agents[0].get("id") if agents else None,
+                "worker_id": worker_assignment.get("worker_id") if worker_assignment else None,
                 "message": (
-                    "Freya is validating the task-specific agent against "
+                    "Freya is validating the assigned Worker against "
                     "capabilities, Skills, runtime tools and policy."
                 ),
             })
@@ -1187,13 +1567,49 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.agent_selected", "status": "Running",
                     "task_id": planned_task_id, "agent_id": selected_agent_id,
+                    "worker_id": worker_assignment.get("worker_id") if worker_assignment else None,
                     "selection_id": selection_id, "score": selection["score"],
                     "selector_version": selection["selector_version"],
                     "classification": selection["classification"],
                     "approval_required": selection["approval_required"],
                     "message": "Freya validated and selected the dynamic agent.",
                 })
-        return {"selection_id": selection_id, "selection": selection}
+                if worker_assignment is not None and reused_worker:
+                    common = {
+                        "worker_id": worker_assignment["worker_id"],
+                        "agent_id": selected_agent_id,
+                        "task_id": planned_task_id,
+                        "orchestration_id": oid,
+                        "execution_strategy": self._execution_strategy(oid),
+                        "active_tools": list(created.get("effective_tools", [])),
+                        "active_capabilities": list(created.get(
+                            "active_capabilities", created.get("required_capabilities", []),
+                        )),
+                    }
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "worker.reused", "status": "Running",
+                        **common,
+                        "previous_task_id": worker_previous_task_id or planned_task_id,
+                        "current_task_id": planned_task_id,
+                        "message": "Reused the same Worker identity and activated this task's policy.",
+                    })
+                    if worker_previous_task_id and worker_previous_task_id != planned_task_id:
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "worker.task_switched", "status": "Running",
+                            **common,
+                            "previous_task_id": worker_previous_task_id,
+                            "current_task_id": planned_task_id,
+                            "message": "Switched the stable Worker to its next assigned task.",
+                        })
+        return {
+            "selection_id": selection_id, "selection": selection,
+            "worker_id": worker_assignment.get("worker_id") if worker_assignment else None,
+            "active_tools": list(created.get("effective_tools", [])) if worker_assignment else [],
+            "active_capabilities": list(created.get(
+                "active_capabilities", created.get("required_capabilities", []),
+            )) if worker_assignment else [],
+            "previous_task_id": worker_previous_task_id,
+        }
 
     def _record_graph_transitions(self, oid: str, transitions: list[dict]) -> None:
         for transition in transitions:
@@ -2266,6 +2682,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     return
                 persisted = self.store.get_execution_graph(oid)
                 plan = run.get("effective_plan") or run["plan"]
+                assignments_by_task = worker_assignment_map(plan)
                 graph = ExecutionGraph(plan, persisted["nodes"])
                 changed = False
 
@@ -2306,6 +2723,28 @@ class Orchestrator(IntegrationOrchestrationMixin):
                                 "runtime_task_id": node.get("runtime_task_id"),
                                 "message": event_message,
                                 "error": event_error,
+                            })
+                        if current in {"evaluating", "failed", "cancelled"}:
+                            runtime_config = runtime_task.get("config", {})
+                            runtime_context = runtime_config.get("runtime_context", {})
+                            active_context = runtime_context.get("active_task_context", {})
+                            self.store.add_orchestration_event(oid, {
+                                "event_type": "worker.task_completed",
+                                "status": runtime_task.get("status"),
+                                "worker_id": worker_id_for_task(plan, node["plan_task_id"]),
+                                "agent_id": node.get("selected_agent_id"),
+                                "task_id": node["plan_task_id"],
+                                "orchestration_id": oid,
+                                "execution_strategy": plan.get("execution_strategy"),
+                                "active_tools": list(active_context.get("active_tools") or []),
+                                "active_capabilities": list(active_context.get("active_capabilities") or []),
+                                "attempt": int(node.get("attempt", 0)),
+                                "evaluation_status": "pending" if current == "evaluating" else "not_applicable",
+                                "message": (
+                                    "Runtime finished this task; semantic evaluation remains pending."
+                                    if current == "evaluating" else
+                                    "Runtime task ended without a semantic evaluation."
+                                ),
                             })
 
                 transitions = graph.refresh_dependencies(utcnow())
@@ -2466,10 +2905,26 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     runtime_context, project_context = self._project_context_for_dispatch(
                         oid, plan, task, run,
                     )
+                    worker_assignment = assignments_by_task.get(task["id"])
+                    active_tools = list(agent.get("config", {}).get(
+                        "active_task_tools", agent.get("tools", []),
+                    ))
+                    active_capabilities = list(agent.get("config", {}).get(
+                        "active_task_capabilities", task.get("required_capabilities", []),
+                    ))
+                    worker_context = self._worker_task_context(
+                        plan, task, worker_assignment, graph.serialize(), agent,
+                        active_tools=active_tools,
+                        active_capabilities=active_capabilities,
+                    )
                     execution_prompt = self._execution_prompt(
                         operational_prompt, task, node.get("attempt_prompt") or "",
                         project_context, self._plan_context_for_dispatch(oid, plan, task),
+                        worker_context,
                     )
+                    if worker_context is not None:
+                        runtime_context = dict(runtime_context or {})
+                        runtime_context["active_task_context"] = worker_context
                     try:
                         runtime_task = self._submit_runtime_task(
                             agent_id, execution_prompt,
@@ -2532,6 +2987,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         active_workers.add(worker_id)
                     slots -= 1
                     dispatched += 1
+                    self.store.add_orchestration_event(oid, {
+                        "event_type": "worker.task_started", "status": runtime_task["status"],
+                        "worker_id": worker_id,
+                        "agent_id": agent_id,
+                        "task_id": task["id"],
+                        "orchestration_id": oid,
+                        "execution_strategy": plan.get("execution_strategy"),
+                        "active_tools": active_tools,
+                        "active_capabilities": active_capabilities,
+                        "attempt": int(graph.node(task["id"])["attempt"]),
+                        "message": "The assigned Worker started its active task with task-scoped tools.",
+                    })
                     self.store.add_orchestration_event(oid, {
                         "event_type": "freya.task.dispatched", "status": runtime_task["status"],
                         "task_id": task["id"], "runtime_task_id": runtime_task["id"],

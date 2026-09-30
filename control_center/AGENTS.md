@@ -27,7 +27,12 @@ Skill preferences with `freya-core` and records an ignored-preference warning.
 before resource validation. It removes unsupported external-only tasks and
 criteria, rewires dependencies, and rejects mixed or uncovered work.
 `skills.py` defines the one active Skill and validates its tool IDs at startup.
-`agent_factory.py` assigns it to every dynamic role without Skill capability
+`agent_factory.py` creates one stable logical Worker per compiled assignment,
+then reactivates it with a fresh task-scoped policy and tool surface for each
+assigned task. Worker identity and assignment metadata stay outside the
+existing provenance contract. Recovery reuses the same Worker when requested;
+replacement generations require an explicit Recovery action. The factory also
+assigns `freya-core` to every dynamic role without Skill capability
 prerequisites. `plan_compiler.py`
 derives missing resource links, assigns execution IDs and checks semantic
 dependencies.
@@ -106,6 +111,13 @@ archival event reports archival `Success` separately from the run's final
 - Use `storage.py` conditional transitions for orchestration state. Save the
   plan with `Planning → Planned` atomically, never reactivate a terminal run,
   and keep cancellation serialized with task submission.
+- Validate `worker_assignments` as authoritative runtime input: every compiled
+  task belongs to exactly one distinct Worker ID. Preserve DAG readiness and
+  serialize dispatch within each assignment; separate Workers may run in
+  parallel. Recompute least-privilege policy, effective tools, and write scope
+  on every task activation. Same-assignment prior artifacts may become
+  evaluator candidates only after current-byte read-back; never accept them
+  across assignments.
 - The production Planner calls loopback Ollama without tools. Deterministic
   fallback requires the explicit `--planner-offline` mode.
 - Keep production `/api/chat` calls in `transport.py`: streamed reconstruction,

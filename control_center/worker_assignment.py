@@ -1,7 +1,8 @@
-"""Deterministic execution slots for semantic plan tasks.
+"""Deterministic worker assignments for semantic plan tasks.
 
-An assignment is a scheduling resource, not a capability grant. Each task
-continues to receive its own task-scoped agent and policy at dispatch.
+An assignment is an execution identity, not a capability grant. A Worker can
+execute multiple assigned Tasks, while each active Task gets a fresh
+least-privilege policy and immutable Runtime snapshot.
 """
 from __future__ import annotations
 
@@ -53,11 +54,61 @@ def worker_assignments(tasks: list[dict[str, Any]], strategy: str) -> list[dict[
 
 
 def worker_id_for_task(plan: dict[str, Any], task_id: str) -> str | None:
-    """Legacy plans without assignments keep their existing scheduling."""
+    """Resolve the authoritative Worker for a task, if this plan has assignments."""
     for assignment in plan.get("worker_assignments", []):
         if task_id in assignment["task_ids"]:
             return assignment["worker_id"]
     return None
+
+
+def worker_assignment_map(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate compiler output and map every assigned plan task to one Worker.
+
+    Plans persisted before worker assignments were introduced remain on the
+    legacy per-task-agent path. Once a plan declares assignments, they must
+    cover the plan exactly once; the runtime never infers or repairs them.
+    """
+    if "worker_assignments" not in plan:
+        return {}
+    raw = plan.get("worker_assignments")
+    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+        raise ValueError("Compiled worker_assignments must be a list of objects.")
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("Compiled plan tasks must be a list.")
+    if not raw and tasks:
+        raise ValueError("Compiled worker_assignments cannot be empty when the plan has tasks.")
+    task_order = [str(item.get("id") or "") for item in tasks if isinstance(item, dict)]
+    if len(task_order) != len(tasks) or not all(task_order):
+        raise ValueError("Compiled plan tasks must have unique non-empty IDs.")
+    if len(set(task_order)) != len(task_order):
+        raise ValueError("Compiled plan task IDs must be unique.")
+
+    by_task: dict[str, dict[str, Any]] = {}
+    worker_ids: set[str] = set()
+    for assignment in raw:
+        worker_id = assignment.get("worker_id")
+        task_ids = assignment.get("task_ids")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("Every worker assignment requires a non-empty worker_id.")
+        if worker_id in worker_ids:
+            raise ValueError("Compiled worker IDs must be unique.")
+        worker_ids.add(worker_id)
+        if worker_id in task_order:
+            raise ValueError("A task_id cannot also be a worker_id.")
+        if (not isinstance(task_ids, list) or not task_ids
+                or any(not isinstance(item, str) or not item for item in task_ids)):
+            raise ValueError(f"Worker {worker_id} requires a non-empty task_ids list.")
+        for task_id in task_ids:
+            if task_id not in task_order:
+                raise ValueError(f"Worker {worker_id} references unknown task {task_id}.")
+            if task_id in by_task:
+                raise ValueError(f"Task {task_id} is assigned to more than one Worker.")
+            by_task[task_id] = {"worker_id": worker_id, "task_ids": list(task_ids)}
+    if set(by_task) != set(task_order):
+        missing = [task_id for task_id in task_order if task_id not in by_task]
+        raise ValueError("Compiled worker assignments omit tasks: " + ", ".join(missing))
+    return by_task
 
 
 def occupied_workers(plan: dict[str, Any], nodes: list[dict[str, Any]], *,
