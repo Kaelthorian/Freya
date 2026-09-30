@@ -518,6 +518,7 @@ class OllamaFailureAnalyzer:
                  "options": {"temperature": 0, "num_ctx": DEFAULT_RECOVERY_CONTEXT_WINDOW,
                              "num_predict": model_profile("failure_analyzer").max_output_tokens}},
                 timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
+                stage="initial", structured_context={"failure_logs": logs},
             )
             if isinstance(response.get("_freya_transport"), dict):
                 self.last_call_metrics["transport"] = response["_freya_transport"]
@@ -580,14 +581,22 @@ class FailureAnalyzer:
                 duration = reported.get("duration_seconds")
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
                     self.metrics["duration_seconds"] = round(float(duration), 4)
-        if isinstance(value, str):
-            if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
-                raise FailureAnalysisError("Failure analysis output is too large.")
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise FailureAnalysisError("Failure analysis output is not valid JSON.") from exc
-        return validate_failure_diagnosis(value, known_log_ids=known_log_ids)
+        from .llm_trace import record_validation
+        try:
+            if isinstance(value, str):
+                if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
+                    raise FailureAnalysisError("Failure analysis output is too large.")
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    raise FailureAnalysisError("Failure analysis output is not valid JSON.") from exc
+            result = validate_failure_diagnosis(value, known_log_ids=known_log_ids)
+        except (FailureAnalysisError, TypeError, ValueError) as exc:
+            record_validation("failure_analyzer", "rejected", detail=f"{type(exc).__name__}: {exc}")
+            raise
+        record_validation("failure_analyzer", "accepted", detail="Grounded diagnosis validated.",
+                          normalized_response=result)
+        return result
 
 
 def semantic_failure_fingerprint(plan_task_id: str, agent_id: str,
@@ -678,6 +687,8 @@ class OllamaRecoveryAdvisor:
                  "options": {"temperature": 0, "num_ctx": DEFAULT_RECOVERY_CONTEXT_WINDOW,
                              "num_predict": model_profile("recovery_replanner").max_output_tokens}},
                 timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
+                stage="revision" if revision else "initial",
+                structured_context=context,
             )
             if isinstance(response.get("_freya_transport"), dict):
                 self.last_call_metrics["transport"] = response["_freya_transport"]
@@ -709,6 +720,18 @@ class RecoveryController:
 
     @staticmethod
     def _parse(value: Any, **kwargs: Any) -> dict[str, Any]:
+        from .llm_trace import record_validation
+        try:
+            result = RecoveryController._parse_impl(value, **kwargs)
+        except (RecoveryValidationError, TypeError, ValueError) as exc:
+            record_validation("recovery_replanner", "rejected", detail=f"{type(exc).__name__}: {exc}")
+            raise
+        record_validation("recovery_replanner", "accepted", detail="Recovery decision validated.",
+                          normalized_response=result)
+        return result
+
+    @staticmethod
+    def _parse_impl(value: Any, **kwargs: Any) -> dict[str, Any]:
         if isinstance(value, str):
             if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
                 raise RecoveryValidationError("Recovery output is too large.")
@@ -897,6 +920,18 @@ class Replanner:
 
     @staticmethod
     def _parse(value: Any) -> dict[str, Any]:
+        from .llm_trace import record_validation
+        try:
+            result = Replanner._parse_impl(value)
+        except (RecoveryValidationError, TypeError, ValueError) as exc:
+            record_validation("recovery_replanner", "rejected", detail=f"{type(exc).__name__}: {exc}")
+            raise
+        record_validation("recovery_replanner", "accepted", detail="Plan revision validated.",
+                          normalized_response=result)
+        return result
+
+    @staticmethod
+    def _parse_impl(value: Any) -> dict[str, Any]:
         if isinstance(value, str):
             if len(value) > MAX_RECOVERY_OUTPUT_CHARS:
                 raise RecoveryValidationError("Plan revision output is too large.")

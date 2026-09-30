@@ -308,6 +308,10 @@ def build_agent_context(effective: dict[str, Any], task: str, workspace: str = "
                   "All filesystem tool paths are relative to the task workspace.",
                   "Use '.' to refer to the workspace root.",
                   "Never use or infer an absolute host filesystem path in tool calls."])
+    provenance = effective.get("config", {}).get("provenance") or {}
+    if isinstance(provenance, dict) and provenance.get("generated_by_freya") is True:
+        lines.extend(["GLOBAL WORKER GUIDANCE",
+                      Path(__file__).with_name("agent.md").read_text(encoding="utf-8")])
     if excluded_skills:
         lines.extend(["SKILLS FILTERED FOR THIS WORKSPACE",
                       "The following assigned skills were not included because their runtime subject is unavailable:",

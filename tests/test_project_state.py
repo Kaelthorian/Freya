@@ -314,7 +314,7 @@ class ProjectContextToolTests(unittest.TestCase):
         self.assertTrue(written.success)
         self.assertEqual((self.workspace / "module.py").read_text(encoding="utf-8"), "after\n")
 
-    def test_responsibility_context_shows_direct_later_work(self):
+    def test_responsibility_context_shows_complete_plan(self):
         plan = {"tasks": [
             {"id": "task-1", "objective": "Create calculator files", "depends_on": [],
              "owned_paths": ["calculator.js"]},
@@ -323,12 +323,14 @@ class ProjectContextToolTests(unittest.TestCase):
             {"id": "task-3", "objective": "Unrelated work", "depends_on": []},
         ]}
         rendered = Orchestrator._responsibility_context(plan, plan["tasks"][0])
-        self.assertIn("PLAN RESPONSIBILITY CONTEXT", rendered)
-        self.assertIn("task-2: Implement calculator logic", rendered)
-        self.assertNotIn("Unrelated work", rendered)
+        self.assertIn("CURRENT TASK RESPONSIBILITY", rendered)
+        self.assertIn('"id":"task-1"', rendered)
+        self.assertIn('"reserved_by":"task-2"', rendered)
+        self.assertIn("Implement calculator logic", rendered)
+        self.assertIn("Unrelated work", rendered)
         prompt = Orchestrator._execution_prompt("Create a calculator", plan["tasks"][0],
                                                 responsibility_context=rendered)
-        self.assertIn("task-2: Implement calculator logic", prompt)
+        self.assertIn("Implement calculator logic", prompt)
 
     def test_truncated_read_cannot_authorize_existing_file_edit(self):
         (self.workspace / "large.py").write_bytes(b"x" * 21_000)

@@ -212,9 +212,22 @@ When a mutating task has no successful write, a current read of every declared
 target permits an `already_satisfied_candidate` result with artifact hash and
 revision evidence. This is technical completion only; Evaluator judges each
 planned criterion. Without current target reads, the Worker retains
-`ExpectedWorkspaceMutationNotObserved`. Dispatch prompts include bounded direct
-dependency, dependent and shared-path responsibilities to keep each worker on
-its assigned step. Agents can report relevant symbol kind, signature, path and
+`ExpectedWorkspaceMutationNotObserved`. When repeated reads have already
+observed every declared target and every current criterion is a simple
+file-presence check, the Worker stops successfully with an
+`already_satisfied_candidate` for Evaluator instead of entering a read loop;
+other repeated reads still stop as `NoProgressDetected`. Dispatch prompts include a read-only,
+bounded view of every task in the effective compiled plan, in plan order. Each
+record includes status, kind, objective, description, dependencies, criteria,
+write targets, owned paths, semantic operations and declared capabilities/tools.
+The current task is highlighted separately, with non-goals derived from other
+tasks. Direct successful dependencies contribute only a short result summary and
+artifact paths, never action logs or file contents. The view is capped at
+70,000 characters and truncates individual text fields; exceeding the cap fails
+closed. `worker.plan_context_prepared` records IDs, counts, successors and size.
+The view does not enter policy construction, so other tasks' declared tools
+remain unavailable. Generated agents also receive `control_center/agent.md`
+as global scope guidance. Agents can report relevant symbol kind, signature, path and
 purpose; ProjectState verifies names against accepted artifact bytes when possible.
 
 
@@ -278,7 +291,8 @@ Semantic review emits `freya.evaluation.started` once and then exactly one
 `freya.evaluation.completed` or `freya.evaluation.failed`. Completion events
 carry the validated criterion-by-criterion decision and metrics; non-accepted
 decisions also carry a bounded summary of the exact input evidence. Evaluator
-prompts and private reasoning are never logged.
+prompts are excluded by default. Optional debug tracing stores bounded,
+redacted prompts and responses; private reasoning is stripped.
 
 Orchestration transitions are conditional on the stored current state:
 Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
@@ -355,7 +369,11 @@ model-proposed explicit entry is separated using clarification history and the
 deterministic Task Spec floor before the unchanged scope validator runs.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec and emits
-Semantic Plan schema version 3. Each task contains `task_kind`, semantic needs,
+Semantic Plan schema version 4. The plan records `task_complexity`,
+`execution_strategy` and a concrete `decomposition_reason` independently of
+task count. One worker handles cohesive work even across several files or steps;
+multiple workers require a benefit beyond delegation and integration cost.
+Each task contains `task_kind`, semantic needs,
 registered operation IDs, dependencies, outcomes, criteria, exact `owned_paths`
 and `write_targets`; it
 contains no tool, capability or Skill IDs. Before planning,
@@ -385,7 +403,20 @@ registered operation raises `UnsupportedResourceRequirement`; an incorrect suppo
 causes one bounded repair. The repair payload contains the exact previous
 Semantic Plan, structured compiler diagnostics and preservation rules.
 
-The Compiler preserves every distinct plan task. It assigns one permanent owner
+The Compiler rejects a declared multi-worker graph whose tasks are a simple
+implementation chain, overlap the same write target, or cite only file/step
+count as justification. One bounded Planner repair may consolidate those tasks.
+For `single_worker`, semantic task count does not imply delegation count: the
+Compiler retains all valid task checkpoints and assigns them to one logical
+worker slot. `worker_assignment.py` deterministically groups dependent steps
+for `multi_worker` and separates independent branches or QA/review roles.
+The compiled plan persists `execution_strategy`, `task_count`, `worker_count`
+and `worker_assignments` (`worker_id` plus ordered `task_ids`).
+`plan_compiler.worker_assignment_created` records those counts and groups.
+Assignments are recomputed from validated tasks when a plan transform adds or
+removes a task. They grant no capabilities; Agent Factory still creates a
+task-scoped policy for each dispatch.
+For accepted graphs it assigns one permanent owner
 per normalized path: the unique creator, otherwise one explicit owner, otherwise
 the sole writer. A duplicate ownership claim from a noncreator is converted to
 a foreign write when the creator is unique. Before ownership assignment,
@@ -804,7 +835,9 @@ Candidate IDs must be unique; duplicate valid IDs reject the selection input
 before scoring because they make the ranking ambiguous.
 
 Selection does not dispatch by itself. The execution graph retains the selected
-agent and waits for both a global slot and per-agent availability. Approval is
+agent and waits for a global slot, per-agent availability and its logical worker
+assignment. Only one task in an assignment can be selected or dispatched at a
+time; dependency edges still control when the next task becomes ready. Approval is
 the existing durable Runtime flow and does not fail the graph while pending.
 At timeout, active children are cancelled and all remaining graph nodes become
 terminal before the parent becomes Failed. The selector itself does not create

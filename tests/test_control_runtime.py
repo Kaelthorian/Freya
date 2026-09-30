@@ -204,6 +204,34 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["result"]["already_satisfied_candidate"]["artifact_observations"][0]["path"],
                          "calculator.html")
 
+    def test_repeated_reads_of_existing_presence_only_target_complete_for_evaluator(self):
+        (self.workspace / "a.js").write_text("// existing scaffold\n", encoding="utf-8")
+        result = self.run_worker([
+            answer(calls=[("read_file", {"path": "a.js"})]) for _ in range(3)
+        ], tools=["read_file"], config={
+            "permissions": "workspace", "task_owned_paths": ["a.js"],
+            "output": self._structured_output(),
+            "verification": {"enabled": True, "completion_criteria": ["a.js exists"]},
+        }, task_characteristics={"requires_filesystem_write": True},
+            prompt="Create a.js if absent")
+        self.assertEqual(result["status"], "Success", result["error"])
+        self.assertTrue(result["already_satisfied_candidate"])
+        self.assertFalse(result["no_progress_detected"])
+        self.assertEqual(result["model_calls"], 3)
+        self.assertTrue(any(item.get("event", {}).get("event_type") == "task.auto_completed"
+                            for item in self.events))
+        evaluation = Evaluator(offline=True).evaluate(
+            planned_task={
+                "id": "task-2", "objective": "Create a.js if absent",
+                "description": "Ensure a.js exists", "success_criteria": ["a.js exists"],
+                "owned_paths": ["a.js"], "write_targets": ["a.js"],
+                "required_capabilities": ["filesystem.read"], "preferred_skills": [],
+            },
+            runtime_task=result,
+            execution_node={"selected_agent_id": "worker", "runtime_task_id": "runtime", "attempt": 1},
+        )
+        self.assertEqual(evaluation["status"], "accepted", evaluation)
+
     def test_native_tools_metrics_and_no_private_reasoning(self):
         response = answer("<think>PRIVATE_INTERNAL</think>", [("write_file", {"path": "hello.py", "content": "print('hello')"})])
         response["message"]["thinking"] = "PRIVATE_INTERNAL"

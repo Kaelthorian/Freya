@@ -505,6 +505,8 @@ class OllamaTaskAnalyst:
                                          if repair else model_profile("task_analyst").max_output_tokens),
                      }},
                     timeout=timeout, telemetry=call_metrics,
+                    stage="repair" if repair else "initial",
+                    structured_context={"analysis_input": user_content},
                 )
             finally:
                 if isinstance(call_metrics.get("transport"), dict):

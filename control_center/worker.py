@@ -225,6 +225,23 @@ def _readback_evidence_criteria(criteria: list[str], path: str, output: str,
     return supported
 
 
+def _presence_only_criteria(criteria: list[str], paths: list[str]) -> bool:
+    """Recognize only simple declared file-presence checks for safe early exit."""
+    if not criteria or not paths:
+        return False
+    names = sorted({name for path in paths for name in (path, Path(path).name)
+                    if name}, key=len, reverse=True)
+    subjects = "|".join(re.escape(name) for name in names)
+    pattern = re.compile(
+        rf"^(?:the\s+)?(?:file\s+)?(?:{subjects})\s+"
+        r"(?:exists|is present|was created|is readable)"
+        r"(?:\s+in\s+(?:the\s+)?(?:selected\s+|task\s+|assigned\s+)?workspace)?"
+        r"(?:\s+and\s+(?:can be read|is readable))?\.?$",
+        re.IGNORECASE,
+    )
+    return all(pattern.fullmatch(str(criterion).strip()) for criterion in criteria)
+
+
 def _parse_tool_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -903,6 +920,17 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
              checkpoint: Callable[[], None], *, transport: Callable[..., dict[str, Any]] = request_json,
              token: str = "", toolbox: PolicyToolbox | None = None,
              approval_handler: Callable[[dict[str, Any]], str] | None = None) -> dict[str, Any]:
+    from .llm_trace import bind_llm_trace
+    with bind_llm_trace(lambda event: emit({"kind": "event", "event": sanitize(event)})):
+        return _run_task_impl(task, project_root, emit, checkpoint, transport=transport,
+                              token=token, toolbox=toolbox, approval_handler=approval_handler)
+
+
+def _run_task_impl(task: dict[str, Any], project_root: Path,
+                   emit: Callable[[dict[str, Any]], None], checkpoint: Callable[[], None], *,
+                   transport: Callable[..., dict[str, Any]] = request_json,
+                   token: str = "", toolbox: PolicyToolbox | None = None,
+                   approval_handler: Callable[[dict[str, Any]], str] | None = None) -> dict[str, Any]:
     """Run synchronously; process control and persistence remain with the parent."""
     config = task["config"]
     box = toolbox or PolicyToolbox(project_root, Path(task["workspace"]), config, task["tools"])
@@ -944,7 +972,8 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
         if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
     ]
     agent_context = build_agent_context(
-        effective, task["prompt"], task.get("workspace", ""),
+        effective, "Follow the PRIMARY TASK user message for the current step and its read-only plan view.",
+        task.get("workspace", ""),
         available_tools=visible_tool_names,
     )
     _visible_skills, filtered_skill_ids = skills_for_workspace(effective["skills"], task.get("workspace", ""))
@@ -1080,7 +1109,18 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                                   "num_ctx": config.get("context_window", 8192),
                                                   "num_predict": min(token_budget, model_profile("worker").max_output_tokens) if token_limited else model_profile("worker").max_output_tokens}},
                                      timeout=min(remaining, model_profile("worker").inactivity_timeout),
-                                     hard_timeout=remaining, token=token)
+                                     hard_timeout=remaining, token=token,
+                                     stage="worker_step", call_id=call_id,
+                                     structured_context={
+                                         "current_task": {"id": task.get("id"),
+                                                          "prompt": task["prompt"],
+                                                          "workspace": task.get("workspace"),
+                                                          "owned_paths": config.get("task_owned_paths", []),
+                                                          "foreign_write_targets": config.get("task_foreign_write_targets", [])},
+                                         "agent_context": agent_context,
+                                         "allowed_tools": visible_tool_schemas,
+                                         "success_criteria": verification.get("completion_criteria", []),
+                                     })
             except Exception as exc:
                 publish("event", event={"event_type": "model.failed", "level": "error", "status": "Failed",
                                          "step_id": call_id, "duration_seconds": round(time.monotonic() - call_start, 4),
@@ -1634,22 +1674,64 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                 action_history[-6] != action_history[-5]
                             )
                             if same_action_count >= 3 or alternating_cycle:
-                                pattern = "the same read-only action" if same_action_count >= 3 else "an alternating read-only action cycle"
-                                no_progress_reason = (
-                                    "NoProgressDetected: {} was repeated without a workspace change "
-                                    "({} read-only actions, {} steps)."
-                                ).format(pattern, telemetry["no_progress_actions"], metrics["steps"])
-                                telemetry["no_progress_detected"] = True
-                                telemetry["stop_reason"] = no_progress_reason
-                                publish("event", event={
-                                    "event_type": "task.no_progress", "level": "error", "status": "Failed",
-                                    "step_id": step_id, "tool": name,
-                                    "reason": "The worker stopped after repeated successful read-only actions produced no workspace progress.",
-                                    "output": {"pattern": pattern, "repeat_count": same_action_count,
-                                               "read_only_actions": telemetry["no_progress_actions"],
-                                               "steps": metrics["steps"], "workspace_changes": telemetry["workspace_changes"]},
-                                    "error_class": "no_progress",
-                                })
+                                targets = list(dict.fromkeys(
+                                    [str(path) for path in (config.get("task_owned_paths") or [])
+                                     if isinstance(path, str)] +
+                                    [str(item["path"]) for item in (config.get("task_foreign_write_targets") or [])
+                                     if isinstance(item, dict) and isinstance(item.get("path"), str)]
+                                ))
+                                criteria = [str(item) for item in verification.get("completion_criteria", [])]
+                                observations = (box.current_observations(targets)
+                                                if targets and hasattr(box, "current_observations") else [])
+                                if (workspace_mutation_required and verification["enabled"]
+                                        and _presence_only_criteria(criteria, targets)
+                                        and len(observations) == len(targets)):
+                                    verification_state["attempted"] = True
+                                    verification_state["passed"] = True
+                                    verification_state["unavailable"] = False
+                                    for observed in observations:
+                                        observed_path = observed["path"]
+                                        read_event = observed_files.get(observed_path, (True, "", "", "filesystem.read"))
+                                        verification_state["evidence"].append({
+                                            "type": "file_readback", "source": "runtime_verification",
+                                            "check": "filesystem:read_file:" + observed_path,
+                                            "status": "passed", "output": "File was read successfully.",
+                                            "path": observed_path, "tool": "read_file",
+                                            "capability": read_event[3], "event_id": read_event[2],
+                                            "supports_acceptance_criteria": [
+                                                criterion for criterion in criteria
+                                                if (observed_path.casefold() in criterion.casefold()
+                                                    or Path(observed_path).name.casefold() in criterion.casefold())
+                                            ],
+                                        })
+                                    success = True
+                                    auto_completed = True
+                                    final = json.dumps({
+                                        "summary": "Current files were observed; Evaluator must confirm the presence criteria.",
+                                        "actions": [], "artifacts": [], "verification": {}, "limitations": [],
+                                    })
+                                    no_progress_reason = ""
+                                    publish("event", event={
+                                        "event_type": "task.auto_completed", "level": "info", "status": "Success",
+                                        "reason": "All declared targets were read and only file-presence criteria remain; semantic acceptance belongs to Evaluator.",
+                                    })
+                                else:
+                                    pattern = "the same read-only action" if same_action_count >= 3 else "an alternating read-only action cycle"
+                                    no_progress_reason = (
+                                        "NoProgressDetected: {} was repeated without a workspace change "
+                                        "({} read-only actions, {} steps)."
+                                    ).format(pattern, telemetry["no_progress_actions"], metrics["steps"])
+                                    telemetry["no_progress_detected"] = True
+                                    telemetry["stop_reason"] = no_progress_reason
+                                    publish("event", event={
+                                        "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                        "step_id": step_id, "tool": name,
+                                        "reason": "The worker stopped after repeated successful read-only actions produced no workspace progress.",
+                                        "output": {"pattern": pattern, "repeat_count": same_action_count,
+                                                   "read_only_actions": telemetry["no_progress_actions"],
+                                                   "steps": metrics["steps"], "workspace_changes": telemetry["workspace_changes"]},
+                                        "error_class": "no_progress",
+                                    })
                             else:
                                 no_progress_reason = ""
                         else:
@@ -2064,7 +2146,12 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
             try:
                 repaired = validate_structured_output(final)
                 model_response_valid = True
+                from .llm_trace import record_validation
+                record_validation("worker", "accepted", detail="Structured worker result validated.",
+                                  normalized_response=repaired)
             except (TypeError, ValueError) as exc:
+                from .llm_trace import record_validation
+                record_validation("worker", "rejected", detail=f"{type(exc).__name__}: {exc}")
                 validation_error = sanitize(str(exc))[:1000]
                 # A response-format repair is useful for prose as well as malformed
                 # JSON. Keep it bounded to one call and record its outcome separately
@@ -2087,6 +2174,9 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                                          "num_predict": (min(token_limit - metrics["total_tokens"], model_profile("worker").repair_output_tokens) if token_limited else model_profile("worker").repair_output_tokens)}},
                             timeout=min(guard(), model_profile("worker").inactivity_timeout),
                             hard_timeout=guard(), token=token, telemetry=repair_call_metrics,
+                            stage="repair", call_id=repair_id,
+                            structured_context={"initial_result": final,
+                                                "expected_contract": "structured_worker_result"},
                         )
                         for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
                             value = repair_response.get(source, 0) or 0
@@ -2098,11 +2188,16 @@ def run_task(task: dict[str, Any], project_root: Path, emit: Callable[[dict[str,
                         if not isinstance(repair_message, dict):
                             raise ValueError("Ollama returned no repair message.")
                         repaired = validate_structured_output(strip_thinking(str(repair_message.get("content", ""))))
+                        from .llm_trace import record_validation
+                        record_validation("worker", "accepted", detail="Repaired worker result validated.",
+                                          normalized_response=repaired)
                         publish("event", event={"event_type": "model.repair.finished", "level": "info", "status": "Success",
                                                  "step_id": repair_id,
                                                  "output": {"valid": True, "fields": sorted(repaired),
                                                             "transport": repair_call_metrics.get("transport", {})}})
                     except Exception as exc:
+                        from .llm_trace import record_validation
+                        record_validation("worker", "rejected", detail=f"{type(exc).__name__}: {exc}")
                         repaired = None
                         repair_error = sanitize("{}: {}".format(type(exc).__name__, exc))[:1000]
                         publish("event", event={"event_type": "model.repair.finished", "level": "warning", "status": "Failed",

@@ -224,7 +224,7 @@ to Global Verification; task-level `success_criteria` belong to the local
 Evaluator. Exact matching text may create a proof link without copying a global
 criterion into a task.
 
-This Semantic Plan schema is version 3. Each task includes a `task_kind` for
+This Semantic Plan schema is version 4. Each task includes a `task_kind` for
 AgentFactory. Its `operations` are registered semantic IDs, not runtime tools
 or permissions. The Plan Compiler maps
 `modify_file` to `filesystem.modify`/`edit_file`, `create_file` to
@@ -259,6 +259,11 @@ keeps its own node, declares `write_targets: ["src/auth.py"]`, and receives
 `foreign_write_targets: [{"path": "src/auth.py", "owner_plan_task_id": "task-1"}]`.
 Two creators of one path invalidate the plan; ambiguous modifier ownership gets
 one bounded Planner repair.
+The compiled plan also contains `execution_strategy`, `task_count`,
+`worker_count` and `worker_assignments`, for example
+`[{"worker_id":"worker-1","task_ids":["task-1","task-2"]}]`.
+Task count and Worker count are independent. The compiler emits
+`plan_compiler.worker_assignment_created` with the strategy and both counts.
 Existing persisted runtime plans keep their compiled `required_capabilities` and
 `required_tools` snapshots and need no database schema migration. New planning,
 Recovery and Integration responses use semantic operation fields. A legacy
@@ -540,6 +545,21 @@ preserves each attempt, including failed calls. Provider errors use stable
 `OLLAMA_INVALID_RESPONSE` categories; the Analyst fallback remains indicated
 by `analysis_mode=deterministic_fallback`.
 
+`llm.call` events appear in the same orchestration and delegated-task log streams.
+By default they contain component, model, stage, prompt name/version, `llm_call_id`,
+hash, size, duration, status and available token counts. With
+`FREYA_DEBUG_LLM_PROMPTS=true`, they additionally contain a redacted structured
+`request_body`, component `structured_context`, `raw_response`, best-effort
+`parsed_response` and truncation metadata. `FREYA_DEBUG_PROMPT_MAX_CHARS`
+limits retained value characters (1000-200000).
+`llm.validation` events use the same call ID for Task Analyst and Planner
+contract decisions and other model-backed validators. With debug enabled,
+they include the redacted normalized result or validation error; otherwise
+they keep status and error type only. Repair calls carry
+`repair_of_llm_call_id` to link them to the rejected call. Debug content is
+persisted and returned by log APIs, so
+enable it only for a local diagnostic session.
+
 Task states are Queued, Running, WaitingForApproval, Paused, Success, Failed and Cancelled. Approval statuses are pending, approved_once, approved_task and denied. Agent states are `Idle`, `Running`, `Waiting`, `Paused`, `Error`
 and `Offline`. Step states use the corresponding running/terminal values.
 
@@ -565,7 +585,7 @@ Integration replan events include resource resolutions for newly added tasks.
 execution outcomes; semantic task acceptance is recorded only by Evaluator.
 Related events include `artifact.read_observed`,
 `artifact.read_before_write_required`, `artifact.stale_read_detected`,
-`task.already_satisfied_candidate`, `task.responsibility_context_generated`,
+`task.already_satisfied_candidate`, `worker.plan_context_prepared`,
 `worker.write_already_satisfied`, `evaluation.infrastructure_failed`,
 `evaluation.criterion.deterministic`, `evaluation.criterion.semantic_started`,
 `evaluation.criterion.semantic_completed`, `evaluation.aggregate.completed`,

@@ -88,7 +88,7 @@ check fail closed. Workers receive a deterministic rendering of the Task Spec,
 never an independent `operational_prompt`. The old Analyst v3 path is retained
 for injected compatibility adapters and historical tests.
 
-Semantic Plan schema version 3 is compiled into runtime plan schema version 4.
+Semantic Plan schema version 4 is compiled into runtime plan schema version 4.
 The Runtime Resource Catalog owns the canonical semantic-operation to
 capability to tool mapping; `plan_compiler.py` alone applies it. Each semantic
 task includes `task_kind`; AgentFactory consumes that compiled classification.
@@ -593,6 +593,15 @@ and `OLLAMA_INVALID_RESPONSE`; `timeout_type` identifies connect, inactivity,
 or hard. Connection refusal opens a five-second provider circuit. A slow but
 active generation leaves it healthy. The `freya.ollama` logger writes one JSON
 metadata record per chat call and excludes prompts, responses and credentials.
+`FREYA_DEBUG_LLM_PROMPTS=true` additionally writes `llm.call` events with the
+redacted structured request body and component context, raw preparse response,
+best-effort parsed JSON,
+prompt version, stage, `llm_call_id`, token counts and truncation metadata.
+`FREYA_DEBUG_PROMPT_MAX_CHARS` sets the per-field value budget (default 20000,
+clamped to 1000-200000). Leave debug off for ordinary runs: logs and their API
+exports may contain private task content even after redaction. `llm.validation`
+events correlate the Task Analyst and semantic compiler decisions with the call.
+The deterministic Agent Selector does not call a model.
 If a call ends with `stop_reason=stop` but Analyst falls back or Planner fails,
 inspect the schema/validation error: the provider completed generation, so a
 network timeout change will not repair that model output.

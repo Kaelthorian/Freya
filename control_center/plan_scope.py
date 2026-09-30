@@ -105,7 +105,10 @@ def semantic_plan_snapshot(value: Any) -> dict[str, Any]:
             elif isinstance(raw, list):
                 compact[field] = [str(value)[:200] for value in raw[:12]]
         result.append(compact)
-    return sanitize({"tasks": result, "task_count": len(tasks)})
+    return sanitize({"tasks": result, "task_count": len(tasks),
+                     "task_complexity": value.get("task_complexity"),
+                     "execution_strategy": value.get("execution_strategy"),
+                     "decomposition_reason": value.get("decomposition_reason")})
 
 
 def reconcile_plan_scope(task_spec: dict[str, Any], value: Any

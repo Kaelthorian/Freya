@@ -490,6 +490,8 @@ class OllamaEvaluator:
                              "num_predict": (model_profile("evaluator").repair_output_tokens
                                              if repair else model_profile("evaluator").max_output_tokens)}},
                 timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
+                stage="repair" if repair else "initial",
+                structured_context=model_context,
             )
             if isinstance(response.get("_freya_transport"), dict):
                 self.last_call_metrics["transport"] = response["_freya_transport"]
@@ -1173,6 +1175,18 @@ class Evaluator:
 
     @staticmethod
     def _parse(value: Any, criteria: list[str]) -> dict[str, Any]:
+        from .llm_trace import record_validation
+        try:
+            result = Evaluator._parse_impl(value, criteria)
+        except (EvaluationValidationError, TypeError, ValueError) as exc:
+            record_validation("evaluator", "rejected", detail=f"{type(exc).__name__}: {exc}")
+            raise
+        record_validation("evaluator", "accepted", detail="Semantic criteria validated.",
+                          normalized_response=result)
+        return result
+
+    @staticmethod
+    def _parse_impl(value: Any, criteria: list[str]) -> dict[str, Any]:
         if isinstance(value, dict) and set(value) == {"message"} and isinstance(value["message"], dict):
             value = value["message"].get("content")
         if isinstance(value, str):

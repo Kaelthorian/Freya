@@ -19,6 +19,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── plan_evidence.py      criterion evidence classification and capability compatibility
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
 │   ├── plan_compiler.py      scope/evidence reconciliation, write-overlap guard, ownership, resource derivation, IDs and DAG validation
+│   ├── worker_assignment.py deterministic logical Worker groups for compiled tasks
 │   ├── cross_task.py         exact file ownership validation and bounded reusable-intent matching
 │   ├── agent_factory.py      dynamic agents, freya-core assignment, task policy and provenance
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
@@ -35,6 +36,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── sandbox.py            disposable workspace copy and restricted Docker execution
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
+│   ├── llm_trace.py          redacted, bounded model-call tracing and debug prompt capture
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
@@ -42,6 +44,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── policy.py             policy schema, legacy migration and engine
 │   ├── skills.py             freya-core definition, tool validation and context rendering
 │   ├── agent_context.py      structured agent defaults, effective config and policy/tool-aware worker context
+│   ├── agent.md              global coordination rules for dynamic Workers
+│   ├── plan_context.py       bounded read-only full-plan snapshot and current-task scope
 │   ├── presets.py            creatable Programmer, QA Tester and Code Auditor presets
 │   └── security.py           secret and private-thinking sanitization
 ├── frontend/                 dependency-free dark web client
@@ -121,8 +125,11 @@ selects them.
    returns zero-write candidates to Evaluator only when declared targets were
    read. `tools.py` compares `edit_file` candidate bytes before writing;
    `worker.py` records diffs and mutations only for material changes and stops
-   repeated no-op edits on one artifact. `orchestrator.py` adds bounded direct plan responsibilities to each
-   execution prompt; ProjectState verifies reported symbols after acceptance.
+   repeated no-op edits on one artifact. `orchestrator.py` adds a bounded
+   snapshot of every effective plan task, current graph status, direct
+   predecessor outcome summary, and current-task non-goals to each execution
+   prompt. `agent_context.py` includes `agent.md` for generated agents;
+   ProjectState verifies reported symbols after acceptance.
    `tools.py` resolves filesystem paths inside the assigned workspace. For
    Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
    allowlisted command to `sandbox.py`; Docker receives only a disposable

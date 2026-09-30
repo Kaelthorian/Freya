@@ -19,9 +19,23 @@ const FREYA_SOUND_PEAK_GAIN = 0.72;
 function scheduleFreyaSound(kind, startAt) {
   const context = freyaAudioContext;
   if (!context || context.state !== 'running') return;
-  const notes = kind === 'clarification'
-    ? [{ frequency: 880, offset: 0, duration: 0.14 }, { frequency: 880, offset: 0.22, duration: 0.14 }]
-    : [{ frequency: 523.25, offset: 0, duration: 0.18 }, { frequency: 659.25, offset: 0.2, duration: 0.18 }, { frequency: 783.99, offset: 0.4, duration: 0.24 }];
+  const patterns = {
+    clarification: [
+      { frequency: 880, offset: 0, duration: 0.14 },
+      { frequency: 880, offset: 0.22, duration: 0.14 },
+    ],
+    complete: [
+      { frequency: 523.25, offset: 0, duration: 0.18 },
+      { frequency: 659.25, offset: 0.2, duration: 0.18 },
+      { frequency: 783.99, offset: 0.4, duration: 0.24 },
+    ],
+    failure: [
+      { frequency: 392, offset: 0, duration: 0.2 },
+      { frequency: 329.63, offset: 0.24, duration: 0.2 },
+      { frequency: 261.63, offset: 0.48, duration: 0.3 },
+    ],
+  };
+  const notes = patterns[kind] || patterns.complete;
   for (const note of notes) {
     const start = startAt + note.offset;
     const oscillator = context.createOscillator(), volume = context.createGain();
@@ -42,7 +56,7 @@ function flushFreyaSounds() {
   let startAt = Math.max(freyaAudioContext.currentTime, freyaSoundQueueEnd);
   for (const kind of pendingFreyaSounds.splice(0)) {
     scheduleFreyaSound(kind, startAt);
-    startAt += kind === 'clarification' ? 0.5 : 0.8;
+    startAt += kind === 'clarification' ? 0.5 : 0.9;
   }
   freyaSoundQueueEnd = startAt;
 }
@@ -69,7 +83,7 @@ function playFreyaSound(kind) {
 }
 
 function observeFreyaStatuses(orchestrations, approvals) {
-  let needsResponse = false, taskFinished = false;
+  let needsResponse = false, taskFinished = false, taskFailed = false;
   if (!freyaStatusSnapshotReady) {
     for (const run of orchestrations) if (run.id) freyaObservedStatuses.set(run.id, run.status);
     freyaStatusSnapshotReady = true;
@@ -78,7 +92,8 @@ function observeFreyaStatuses(orchestrations, approvals) {
       if (!run.id) continue;
       const previous = freyaObservedStatuses.get(run.id);
       if (run.status === 'NeedsClarification' && previous !== 'NeedsClarification') needsResponse = true;
-      if (freyaTerminalStatuses.has(run.status) && !freyaTerminalStatuses.has(previous)) taskFinished = true;
+      if (run.status === 'Success' && !freyaTerminalStatuses.has(previous)) taskFinished = true;
+      if (run.status === 'Failed' && !freyaTerminalStatuses.has(previous)) taskFailed = true;
       freyaObservedStatuses.set(run.id, run.status);
     }
   }
@@ -94,6 +109,7 @@ function observeFreyaStatuses(orchestrations, approvals) {
   }
   if (needsResponse) playFreyaSound('clarification');
   if (taskFinished) playFreyaSound('complete');
+  if (taskFailed) playFreyaSound('failure');
 }
 
 document.addEventListener('pointerdown', unlockFreyaAudio, { passive: true });

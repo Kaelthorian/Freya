@@ -26,9 +26,10 @@ from .skills import SkillCompatibilityError
 from .plan_scope import PlannerScopeError, semantic_plan_snapshot
 from .cross_task import (MAX_OWNED_PATHS, CrossTaskRequestError,
                          normalize_owned_paths, owned_path_key)
+from .worker_assignment import worker_assignments
 
 
-SEMANTIC_PLAN_SCHEMA_VERSION = 3
+SEMANTIC_PLAN_SCHEMA_VERSION = 4
 PLAN_SCHEMA_VERSION = 4
 MAX_PLAN_TASKS = 20
 # User prompts are accepted without an application-level character limit.
@@ -174,13 +175,18 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
         "type": "object",
         "properties": {
             "summary": {"type": "string"},
+            "task_complexity": {"type": "string", "enum": ["simple", "multi_step", "complex"]},
+            "execution_strategy": {"type": "string", "enum": ["single_worker", "multi_worker"]},
+            "decomposition_reason": {"type": "string"},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
                       "items": {"type": "object", "properties": task_fields,
             "required": sorted(task_fields), "additionalProperties": False}},
             "unsupported_requirements": unsupported,
         },
-        "required": ["summary", "success_criteria", "tasks", "unsupported_requirements"],
+        "required": ["summary", "task_complexity", "execution_strategy",
+                     "decomposition_reason", "success_criteria", "tasks",
+                     "unsupported_requirements"],
         "additionalProperties": False,
     }
 
@@ -285,8 +291,13 @@ def _normalize_python_console_calculator(plan: dict[str, Any],
     normalized["goal"] = task_spec["objective"]
     normalized["summary"] = "Create and verify the requested Python console calculator."
     normalized["complexity"] = "simple"
+    if "execution_strategy" in normalized:
+        normalized["execution_strategy"] = "single_worker"
+        normalized["decomposition_reason"] = (
+            "One implementation worker owns the console calculator; controlled QA is appended separately.")
     normalized["success_criteria"] = criteria
     normalized.pop(CRITERION_LINKS_FIELD, None)
+    normalized.pop("write_owners", None)
     from .plan_compiler import compile_semantic_task_resources
     normalized["tasks"] = [compile_semantic_task_resources({
         "id": "task-1",
@@ -335,6 +346,11 @@ def _append_code_audit_task(plan: dict[str, Any], analysis: Any = None,
         suffix += 1
     audited = dict(plan)
     audited["complexity"] = "multi_step"
+    if "execution_strategy" in audited:
+        audited["execution_strategy"] = "multi_worker"
+        audited["decomposition_reason"] = (
+            str(audited.get("decomposition_reason") or "") +
+            " A separate read-only audit provides independent review after implementation.")[:1000]
     from .plan_compiler import compile_semantic_task_resources
     audited["tasks"] = [*tasks, compile_semantic_task_resources({
         "id": audit_id,
@@ -417,6 +433,11 @@ def _append_qa_task(plan: dict[str, Any], analysis: Any,
     }, resource_catalog)
     updated = dict(plan)
     updated["complexity"] = "multi_step"
+    if "execution_strategy" in updated:
+        updated["execution_strategy"] = "multi_worker"
+        updated["decomposition_reason"] = (
+            str(updated.get("decomposition_reason") or "") +
+            " Controlled interactive QA requires an independent dependent worker.")[:1000]
     # If the Planner model already emitted an audit node, normalize it behind
     # QA instead of allowing audit-before-behavior-test ordering.
     normalized_audits = []
@@ -645,6 +666,8 @@ class OllamaPlanner:
                     },
                 },
                 timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
+                stage="repair" if repair else "initial",
+                structured_context=model_context,
             )
             if isinstance(response.get("_freya_transport"), dict):
                 self.last_call_metrics["transport"] = response["_freya_transport"]
@@ -1059,7 +1082,9 @@ def _inferred_owned_paths(objective: str, task_kind: str,
 def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                    repair_model_criteria: bool = False) -> dict[str, Any]:
     """Return a stable representation while enforcing field types and bounds."""
-    raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD, "write_owners"})
+    raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD, "write_owners",
+        "task_complexity", "execution_strategy", "decomposition_reason",
+        "task_count", "worker_count", "worker_assignments"})
     complexity = _text(raw["complexity"], "plan.complexity", 32).casefold().replace("-", "_")
     if complexity not in {"simple", "multi_step"}:
         raise PlanValidationError("plan.complexity must be simple or multi_step.")
@@ -1173,6 +1198,19 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
         "success_criteria": _text_list(raw["success_criteria"], "plan.success_criteria",
                                         MAX_CRITERIA, allow_empty=False),
     }
+    if "task_complexity" in raw:
+        classification = _text(raw["task_complexity"], "plan.task_complexity", 32)
+        if classification not in {"simple", "multi_step", "complex"}:
+            raise PlanValidationError("Invalid task_complexity.")
+        result["task_complexity"] = classification
+    if "execution_strategy" in raw:
+        strategy = _text(raw["execution_strategy"], "plan.execution_strategy", 32)
+        if strategy not in {"single_worker", "multi_worker"}:
+            raise PlanValidationError("Invalid execution_strategy.")
+        result["execution_strategy"] = strategy
+    if "decomposition_reason" in raw:
+        result["decomposition_reason"] = _text(
+            raw["decomposition_reason"], "plan.decomposition_reason", 1000)
     if "write_owners" in raw:
         owners = raw["write_owners"]
         if not isinstance(owners, dict):
@@ -1252,6 +1290,13 @@ def validate_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
 
     for task_id in ids:
         visit(task_id)
+    if "execution_strategy" in plan:
+        # Assignments are derived from validated tasks on every normalization.
+        # This also keeps existing plan transforms and replans consistent.
+        assignments = worker_assignments(plan["tasks"], plan["execution_strategy"])
+        plan["task_count"] = len(plan["tasks"])
+        plan["worker_count"] = len(assignments)
+        plan["worker_assignments"] = assignments
     return plan
 
 
@@ -1652,7 +1697,16 @@ class Planner:
         request = (
             PLANNER_SOURCE_OF_TRUTH_INSTRUCTIONS + "\n\n"
             "Plan HOW to satisfy this canonical Task Spec. Return JSON with summary, "
-            "success_criteria and tasks. Each task has a meaningful key, task_kind, objective, description, "
+            "task_complexity, execution_strategy, decomposition_reason, success_criteria and tasks. "
+            "Classify task_complexity as simple, multi_step or complex independently of worker count. "
+            "Choose single_worker by default, even for multiple files, implementation steps, "
+            "HTML/CSS/JS, operations or acceptance criteria. One worker can perform cohesive work "
+            "and local checks. Choose multi_worker only when a distinct dependency, specialist, "
+            "independent audit, controlled QA or substantial separable subsystem creates more "
+            "benefit than delegation, context handoff and integration cost. State that concrete "
+            "benefit in decomposition_reason; for single_worker state why one owner suffices. "
+            "Do not split a small feature into scaffold, logic and finalization tasks. "
+            "Each task has a meaningful key, task_kind, objective, description, "
             "depends_on (semantic task keys), semantic_needs, operations, success_criteria, "
             "owned_paths and write_targets. "
             "task_kind must be one of " + json.dumps(sorted(TASK_KIND_VALUES)) + ". "
@@ -1704,7 +1758,10 @@ class Planner:
             )
             if programming and "python" in lower:
                 operations.append("run_python_script")
-            semantic = {"summary": objective, "tasks": [{
+            semantic = {"summary": objective, "task_complexity": "simple",
+                        "execution_strategy": "single_worker",
+                        "decomposition_reason": "One worker can complete the cohesive deliverable and its local checks.",
+                        "tasks": [{
                 "key": "implement", "objective": objective,
                 "task_kind": "program_creation" if programming else "general",
                 "description": "Complete the specified deliverable in the selected workspace and verify it.",
@@ -1739,6 +1796,10 @@ class Planner:
             if plan is not None:
                 record.update({
                     "task_ids": [task["id"] for task in plan["tasks"]],
+                    "execution_strategy": plan.get("execution_strategy"),
+                    "task_count": plan.get("task_count"),
+                    "worker_count": plan.get("worker_count"),
+                    "worker_assignments": plan.get("worker_assignments", []),
                     "global_criteria": len(plan["success_criteria"]),
                 })
             if error is not None:
@@ -1828,6 +1889,14 @@ class Planner:
                             link["supports_global_criteria"] = list(dict.fromkeys([
                                 *link["supports_global_criteria"], *behavior_globals]))
                 compiled = validate_plan(plan)
+                for event in self.metrics["compiler_events"]:
+                    if event.get("event_type") == "plan_compiler.worker_assignment_created":
+                        event.update({
+                            "strategy": compiled.get("execution_strategy"),
+                            "task_count": compiled.get("task_count"),
+                            "worker_count": compiled.get("worker_count"),
+                            "worker_assignments": compiled.get("worker_assignments", []),
+                        })
                 resource_resolutions = [item for item in planner_resource_resolutions
                                         if item.get("action") in {
                                             "planner_tool_hint_ignored",
@@ -1849,6 +1918,10 @@ class Planner:
                 self.metrics["resource_resolutions"] = resource_resolutions
                 self.metrics["compiled_runtime_plan"] = {
                     "schema_version": PLAN_SCHEMA_VERSION,
+                    "execution_strategy": compiled.get("execution_strategy"),
+                    "task_count": compiled.get("task_count"),
+                    "worker_count": compiled.get("worker_count"),
+                    "worker_assignments": compiled.get("worker_assignments", []),
                     "write_owners": dict(compiled.get("write_owners", {})),
                     "tasks": [{
                         "id": task["id"],
@@ -1889,6 +1962,9 @@ class Planner:
                 record["compiler_events"] = self.metrics["compiler_events"]
                 self.metrics["semantic_compiler"] = record
                 self.metrics["semantic_compiler_attempts"].append(record)
+                from .llm_trace import record_validation
+                record_validation("planner", "accepted", detail=f"Compiled {len(compiled['tasks'])} tasks.",
+                                  normalized_response=compiled)
                 return compiled
             except (UnsupportedResourceRequirement, SkillCompatibilityError, PlannerScopeError) as exc:
                 record = compiler_metrics(
@@ -1903,6 +1979,8 @@ class Planner:
                 self.metrics["semantic_compiler_attempts"].append(record)
                 raise
             except (ValueError, TypeError, PlanValidationError) as exc:
+                from .llm_trace import record_validation
+                record_validation("planner", "rejected", detail=f"{type(exc).__name__}: {exc}")
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Failed",
                     attempt_number=attempt + 1, error=exc,
@@ -1918,7 +1996,10 @@ class Planner:
                 message = str(exc)[:600]
                 affected_paths = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", message)
                 affected_ids = sorted({int(number) for number in re.findall(r"\btask-(\d+)\b", message)})
-                affected_for_repair = set(affected_ids)
+                from .plan_compiler import OverfragmentedPlan
+                consolidation = isinstance(exc, OverfragmentedPlan)
+                affected_for_repair = (set(range(1, len(value.get("tasks", [])) + 1))
+                                       if consolidation else set(affected_ids))
                 preserve_all_repair_tasks = message.startswith("Planner unsupported claim")
                 error_type = type(exc).__name__
                 diagnostic = {"type": error_type, "message": message,
@@ -1930,11 +2011,14 @@ class Planner:
                     "affected_paths": affected_paths,
                     "original_task_count": len(value.get("tasks", []))})
                 repair_payload = {
-                    "instruction": "Repair only the compiler-rejected part of this semantic plan. Return the complete semantic plan JSON.",
+                    "instruction": ("Consolidate unjustified worker tasks and update execution_strategy and "
+                                    "decomposition_reason. Return the complete semantic plan JSON."
+                                    if consolidation else
+                                    "Repair only the compiler-rejected part of this semantic plan. Return the complete semantic plan JSON."),
                     "canonical_task_spec": public_spec,
                     "previous_semantic_plan": original_for_repair,
                     "compiler_error": diagnostic,
-                    "rules": {"preserve_unaffected_tasks": True,
+                    "rules": {"preserve_unaffected_tasks": not consolidation,
                               "preserve_user_scope": True, "do_not_add_requirements": True},
                 }
                 encoded = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))

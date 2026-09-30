@@ -517,6 +517,8 @@ class _OllamaStructuredAdapter:
                      "num_predict": (model_profile(component).repair_output_tokens
                                      if repair else model_profile(component).max_output_tokens)}},
                 timeout=self.timeout_seconds, telemetry=self.last_call_metrics,
+                stage="repair" if repair else "initial",
+                structured_context=model_context,
             )
             if isinstance(response.get("_freya_transport"), dict):
                 self.last_call_metrics["transport"] = response["_freya_transport"]
@@ -842,6 +844,8 @@ class GlobalVerifier(_MeasuredModel):
         try:
             result, _ = self._validate_model_decision(output, prepared)
         except (IntegrationValidationError, TypeError, ValueError) as first_error:
+            from .llm_trace import record_validation
+            record_validation("global_verifier", "rejected", detail=f"{type(first_error).__name__}: {first_error}")
             first_diagnostics = dict(self.metrics.get("validation") or {})
             if not first_diagnostics:
                 first_diagnostics = {
@@ -879,6 +883,8 @@ class GlobalVerifier(_MeasuredModel):
                 first_diagnostics["normalized"] |= second_diagnostics["normalized"]
                 self.metrics["validation"] = first_diagnostics
             except Exception as second_error:
+                from .llm_trace import record_validation
+                record_validation("global_verifier", "rejected", detail=f"{type(second_error).__name__}: {second_error}")
                 second_diagnostics = self.metrics.get("validation") or {}
                 first_diagnostics["repair_global_verifier_status"] = second_diagnostics.get(
                     "global_verifier_status", "<invalid>")
@@ -891,6 +897,9 @@ class GlobalVerifier(_MeasuredModel):
                 raise IntegrationGenerationError(
                     "Global verifier output remained invalid after one repair: " + str(second_error)
                 ) from second_error
+        from .llm_trace import record_validation
+        record_validation("global_verifier", "accepted", detail="Global criteria validated.",
+                          normalized_response=result)
         return {**result, "metrics": dict(self.metrics), "deterministic": False,
                 "context_truncated": prepared["context_truncated"]}
 
@@ -1094,6 +1103,9 @@ class IntegrationReplanner(_MeasuredModel):
                         historical_task_ids=historical_task_ids, max_tasks=max_tasks,
                         criterion_links=candidate["criterion_links"],
                     )
+                from .llm_trace import record_validation
+                record_validation("integration_replanner", "accepted", detail="Append-only revision validated.",
+                                  normalized_response=revised)
                 return {"summary": summary, "plan": revised, "id_allocation": allocation,
                         "new_task_ids": [item["id"] for item in revised["tasks"]
                                          if item["id"] not in {task["id"] for task in current_plan["tasks"]}],
@@ -1104,6 +1116,8 @@ class IntegrationReplanner(_MeasuredModel):
                     "Integration requested an unsupported runtime resource: " + str(exc)
                 ) from exc
             except (IntegrationValidationError, TypeError, ValueError) as exc:
+                from .llm_trace import record_validation
+                record_validation("integration_replanner", "rejected", detail=f"{type(exc).__name__}: {exc}")
                 last_error = exc
         raise IntegrationGenerationError(
             "Integration replanner failed strict validation after one repair: " + str(last_error)
@@ -1193,8 +1207,13 @@ class ResultIntegrator(_MeasuredModel):
             try:
                 value = self._validate(self._json(self._call(
                     prompt, {**context, "_freya_repair": True} if index else context)), allowed)
+                from .llm_trace import record_validation
+                record_validation("result_integrator", "accepted", detail="Grounded final response validated.",
+                                  normalized_response=value)
                 return self.render(value), dict(self.metrics), False
-            except (IntegrationValidationError, TypeError, ValueError):
+            except (IntegrationValidationError, TypeError, ValueError) as exc:
+                from .llm_trace import record_validation
+                record_validation("result_integrator", "rejected", detail=f"{type(exc).__name__}: {exc}")
                 continue
             except Exception:
                 # A provider failure in presentation cannot invalidate proven work.

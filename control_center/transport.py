@@ -295,24 +295,31 @@ def model_request(request: Callable[..., dict[str, Any]], component: str,
                   method: str, url: str, body: dict[str, Any], *, timeout: float,
                   token: str = "", hard_timeout: float | None = None,
                   max_output_tokens: int | None = None,
-                  telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
+                  telemetry: dict[str, Any] | None = None,
+                  stage: str = "initial", call_id: str | None = None,
+                  prompt_name: str | None = None,
+                  structured_context: Any = None) -> dict[str, Any]:
     """Preserve injected transports while routing production calls by profile."""
-    if request is request_json:
-        try:
-            response = request_json(method, url, body, timeout=timeout, token=token,
-                                    component=component, hard_timeout=hard_timeout,
-                                    max_output_tokens=max_output_tokens)
-        except TransportError as exc:
+    from .llm_trace import trace_model_call
+    def perform() -> dict[str, Any]:
+        if request is request_json:
+            try:
+                response = request_json(method, url, body, timeout=timeout, token=token,
+                                        component=component, hard_timeout=hard_timeout,
+                                        max_output_tokens=max_output_tokens)
+            except TransportError as exc:
+                if telemetry is not None:
+                    telemetry["transport"] = exc.metrics
+                raise
             if telemetry is not None:
-                telemetry["transport"] = exc.metrics
-            raise
-        if telemetry is not None:
-            telemetry["transport"] = response.get("_freya_transport", {})
-        return response
-    kwargs: dict[str, Any] = {"timeout": timeout}
-    if token:
-        kwargs["token"] = token
-    return request(method, url, body, **kwargs)
+                telemetry["transport"] = response.get("_freya_transport", {})
+            return response
+        kwargs: dict[str, Any] = {"timeout": timeout}
+        if token:
+            kwargs["token"] = token
+        return request(method, url, body, **kwargs)
+    return trace_model_call(component, body, perform, stage=stage, call_id=call_id,
+                            prompt_name=prompt_name, structured_context=structured_context)
 
 
 def request_json(method: str, url: str, body: dict[str, Any] | None = None,

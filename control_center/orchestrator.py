@@ -31,6 +31,8 @@ from .task_spec import TaskSpecAnalyst, render_task_spec, validate_task_spec
 from .cross_task import owned_path_key
 from .cross_task import CrossTaskIntentMatcher
 from .project_state import ProjectStateManager
+from .plan_context import render_plan_context
+from .worker_assignment import occupied_workers, worker_id_for_task
 
 
 ACTIVE_DELEGATED_TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused"}
@@ -251,30 +253,31 @@ class Orchestrator(IntegrationOrchestrationMixin):
         return "\n\n".join(section for section in sections if section.strip())
 
     @staticmethod
-    def _responsibility_context(plan: dict[str, Any], task: dict[str, Any]) -> str:
-        """Show only direct plan neighbors and shared concrete paths."""
-        task_id = str(task.get("id") or "")
-        dependencies = set(task.get("depends_on") or [])
-        own_paths = set(task.get("write_targets") or task.get("owned_paths") or [])
-        related = []
-        for other in plan.get("tasks", []):
-            if not isinstance(other, dict) or other.get("id") == task_id:
-                continue
-            other_paths = set(other.get("write_targets") or other.get("owned_paths") or [])
-            relation = ("Earlier" if other.get("id") in dependencies else
-                        "Later" if task_id in (other.get("depends_on") or []) else
-                        "Related" if own_paths & other_paths else "")
-            if relation:
-                related.append((relation, other))
-        lines = ["PLAN RESPONSIBILITY CONTEXT", "Your responsibility: " +
-                 str(task.get("objective") or "")[:350]]
-        for relation, other in related[:8]:
-            paths = sorted(own_paths & set(other.get("write_targets") or other.get("owned_paths") or []))[:4]
-            lines.append(f"- {relation} {other.get('id')}: {str(other.get('objective') or '')[:250]}"
-                         + ("; shared paths: " + ", ".join(paths) if paths else ""))
-        lines.append("Complete your delegated step. Do not proactively implement work explicitly "
-                     "assigned to another plan task unless needed to make your own artifact valid or coherent.")
-        return "\n".join(lines)[:3000]
+    def _responsibility_context(plan: dict[str, Any], task: dict[str, Any],
+                                nodes: list[dict[str, Any]] | None = None) -> str:
+        """Render a bounded snapshot of the complete effective plan."""
+        return render_plan_context(plan, task, nodes)[0]
+
+    def _plan_context_for_dispatch(self, orchestration_id: str,
+                                   plan: dict[str, Any], task: dict[str, Any]) -> str:
+        try:
+            graph = self.store.get_execution_graph(orchestration_id)
+            nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+        except (KeyError, ValueError):
+            nodes = []
+        # An approved owner-scoped change and legacy delegation may be an
+        # execution step outside the immutable compiled task list. Show it as
+        # the current step in the read-only view without modifying the plan.
+        visible_plan = plan
+        if task.get("id") not in {item.get("id") for item in plan.get("tasks", [])
+                                   if isinstance(item, dict)}:
+            visible_plan = {**plan, "tasks": [*plan.get("tasks", []), task]}
+        rendered, metadata = render_plan_context(visible_plan, task, nodes)
+        self.store.add_orchestration_event(orchestration_id, {
+            "event_type": "worker.plan_context_prepared", "status": "Success",
+            "plan_task_id": task.get("id"), **metadata,
+        })
+        return rendered
 
     def _project_context_for_dispatch(self, orchestration_id: str,
                                      plan: dict[str, Any], task: dict[str, Any],
@@ -291,13 +294,6 @@ class Orchestrator(IntegrationOrchestrationMixin):
         snapshot, rendered = self.project_state.snapshot_for_dispatch(
             orchestration_id, plan, task, workspace, graph,
         )
-        self.store.add_orchestration_event(orchestration_id, {
-            "event_type": "task.responsibility_context_generated", "status": "Success",
-            "plan_task_id": task.get("id"), "related_task_count": sum(
-                1 for other in plan.get("tasks", []) if isinstance(other, dict)
-                and (other.get("id") in (task.get("depends_on") or [])
-                     or task.get("id") in (other.get("depends_on") or []))),
-        })
         return {"project_state_snapshot": snapshot}, rendered
 
     def _submit_runtime_task(self, agent_id: str, prompt: str, workspace: str | None,
@@ -839,6 +835,10 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "phase": "plan_compiler", "actor_type": "runtime",
                 "attempt": compiler.get("attempt"),
                 "task_ids": compiler.get("task_ids", []),
+                "execution_strategy": compiler.get("execution_strategy"),
+                "task_count": compiler.get("task_count"),
+                "worker_count": compiler.get("worker_count"),
+                "worker_assignments": compiler.get("worker_assignments", []),
                 "global_criteria": compiler.get("global_criteria"),
                 "duration_seconds": compiler.get("duration_seconds"),
                 "semantic_plan_schema_version": compiler.get("semantic_plan_schema_version"),
@@ -2041,7 +2041,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 f"The requester observed artifact revision {request.get('requester_observed_revision', 0)}; "
                 "inspect the current project context and read the latest file before editing.",
                 project_context,
-                self._responsibility_context(plan, task),
+                self._plan_context_for_dispatch(oid, plan, task),
             )
             with self.lock:
                 if self.store.get_orchestration(oid)["status"] != "Running":
@@ -2331,8 +2331,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
 
 
                 if recovery_target is None and evaluation_target is None:
+                    reserved_workers = occupied_workers(plan, graph.serialize())
                     for task in graph.ready_tasks():
-                        if not graph.node(task["id"]).get("selection_id"):
+                        worker_id = worker_id_for_task(plan, task["id"])
+                        if (not graph.node(task["id"]).get("selection_id")
+                                and (worker_id is None or worker_id not in reserved_workers)):
                             selection_target = task
                             break
 
@@ -2416,12 +2419,20 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 }
                 active_agents.update(item.get("agent_id") for item in active_runtime
                                      if item.get("agent_id"))
+                active_workers = occupied_workers(
+                    plan, active_nodes, include_selected_ready=False)
                 for task in graph.ready_tasks():
                     if slots <= 0:
                         break
                     node = graph.node(task["id"])
                     agent_id = node.get("selected_agent_id")
                     if not node.get("selection_id") or not agent_id:
+                        continue
+                    worker_id = worker_id_for_task(plan, task["id"])
+                    if worker_id is not None and worker_id in active_workers:
+                        graph.set_waiting_reason(
+                            task["id"], "Assigned worker is executing another task.", utcnow(),
+                        )
                         continue
                     try:
                         agent = self.store.get_agent(agent_id)
@@ -2457,7 +2468,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     )
                     execution_prompt = self._execution_prompt(
                         operational_prompt, task, node.get("attempt_prompt") or "",
-                        project_context, self._responsibility_context(plan, task),
+                        project_context, self._plan_context_for_dispatch(oid, plan, task),
                     )
                     try:
                         runtime_task = self._submit_runtime_task(
@@ -2517,12 +2528,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             pass
                         raise
                     active_agents.add(agent_id)
+                    if worker_id is not None:
+                        active_workers.add(worker_id)
                     slots -= 1
                     dispatched += 1
                     self.store.add_orchestration_event(oid, {
                         "event_type": "freya.task.dispatched", "status": runtime_task["status"],
                         "task_id": task["id"], "runtime_task_id": runtime_task["id"],
                         "agent_id": agent_id, "selection_id": node["selection_id"],
+                        "worker_id": worker_id,
                         "message": "Ready planned task was dispatched exactly once.",
                     })
                     self.store.add_orchestration_event(oid, {
@@ -2544,6 +2558,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self.wait(min(.2, max(0, deadline - self.clock())))
 
     def _run(self, oid, answers: dict[str, str] | None = None):
+        from .llm_trace import bind_llm_trace
+        with bind_llm_trace(lambda event: self.store.add_orchestration_event(oid, event)):
+            return self._run_impl(oid, answers)
+
+    def _run_impl(self, oid, answers: dict[str, str] | None = None):
         # The injected legacy decision callback retains its historical test API.
         if self.decide is not None:
             return self._run_legacy(oid)
@@ -2931,7 +2950,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         )
                         execution_prompt = self._execution_prompt(
                             operational_prompt, item, objective, project_context,
-                            self._responsibility_context(plan_snapshot, planned_context_task),
+                            self._plan_context_for_dispatch(oid, plan_snapshot, planned_context_task),
                         )
                         task = self._submit_runtime_task(
                             agent_id, execution_prompt, self._workspace_for_run(running), runtime_context,

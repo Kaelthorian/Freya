@@ -1545,7 +1545,8 @@ class TaskSpecAnalyst:
                  "stream": False, "think": False,
                  "options": {"temperature": 0, "num_ctx": self.context_window,
                              "num_predict": model_profile("task_analyst").repair_output_tokens if repair else model_profile("task_analyst").max_output_tokens}},
-                timeout=timeout)
+                timeout=timeout, stage="repair" if repair else "initial",
+                structured_context=payload)
             for target, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
                 self.metrics[target] = self.metrics.get(target, 0) + int(response.get(source) or 0)
             self.metrics["total_tokens"] = self.metrics["prompt_tokens"] + self.metrics["generated_tokens"]
@@ -1706,6 +1707,8 @@ class TaskSpecAnalyst:
             )
 
         def record_invalid(stage: str, exc: Exception, raw_response: str) -> dict[str, Any]:
+            from .llm_trace import record_validation
+            record_validation("task_analyst", "rejected", detail=f"{type(exc).__name__}: {exc}")
             diagnostic = self._contract_error(
                 exc, raw_response, bool(self.metrics.get("normalization_attempted")),
             )
@@ -1744,6 +1747,9 @@ class TaskSpecAnalyst:
                 except (ValueError, KeyError, TypeError) as repair_exc:
                     repair_error = record_invalid("repair", repair_exc, raw)
                     self.metrics["fallback_used"] = True
+                    from .llm_trace import record_validation
+                    record_validation("task_analyst", "fallback",
+                                      detail="Deterministic fallback after rejected repair.")
                     self.metrics["mode"] = "deterministic_fallback"
                     self.metrics["fallback_reason"] = self._diagnostic_message(repair_error)
                     self.metrics["fallback_error"] = self.metrics["fallback_reason"]
@@ -1770,12 +1776,19 @@ class TaskSpecAnalyst:
                 note_normalization("initial", changes)
             if self.metrics["fallback_used"]:
                 self._record_clarification_lifecycle(previous, result, [], [])
+            else:
+                from .llm_trace import record_validation
+                record_validation("task_analyst", "accepted", detail="Canonical Task Spec validated.",
+                                  normalized_response=result)
             return result
         except ClarificationCycleError:
             raise
         except Exception as exc:
             self.metrics["mode"] = "deterministic_fallback"
             self.metrics["fallback_used"] = True
+            from .llm_trace import record_validation
+            record_validation("task_analyst", "fallback",
+                              detail=f"{type(exc).__name__}: model processing failed.")
             reason = sanitize(str(exc))[:1000]
             self.metrics["fallback_reason"] = reason
             self.metrics["fallback_error"] = reason

@@ -32,6 +32,67 @@ class CriterionEvidenceMismatch(PlanValidationError):
     """A task cannot produce the minimum evidence required by its criterion."""
 
 
+class OverfragmentedPlan(PlanValidationError):
+    """Delegation cost is not justified by the semantic task graph."""
+
+
+def _validate_decomposition(plan: dict[str, Any], tasks: list[dict[str, Any]],
+                            dependencies: list[set[int]], catalog: RuntimeResourceCatalog) -> None:
+    """Apply the new strategy contract without reinterpreting older saved plans."""
+    fields = {"task_complexity", "execution_strategy", "decomposition_reason"}
+    if not fields.intersection(plan):
+        return
+    if not fields <= plan.keys():
+        raise PlanValidationError("Semantic plan must include all decomposition decision fields.")
+    complexity = plan["task_complexity"]
+    strategy = plan["execution_strategy"]
+    reason = plan["decomposition_reason"]
+    if complexity not in {"simple", "multi_step", "complex"}:
+        raise PlanValidationError("Invalid task_complexity.")
+    if strategy not in {"single_worker", "multi_worker"}:
+        raise PlanValidationError("Invalid execution_strategy.")
+    if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 1000:
+        raise PlanValidationError("decomposition_reason must explain the worker decision.")
+    count = len(tasks)
+    # Semantic tasks are checkpoints, not worker allocations. A cohesive chain
+    # can contain many tasks and still occupy one execution slot.
+    if strategy == "single_worker" or count == 1:
+        _compiler_event(catalog, "plan_compiler.decomposition_validated", task_count=count,
+                        task_complexity=complexity, execution_strategy=strategy)
+        return
+    review_or_qa = any(task.get("task_kind") in {"review", "testing"} for task in tasks)
+    implementation_only = all(task.get("task_kind") in {
+        "file_creation", "program_creation", "code_change", "general"
+    } for task in tasks)
+    linear = all(dependencies[index] == {index - 1} for index in range(1, count))
+    same_targets = any(set(left.get("write_targets", [])) & set(right.get("write_targets", []))
+                       for left, right in zip(tasks, tasks[1:]))
+    stems = [{str(path).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+              for path in task.get("write_targets", [])} for task in tasks]
+    coupled_pair = (count == 2 and linear and complexity != "complex" and
+                    (bool(stems[0] & stems[1]) or
+                     _responsibility_similarity(tasks[0], tasks[1]) >= 0.6))
+    vague = re.search(r"(?i)(multiple? files?|several files?|many steps?|different operations?|"
+                      r"html.?css.?js|acceptance criteria|more than one file)", reason)
+    concrete = re.search(r"(?i)(independent (?:audit|review|verification)|controlled qa|"
+                         r"separate subsystems?|distinct (?:interface|dependency|speciali[sz])|"
+                         r"parallel (?:implementation|development))", reason)
+    overfragmented = bool((vague and not concrete) or
+                          (implementation_only and not review_or_qa and (
+                              complexity == "simple" or same_targets or
+                              coupled_pair or
+                              (count >= 3 and linear and complexity != "complex"))))
+    if overfragmented:
+        _compiler_event(catalog, "plan_compiler.overfragmented", task_count=count,
+                        task_complexity=complexity, execution_strategy=strategy,
+                        reason="delegation_cost_exceeds_benefit")
+        raise OverfragmentedPlan(
+            "OverfragmentedPlan: cohesive implementation tasks should be consolidated; "
+            "reserve separate workers for a concrete dependency, specialist, QA, audit or subsystem boundary.")
+    _compiler_event(catalog, "plan_compiler.decomposition_validated", task_count=count,
+                    task_complexity=complexity, execution_strategy=strategy)
+
+
 def _dependency_indexes(tasks: list[dict[str, Any]], keys: list[str]) -> list[set[int]]:
     """Resolve semantic dependency keys once for structural compiler checks."""
     result: list[set[int]] = []
@@ -570,6 +631,7 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
             raise PlanValidationError("Semantic task references are ambiguous.")
         keys.append(key)
     dependency_indexes = _dependency_indexes(raw_tasks, keys)
+    _validate_decomposition(value, raw_tasks, dependency_indexes, resource_catalog)
     preliminary_resources = [
         compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
         for item in raw_tasks
@@ -653,6 +715,9 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
         compiled = validate_plan({"goal": spec["objective"],
                           "summary": str(value.get("summary") or spec["objective"]).strip(),
                           "complexity": "simple" if len(tasks) == 1 else "multi_step",
+                          **({field: value[field] for field in
+                              ("task_complexity", "execution_strategy", "decomposition_reason")
+                              if field in value}),
                           "tasks": tasks, "write_owners": write_owners,
                           "success_criteria": global_criteria,
                           "criterion_links": links})
@@ -661,6 +726,12 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
             _compiler_event(resource_catalog, "plan_compiler.ownership_conflict",
                             message=str(exc)[:600])
         raise
+    _compiler_event(resource_catalog, "plan_compiler.worker_assignment_created",
+                    strategy=compiled.get("execution_strategy"),
+                    task_count=compiled.get("task_count"),
+                    worker_count=compiled.get("worker_count"),
+                    worker_assignments=compiled.get("worker_assignments", []))
     _compiler_event(resource_catalog, "plan_compiler.completed",
-                    task_count=len(compiled["tasks"]))
+                    task_count=len(compiled["tasks"]),
+                    worker_count=compiled.get("worker_count"))
     return compiled

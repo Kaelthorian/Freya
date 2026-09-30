@@ -181,9 +181,19 @@ class CrossTaskIntentMatcher:
             "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 160},
         }
         response = model_request(self.request, "evaluator", "POST", self.endpoint + "/api/chat", payload,
-                                timeout=self.timeout_seconds, hard_timeout=self.timeout_seconds)
+                                timeout=self.timeout_seconds, hard_timeout=self.timeout_seconds,
+                                prompt_name="intent_matcher",
+                                structured_context={"approved_intent": approved_intent,
+                                                    "requested_intent": requested_intent})
         message = response.get("message") if isinstance(response, dict) else None
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             raise CrossTaskRequestError("Intent matcher returned no response.")
-        result = json.loads(message["content"])
-        return validate_intent_match(result) | {"method": "llm"}
+        from .llm_trace import record_validation
+        try:
+            result = validate_intent_match(json.loads(message["content"]))
+        except (ValueError, TypeError) as exc:
+            record_validation("intent_matcher", "rejected", detail=f"{type(exc).__name__}: {exc}")
+            raise
+        record_validation("intent_matcher", "accepted", detail="Intent equivalence validated.",
+                          normalized_response=result)
+        return result | {"method": "llm"}
