@@ -2375,7 +2375,9 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
 
 def process_main(task: dict[str, Any], project_root: str, outbox: Any,
                  pause_event: Any, ready_event: Any, go_event: Any,
-                 control_queue: Any = None) -> None:
+                 control_queue: Any = None, settings: Any = None) -> None:
+    from .settings import initialize_settings
+    initialize_settings(settings)
     if os.name != "nt":
         os.setsid()
     # Parent assigns the Windows Job Object before tools may start subprocesses.

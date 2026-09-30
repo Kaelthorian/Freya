@@ -570,10 +570,19 @@ hash, size, duration, status and available token counts. With
 `FREYA_DEBUG_LLM_PROMPTS=true`, they additionally contain a redacted structured
 `request_body`, component `structured_context`, `raw_response`, best-effort
 `parsed_response` and truncation metadata. `FREYA_DEBUG_PROMPT_MAX_CHARS`
-limits retained value characters (1000-200000).
+limits retained value characters (1000-4000000; default 4000000). It is loaded
+with the flag once at startup from the process environment, then explicitly
+propagated to workers. `.env` files are not loaded. The stdout startup event
+`freya.config.loaded` reports the effective boolean and source; it is independent
+of orchestration/task log streams.
 `llm.validation` events use the same call ID for Task Analyst and Planner
 contract decisions and other model-backed validators. With debug enabled,
-they include the redacted normalized result or validation error; otherwise
+they include the redacted normalized result or validation error; rejected events
+include `error_type`, `validation_message`, `raw_response` when available,
+`contract_name`, `contract_version`, `validation_stage` and `call_stage`. The
+`raw_response` is preparse model message content, while `parsed_response` is a
+best-effort JSON decode and `normalized_response` is the validator's result.
+Otherwise
 they keep status and error type only. Repair calls carry
 `repair_of_llm_call_id` to link them to the rejected call. Debug content is
 persisted and returned by log APIs, so

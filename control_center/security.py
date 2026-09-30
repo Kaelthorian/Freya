@@ -31,7 +31,8 @@ def sanitize(value: Any, *, max_string_chars: int = 24000) -> Any:
     """Keep metric names/counts and env references, remove credentials and thinking."""
     if isinstance(value, dict):
         if value.get("event_type") in {"llm.call", "llm.validation"} and value.get("debug_prompts_enabled") is True:
-            max_string_chars = 200000
+            from .settings import MAX_DEBUG_CHARS
+            max_string_chars = MAX_DEBUG_CHARS
         clean = {}
         for key, item in value.items():
             name = str(key)

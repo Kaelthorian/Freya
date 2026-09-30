@@ -11,6 +11,7 @@ from .api import Application
 from .http import ControlServer
 from .runtime import Runtime
 from .storage import Store
+from .settings import initialize_settings, report_startup_config
 from .orchestrator import Orchestrator
 from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
                       DEFAULT_PLANNER_TIMEOUT_SECONDS, OllamaPlanner, Planner)
@@ -139,6 +140,8 @@ def main():
             or not 1 <= args.max_integration_rounds <= 10
             or not 1 <= args.max_integration_model_calls <= 100):
         parser.error("Recovery or integration limits are outside their supported ranges.")
+    settings = initialize_settings()
+    report_startup_config(settings)
     lock = InstanceLock(data_dir)
     runtime = None
     server = None

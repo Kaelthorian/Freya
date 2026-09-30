@@ -49,6 +49,22 @@ The browser never calls Ollama directly. The API validates agent definitions;
 the worker revalidates the immutable task snapshot before every tool call. The
 parent process alone writes execution events and state to SQLite.
 
+Prompt-debug configuration lives in the immutable `settings.Settings` startup
+snapshot, independent of per-agent configuration and capability policy. The CLI
+loads only the two named debug environment variables before constructing Runtime
+or any model component, and prints a body-free `freya.config.loaded` event to
+stdout. There is no dotenv loader. Runtime passes the same snapshot explicitly
+through multiprocessing spawn; the worker installs it before execution. All
+model adapters share `llm_trace.py` through `transport.model_request`; no component
+reads the flag independently. Changing the environment requires a server restart.
+Tracing observes the provider's effective streamed request, redacted preparse
+content and best-effort JSON; existing validators report normalized results.
+Debug rejection events correlate contract versions, rule messages and the last
+call's redacted raw content. The evidence-contract validator has a shared
+observational wrapper that re-raises the original exception unchanged. Debug
+never changes model input, output limits, tool policy or evaluation decisions.
+See [Prompt debug diagnostics](DEBUG_LLM_PROMPTS.md) for setup and capture limits.
+
 ```text
 browser → HTTP API → SQLite
              ↓

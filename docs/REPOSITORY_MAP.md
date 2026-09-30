@@ -37,6 +37,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── sandbox.py            disposable workspace copy and restricted Docker execution
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── llm_trace.py          redacted, bounded model-call tracing and debug prompt capture
+│   ├── settings.py           immutable startup observability settings, boolean parsing and spawn snapshot
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation

@@ -11,6 +11,7 @@ from typing import Any, Callable
 from .config import validate_endpoint
 from .security import sanitize
 from .transport import model_profile, model_request, request_json
+from .llm_trace import observe_validation
 
 
 EVALUATOR_VERSION = 8
@@ -1166,6 +1167,7 @@ class Evaluator:
         return records
 
     @staticmethod
+    @observe_validation("evaluator", validation_stage="evidence_contract")
     def _validate_semantic_evidence_claims(decision: dict[str, Any],
                                            context: dict[str, Any]) -> None:
         """Reject an UNKNOWN rationale that denies visible objective content."""

@@ -84,6 +84,21 @@ def provider_health(origin: str) -> dict[str, Any]:
             "retry_after_seconds": round(remaining, 3)}
 
 
+def _chat_payload(body: dict[str, Any], component: str,
+                  max_output_tokens: int | None) -> dict[str, Any]:
+    """The provider's effective body, shared with tracing without mutating callers."""
+    profile = MODEL_PROFILES.get(component, MODEL_PROFILES["worker"])
+    payload = dict(body)
+    payload["stream"] = True
+    options = dict(payload.get("options") or {})
+    if max_output_tokens is not None:
+        options["num_predict"] = max_output_tokens
+    elif not isinstance(options.get("num_predict"), int) or options["num_predict"] < 0:
+        options["num_predict"] = profile.max_output_tokens
+    payload["options"] = options
+    return payload
+
+
 def _chat_request(url: str, body: dict[str, Any], *, token: str,
                   component: str, timeout: float | None, hard_timeout: float | None,
                   max_output_tokens: int | None) -> dict[str, Any]:
@@ -127,16 +142,9 @@ def _chat_request(url: str, body: dict[str, Any], *, token: str,
         error.metrics = dict(metrics)
         raise error
 
-    payload = dict(body)
     # Legacy adapters and injected test transports retain their request shape;
     # production chat always streams here and reconstructs that same shape.
-    payload["stream"] = True
-    options = dict(payload.get("options") or {})
-    if max_output_tokens is not None:
-        options["num_predict"] = max_output_tokens
-    elif not isinstance(options.get("num_predict"), int) or options["num_predict"] < 0:
-        options["num_predict"] = profile.max_output_tokens
-    payload["options"] = options
+    payload = _chat_payload(body, component, max_output_tokens)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     path = parsed.path or "/"
     if parsed.query:
@@ -318,7 +326,10 @@ def model_request(request: Callable[..., dict[str, Any]], component: str,
         if token:
             kwargs["token"] = token
         return request(method, url, body, **kwargs)
-    return trace_model_call(component, body, perform, stage=stage, call_id=call_id,
+    trace_body = (_chat_payload(body, component, max_output_tokens)
+                  if request is request_json and method == "POST" and urlsplit(url).path == "/api/chat"
+                  else body)
+    return trace_model_call(component, trace_body, perform, stage=stage, call_id=call_id,
                             prompt_name=prompt_name, structured_context=structured_context)
 
 

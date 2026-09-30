@@ -625,14 +625,41 @@ and `OLLAMA_INVALID_RESPONSE`; `timeout_type` identifies connect, inactivity,
 or hard. Connection refusal opens a five-second provider circuit. A slow but
 active generation leaves it healthy. The `freya.ollama` logger writes one JSON
 metadata record per chat call and excludes prompts, responses and credentials.
-`FREYA_DEBUG_LLM_PROMPTS=true` additionally writes `llm.call` events with the
-redacted structured request body and component context, raw preparse response,
-best-effort parsed JSON,
-prompt version, stage, `llm_call_id`, token counts and truncation metadata.
-`FREYA_DEBUG_PROMPT_MAX_CHARS` sets the per-field value budget (default 20000,
-clamped to 1000-200000). Leave debug off for ordinary runs: logs and their API
-exports may contain private task content even after redaction. `llm.validation`
-events correlate the Task Analyst and semantic compiler decisions with the call.
+Set the flag in the same PowerShell process that starts the server, then restart:
+
+```powershell
+$env:FREYA_DEBUG_LLM_PROMPTS = "true"
+python -m control_center --port 8765 --workers 2 --data-dir .\data
+```
+
+Startup prints `freya.config.loaded` with `debug_llm_prompts`, `source`
+(`environment` or `default`), provider and capture budget, followed by
+`Debug LLM prompts: ENABLED` or `DISABLED`. This event is on server stdout;
+it is not attached to an orchestration or stored in the task log API.
+`settings.Settings` loads once at startup and is explicitly passed to spawned
+workers. All model components share that snapshot. Changing the variable in
+another terminal or after startup does not reconfigure a running server.
+Freya does not load `.env` or `.env.local`; the precedence is process environment
+then default. No dotenv dependency is needed. Unset/empty/false/0/no/off are false;
+true/1/yes/on are true, ignoring case and surrounding whitespace. Other strings
+fail closed to false. Debug defaults to false.
+
+Debug adds the redacted effective structured `request_body`, component
+`structured_context`, `raw_response`, best-effort `parsed_response`, prompt
+version, stage, `llm_call_id`, token counts and truncation metadata to `llm.call`.
+The structured request includes messages, tools, format and effective stream/
+output options. `llm.validation` distinguishes normalized results from raw
+content, and includes error type, validation message, contract name/version,
+validation stage and call stage for rejections. Repairs link the same component's
+previous call using `repair_of_llm_call_id`.
+`FREYA_DEBUG_PROMPT_MAX_CHARS` sets the per-field value budget (default 4000000,
+clamped to 1000-4000000). The larger default avoids the old 20000-character
+capture and 200000-character persistence ceilings. Truncation remains explicit
+for oversized requests or a lower configured budget. Leave debug off for ordinary
+runs: logs and their API exports may contain private task content even after
+redaction. No debug setting changes model behavior or permissions.
+See [Prompt debug diagnostics](DEBUG_LLM_PROMPTS.md) for investigation evidence,
+event examples, regression steps and validation limits.
 The deterministic Agent Selector does not call a model.
 If a call ends with `stop_reason=stop` but Analyst falls back or Planner fails,
 inspect the schema/validation error: the provider completed generation, so a

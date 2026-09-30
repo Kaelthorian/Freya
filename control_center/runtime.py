@@ -90,6 +90,8 @@ class Runtime:
         self.project_root = Path(project_root).resolve()
         self.max_workers = max_workers
         self.context = multiprocessing.get_context("spawn")
+        from .settings import get_settings
+        self.settings = get_settings()
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.closed = False
@@ -315,7 +317,8 @@ class Runtime:
         control_queue = self.context.Queue()
         pause_event, ready_event, go_event = self.context.Event(), self.context.Event(), self.context.Event()
         process = self.context.Process(target=process_main,
-                                       args=(task, str(self.project_root), outbox, pause_event, ready_event, go_event, control_queue),
+                                       args=(task, str(self.project_root), outbox, pause_event, ready_event, go_event, control_queue,
+                                             self.settings),
                                        name="agent-task-" + task["id"][:12], daemon=False)
         started = time.monotonic()
         process.start()
