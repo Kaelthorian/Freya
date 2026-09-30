@@ -32,7 +32,10 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations, criterion_links=No
         catalog[f"evaluation:{eid}"] = {"type": "evaluation_context", "task_id": tid}
         evaluation = evaluations[eid]
         declared = {criterion_key(item) for item in task_by_id[tid]["success_criteria"]}
-        local = evaluation.get("criteria") or []
+        all_decisions = evaluation.get("criteria") or []
+        local = [item for item in all_decisions if isinstance(item, dict)
+                 and item.get("origin_type") != "global"
+                 and (item.get("origin_task_id") is None or item.get("origin_task_id") == tid)]
         satisfied = {criterion_key(item.get("criterion", "")) for item in local
                      if isinstance(item, dict) and item.get("status") == "satisfied"}
         aligned = {}
@@ -54,7 +57,7 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations, criterion_links=No
         if failed or unavailable:
             continue
         evidence_index = 0
-        for decision in local:
+        for decision in all_decisions:
             if not isinstance(decision, dict):
                 continue
             key = criterion_key(decision.get("criterion", ""))
@@ -62,9 +65,28 @@ def build_proof_metadata(criteria, tasks, nodes, evaluations, criterion_links=No
                 evidence_index += 1
                 if evidence_index > 20:
                     break
-                if key not in aligned or not value or decision.get("status") != "satisfied":
+                if not value or decision.get("status") != "satisfied":
                     continue
                 ref = f"evidence:{eid}:{evidence_index}"
+                if decision.get("origin_type") == "global":
+                    global_id = decision.get("criterion_id")
+                    global_key = global_by_id.get(str(global_id))
+                    if global_key not in proofs:
+                        continue
+                    if ref not in catalog:
+                        catalog[ref] = {
+                            "type": "evaluation_evidence", "worker_id": evaluation.get("worker_id"),
+                            "criterion": key, "global_criterion_ids": [],
+                            "criterion_status": "satisfied",
+                        }
+                    catalog[ref]["global_criterion_ids"].append(global_id)
+                    proofs[global_key].append(ref)
+                    continue
+                if (decision.get("origin_task_id") is not None
+                        and decision.get("origin_task_id") != tid):
+                    continue
+                if key not in aligned:
+                    continue
                 for global_id, global_key, local_id in aligned[key]:
                     if any(catalog[old]["type"] == "evaluation_evidence" for old in proofs[global_key]):
                         continue

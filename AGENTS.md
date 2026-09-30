@@ -61,8 +61,10 @@ Ollama and allowlisted tools → selected agent workspace.
 - Diagnose terminal task-graph failures from bounded, sanitized persisted logs only.
   The post-failure pass is tool-free, runs once, cites supplied log IDs, and must
   never re-execute work, grant capabilities, or reopen a terminal state.
-- Treat Runtime `Success` as technical completion only; unlock dependencies and
-  emit semantic task success only after the evaluator accepts required evidence.
+- Treat Runtime `Success` as technical completion only. Persist each Task as
+  `runtime_success` and release its DAG dependents; once every Task assigned to
+  that Worker reaches `runtime_success`, evaluate the Worker Assignment once.
+  Only accepted Worker evidence enters global integration or orchestration success.
 - Keep Python support at 3.10+ and avoid runtime dependencies unless setup and
   documentation are updated.
 

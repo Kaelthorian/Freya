@@ -111,8 +111,9 @@ rejected Semantic Plan and structured diagnostics. Local task checks and global
 plan checks are kept separate.
 
 To validate runtime consumption of compiled Worker assignments, including
-stable identity, per-task tools, DAG gating, parallel Workers, recovery and
-seven-task single-Worker scheduling, run:
+stable identity, per-task tools, technical DAG gating, parallel Workers,
+origin-aware recovery, read-only evidence gathering, evidence provenance,
+single-Worker global-proof reuse, and seven-task/one-evaluation scheduling, run:
 
 ```powershell
 python -m unittest tests.test_worker_assignments -v
@@ -261,7 +262,10 @@ and this simple request does not add a code-audit node.
 For file-only implementation criteria, the worker also finishes immediately
 after a matching read-back of the new artifact.
 
-Semantic evaluation has separate local-model configuration:
+Semantic evaluation has separate local-model configuration. The Evaluator runs
+once after all active Tasks assigned to one Worker reach `runtime_success`; it
+receives their bounded evidence with Task, Runtime Task and Worker provenance.
+Every assigned Task node references that one immutable evaluation.
 
 ```powershell
 python -m control_center --evaluator-model qwen2.5-coder:7b `
@@ -285,10 +289,11 @@ unspecified. The Planner chooses implementation strategy from the ready Task
 Spec; a clarification is asked only when a missing decision changes the product
 rather than its implementation.
 
-For each non-accepted evaluation, `freya.evaluation.completed` includes the
-validated decision by criterion and a bounded summary of the exact task and
-verification evidence shown to the evaluator. `GET /api/logs` exposes the same
-event output. Structured final responses receive one repair attempt even when
+For each non-accepted Worker evaluation, `worker.evaluation.completed` and the
+compatibility `freya.evaluation.completed` event include the validated
+criterion decisions, origin Task IDs and a bounded summary of the assignment
+evidence shown to the evaluator. `GET /api/logs` exposes the same event output.
+Structured final responses receive one repair attempt even when
 the original answer is prose; if normalization is needed, `task.result_contract`
 stores a sanitized response preview, validation error, repair outcome and
 fallback status. A failed format repair is diagnostic and does not itself
@@ -297,9 +302,11 @@ commands are accepted deterministically.
 
 The semantic Evaluator input is assembled in `Evaluator._semantic_context`:
 linked `workspace_diff`, `file_readback`, `file_content_match` and test records
-carry bounded content beside the unresolved criterion. A short diff remains
-complete; large excerpts set `content_truncated`. The snapshot returned by
-`Evaluator.evaluate` still contains the separate full bounded evidence catalog.
+from any Task in the same Worker Assignment carry bounded content beside the
+unresolved criterion. `worker_context` lists each Task's objective, criteria
+and Runtime outcome. A short diff remains complete; large excerpts set
+`content_truncated`. The snapshot returned by `Evaluator.evaluate` still
+contains the separate full bounded evidence catalog.
 
 An identical write alone still does not populate the current-attempt read map
 and cannot satisfy an unrelated criterion. For compiled Worker assignments,
@@ -323,9 +330,11 @@ python -m control_center --recovery-model qwen2.5-coder:7b `
 The recovery endpoint remains loopback-only. Invalid JSON gets at most one repair
 without exceeding the total model-call budget. The orchestration wall-clock deadline
 is rechecked after each recovery or replanning call before more work starts.
-Use `--recovery-offline` for model-free deterministic behavior: same-agent
-retry for `needs_revision`/`blocked`, a new dynamic agent variant for `rejected`,
-and fail for evaluator errors. Same-agent retry reuses the exact generated ID;
+Use `--recovery-offline` for model-free deterministic behavior: a blocked
+evaluation with missing evidence requests a same-assignment read-only observer
+when one exists; otherwise `needs_revision`/`blocked` use the configured retry
+policy, `rejected` requests a new dynamic agent variant, and evaluator errors
+fail. Same-agent retry reuses the exact generated ID;
 different-agent retry creates a new identity/Skill combination while preserving
 the same task-derived capability ceiling. Every retry creates a persisted attempt
 and reruns Agent Selector and capability-policy checks. Recovery never grants capabilities or
@@ -656,10 +665,13 @@ local end-to-end run.
   idempotent `freya.dynamic_agent.archived` event records cleanup.
 - A planner timeout or invalid repaired response leaves the orchestration Failed;
   inspect `planning_metrics` and `freya.planning.failed` on the run.
-- A Runtime task `Success` means execution finished technically. Its graph node
-  remains `evaluating` until semantic evidence is accepted; failed, missing or
-  contradictory evidence fails closed. Inspect the orchestration evaluations
-  endpoint and `freya.evaluation.*` events.
+- A Runtime Task `Success` means execution finished technically and its node
+  enters `runtime_success`, which releases DAG dependents. The Evaluator waits
+  until every active Task assigned to that Worker is `runtime_success`; one
+  accepted evaluation is then shared by those nodes. Failed criteria enter
+  recovery at their originating Task. Inspect `worker_id` and
+  `evaluated_task_ids` at the evaluations endpoint and the
+  `worker.evaluation.*` events.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
 - `run_command` is allowlisted and uses argv without a shell. Agent code runs

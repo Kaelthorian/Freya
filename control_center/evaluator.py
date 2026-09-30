@@ -13,7 +13,7 @@ from .security import sanitize
 from .transport import model_profile, model_request, request_json
 
 
-EVALUATOR_VERSION = 7
+EVALUATOR_VERSION = 8
 EVALUATION_STATUSES = {"accepted", "needs_revision", "rejected", "blocked"}
 CRITERION_STATUSES = {"satisfied", "partial", "unsatisfied", "unknown"}
 RECOMMENDED_ACTIONS = {"accept", "revise", "reject", "gather_evidence"}
@@ -32,7 +32,7 @@ MAX_RESULT_CHARS = 12_000
 MAX_VERIFICATION_OUTPUT_CHARS = 4_000
 MAX_SUMMARY_CHARS = 4_000
 MAX_REASON_CHARS = 2_000
-MAX_LIST_ITEMS = 20
+MAX_LIST_ITEMS = 100
 MAX_LIST_TEXT_CHARS = 1_000
 MAX_EVIDENCE_TEXT_CHARS = 2_000
 MAX_STRUCTURED_EVIDENCE_CHARS = 48_000
@@ -201,6 +201,7 @@ def normalize_execution_evidence(execution_result: dict[str, Any],
         if isinstance(raw.get("change_type"), str):
             record["change_type"] = clip(raw["change_type"], 100)
         for key in ("tool", "capability", "event_id", "timestamp", "evidence_id", "result",
+                    "source_task_id", "source_runtime_task_id", "worker_id",
                     "pattern", "condition", "content_sha256", "error_class"):
             value = raw.get(key)
             if isinstance(value, str) and value:
@@ -586,7 +587,8 @@ class Evaluator:
                     "output": clip(item.get("output", ""), MAX_VERIFICATION_OUTPUT_CHARS),
                 }
                 for key in ("type", "tool", "symbol", "source", "capability", "event_id",
-                            "evidence_id", "criterion_id", "condition", "pattern",
+                            "evidence_id", "criterion_id", "source_task_id",
+                            "source_runtime_task_id", "worker_id", "timestamp", "condition", "pattern",
                             "content_sha256"):
                     if isinstance(item.get(key), str):
                         bounded_item[key] = clip(item[key], 100)
@@ -681,11 +683,17 @@ class Evaluator:
                 "error": clip(runtime_task.get("error", ""), 2_000),
                 "actions": bounded_records(result.get("actions"), (
                     "tool", "arguments", "capability", "policy_decision", "success",
-                    "changed", "already_satisfied", "error_class",
+                    "changed", "already_satisfied", "error_class", "event_id", "timestamp",
+                    "source_task_id", "source_runtime_task_id", "worker_id",
                 )),
-                "artifacts": bounded_records(result.get("artifacts"), ("path", "change_type")),
-                "workspace_diffs": bounded_records(result.get("workspace_diffs"),
-                                                   ("path", "change_type")),
+                "artifacts": bounded_records(result.get("artifacts"), (
+                    "path", "change_type", "source_task_id", "source_runtime_task_id",
+                    "worker_id", "timestamp",
+                )),
+                "workspace_diffs": bounded_records(result.get("workspace_diffs"), (
+                    "path", "change_type", "source_task_id", "source_runtime_task_id",
+                    "worker_id", "timestamp",
+                )),
                 "already_satisfied_candidate": bounded_candidate,
                 "verification": {
                     key: bool(verification.get(key)) for key in
@@ -699,7 +707,11 @@ class Evaluator:
             "evidence_by_criterion": normalized_evidence["by_criterion"],
             "global_evidence_ids": normalized_evidence["global"],
             "evidence_associations": normalized_evidence["associations"],
+            "worker_evidence_pool": normalized_evidence["records"],
         }
+        worker_context = planned_task.get("worker_context")
+        if isinstance(worker_context, dict):
+            context["worker_context"] = sanitize(worker_context)
         context["context_truncated"] = truncated
         context["structured_evidence_truncated"] = normalized_evidence["count_truncated"] or any(
             isinstance(items, list) and len(items) > MAX_LIST_ITEMS for items in (
@@ -727,6 +739,7 @@ class Evaluator:
             },
             "evidence_by_criterion": [],
             "global_evidence": [],
+            "worker_context": bounded.get("worker_context", {}),
             "context_truncated": bool(bounded.get("structured_evidence_truncated")),
         }
         context["planned_task"]["success_criteria"] = unresolved
@@ -751,6 +764,7 @@ class Evaluator:
             record = {key: item[key] for key in (
                 "id", "type", "source", "collection", "status", "check", "path",
                 "change_type", "tool", "capability", "event_id", "timestamp",
+                "source_task_id", "source_runtime_task_id", "worker_id",
                 "content_sha256", "condition", "pattern", "match", "exit_code", "command",
                 "content_truncated",
             ) if key in item}
@@ -948,6 +962,12 @@ class Evaluator:
                                and item.get("change_type") == "created"
                                for item in runtime.get(field, [])):
                             evidence_types.append(label)
+                    candidate = runtime.get("already_satisfied_candidate") or {}
+                    for observation in candidate.get("artifact_observations", []):
+                        if (isinstance(observation, dict)
+                                and Evaluator._path_key(observation.get("path")) == key
+                                and observation.get("change_type") not in {"deleted", "removed"}):
+                            evidence_types.append("already_satisfied.observation:" + path)
                     if any(item.get("status", "").casefold() == "passed"
                            and Evaluator._path_key(item.get("path") or
                                str(item.get("check", "")).removeprefix("filesystem:read_file:")) == key
@@ -1351,12 +1371,15 @@ class Evaluator:
                 "unknown. Absence of deterministic verification evidence is not by itself failure. "
                 "evidence_by_criterion contains stable criterion IDs and the actual bounded evidence "
                 "records, including available diff, read-back and test output. Inspect their content. "
-                "global_evidence is not automatically relevant: include a "
-                "global record only when its path/content/result directly bears on the criterion. Prefer "
-                "test results, real read-back, workspace diff content, and tool outcomes over agent text. "
-                "A file creation proves presence only, never semantic correctness. A diff/read-back with "
-                "relevant content is evidence to assess, not an automatic pass. Do not call relevant, "
-                "sufficient objective evidence unknown merely because verification flags are unset. "
+                "global_evidence is not automatically relevant: include a global record only when its "
+                "path/content/result directly bears on the criterion. Prefer test results, real read-back, "
+                "workspace diff content, and tool outcomes over agent text. A file creation proves presence "
+                "only, never semantic correctness. A diff/read-back with relevant content is evidence to "
+                "assess, not an automatic pass. Do not call relevant, sufficient objective evidence unknown "
+                "merely because verification flags are unset. Evidence produced by another Task in the same "
+                "Worker Assignment may support a criterion when its content directly proves that criterion. "
+                "Check source_task_id and worker_id to preserve provenance. Keep criterion origin_task_id and "
+                "criterion_id traceable in the stored result. "
                 "Do not infer tests, builds or commands passed without objective execution evidence. "
                 "A content_truncated record may omit required facts; use unknown when the visible "
                 "excerpt cannot establish the criterion. Never claim a diff or read-back is absent "

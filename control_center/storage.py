@@ -31,6 +31,7 @@ from .tools import argument_summary
 from .cross_task import (CrossTaskRequestError, normalize_owned_path,
                          normalize_owned_paths, owned_path_key,
                          validate_cross_task_intent)
+from .worker_assignment import worker_assignment_map
 
 
 TASK_STATUSES = {"Queued", "Running", "WaitingForApproval", "Paused", "Success", "Failed", "Cancelled"}
@@ -116,6 +117,15 @@ class Store(IntegrationStoreMixin):
                 if name not in node_columns:
                     connection.execute(
                         f"ALTER TABLE orchestration_task_nodes ADD COLUMN {name} {definition}"
+                    )
+            evaluation_columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(orchestration_evaluations)"
+            )}
+            for name, definition in (("worker_id", "TEXT"),
+                                     ("evaluated_task_ids_json", "TEXT NOT NULL DEFAULT '[]'")):
+                if name not in evaluation_columns:
+                    connection.execute(
+                        f"ALTER TABLE orchestration_evaluations ADD COLUMN {name} {definition}"
                     )
             for name, definition in (("recovery_action_id", "TEXT"),
                                      ("attempt_prompt", "TEXT NOT NULL DEFAULT ''"),
@@ -713,6 +723,10 @@ class Store(IntegrationStoreMixin):
                 "SELECT * FROM orchestration_evaluations WHERE orchestration_id=? "
                 "ORDER BY created_at,id", (oid,),
             )]
+            result["workers"] = [self._worker_state(x) for x in c.execute(
+                "SELECT * FROM orchestration_workers WHERE orchestration_id=? ORDER BY worker_id",
+                (oid,),
+            )]
             result["attempts"] = [dict(x) for x in c.execute(
                 "SELECT * FROM orchestration_execution_attempts WHERE orchestration_id=? "
                 "ORDER BY created_at,id", (oid,),
@@ -1081,6 +1095,7 @@ class Store(IntegrationStoreMixin):
         evaluation = _load(item.pop("evaluation_json")) or {}
         item["metrics"] = _load(item.pop("metrics_json")) or {}
         snapshot = _load(item.pop("snapshot_json")) or {}
+        item["evaluated_task_ids"] = _load(item.pop("evaluated_task_ids_json", "[]")) or []
         item["context_truncated"] = bool(item["context_truncated"])
         item["deterministic"] = bool(item["deterministic"])
         for field in ("confidence", "criteria", "issues", "missing_evidence",
@@ -1164,6 +1179,7 @@ class Store(IntegrationStoreMixin):
     def initialize_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict:
         """Atomically create exactly one durable node for every planned task."""
         now = utcnow()
+        assignments = None
         with self._connection(write=True) as c:
             run = c.execute(
                 "SELECT status,plan_json FROM orchestration_runs WHERE id=?", (oid,),
@@ -1174,6 +1190,12 @@ class Store(IntegrationStoreMixin):
                 raise ValueError("Execution graph can only be initialized for a planned run.")
             plan = validate_plan(_load(run["plan_json"]))
             tasks = plan["tasks"]
+            if "worker_assignments" in plan:
+                worker_assignment_map(plan)
+                assignments = list(plan["worker_assignments"])
+            else:
+                assignments = [{"worker_id": task["id"], "task_ids": [task["id"]]}
+                               for task in tasks]
             by_id = {node.get("plan_task_id"): node for node in nodes}
             if len(by_id) != len(nodes) or set(by_id) != {task["id"] for task in tasks}:
                 raise ValueError("Execution graph nodes must match planned tasks exactly once.")
@@ -1196,6 +1218,7 @@ class Store(IntegrationStoreMixin):
                     (oid, task["id"], index, _dump(task["depends_on"]), expected_state,
                      sanitize(task["objective"]), now),
                 )
+        self.ensure_worker_states(oid, assignments or [])
         return self.get_execution_graph(oid)
 
     def get_execution_graph(self, oid: str) -> dict[str, Any]:
@@ -1208,6 +1231,100 @@ class Store(IntegrationStoreMixin):
             )]
         return {"orchestration_id": oid, "nodes": nodes,
                 "summary": graph_summary(nodes) if nodes else None}
+
+    @staticmethod
+    def _worker_state(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["assigned_task_ids"] = _load(item.pop("assigned_task_ids_json")) or []
+        return item
+
+    def ensure_worker_states(self, oid: str, assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Create durable Worker lifecycle rows for current compiled assignments."""
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            if connection.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            for assignment in assignments:
+                worker_id = str(assignment.get("worker_id") or "")
+                task_ids = assignment.get("task_ids")
+                if not worker_id or not isinstance(task_ids, list) or not task_ids:
+                    raise ValueError("Worker state requires an ID and assigned task IDs.")
+                connection.execute(
+                    "INSERT OR IGNORE INTO orchestration_workers("
+                    "orchestration_id,worker_id,assigned_task_ids_json,status,updated_at) "
+                    "VALUES(?,?,?,'executing',?)",
+                    (oid, worker_id, _dump(task_ids), now),
+                )
+                connection.execute(
+                    "UPDATE orchestration_workers SET assigned_task_ids_json=?,updated_at=? "
+                    "WHERE orchestration_id=? AND worker_id=? AND status NOT IN ('accepted','completed','failed')",
+                    (_dump(task_ids), now, oid, worker_id),
+                )
+            return [self._worker_state(row) for row in connection.execute(
+                "SELECT * FROM orchestration_workers WHERE orchestration_id=? ORDER BY worker_id", (oid,)
+            )]
+
+    @staticmethod
+    def _sync_worker_assignments_tx(connection: sqlite3.Connection, oid: str,
+                                    assignments: list[dict[str, Any]], now: str) -> None:
+        """Reopen a Worker lifecycle row when a validated revision changes its active Tasks."""
+        for assignment in assignments:
+            worker_id = str(assignment.get("worker_id") or "")
+            task_ids = assignment.get("task_ids")
+            if not worker_id or not isinstance(task_ids, list) or not task_ids:
+                raise ValueError("Worker state requires an ID and assigned task IDs.")
+            row = connection.execute(
+                "SELECT assigned_task_ids_json,status,evaluation_id FROM orchestration_workers "
+                "WHERE orchestration_id=? AND worker_id=?", (oid, worker_id),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO orchestration_workers(orchestration_id,worker_id,"
+                    "assigned_task_ids_json,status,updated_at) VALUES(?,?,?,'executing',?)",
+                    (oid, worker_id, _dump(task_ids), now),
+                )
+                continue
+            changed = _load(row["assigned_task_ids_json"]) != task_ids
+            reopen = changed or row["status"] == "recovery_required"
+            status = ("executing" if reopen and row["status"] in
+                      {"accepted", "completed", "recovery_required"} else row["status"])
+            evaluation_id = None if status == "executing" and reopen else row["evaluation_id"]
+            connection.execute(
+                "UPDATE orchestration_workers SET assigned_task_ids_json=?,status=?,"
+                "evaluation_id=?,updated_at=? WHERE orchestration_id=? AND worker_id=?",
+                (_dump(task_ids), status, evaluation_id, now, oid, worker_id),
+            )
+
+    def list_workers(self, oid: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if connection.execute("SELECT 1 FROM orchestration_runs WHERE id=?", (oid,)).fetchone() is None:
+                raise KeyError(oid)
+            return [self._worker_state(row) for row in connection.execute(
+                "SELECT * FROM orchestration_workers WHERE orchestration_id=? ORDER BY worker_id", (oid,)
+            )]
+
+    def set_worker_status(self, oid: str, worker_id: str, status: str, *,
+                          expected_statuses: set[str] | None = None,
+                          agent_id: str | None = None,
+                          evaluation_id: str | None = None) -> bool:
+        allowed = {"executing", "evaluation_pending", "evaluating", "accepted",
+                   "recovery_required", "failed", "completed"}
+        if status not in allowed:
+            raise ValueError("Unknown Worker state.")
+        now = utcnow()
+        with self._connection(write=True) as connection:
+            where = "orchestration_id=? AND worker_id=?"
+            params: list[Any] = [status, agent_id, evaluation_id, now, oid, worker_id]
+            if expected_statuses is not None:
+                if not expected_statuses:
+                    return False
+                where += " AND status IN (" + ",".join("?" for _ in expected_statuses) + ")"
+                params.extend(sorted(expected_statuses))
+            cursor = connection.execute(
+                "UPDATE orchestration_workers SET status=?,agent_id=COALESCE(?,agent_id),"
+                "evaluation_id=?,updated_at=? WHERE " + where, params,
+            )
+            return cursor.rowcount == 1
 
     def save_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict[str, Any]:
         """Persist an in-memory graph without allowing terminal nodes to reopen."""
@@ -1327,6 +1444,101 @@ class Store(IntegrationStoreMixin):
             )
         return self.get_evaluation(evaluation_id)
 
+    def commit_worker_evaluation(self, evaluation_id: str, oid: str, worker_id: str,
+                                 assigned_task_ids: list[str], anchor_task_id: str, *,
+                                 failed_task_id: str | None,
+                                 runtime_task_id: str, agent_id: str, attempt: int,
+                                 evaluator_version: int, evaluation: dict[str, Any],
+                                 metrics: dict[str, Any], snapshot: dict[str, Any],
+                                 context_truncated: bool, deterministic: bool
+                                 ) -> dict[str, Any] | None:
+        """Persist one assignment-wide decision and its Task provenance atomically."""
+        status = evaluation.get("status")
+        if status not in {"accepted", "needs_revision", "rejected", "blocked", "error"}:
+            raise ValueError("Unknown persisted Worker evaluation status.")
+        task_ids = list(dict.fromkeys(assigned_task_ids))
+        if not task_ids or len(task_ids) != len(assigned_task_ids) or anchor_task_id not in task_ids:
+            raise ValueError("Worker evaluation requires unique assigned task IDs and an anchor.")
+        if failed_task_id is not None and failed_task_id not in task_ids:
+            raise ValueError("Worker evaluation failure origin must belong to the assignment.")
+        now = utcnow()
+        summary = str(evaluation.get("summary") or "").strip()
+        accepted = status == "accepted"
+        failure_task_id = None if accepted else (failed_task_id or anchor_task_id)
+        error = None if accepted else {
+            "needs_revision": "Worker evaluation requires revision.",
+            "rejected": "Worker evaluation rejected the assignment result.",
+            "blocked": "Worker evaluation could not determine assignment success.",
+            "error": "Evaluator infrastructure failed; no semantic decision was made.",
+        }[status]
+        if error and summary:
+            error += " " + summary
+        with self._connection(write=True) as c:
+            run = c.execute(
+                "SELECT status FROM orchestration_runs WHERE id=?", (oid,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(oid)
+            worker = c.execute(
+                "SELECT assigned_task_ids_json,status FROM orchestration_workers "
+                "WHERE orchestration_id=? AND worker_id=?", (oid, worker_id),
+            ).fetchone()
+            if worker is None:
+                raise KeyError(worker_id)
+            if (run["status"] != "Running" or worker["status"] != "evaluating"
+                    or _load(worker["assigned_task_ids_json"]) != task_ids):
+                return None
+            nodes = {row["plan_task_id"]: row for row in c.execute(
+                "SELECT plan_task_id,state,runtime_task_id,selected_agent_id,attempt "
+                "FROM orchestration_task_nodes WHERE orchestration_id=? AND plan_task_id IN (" +
+                ",".join("?" for _ in task_ids) + ")", (oid, *task_ids),
+            )}
+            if set(nodes) != set(task_ids) or any(
+                    node["state"] != "runtime_success" for node in nodes.values()):
+                return None
+            anchor = nodes[anchor_task_id]
+            if (anchor["runtime_task_id"] != runtime_task_id
+                    or anchor["selected_agent_id"] != agent_id
+                    or int(anchor["attempt"]) != int(attempt)):
+                return None
+            if failure_task_id is not None and nodes[failure_task_id]["state"] != "runtime_success":
+                return None
+            c.execute(
+                "INSERT INTO orchestration_evaluations("
+                "id,orchestration_id,plan_task_id,runtime_task_id,agent_id,attempt,"
+                "evaluator_version,status,summary,evaluation_json,metrics_json,snapshot_json,"
+                "context_truncated,deterministic,worker_id,evaluated_task_ids_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (evaluation_id, oid, anchor_task_id, runtime_task_id, agent_id, int(attempt),
+                 int(evaluator_version), status, sanitize(summary), _dump(evaluation),
+                 _dump(metrics), _dump(snapshot), int(bool(context_truncated)),
+                 int(bool(deterministic)), worker_id, _dump(task_ids), now),
+            )
+            for task_id in task_ids:
+                state = "recovery_pending" if task_id == failure_task_id else "runtime_success"
+                node_error = sanitize(error) if task_id == failure_task_id and error else None
+                c.execute(
+                    "UPDATE orchestration_task_nodes SET state=?,evaluation_id=?,"
+                    "evaluation_status=?,recovery_action_id=NULL,waiting_reason='',error=?,updated_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND state='runtime_success'",
+                    (state, evaluation_id, status, node_error, now, oid, task_id),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise RuntimeError("Worker evaluation lost a Task state precondition.")
+                c.execute(
+                    "UPDATE orchestration_execution_attempts SET evaluation_id=?,status=?,finished_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND attempt=? AND runtime_task_id=?",
+                    (evaluation_id, state, now, oid, task_id,
+                     int(nodes[task_id]["attempt"]), nodes[task_id]["runtime_task_id"]),
+                )
+            worker_status = "accepted" if accepted else "recovery_required"
+            c.execute(
+                "UPDATE orchestration_workers SET status=?,agent_id=?,evaluation_id=?,updated_at=? "
+                "WHERE orchestration_id=? AND worker_id=? AND status='evaluating'",
+                (worker_status, agent_id, evaluation_id, now, oid, worker_id),
+            )
+        return self.get_evaluation(evaluation_id)
+
     def record_execution_attempt(self, oid: str, plan_task_id: str, *,
                                  selected_agent_id: str, selection_id: str,
                                  runtime_task_id: str, delegation_id: str,
@@ -1388,7 +1600,8 @@ class Store(IntegrationStoreMixin):
                                ) -> dict[str, Any] | None:
         """Persist one decision and atomically fail, retry, or reserve replanning."""
         action = decision.get("action")
-        if action not in {"retry_same_agent", "retry_different_agent", "replan_subgraph", "fail"}:
+        if action not in {"retry_same_agent", "retry_different_agent", "replan_subgraph",
+                          "gather_evidence", "fail"}:
             raise ValueError("Unknown recovery action.")
         now = utcnow()
         with self._connection(write=True) as c:
@@ -1404,6 +1617,17 @@ class Store(IntegrationStoreMixin):
                     or int(node["attempt"]) != int(source_attempt)
                     or node["evaluation_id"] != source_evaluation_id):
                 return None
+            evaluation_row = c.execute(
+                "SELECT worker_id,evaluated_task_ids_json FROM orchestration_evaluations "
+                "WHERE id=? AND orchestration_id=?", (source_evaluation_id, oid),
+            ).fetchone()
+            if evaluation_row is None:
+                return None
+            worker_id = evaluation_row["worker_id"]
+            worker_task_ids = _load(evaluation_row["evaluated_task_ids_json"]) or [plan_task_id]
+            affected_ids = list(dict.fromkeys(decision.get("affected_task_ids") or [plan_task_id]))
+            if (plan_task_id not in affected_ids or not set(affected_ids) <= set(worker_task_ids)):
+                raise ValueError("Recovery scope must stay within its evaluated Worker Assignment.")
             c.execute(
                 "INSERT INTO orchestration_recovery_actions("
                 "id,orchestration_id,plan_task_id,source_attempt,source_evaluation_id,action,"
@@ -1433,6 +1657,12 @@ class Store(IntegrationStoreMixin):
                     ) if item)),
                      now, now, oid, plan_task_id, source_evaluation_id),
                 )
+                if worker_id:
+                    c.execute(
+                        "UPDATE orchestration_workers SET status='failed',evaluation_id=?,updated_at=? "
+                        "WHERE orchestration_id=? AND worker_id=?",
+                        (source_evaluation_id, now, oid, worker_id),
+                    )
             elif action in {"retry_same_agent", "retry_different_agent"}:
                 cursor = c.execute(
                     "UPDATE orchestration_task_nodes SET state='ready',selected_agent_id=NULL,"
@@ -1443,6 +1673,78 @@ class Store(IntegrationStoreMixin):
                     "AND evaluation_id=?",
                     (recovery_id, sanitize(prompt), now, oid, plan_task_id, source_evaluation_id),
                 )
+                for task_id in affected_ids:
+                    if task_id == plan_task_id:
+                        continue
+                    c.execute(
+                        "UPDATE orchestration_task_nodes SET state='pending',selected_agent_id=NULL,"
+                        "selection_id=NULL,runtime_task_id=NULL,delegation_id=NULL,evaluation_id=NULL,"
+                        "evaluation_status=NULL,recovery_action_id=?,attempt_prompt=?,waiting_reason='',"
+                        "result_json=NULL,error=NULL,started_at=NULL,finished_at=NULL,updated_at=? "
+                        "WHERE orchestration_id=? AND plan_task_id=? AND state='runtime_success'",
+                        (recovery_id, sanitize("Re-run this dependent Task after its prerequisite is corrected."),
+                         now, oid, task_id),
+                    )
+                    if c.execute("SELECT changes()").fetchone()[0] != 1:
+                        raise ValueError("Recovery dependent Task is no longer runtime_success.")
+                for task_id in worker_task_ids:
+                    if task_id not in affected_ids:
+                        c.execute(
+                            "UPDATE orchestration_task_nodes SET evaluation_id=NULL,evaluation_status=NULL,"
+                            "recovery_action_id=NULL,updated_at=? WHERE orchestration_id=? AND plan_task_id=? "
+                            "AND state='runtime_success' AND evaluation_id=?",
+                            (now, oid, task_id, source_evaluation_id),
+                        )
+                if worker_id:
+                    c.execute(
+                        "UPDATE orchestration_workers SET status='executing',evaluation_id=NULL,updated_at=? "
+                        "WHERE orchestration_id=? AND worker_id=?",
+                        (now, oid, worker_id),
+                    )
+            elif action == "gather_evidence":
+                observers = [task_id for task_id in affected_ids if task_id != plan_task_id]
+                if len(observers) != 1:
+                    raise ValueError("Evidence gathering requires exactly one assigned observation Task.")
+                observer_id = observers[0]
+                observer = c.execute(
+                    "SELECT state FROM orchestration_task_nodes WHERE orchestration_id=? AND plan_task_id=?",
+                    (oid, observer_id),
+                ).fetchone()
+                if observer is None or observer["state"] != "runtime_success":
+                    raise ValueError("Evidence observation Task must have completed runtime execution.")
+                cursor = c.execute(
+                    "UPDATE orchestration_task_nodes SET state='runtime_success',evaluation_id=NULL,"
+                    "evaluation_status=NULL,recovery_action_id=?,error=NULL,updated_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND state='recovery_pending' "
+                    "AND evaluation_id=?",
+                    (recovery_id, now, oid, plan_task_id, source_evaluation_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Recovery source Task transition lost its precondition.")
+                c.execute(
+                    "UPDATE orchestration_task_nodes SET state='ready',selected_agent_id=NULL,"
+                    "selection_id=NULL,runtime_task_id=NULL,delegation_id=NULL,evaluation_id=NULL,"
+                    "evaluation_status=NULL,recovery_action_id=?,attempt_prompt=?,waiting_reason='',"
+                    "result_json=NULL,error=NULL,started_at=NULL,finished_at=NULL,updated_at=? "
+                    "WHERE orchestration_id=? AND plan_task_id=? AND state='runtime_success'",
+                    (recovery_id, sanitize(prompt), now, oid, observer_id),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise RuntimeError("Evidence observation Task transition lost its precondition.")
+                for task_id in worker_task_ids:
+                    if task_id not in {plan_task_id, observer_id}:
+                        c.execute(
+                            "UPDATE orchestration_task_nodes SET evaluation_id=NULL,evaluation_status=NULL,"
+                            "recovery_action_id=NULL,updated_at=? WHERE orchestration_id=? AND plan_task_id=? "
+                            "AND state='runtime_success' AND evaluation_id=?",
+                            (now, oid, task_id, source_evaluation_id),
+                        )
+                if worker_id:
+                    c.execute(
+                        "UPDATE orchestration_workers SET status='executing',evaluation_id=NULL,updated_at=? "
+                        "WHERE orchestration_id=? AND worker_id=?",
+                        (now, oid, worker_id),
+                    )
             else:
                 cursor = c.execute(
                     "UPDATE orchestration_task_nodes SET recovery_action_id=?,updated_at=? "
@@ -1450,6 +1752,12 @@ class Store(IntegrationStoreMixin):
                     "AND evaluation_id=?",
                     (recovery_id, now, oid, plan_task_id, source_evaluation_id),
                 )
+                if worker_id:
+                    c.execute(
+                        "UPDATE orchestration_workers SET status='recovery_required',evaluation_id=?,updated_at=? "
+                        "WHERE orchestration_id=? AND worker_id=?",
+                        (source_evaluation_id, now, oid, worker_id),
+                    )
             if cursor.rowcount != 1:
                 raise RuntimeError("Recovery node transition lost its atomic precondition.")
         return self.get_recovery(recovery_id)
@@ -1535,7 +1843,8 @@ class Store(IntegrationStoreMixin):
             protected = set(current_nodes) - allowed
             affected = set(_load(recovery["affected_task_ids_json"]) or [])
             accepted = {task_id for task_id, node in current_nodes.items()
-                        if node["state"] == "success"}
+                        if node["state"] in {"success", "runtime_success"}
+                        and node.get("evaluation_status") == "accepted"}
             normalized = validate_replan_revision(
                 current_plan=current_plan, revised_plan=normalized,
                 source_task_id=source_task_id, affected_task_ids=affected,
@@ -1568,7 +1877,7 @@ class Store(IntegrationStoreMixin):
                     else:
                         state = current_nodes[task_id]["state"]
                         if state in {"pending", "ready"}:
-                            state = ("ready" if all(states.get(dep) == "success"
+                            state = ("ready" if all(states.get(dep) in {"success", "runtime_success"}
                                                     for dep in task["depends_on"]) else "pending")
                     c.execute(
                         "UPDATE orchestration_task_nodes SET plan_order=?,depends_on_json=?,state=?,"
@@ -1579,7 +1888,7 @@ class Store(IntegrationStoreMixin):
                     )
                     states[task_id] = state
                 else:
-                    state = ("ready" if all(states.get(dep) == "success"
+                    state = ("ready" if all(states.get(dep) in {"success", "runtime_success"}
                                             for dep in task["depends_on"]) else "pending")
                     c.execute(
                         "INSERT INTO orchestration_task_nodes("
@@ -1598,6 +1907,14 @@ class Store(IntegrationStoreMixin):
                 if (len(tracked) != 1 or tracked[0]["plan_task_id"] != task_id
                         or tracked[0]["state"] != current_nodes[task_id]["state"]):
                     raise RuntimeError("Plan revision orphaned an active Runtime task.")
+            active_assignments = [{
+                **assignment,
+                "task_ids": [task_id for task_id in assignment["task_ids"]
+                             if states.get(task_id) != "superseded"],
+            } for assignment in normalized.get("worker_assignments", [])]
+            self._sync_worker_assignments_tx(
+                c, oid, [item for item in active_assignments if item["task_ids"]], now,
+            )
             c.execute(
                 "UPDATE orchestration_runs SET effective_plan_json=?,current_plan_revision=?,"
                 "updated_at=? WHERE id=? AND status='Running'",

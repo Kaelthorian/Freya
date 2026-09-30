@@ -14,10 +14,13 @@ from .planner import validate_plan
 
 NODE_STATES = {
     "pending", "ready", "running", "waiting_for_approval", "evaluating",
+    "runtime_success",
     "recovery_pending", "blocked", "success", "failed", "cancelled", "skipped",
     "superseded",
 }
-TERMINAL_NODE_STATES = {"blocked", "success", "failed", "cancelled", "skipped", "superseded"}
+TERMINAL_NODE_STATES = {
+    "runtime_success", "blocked", "success", "failed", "cancelled", "skipped", "superseded",
+}
 DEPENDENCY_FAILURE_STATES = {"blocked", "failed", "cancelled", "skipped"}
 ACTIVE_NODE_STATES = {"running", "waiting_for_approval", "evaluating"}
 
@@ -35,6 +38,7 @@ def graph_summary(nodes: list[dict[str, Any]]) -> dict[str, Any]:
         "terminal": terminal,
         "complete": terminal == total and total > 0,
         "successful": counts["success"],
+        "runtime_successful": counts["runtime_success"],
         "failed": counts["failed"],
         "blocked": counts["blocked"],
         "cancelled": counts["cancelled"],
@@ -188,7 +192,7 @@ class ExecutionGraph:
         elif status == "Paused":
             target, reason = "running", "Runtime task is paused."
         elif status == "Success":
-            target, reason = "evaluating", "Semantic evaluation is pending."
+            target, reason = "runtime_success", "Runtime execution completed successfully."
         elif status == "Failed":
             target, reason = "failed", ""
         elif status == "Cancelled":
@@ -203,14 +207,23 @@ class ExecutionGraph:
             node["finished_at"] = timestamp
         return changed
 
+    def restore_legacy_evaluating_node(self, task_id: str,
+                                       timestamp: str | None = None) -> None:
+        """Resume a pre-Worker-evaluation run after its old per-Task checkpoint."""
+        node = self.node(task_id)
+        if node["state"] != "evaluating":
+            raise ValueError("Only a legacy evaluating node can be restored.")
+        node.update(state="runtime_success", waiting_reason="",
+                    finished_at=timestamp, updated_at=timestamp)
+
     def apply_evaluation(self, task_id: str, evaluation_id: str, status: str,
                          summary: str, timestamp: str | None = None) -> bool:
         """Apply one immutable semantic decision to a technically successful node."""
         node = self.node(task_id)
         if node["state"] in TERMINAL_NODE_STATES:
             return False
-        if node["state"] != "evaluating":
-            raise ValueError("Only an evaluating node can receive semantic evaluation.")
+        if node["state"] not in {"evaluating", "runtime_success"}:
+            raise ValueError("Only a technically successful node can receive semantic evaluation.")
         if node.get("evaluation_id"):
             if (node["evaluation_id"], node.get("evaluation_status")) == (evaluation_id, status):
                 return False
@@ -292,7 +305,7 @@ class ExecutionGraph:
                 target = None
                 if any(state in DEPENDENCY_FAILURE_STATES for state in dependency_states):
                     target = "blocked"
-                elif all(state == "success" for state in dependency_states):
+                elif all(state in {"runtime_success", "success"} for state in dependency_states):
                     target = "ready"
                 if target:
                     node.update(state=target, updated_at=timestamp)

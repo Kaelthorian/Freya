@@ -1942,7 +1942,7 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                         ),
                     })
             if not (changed_write_actions or telemetry["workspace_changes"] or runtime_artifacts
-                    or already_satisfied_candidate):
+                    or already_satisfied_write_actions or already_satisfied_candidate):
                 mutation_failure = (
                     "ExpectedWorkspaceMutationNotObserved: this task requires a workspace "
                     "mutation, but no successful write action or resulting artifact was recorded."

@@ -97,8 +97,12 @@ archival event reports archival `Success` separately from the run's final
 - Preserve semantic and derived decisions in separate audit events. Keep exact
   `owned_paths`, reject duplicate normalized owners, and log the semantic
   operation to capability to tool mapping produced by the compiler.
-- Worker completion is technical only. It reports execution completion or
-  failure; only Evaluator acceptance unlocks dependencies and semantic success.
+- Worker Runtime completion is technical only. A successful Task enters
+  `runtime_success` and releases its DAG dependents. Once every Task in the
+  compiled Worker Assignment reaches that state, Evaluator runs once over the
+  assignment evidence pool. Acceptance is shared by those Task nodes; a failed
+  criterion maps to its origin Task for recovery. Global integration requires
+  every active Task to reference an accepted Worker Evaluation.
 - Keep the Evaluator's durable evidence catalog separate from its compact model
   input. Put bounded diff, read-back and test content beside each unresolved
   criterion in the semantic input; preserve path, provenance and truncation

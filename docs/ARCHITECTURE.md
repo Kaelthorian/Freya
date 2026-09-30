@@ -75,11 +75,14 @@ produces the durable execution plan.
 The Agent Factory determines
 **who** executes each planned task by constructing a task-specific identity,
 Skill set and least-privilege policy. The Agent Selector independently validates
-and classifies that candidate before dispatch. The deterministic Execution Graph determines **when** dependency-ready
-tasks run. The Worker determines **how** one selected task executes. Capability
-Policy remains the sole authority for **whether** each requested action is
-permitted. The Evaluator determines **whether the produced result actually
-satisfied** the planned objective and criteria.
+and classifies that candidate before dispatch. The deterministic Execution Graph
+determines **when** dependency-ready tasks run. A logical Worker Assignment can
+own several Tasks; the Worker determines **how** each selected Task executes
+and supplies one assignment-wide evidence pool. Capability Policy remains the
+sole authority for **whether** each requested action is permitted. The
+Evaluator determines **whether the produced result actually satisfied** the
+criteria assigned to that Worker after all its Tasks reach technical success.
+Criterion provenance maps every decision back to its originating Task.
 The Global Verifier determines **whether the complete accepted effective plan
 satisfies the operational objective and global criteria**. The Integration
 Replanner may only append new work for a global gap; it cannot edit, delete,
@@ -98,7 +101,7 @@ sanitized evidence.
 | Tool execution and objective evidence | Worker Runtime | Technical result and evidence |
 | Lifecycle, dispatch, approvals and coordination | Freya / Orchestrator | Orchestration state |
 | Dependency readiness | Execution Graph | Ready task set |
-| Local task acceptance | Evaluator | Evaluation decision |
+| Worker Assignment acceptance | Evaluator | One decision with per-criterion Task provenance |
 | Bounded local failure strategy | Recovery / Replanner | Recovery action or revised plan |
 | Whole-system correctness | Global Verifier | Global decision |
 | Final response from accepted facts | Result Integrator | User-facing result |
@@ -148,12 +151,20 @@ scoring semantics and evidence used at selection time.
 including immutable dependency/order data, selection and agent IDs, Runtime
 task and delegation IDs, attempts, waiting reason, result/error, and timestamps.
 The plan remains the immutable intent; node rows are the durable execution state.
-`orchestration_evaluations` stores one immutable, versioned decision per
-`(orchestration_id, plan_task_id, attempt)`, including the bounded input
-snapshot, criterion-by-criterion result, independent model metrics and
-truncation/deterministic flags. Nodes keep only `evaluation_id` and
-`evaluation_status`. Insertion and the `evaluating → success|recovery_pending` transition
-are one transaction.
+`orchestration_workers` stores the current compiled Worker ID, active assigned
+Task IDs, lifecycle status and current evaluation reference. A validated plan
+revision updates this set atomically and reopens a Worker when its assigned
+Tasks change. `orchestration_evaluations` stores one immutable, versioned
+decision per Worker evaluation, including `worker_id`, the complete
+`evaluated_task_ids`, its anchor Runtime attempt, bounded evidence snapshot,
+criterion origins, model metrics and truncation/deterministic flags. Every
+assigned Task node references the same evaluation. Runtime success is persisted
+as `runtime_success`; accepted evaluation preserves that technical state and
+sets `evaluation_status=accepted`. For a non-accepted result, only the first
+failed origin Task enters `recovery_pending`; sibling Task nodes retain the
+shared evaluation reference until an atomic retry or observation action resets
+them. The evaluation insert, Task references and Worker state transition share
+one transaction.
 `orchestration_execution_attempts` stores every real dispatch independently,
 including its selection, agent, Runtime task, delegation, prompt, evaluation,
 recovery action, status and timestamps. `orchestration_recovery_actions` stores
@@ -199,8 +210,9 @@ including foreign-owned ones. Ownership restricts writes only. The Worker
 requires a successful read of current bytes in the same attempt before editing
 or overwriting an existing file; changed hashes return `STALE_ARTIFACT` and
 require a fresh read. A truncated `read_file` response does not authorize a
-write because the agent has not seen the full source. After the Evaluator accepts a task, ProjectState accepts only
-artifact paths present in the Worker action ledger, verifies the file still
+write because the agent has not seen the full source. After the Evaluator
+accepts the Worker Assignment, ProjectState accepts only artifact paths
+present in the Worker action ledger, verifies the file still
 exists under the assigned workspace, and records its current hash. Worker
 symbol reports are checked against the current artifact bytes and declaration
 line; dependency reports are stored as observed metadata. Rejected or
@@ -211,10 +223,14 @@ snapshot and must inspect and read the current file before editing.
 When a mutating task has no successful write, a current read of every declared
 target permits an `already_satisfied_candidate` result with artifact hash and
 revision evidence. This is technical completion only; Evaluator judges each
-planned criterion. For compiled assignments, current bytes attributed to an
-accepted earlier task in the same Worker assignment may also be cited after
-read-back; evidence from another assignment is ineligible. Without eligible
-current observations, the Worker retains `ExpectedWorkspaceMutationNotObserved`.
+planned criterion. A successful `ALREADY_SATISFIED` write counts as technical
+mutation evidence after exact current-byte comparison, even though it creates
+no artifact or diff; semantic criteria still require Evaluator proof. For
+compiled assignments, current bytes attributed to an earlier Task in the same
+Worker assignment may also be cited after read-back; evidence from another
+assignment is ineligible. Without a successful changed write, exact no-op
+write, resulting artifact, or current observation candidate, the Worker retains
+`ExpectedWorkspaceMutationNotObserved`.
 When repeated reads have already
 observed every declared target and every current criterion is a simple
 file-presence check, the Worker stops successfully with an
@@ -245,7 +261,8 @@ that exact write was already changed in the current run, the same satisfied
 write repeats, or it is the last tool call in the current model response. This
 is execution completion only: the result, artifacts, workspace diffs and
 verification evidence are preserved, no semantic criterion is marked satisfied
-from the no-op, and the Evaluator remains responsible for task acceptance.
+from the no-op, and the Evaluator reviews it with the rest of the Worker
+Assignment evidence after all its Tasks finish.
 
 Production runs transition `Queued → Analyzing → NeedsClarification` when
 the Analyst must ask the user. Each response returns that same run to
@@ -291,16 +308,22 @@ Assigned Workers additionally emit `worker.created`, `worker.reused`,
 `worker.completed` with bounded Worker, agent, orchestration, task, strategy,
 active-tool and active-capability metadata. Explicit Recovery replacement or
 recreation emits `worker.recreated`.
-The Worker emits `worker.execution.completed` or
-`worker.execution.failed` for technical execution only; Evaluator acceptance
-is persisted separately. Recovery and Integration revision events include the
-semantic operation to capability to tool resolution records for new tasks.
-Semantic review emits `freya.evaluation.started` once and then exactly one
-`freya.evaluation.completed` or `freya.evaluation.failed`. Completion events
-carry the validated criterion-by-criterion decision and metrics; non-accepted
-decisions also carry a bounded summary of the exact input evidence. Evaluator
-prompts are excluded by default. Optional debug tracing stores bounded,
-redacted prompts and responses; private reasoning is stripped.
+The Orchestrator emits `worker.execution_completed` when every assigned Task
+has technical success, or `worker.execution_failed` when Runtime failure
+prevents evaluation. Each Runtime-successful
+Task emits `worker.task_completed` with `evaluation_status=worker_pending`;
+once an assignment is complete, `worker.evaluation_started`, per-criterion
+completion/insufficient-evidence events, and `worker.evaluation.completed`
+identify the Worker, assigned Task IDs, evaluation ID and origin Task IDs.
+Legacy `freya.evaluation.*` events remain once per Worker Evaluation for older
+activity clients. Recovery adds `worker.recovery_started` and
+`worker.recovery_completed`, including failed criteria and affected Task IDs.
+Recovery and Integration revision events include the semantic operation to
+capability to tool resolution records for new tasks. Evaluation completion
+events carry the validated criterion-by-criterion decision and metrics;
+non-accepted decisions also carry a bounded summary of the exact input
+evidence. Evaluator prompts are excluded by default. Optional debug tracing
+stores bounded, redacted prompts and responses; private reasoning is stripped.
 
 Orchestration transitions are conditional on the stored current state:
 Recovery emits `freya.recovery.started`, `freya.recovery.decided`,
@@ -475,8 +498,9 @@ Tools remain concrete worker operations; capabilities remain declared action
 requirements in the compiled plan; semantic operations remain planning intent;
 Skills remain guidance. The Worker reports `execution_complete` or
 `execution_failed` as technical outcomes only. It cannot accept its own result.
-The Evaluator alone accepts local task evidence. The Orchestrator owns lifecycle
-and dependency coordination. Recovery may replan only its deterministic local
+The Evaluator accepts evidence once per Worker Assignment and retains each
+criterion's origin Task. The Orchestrator owns lifecycle and dependency
+coordination. Recovery may replan only its deterministic local
 scope and may compile new operations only within the superseded tasks' existing
 capability budget. Integration Replanner applies the same rule against the
 compiled plan budget. The Global Verifier accepts the whole objective from
@@ -508,8 +532,10 @@ persisted timestamps and metrics rather than frontend input.
 
 `ExecutionGraph` is local, deterministic and model-free. It deep-copies the
 validated plan and maintains `pending`, `ready`, `running`,
-`waiting_for_approval`, `evaluating`, `recovery_pending`, `blocked`, `success`, `failed`,
-`cancelled`, `skipped`, and `superseded` nodes. Only successful dependencies release work.
+`waiting_for_approval`, legacy `evaluating`, `runtime_success`,
+`recovery_pending`, `blocked`, `success`, `failed`, `cancelled`, `skipped`, and
+`superseded` nodes. A technically successful Task in `runtime_success` releases
+its dependencies before its Worker Assignment is semantically evaluated.
 Failure or cancellation blocks descendants transitively while unrelated
 branches continue. Join nodes wait for every dependency.
 
@@ -539,14 +565,18 @@ reselect; ordinary scheduler failures never cause silent reselection.
 Runtime `Queued` and `Running` map to graph `running`;
 `WaitingForApproval` maps to `waiting_for_approval`; Runtime `Paused` remains a
 nonterminal `running` node with an explicit reason. Runtime `Success` maps to
-persistent `evaluating`; it never directly produces graph success. Only
-evaluator `accepted` maps to `success`. `needs_revision`, `rejected`, `blocked`,
-and evaluator infrastructure failure atomically map to `recovery_pending` while
-preserving the evaluation reference. Recovery may retry the same revalidated
-agent, retry with prior agents hard-excluded, create a validated effective-plan
-revision, or fail. Retry clears only current-node references; immutable attempt,
-evaluation, selection and recovery history remains. Other Runtime statuses map to their
-graph equivalents. A fully accepted graph enters `Integrating`; it does not
+terminal technical state `runtime_success` and immediately releases dependency
+readiness; it does not mark semantic acceptance. The Scheduler invokes one
+Evaluator call when every active Task in a Worker Assignment is
+`runtime_success`. An accepted decision leaves those nodes in `runtime_success`
+with a shared accepted evaluation reference. `needs_revision`, `rejected`,
+`blocked`, and Evaluator infrastructure failure put the criterion's origin
+Task in `recovery_pending` and preserve the shared evaluation reference.
+Recovery maps that origin to bounded retry/replan scope, or schedules an
+existing same-Worker read-only Task to gather evidence. Retry clears current
+Worker references while immutable attempt, evaluation, selection and recovery
+history remains. Other Runtime statuses map to their graph equivalents. A
+fully accepted graph enters `Integrating`; it does not
 directly produce orchestration success. The parent succeeds only after an
 immutable global verification is `accepted`, and fails after all reachable work is terminal when any node failed,
 was blocked, cancelled, or skipped. User cancellation remains `Cancelled`.
@@ -563,16 +593,18 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` version 7 is read-only. Before checks or model inference,
-`normalize_execution_evidence` builds a bounded catalog from verification
-records, tool outcomes, artifact changes and workspace diffs. It retains
-available content/output, path, operation, status, source, tool, capability,
-event ID, timestamp, hash and check condition. Deterministic evidence IDs
-deduplicate identical records. The Orchestrator supplies each task's stable
-local criterion IDs from `criterion_links.local`; legacy criterion-text links
-are normalized to those IDs. Explicit verification links and criterion IDs are
-authoritative, while path or file-kind associations are marked as inferred.
-Evidence with no grounded link remains global.
+`Evaluator` version 8 is read-only and runs once per completed Worker
+Assignment. Before checks or model inference, `normalize_execution_evidence`
+builds a bounded catalog from all assigned Tasks' verification records, tool
+outcomes, artifact changes, no-op observations and workspace diffs. Each record
+retains its source Task, Runtime Task, Worker, timestamp and namespaced evidence
+ID along with content/output, path, operation, status, tool, capability, hash
+and check condition. The Orchestrator supplies stable local and applicable
+global criterion IDs; every decision preserves `origin_task_id` and
+`origin_type`. Explicit verification links and criterion IDs are authoritative,
+while path or file-kind associations are marked as inferred. Evidence with no
+grounded link remains global but can support a criterion only when its content
+directly proves that criterion.
 
 The durable evaluation snapshot contains the evidence catalog, per-criterion
 references and global evidence IDs. The semantic model receives a separate
@@ -640,14 +672,18 @@ attempt before persisting.
 ## Semantic recovery and replanning
 
 `RecoveryController` is separate from Planner and Evaluator. Its strict schema
-allows only `retry_same_agent`, `retry_different_agent`, `replan_subgraph`, or
-`fail`; invalid model output gets one repair. Its Ollama adapter is loopback-only,
-tool-free, streamed through `transport.py`, and independently metered. `--recovery-offline` makes
-no model call and applies deterministic recovery: `needs_revision` and `blocked`
-reuse the exact generated agent after revalidation, while `rejected` requests a
-new generated variant with the same task-derived policy ceiling. Evaluator
-`error` fails. The normal attempt, action, fingerprint and
-wall-clock limits still apply.
+allows `gather_evidence`, `retry_same_agent`, `retry_different_agent`,
+`replan_subgraph`, or `fail`; invalid model output gets one repair. Its Ollama
+adapter is loopback-only, tool-free, streamed through `transport.py`, and
+independently metered. `--recovery-offline` makes no model call. A blocked Worker
+evaluation that recommends `gather_evidence` with missing evidence chooses a
+completed same-assignment Task whose compiled operation/capability/tools are
+read-only; that Task is rerun with its existing read surface while the failed
+origin Task remains technically complete. If no observer Task qualifies,
+recovery fails closed. Other `needs_revision` and `blocked` decisions reuse the
+exact generated agent after revalidation, while `rejected` requests a new
+generated variant with the same task-derived policy ceiling. Evaluator `error`
+fails. The normal attempt, action, fingerprint and wall-clock limits still apply.
 
 Defaults allow three semantic attempts per task, two plan revisions, eight
 recovery actions and sixteen total recovery/replanning model calls per orchestration.
@@ -722,7 +758,7 @@ failure class, stop reason, workspace-change count and no-progress flag.
 
 ## Global integration and result composition
 
-Integration version 3 requires criterion-specific grounded proof, not merely
+Integration version 6 requires criterion-specific grounded proof, not merely
 known evidence refs. The bounded catalog, exact association rules, Storage
 reconstruction and the explicitly isolated legacy exception are specified in
 [Integration proof contract](INTEGRATION_PROOF.md). Generic state updates cannot
@@ -736,14 +772,21 @@ resource budget.
 
 `build_integration_input` runs deterministic preconditions before any global
 model call. Every active effective task (all effective-plan tasks except
-`superseded` history) must be `success`, retain an `accepted` evaluation and
-have no pending, ready, running, approval, evaluating, recovery or failure
-state. The context contains the original prompt/goal/global criteria, current
+`superseded` history) must be `success` or `runtime_success`, retain an
+`accepted` evaluation and have no pending, ready, running, approval, evaluating,
+recovery or failure state. The context contains the original prompt/goal/global criteria, current
 effective plan revision, active task objective/result summary, accepted
 evaluation summary/evidence/verification and a compact revision history. Text
 and list bounds set `context_truncated`; the serialized model context is capped
 at 48,000 characters and fails closed if it cannot be reduced safely. Result
 and evidence text are always untrusted data and never instructions.
+
+When exactly one active Worker Assignment has an accepted Worker Evaluation
+that already covers each exact global criterion with direct evidence,
+`integration_orchestrator.py` reuses those proof refs and records the
+integration result without another verifier call. Multiple active Workers,
+cross-Worker criteria, or missing exact proof continue through global
+verification.
 
 `GlobalVerifier` first applies evidence-first hard checks. Failed objective
 verification cannot be overridden by an accepting model; unavailable required

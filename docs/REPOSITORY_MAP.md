@@ -25,8 +25,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── project_state.py      per-orchestration artifact metadata, bounded context snapshots and accepted updates
-│   ├── evaluator.py          evidence normalization/criterion mapping, objective checks, status aggregation and tool-free Ollama adapter
-│   ├── recovery.py           recovery decisions, validated replanning and log-grounded failure diagnosis
+│   ├── evaluator.py          Worker evidence aggregation/criterion mapping, objective checks, status aggregation and tool-free Ollama adapter
+│   ├── recovery.py           origin-aware Worker recovery, read-only evidence gathering, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier contract, direct-proof decision, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and explicit local-to-global criterion proof mapping
 │   ├── integration_orchestrator.py integration lifecycle and verifier validation events
@@ -149,9 +149,15 @@ selects them.
    blocks one; the worker stops that call batch so it can change strategy. A
    missing Docker daemon/image produces `SandboxUnavailable`.
    `agent_selector.py` then validates and classifies that generated
-   candidate before delegation. Worker completion is technical only; it emits an
-   execution outcome and enters `evaluating`. `evaluator.py` must accept the
-   result before dependencies unlock.
+   candidate before delegation. Runtime `Success` enters `runtime_success` and
+   releases DAG dependencies. `orchestrator.py` waits until all active Tasks in
+   one compiled Worker Assignment finish, aggregates their bounded evidence
+   with task/runtime/worker provenance, then calls `evaluator.py` once for that
+   Worker. One immutable evaluation is referenced by every assigned Task node;
+   failed criteria retain their origin Task so Recovery can select the right
+   subgraph. A single Worker evaluation may also satisfy identical global
+   criteria when it carries direct proof; multi-Worker plans still use the
+   Global Verifier.
    A non-accepted evaluation enters bounded recovery; retries are reselected and
    recorded as new attempts, while deterministic DAG scope limits replanning to
    the recovery source and never-started descendants. Replanner compiles new

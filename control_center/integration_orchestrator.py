@@ -129,6 +129,54 @@ class IntegrationOrchestrationMixin:
         if resume:
             self._run_graph(oid, self.store.get_orchestration(oid), deadline)
 
+    def _single_worker_global_outcome(self, oid: str, run: dict,
+                                     prepared: dict) -> dict | None:
+        """Reuse one accepted Worker decision when it already proves every global criterion."""
+        plan = run.get("effective_plan") or run.get("plan") or {}
+        active_task_ids = set((prepared.get("snapshot") or {}).get("active_task_ids") or [])
+        assignments = self._worker_groups(plan, active_task_ids)
+        criteria = prepared["context"].get("global_success_criteria") or []
+        if len(assignments) != 1 or not criteria:
+            return None
+        worker_id = assignments[0]["worker_id"]
+        worker_task_ids = list(assignments[0]["task_ids"])
+        evaluations = [item for item in self.store.list_evaluations(oid)
+                       if item.get("worker_id") == worker_id
+                       and item.get("status") == "accepted"
+                       and item.get("evaluated_task_ids") == worker_task_ids]
+        if not evaluations:
+            return None
+        evaluation = evaluations[-1]
+        links = {item.get("id"): item.get("criterion")
+                 for item in (plan.get("criterion_links") or {}).get("global", [])
+                 if isinstance(item, dict)}
+        decisions = {item.get("criterion_id"): item for item in evaluation.get("criteria", [])
+                     if isinstance(item, dict) and item.get("origin_type") == "global"}
+        global_rows = []
+        for criterion in criteria:
+            criterion_id = next((identifier for identifier, text in links.items()
+                                 if text == criterion), None)
+            decision = decisions.get(criterion_id)
+            proof_refs = prepared["proof_refs_by_criterion"].get(criterion_key(criterion), [])
+            if not decision or decision.get("status") != "satisfied" or not proof_refs:
+                return None
+            global_rows.append({
+                "criterion": criterion, "status": "satisfied",
+                "reason": "The accepted Worker Evaluation already assessed this exact global criterion.",
+                "evidence": list(dict.fromkeys(proof_refs)),
+            })
+        return {
+            "status": "accepted",
+            "summary": "The single Worker Evaluation already accepted and grounded every global criterion.",
+            "criteria": global_rows, "cross_task_issues": [], "missing_evidence": [],
+            "responsible_task_ids": [], "recommended_action": "accept",
+            "metrics": {"model_calls": 0, "prompt_tokens": 0, "generated_tokens": 0,
+                        "total_tokens": 0, "duration_seconds": 0.0,
+                        "worker_evaluation_reused": True},
+            "deterministic": True, "context_truncated": bool(prepared["context_truncated"]),
+            "reused_worker_evaluation": evaluation["id"],
+        }
+
     def _run_global_integration(self, oid: str, deadline: float) -> bool:
         if self.clock() >= deadline:
             self._timeout_integration(oid)
@@ -146,26 +194,28 @@ class IntegrationOrchestrationMixin:
         used_calls = self._integration_model_calls_used(oid)
         remaining_calls = int(self.config["max_integration_model_calls"]) - used_calls
         technical_error = None
-        try:
-            with self.integration_lock:
-                outcome = self.global_verifier.verify(
-                    prepared, max_model_calls=max(0, min(2, remaining_calls)),
-                )
-        except Exception as exc:
-            technical_error = str(exc)
-            outcome = {
-                "status": "error",
-                "summary": "Global verifier failed: " + technical_error[:1000],
-                "criteria": [{"criterion": item, "status": "unknown",
-                              "reason": "The global verifier did not complete.", "evidence": []}
-                             for item in prepared["context"]["global_success_criteria"]],
-                "cross_task_issues": [],
-                "missing_evidence": list(prepared["context"]["global_success_criteria"]),
-                "responsible_task_ids": [], "recommended_action": "fail",
-                "metrics": dict(getattr(self.global_verifier, "metrics", {}) or {}),
-                "deterministic": False,
-                "context_truncated": bool(prepared["context_truncated"]),
-            }
+        outcome = self._single_worker_global_outcome(oid, run, prepared)
+        if outcome is None:
+            try:
+                with self.integration_lock:
+                    outcome = self.global_verifier.verify(
+                        prepared, max_model_calls=max(0, min(2, remaining_calls)),
+                    )
+            except Exception as exc:
+                technical_error = str(exc)
+                outcome = {
+                    "status": "error",
+                    "summary": "Global verifier failed: " + technical_error[:1000],
+                    "criteria": [{"criterion": item, "status": "unknown",
+                                  "reason": "The global verifier did not complete.", "evidence": []}
+                                 for item in prepared["context"]["global_success_criteria"]],
+                    "cross_task_issues": [],
+                    "missing_evidence": list(prepared["context"]["global_success_criteria"]),
+                    "responsible_task_ids": [], "recommended_action": "fail",
+                    "metrics": dict(getattr(self.global_verifier, "metrics", {}) or {}),
+                    "deterministic": False,
+                    "context_truncated": bool(prepared["context_truncated"]),
+                }
         if self.clock() >= deadline:
             self._timeout_integration(oid)
             return False
@@ -212,6 +262,7 @@ class IntegrationOrchestrationMixin:
                 "integration_status": result["status"],
                 "criteria_count": len(result["criteria"]),
                 "criteria_diagnostics": self._criterion_diagnostics(prepared, result),
+                "reused_worker_evaluation": outcome.get("reused_worker_evaluation"),
                 "message": result["summary"],
             })
         if result["status"] == "accepted":
@@ -333,7 +384,8 @@ class IntegrationOrchestrationMixin:
             })
         graph_nodes = self.store.get_execution_graph(oid)["nodes"]
         accepted = {node["plan_task_id"] for node in graph_nodes
-                    if node["state"] == "success" and node.get("evaluation_status") == "accepted"}
+                    if node["state"] in {"success", "runtime_success"}
+                    and node.get("evaluation_status") == "accepted"}
         historical = {node["plan_task_id"] for node in graph_nodes}
         try:
             with self.integration_lock:

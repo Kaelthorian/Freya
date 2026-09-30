@@ -135,11 +135,17 @@ class IntegrationStoreMixin:
             if node["state"] == "superseded":
                 continue
             row = connection.execute(
-                "SELECT * FROM orchestration_evaluations WHERE id=? AND orchestration_id=? "
-                "AND plan_task_id=? AND attempt=?",
-                (node.get("evaluation_id"), oid, node["plan_task_id"], node["attempt"]),
+                "SELECT * FROM orchestration_evaluations WHERE id=? AND orchestration_id=?",
+                (node.get("evaluation_id"), oid),
             ).fetchone()
             if row is not None:
+                if row["worker_id"]:
+                    evaluated_task_ids = _load(row["evaluated_task_ids_json"]) or []
+                    if node["plan_task_id"] not in evaluated_task_ids:
+                        continue
+                elif (row["plan_task_id"] != node["plan_task_id"]
+                      or int(row["attempt"]) != int(node["attempt"])):
+                    continue
                 evaluations[row["id"]] = self._evaluation(row, include_snapshot=True)
         original_plan = _load(run["plan_json"])
         prepared = build_integration_input(
@@ -225,6 +231,10 @@ class IntegrationStoreMixin:
             )
             if cursor.rowcount != 1:
                 return None
+            connection.execute(
+                "UPDATE orchestration_workers SET status='completed',updated_at=? "
+                "WHERE orchestration_id=? AND status='accepted'", (now, oid),
+            )
         return self.get_orchestration(oid)
 
     def commit_integration_plan_revision(self, revision_id: str, oid: str,
@@ -295,7 +305,7 @@ class IntegrationStoreMixin:
             by_id = {task["id"]: task for task in normalized["tasks"]}
             for index, task_id in enumerate(actual_new_ids):
                 task = by_id[task_id]
-                state = ("ready" if all(states.get(dependency) == "success"
+                state = ("ready" if all(states.get(dependency) in {"success", "runtime_success"}
                                         for dependency in task["depends_on"]) else "pending")
                 connection.execute(
                     "INSERT INTO orchestration_task_nodes("
@@ -305,6 +315,9 @@ class IntegrationStoreMixin:
                      sanitize(task["objective"]), revision, now),
                 )
                 states[task_id] = state
+            self._sync_worker_assignments_tx(
+                connection, oid, normalized.get("worker_assignments", []), now,
+            )
             cursor = connection.execute(
                 "UPDATE orchestration_runs SET effective_plan_json=?,current_plan_revision=?,"
                 "status='Running',updated_at=? WHERE id=? AND status='Integrating' "

@@ -50,12 +50,14 @@ immutable and versioned.
 `GET /api/orchestrations` lists runs and `GET /api/orchestrations/{id}` returns
 the run, immutable `plan`, `plan_schema_version`, `plan_created_at`,
 `planning_metrics`, selection snapshots, delegations, execution attempts,
-evaluations, recovery actions, plan revisions, and events needed to reconstruct it.
+evaluations, Worker lifecycle rows, recovery actions, plan revisions, and events
+needed to reconstruct it.
 Freya also persists bounded per-run ProjectState metadata for generated agents.
 The internal `project_context` worker tool can query artifact, symbol, task and
 summary metadata from the latest dispatch snapshot; it never returns file
 contents and has no HTTP route. ProjectState changes are parent-owned and worker
-candidate updates are committed only after semantic evaluation accepts the task.
+candidate updates are committed only after the Task's Worker Assignment
+evaluation accepts the shared result.
 The requester's observed artifact revision is recorded with cross-task
 modification requests so the owner can inspect the current snapshot and reread
 the file before changing it.
@@ -83,15 +85,18 @@ metrics.
 the plan and its version metadata directly. Existing agent and task routes
 remain compatible.
 `GET /api/orchestrations/{id}/graph` returns durable nodes in immutable plan
-order plus a summary with per-state counts, active/terminal totals and a
-`complete` flag. Historical pre-4.3 runs return an empty node list and null
+order plus a summary with per-state counts, active/terminal totals, a separate
+`runtime_successful` count and a `complete` flag. `runtime_success` is a
+technically complete Task and releases its dependencies; it does not mean that
+the Worker's semantic evaluation has been accepted. Historical pre-4.3 runs return an empty node list and null
 summary. `GET /api/orchestrations/{id}` includes the same `graph_summary`.
 Nodes expose nullable `evaluation_id` and `evaluation_status` references, not
-the full evaluation. `GET /api/orchestrations/{id}/evaluations` returns the
+the full evaluation. All Tasks evaluated together for one Worker Assignment
+share those references. `GET /api/orchestrations/{id}/evaluations` returns the
 immutable evaluation records with status, summary, confidence, per-criterion
 decisions, issues, missing evidence, recommended action, version, independent
-metrics and truncation/deterministic flags. It never returns evaluator prompts
-or the private input snapshot.
+metrics, `worker_id`, and `evaluated_task_ids`, plus truncation/deterministic
+flags. It never returns evaluator prompts or the private input snapshot.
 `GET /api/orchestrations/{id}/integrations` returns immutable global
 verification history ordered by round. Each item exposes `round`, `status`,
 `summary`, criterion decisions, cross-task issues, missing evidence,
@@ -336,11 +341,12 @@ The execution graph runs the complete validated DAG. Dependency-ready tasks use 
 plan-order fairness, selection is persisted once per task, independent branches
 may run in parallel within `max_parallel_tasks`, joins wait for all parents, and
 failure blocks descendants without stopping independent work. Node states are
-`pending`, `ready`, `running`, `waiting_for_approval`, `evaluating`,
-`recovery_pending`, `blocked`, `success`, `failed`, `cancelled`, `skipped`, and
-`superseded`. Runtime `Success` enters `evaluating`; only an `accepted`
-evaluation becomes node `success`. Other semantic outcomes enter
-`recovery_pending` and receive exactly one bounded decision for that attempt.
+`pending`, `ready`, `running`, `waiting_for_approval`, legacy `evaluating`,
+`runtime_success`, `recovery_pending`, `blocked`, `success`, `failed`,
+`cancelled`, `skipped`, and `superseded`. Runtime `Success` enters
+`runtime_success` and releases dependencies. After every active Task assigned
+to a Worker reaches that state, one `accepted` Worker evaluation is shared by
+its Task nodes; non-accepted criteria route recovery to their origin Task.
 Evaluator resolves objective criteria first and sends only unresolved criteria
 to the tool-free semantic model. The model returns only per-criterion
 `criterion`, `status`, `reason`, `evidence`, and `confidence`; Python computes the
@@ -594,8 +600,9 @@ Planning audit events separate semantic proposals from compiler decisions:
 `freya.plan.ownership_resolved` records normalized file owners, and
 `freya.plan.compiled` records the validated runtime plan. Recovery and
 Integration replan events include resource resolutions for newly added tasks.
-`worker.execution.completed` and `worker.execution.failed` report technical
-execution outcomes; semantic task acceptance is recorded only by Evaluator.
+`worker.execution_completed` and `worker.execution_failed` report technical
+execution outcomes; `worker.evaluation.*` records the assignment-wide semantic
+decision with criterion origin Task IDs.
 The activity endpoint includes Worker lifecycle identity and task-scoped tools
 and capabilities in event details.
 Related events include `artifact.read_observed`,
@@ -604,6 +611,9 @@ Related events include `artifact.read_observed`,
 `worker.created`, `worker.reused`, `worker.task_switched`,
 `worker.task_started`, `worker.task_completed`, `worker.completed`,
 `worker.recreated`, `worker.write_already_satisfied`,
+`worker.evaluation_started`, `worker.evaluation.criterion_completed`,
+`worker.evaluation.insufficient_evidence`, `worker.evaluation.completed`,
+`worker.recovery_started`, `worker.recovery_completed`,
 `evaluation.infrastructure_failed`,
 `evaluation.criterion.deterministic`, `evaluation.criterion.semantic_started`,
 `evaluation.criterion.semantic_completed`, `evaluation.aggregate.completed`,

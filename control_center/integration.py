@@ -26,7 +26,7 @@ from .transport import model_profile, model_request, request_json
 from .integration_proof import build_proof_metadata, criterion_key
 
 
-INTEGRATION_VERSION = 5
+INTEGRATION_VERSION = 6
 GLOBAL_STATUSES = {"accepted", "needs_work", "blocked", "error"}
 CRITERION_STATUSES = {"satisfied", "unsatisfied", "partial", "unknown"}
 GLOBAL_ACTIONS = {
@@ -285,7 +285,8 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
                     if node_by_id[task["id"]].get("state") != "superseded"]
     if not active_nodes:
         raise IntegrationPreconditionError("No active effective tasks exist.")
-    non_success = [node["plan_task_id"] for node in active_nodes if node.get("state") != "success"]
+    non_success = [node["plan_task_id"] for node in active_nodes
+                   if node.get("state") not in {"success", "runtime_success"}]
     if non_success:
         raise IntegrationPreconditionError(
             "Global verification requires every active effective task to be successful: "
@@ -337,14 +338,24 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
         task_ref, evaluation_ref = f"task:{task_id}", f"evaluation:{evaluation_id}"
         evidence_refs.update({task_ref, evaluation_ref})
         evidence = []
-        for criterion in evaluation.get("criteria") or []:
+        all_criteria = evaluation.get("criteria") or []
+        evidence_index = 0
+        task_criteria = []
+        for criterion in all_criteria:
             if not isinstance(criterion, dict):
                 continue
+            origin_task_id = criterion.get("origin_task_id")
+            is_global = criterion.get("origin_type") == "global"
+            if not is_global and (origin_task_id is None or origin_task_id == task_id):
+                task_criteria.append(criterion)
             for item in criterion.get("evidence") or []:
-                if len(evidence) >= 20:
+                evidence_index += 1
+                if evidence_index > 20:
                     context_truncated = True
                     break
-                reference = f"evidence:{evaluation_id}:{len(evidence) + 1}"
+                if is_global or (origin_task_id is not None and origin_task_id != task_id):
+                    continue
+                reference = f"evidence:{evaluation_id}:{evidence_index}"
                 evidence_refs.add(reference)
                 evidence.append({"ref": reference, "value": clip(item, 1_000)})
         snapshot_input = (evaluation.get("snapshot") or {}).get("input") or {}
@@ -369,7 +380,7 @@ def build_integration_input(*, original_user_prompt: str, original_plan: dict[st
             "attempt": int(node.get("attempt") or 0),
             "evaluation_id": evaluation_id, "evaluation_ref": evaluation_ref,
             "evaluation_summary": clip(evaluation.get("summary", ""), 2_000),
-            "evaluation_criteria": evaluation.get("criteria") or [],
+            "evaluation_criteria": task_criteria,
             "evidence": evidence,
             "verification": {
                 key: bool(verification.get(key)) for key in

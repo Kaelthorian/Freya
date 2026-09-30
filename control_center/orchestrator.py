@@ -283,7 +283,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if previous_id == task_id:
                 break
             previous_node = node_by_id.get(previous_id, {})
-            if previous_node.get("state") != "success":
+            if previous_node.get("state") not in {"success", "runtime_success"}:
                 continue
             previous_task = plan_by_id.get(previous_id, {})
             runtime_id = previous_node.get("runtime_task_id")
@@ -1357,6 +1357,13 @@ class Orchestrator(IntegrationOrchestrationMixin):
             assignments_by_task = worker_assignment_map(plan_snapshot)
             raw_assignment = assignments_by_task.get(planned_task_id)
             worker_assignment = dict(raw_assignment) if raw_assignment else None
+            if worker_assignment is not None:
+                current_states = {item["plan_task_id"]: item["state"]
+                                  for item in self.store.get_execution_graph(oid)["nodes"]}
+                worker_assignment["task_ids"] = [
+                    task_id for task_id in worker_assignment["task_ids"]
+                    if current_states.get(task_id) != "superseded"
+                ]
             if node.get("recovery_action_id"):
                 recovery_action = self.store.get_recovery(node["recovery_action_id"])
                 recovery_action_kind = recovery_action.get("action")
@@ -1617,7 +1624,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if transition["to"] == "ready":
                 self.store.add_orchestration_event(oid, {
                     "event_type": "freya.task.ready", "status": "Running", "task_id": task_id,
-                    "message": "All dependencies succeeded; the planned task is ready.",
+                    "message": "All dependencies reached runtime_success or semantic acceptance; the planned task is ready.",
                 })
             elif transition["to"] == "blocked":
                 self.store.add_orchestration_event(oid, {
@@ -1647,6 +1654,10 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 key: item[key] for key in ("check", "status", "type", "tool", "exit_code")
                 if key in item
             }
+            for key in ("path", "capability", "evidence_id", "source_task_id",
+                        "source_runtime_task_id", "worker_id", "timestamp"):
+                if isinstance(item.get(key), str):
+                    bounded[key] = item[key][:500]
             for key in ("command", "supports_acceptance_criteria"):
                 value = item.get(key)
                 if isinstance(value, list):
@@ -1657,7 +1668,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         return sanitize({
             "planned_task": {
                 key: planned.get(key)
-                for key in ("id", "objective", "description", "success_criteria")
+                for key in ("id", "objective", "description", "success_criteria", "worker_context")
                 if key in planned
             },
             "runtime_task": {
@@ -1676,56 +1687,351 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "context_truncated": bool(snapshot.get("context_truncated")),
         })
 
-    def _evaluate_graph_node(self, oid: str, plan: dict, target: dict,
-                             deadline: float) -> None:
-        """Evaluate one technical success without holding the orchestration lock."""
-        task_id = target["plan_task_id"]
-        planned_task = next(task for task in plan["tasks"] if task["id"] == task_id)
+    @staticmethod
+    def _worker_groups(plan: dict[str, Any],
+                       active_task_ids: set[str] | None = None) -> list[dict[str, Any]]:
+        """Return validated assignments; saved pre-assignment plans stay per-Task."""
+        if "worker_assignments" in plan:
+            worker_assignment_map(plan)
+            assignments = [dict(item) for item in plan["worker_assignments"]]
+        else:
+            assignments = [{"worker_id": task["id"], "task_ids": [task["id"]]}
+                           for task in plan.get("tasks", [])]
+        if active_task_ids is not None:
+            assignments = [{**item, "task_ids": [task_id for task_id in item["task_ids"]
+                                                   if task_id in active_task_ids]}
+                           for item in assignments]
+            assignments = [item for item in assignments if item["task_ids"]]
+        return assignments
+
+    @staticmethod
+    def _stamp_worker_provenance(item: Any, *, task_id: str, runtime_task_id: str,
+                                 worker_id: str, timestamp: str, index: int,
+                                 evidence_kind: str = "evidence") -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        value = dict(item)
+        value.update(source_task_id=task_id, source_runtime_task_id=runtime_task_id,
+                     worker_id=worker_id)
+        value.setdefault("timestamp", timestamp)
+        original_id = value.get("evidence_id")
+        if isinstance(original_id, str) and original_id:
+            value["source_evidence_id"] = original_id[:500]
+        value["evidence_id"] = f"{worker_id}:{runtime_task_id}:{evidence_kind}:{index}"
+        return value
+
+    def _worker_evaluation_input(self, oid: str, plan: dict, assignment: dict,
+                                 nodes: list[dict], run: dict,
+                                 anchor_task_id: str) -> tuple[dict, dict, dict, dict, list[dict]]:
+        """Aggregate every assigned Task result without dropping evidence provenance."""
+        worker_id = assignment["worker_id"]
+        task_ids = list(assignment["task_ids"])
+        task_by_id = {item["id"]: item for item in plan["tasks"]}
+        node_by_id = {item["plan_task_id"]: item for item in nodes}
+        task_runs = [(task_by_id[task_id], node_by_id[task_id],
+                      self.store.get_task(node_by_id[task_id]["runtime_task_id"]))
+                     for task_id in task_ids]
+        agent_ids = {node.get("selected_agent_id") for _, node, _ in task_runs}
+        if len(agent_ids) != 1 or not next(iter(agent_ids)):
+            raise ValueError("A Worker Assignment must preserve one selected Worker identity.")
+        agent_id = next(iter(agent_ids))
+        anchor_task, anchor_node, anchor_runtime = next(
+            item for item in task_runs if item[0]["id"] == anchor_task_id)
+
+        criterion_links = plan.get("criterion_links") or {}
+        local_links = criterion_links.get("local", [])
+        global_links = criterion_links.get("global", [])
+        criteria: list[dict[str, Any]] = []
+        for task, _, _ in task_runs:
+            for index, criterion in enumerate(task.get("success_criteria") or [], 1):
+                link = next((item for item in local_links if isinstance(item, dict)
+                             and item.get("task_id") == task["id"]
+                             and item.get("criterion") == criterion), None)
+                criteria.append({
+                    "criterion_id": (link.get("id") if link else f"{task['id']}:AC-{index}"),
+                    "origin_task_id": task["id"], "criterion": criterion,
+                    "origin_type": "task",
+                })
+        active_task_ids = {task_id for task_id, node in node_by_id.items()
+                           if node.get("state") != "superseded"}
+        single_worker = len(self._worker_groups(plan, active_task_ids)) == 1
+        if single_worker:
+            for index, criterion in enumerate(plan.get("success_criteria") or [], 1):
+                link = next((item for item in global_links if isinstance(item, dict)
+                             and item.get("criterion") == criterion), None)
+                criteria.append({
+                    "criterion_id": (link.get("id") if link else f"global:GC-{index}"),
+                    "origin_task_id": None, "criterion": criterion,
+                    "origin_type": "global",
+                })
+
+        unique_criteria: list[str] = []
+        seen_criteria: set[str] = set()
+        for item in criteria:
+            key = str(item.get("criterion") or "").strip().casefold()
+            if key and key not in seen_criteria:
+                seen_criteria.add(key)
+                unique_criteria.append(item["criterion"])
+        acceptance_criteria = [{"id": item["criterion_id"], "criterion": item["criterion"]}
+                               for item in criteria]
+        owned_paths = list(dict.fromkeys(
+            path for task, _, _ in task_runs for path in task.get("owned_paths", [])
+            if isinstance(path, str)))
+        write_targets = list(dict.fromkeys(
+            path for task, _, _ in task_runs for path in task.get("write_targets", [])
+            if isinstance(path, str)))
+        actions, artifacts, diffs, evidence = [], [], [], []
+        already_observations = []
+        task_contexts = []
+        verification_flags = {name: [] for name in
+                              ("requested", "attempted", "passed", "failed", "unavailable")}
+        result_summaries = []
+        for task, node, runtime in task_runs:
+            result = runtime.get("result") if isinstance(runtime.get("result"), dict) else {}
+            verification = runtime.get("verification")
+            if not isinstance(verification, dict) or not verification:
+                verification = result.get("verification", {})
+            verification = verification if isinstance(verification, dict) else {}
+            finished = str(runtime.get("finished_at") or runtime.get("created_at") or "")
+            for name in verification_flags:
+                verification_flags[name].append(bool(verification.get(name)))
+            for index, action in enumerate(result.get("actions") or [], 1):
+                stamped = self._stamp_worker_provenance(
+                    action, task_id=task["id"], runtime_task_id=runtime["id"],
+                    worker_id=worker_id, timestamp=finished, index=index,
+                    evidence_kind="action",
+                )
+                if stamped:
+                    actions.append(stamped)
+            for field, output in (("artifacts", artifacts), ("workspace_diffs", diffs)):
+                for index, record in enumerate(result.get(field) or [], 1):
+                    stamped = self._stamp_worker_provenance(
+                        record, task_id=task["id"], runtime_task_id=runtime["id"],
+                        worker_id=worker_id, timestamp=finished, index=index,
+                        evidence_kind=field,
+                    )
+                    if stamped:
+                        output.append(stamped)
+            for index, item in enumerate(verification.get("evidence") or [], 1):
+                stamped = self._stamp_worker_provenance(
+                    item, task_id=task["id"], runtime_task_id=runtime["id"],
+                    worker_id=worker_id, timestamp=finished, index=index,
+                    evidence_kind="verification",
+                )
+                if stamped:
+                    evidence.append(stamped)
+            candidate = result.get("already_satisfied_candidate")
+            observations = candidate.get("artifact_observations", []) if isinstance(candidate, dict) else []
+            for index, observation in enumerate(observations, 1):
+                stamped = self._stamp_worker_provenance(
+                    observation, task_id=task["id"], runtime_task_id=runtime["id"],
+                    worker_id=worker_id, timestamp=finished, index=index,
+                    evidence_kind="already_satisfied",
+                )
+                if stamped:
+                    already_observations.append(stamped)
+            result_summaries.append({
+                "task_id": task["id"], "runtime_task_id": runtime["id"],
+                "status": runtime.get("status"), "result": str(runtime.get("result") or "")[:1200],
+            })
+            task_contexts.append({
+                "task_id": task["id"], "objective": task.get("objective", ""),
+                "success_criteria": [item for item in criteria
+                                     if item.get("origin_task_id") == task["id"]],
+                "depends_on": list(task.get("depends_on") or []),
+                "runtime_task_id": runtime["id"], "runtime_status": runtime.get("status"),
+                "result_preview": str(runtime.get("result") or "")[:1000],
+                "action_count": len(result.get("actions") or []),
+                "artifact_paths": [item.get("path") for item in result.get("artifacts", [])
+                                   if isinstance(item, dict) and isinstance(item.get("path"), str)][:20],
+                "read_results": [item.get("evidence_id") for item in evidence
+                                 if item.get("source_task_id") == task["id"]
+                                 and item.get("type") in {"file_readback", "file_content_match"}],
+                "already_satisfied_evidence": [item for item in already_observations
+                                               if item.get("source_task_id") == task["id"]],
+                "verification": {key: verification.get(key) for key in verification_flags},
+            })
+
+        workspace = self._workspace_for_run(run)
+        workspace_state = self.store.get_project_state(oid) or {}
+        if workspace and task_runs:
+            try:
+                workspace_state, _ = self.project_state.snapshot_for_dispatch(
+                    oid, plan, task_runs[-1][0], workspace, nodes,
+                )
+            except (OSError, RuntimeError, ValueError):
+                workspace_state = self.store.get_project_state(oid) or workspace_state
+        worker_context = {
+            "worker_id": worker_id, "agent_id": agent_id,
+            "assigned_task_ids": task_ids,
+            "execution_strategy": plan.get("execution_strategy"),
+            "tasks": task_contexts,
+            "dependency_results": [{
+                "task_id": task["id"],
+                "depends_on": [{
+                    "task_id": dep, "state": node_by_id[dep].get("state"),
+                    "result": str(node_by_id[dep].get("result") or "")[:500],
+                    "error": str(node_by_id[dep].get("error") or "")[:300],
+                } for dep in task.get("depends_on", []) if dep in node_by_id],
+            } for task, _, _ in task_runs],
+            "workspace_state": workspace_state,
+        }
+        # Keep model-facing task context bounded; detailed read/diff content remains
+        # in the evidence catalog with its full source provenance.
+        rendered_worker_context = json.dumps(
+            sanitize(worker_context), ensure_ascii=False, separators=(",", ":"), default=str,
+        )
+        if len(rendered_worker_context) > 8_000:
+            worker_context["workspace_state"] = {
+                "revision": workspace_state.get("revision"),
+                "manifest": workspace_state.get("manifest", {}),
+                "snapshot_truncated": True,
+            }
+            for item in worker_context["tasks"]:
+                item["result_preview"] = str(item.get("result_preview") or "")[:300]
+            worker_context["context_truncated"] = True
+
+        combined_result = {
+            "actions": actions, "artifacts": artifacts, "workspace_diffs": diffs,
+            "already_satisfied_candidate": {"artifact_observations": already_observations},
+            "tasks": result_summaries,
+        }
+        verification = {
+            "requested": any(verification_flags["requested"]),
+            "attempted": any(verification_flags["attempted"]),
+            "passed": bool(verification_flags["passed"])
+                      and all(not verification_flags["requested"][i]
+                              or verification_flags["passed"][i]
+                              for i in range(len(verification_flags["passed"]))),
+            "failed": any(verification_flags["failed"]),
+            "unavailable": any(verification_flags["unavailable"]),
+            "evidence": evidence,
+            "skipped_with_reason": "; ".join(dict.fromkeys(
+                str(runtime.get("verification", {}).get("skipped_with_reason") or "")
+                for _, _, runtime in task_runs
+                if isinstance(runtime.get("verification"), dict)
+                and runtime.get("verification", {}).get("skipped_with_reason")))[:2_000],
+        }
+        planned = {
+            "id": worker_id, "objective": "\n".join(task["objective"] for task, _, _ in task_runs),
+            "description": "Worker Assignment: " + worker_id,
+            "success_criteria": unique_criteria,
+            "acceptance_criteria": acceptance_criteria,
+            "owned_paths": owned_paths, "write_targets": write_targets,
+            "worker_context": worker_context,
+        }
+        runtime_aggregate = {
+            "id": anchor_runtime["id"], "status": "Success", "agent_id": agent_id,
+            "workspace": anchor_runtime.get("workspace"),
+            "result": combined_result, "verification": verification,
+            "error": "", "finished_at": max(
+                (str(runtime.get("finished_at") or "") for _, _, runtime in task_runs), default=""),
+        }
+        execution_node = {
+            "selected_agent_id": agent_id, "runtime_task_id": anchor_runtime["id"],
+            "attempt": int(anchor_node.get("attempt", 0)),
+            "worker_id": worker_id, "assigned_task_ids": task_ids,
+        }
+        return planned, runtime_aggregate, execution_node, worker_context, criteria
+
+    def _evaluate_worker_assignment(self, oid: str, plan: dict, assignment: dict,
+                                   deadline: float) -> None:
+        """Evaluate one complete Worker Assignment over its accumulated runtime evidence."""
+        worker_id = assignment["worker_id"]
+        task_ids = list(assignment["task_ids"])
         evaluation_id = str(uuid4())
         with self.lock:
-            if self.store.get_orchestration(oid)["status"] != "Running":
+            run = self.store.get_orchestration(oid)
+            if run["status"] != "Running":
                 return
-            current = ExecutionGraph(
-                plan, self.store.get_execution_graph(oid)["nodes"],
-            ).node(task_id)
-            if (current["state"] != "evaluating" or current.get("evaluation_id")
-                    or current.get("runtime_task_id") != target.get("runtime_task_id")
-                    or int(current.get("attempt", 0)) != int(target.get("attempt", 0))):
+            graph_record = self.store.get_execution_graph(oid)
+            graph_nodes = graph_record["nodes"]
+            node_by_id = {item["plan_task_id"]: item for item in graph_nodes}
+            if any(task_id not in node_by_id or node_by_id[task_id]["state"] != "runtime_success"
+                   for task_id in task_ids):
                 return
-            runtime_task = self.store.get_task(target["runtime_task_id"])
+            workers = {item["worker_id"]: item for item in self.store.list_workers(oid)}
+            worker = workers.get(worker_id)
+            if worker is None or worker.get("status") in {"accepted", "completed", "failed"}:
+                return
+            prior_keys = {(item.get("plan_task_id"), int(item.get("attempt", 0)))
+                          for item in self.store.list_evaluations(oid)}
+            anchor_task_id = next((task_id for task_id in task_ids
+                                   if (task_id, int(node_by_id[task_id].get("attempt", 0)))
+                                   not in prior_keys), None)
+            if anchor_task_id is None:
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.evaluation.failed", "status": "Failed",
+                    "worker_id": worker_id, "assigned_task_ids": task_ids,
+                    "message": "No unconsumed Task attempt is available to anchor this immutable Worker Evaluation.",
+                })
+                self.store.set_worker_status(
+                    oid, worker_id, "failed", agent_id=node_by_id[task_ids[0]].get("selected_agent_id"),
+                )
+                return
+            try:
+                planned, runtime_aggregate, execution_node, worker_context, criteria = (
+                    self._worker_evaluation_input(
+                        oid, plan, assignment, graph_nodes, run, anchor_task_id,
+                    )
+                )
+            except Exception as exc:
+                self.store.set_worker_status(
+                    oid, worker_id, "failed", agent_id=node_by_id[task_ids[0]].get("selected_agent_id"),
+                )
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.evaluation.failed", "status": "Failed",
+                    "worker_id": worker_id, "assigned_task_ids": task_ids,
+                    "message": "Could not construct the Worker evidence context: " + str(exc)[:1000],
+                })
+                return
+            agent_id = execution_node["selected_agent_id"]
+            self.store.set_worker_status(
+                oid, worker_id, "evaluation_pending",
+                expected_statuses={"executing", "evaluation_pending", "evaluating"},
+                agent_id=agent_id,
+            )
+            if worker.get("status") != "evaluation_pending":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.execution_completed", "status": "evaluation_pending",
+                    "worker_id": worker_id, "agent_id": agent_id,
+                    "assigned_task_ids": task_ids,
+                    "execution_strategy": plan.get("execution_strategy"),
+                    "message": "Every executable Task assigned to this Worker has runtime_success.",
+                })
+            if not self.store.set_worker_status(
+                    oid, worker_id, "evaluating",
+                    expected_statuses={"evaluation_pending", "evaluating"},
+                    agent_id=agent_id, evaluation_id=evaluation_id):
+                return
+            self.store.add_orchestration_event(oid, {
+                "event_type": "worker.evaluation_started", "status": "Running",
+                "worker_id": worker_id, "agent_id": agent_id,
+                "assigned_task_ids": task_ids, "evaluation_id": evaluation_id,
+                "evaluator_version": EVALUATOR_VERSION,
+                "message": "Freya started the assignment-wide evidence evaluation.",
+            })
+            # Retain the historical event name with Worker identity for clients
+            # that have not yet migrated their activity views.
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.evaluation.started", "status": "Running",
-                "task_id": task_id, "plan_task_id": task_id,
-                "agent_id": target.get("selected_agent_id"),
-                "runtime_task_id": target.get("runtime_task_id"),
-                "evaluation_id": evaluation_id,
-                "evaluation_status": "evaluating",
-                "evaluator_version": EVALUATOR_VERSION,
-                "message": "Freya started evidence-first semantic evaluation.",
+                "worker_id": worker_id, "assigned_task_ids": task_ids,
+                "agent_id": agent_id, "evaluation_id": evaluation_id,
+                "evaluation_status": "evaluating", "evaluator_version": EVALUATOR_VERSION,
+                "message": "Freya started one semantic evaluation for the complete Worker Assignment.",
             })
+
         technical_error = None
         try:
-            evaluation_task = dict(planned_task)
-            criterion_links = plan.get("criterion_links")
-            local_links = criterion_links.get("local", []) if isinstance(criterion_links, dict) else []
-            if isinstance(local_links, list):
-                evaluation_task["acceptance_criteria"] = [
-                    {"id": item["id"], "criterion": item["criterion"]}
-                    for item in local_links if isinstance(item, dict)
-                    and item.get("task_id") == task_id
-                    and isinstance(item.get("id"), str)
-                    and isinstance(item.get("criterion"), str)
-                    and item.get("criterion") in planned_task.get("success_criteria", [])
-                ]
             with self.evaluator_lock:
                 outcome = self.evaluator.evaluate(
-                    planned_task=evaluation_task, runtime_task=runtime_task,
-                    execution_node=target,
+                    planned_task=planned, runtime_task=runtime_aggregate,
+                    execution_node=execution_node,
                 )
         except Exception as exc:
             technical_error = str(exc)
             outcome = technical_failure_evaluation(
-                technical_error, list(planned_task.get("success_criteria") or []),
+                technical_error, list(planned.get("success_criteria") or []),
             )
             outcome.update(
                 metrics=dict(getattr(self.evaluator, "metrics", {}) or {}),
@@ -1740,94 +2046,134 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self._timeout(oid)
             return
 
-        evaluation = {key: outcome[key] for key in EVALUATION_FIELDS if key in outcome}
-        if outcome.get("status") == "error":
-            evaluation = {key: outcome[key] for key in (
-                "status", "confidence", "summary", "criteria", "issues",
-                "missing_evidence", "evaluation_status", "failure_class",
-                "recommended_runtime_action",
-            ) if key in outcome}
+        base_evaluation = {key: outcome[key] for key in EVALUATION_FIELDS if key in outcome}
+        by_criterion = {str(item.get("criterion") or "").strip().casefold(): item
+                        for item in base_evaluation.get("criteria", []) if isinstance(item, dict)}
+        criterion_results = []
+        criterion_metadata = {item["criterion_id"]: item for item in criteria}
+        for criterion in planned["acceptance_criteria"]:
+            decision = by_criterion.get(str(criterion["criterion"]).strip().casefold())
+            if decision is None:
+                decision = {"status": "unknown", "reason": "No criterion decision was returned.",
+                            "evidence": []}
+            criterion_results.append({
+                "criterion_id": criterion["id"],
+                "origin_task_id": criterion_metadata[criterion["id"]]["origin_task_id"],
+                "origin_type": criterion_metadata[criterion["id"]]["origin_type"],
+                "criterion": criterion["criterion"],
+                "status": decision["status"], "reason": decision["reason"],
+                "evidence": list(decision.get("evidence") or []),
+            })
+        evaluation = dict(base_evaluation)
+        evaluation["criteria"] = criterion_results
+        evaluation["worker_id"] = worker_id
+        evaluation["assigned_task_ids"] = task_ids
+        failed_criteria = [item for item in criterion_results if item["status"] != "satisfied"]
+        failed_task_ids = list(dict.fromkeys(
+            item["origin_task_id"] for item in failed_criteria
+            if item.get("origin_task_id") in task_ids))
+        failed_criterion_ids = [item["criterion_id"] for item in failed_criteria]
+        failed_task_id = failed_task_ids[0] if failed_task_ids else task_ids[0]
         metrics = dict(outcome.get("metrics") or {})
-        snapshot = {
+        metrics.update({
+            "worker_evaluation_model_calls": int(metrics.get("model_calls", 0) or 0),
+            "worker_evaluation_tokens": int(metrics.get("total_tokens", 0) or 0),
+            "worker_evaluation_duration": float(metrics.get("duration_seconds", 0.0) or 0.0),
+            "criteria_count": len(criterion_results),
+            "evidence_count": len(outcome.get("context_snapshot", {}).get(
+                "worker_evidence_pool", [])) if isinstance(outcome.get("context_snapshot"), dict) else 0,
+        })
+        # Prefer an attempt without a prior immutable evaluation row as the
+        # storage anchor; the evaluation itself belongs to worker_id.
+        current_nodes = {item["plan_task_id"]: item for item in self.store.get_execution_graph(oid)["nodes"]}
+        anchor = current_nodes[anchor_task_id]
+        evaluation_snapshot = {
             "evaluator_version": EVALUATOR_VERSION,
             "input": outcome.get("context_snapshot") or {},
+            "worker_context": worker_context,
+            "worker_evidence_pool": (outcome.get("context_snapshot") or {}).get(
+                "worker_evidence_pool", []),
             "evaluation": evaluation,
-            "criterion_details": outcome.get("criterion_details") or [],
+            "criterion_details": criterion_results,
         }
         with self.lock:
             run = self.store.get_orchestration(oid)
             if run["status"] != "Running":
                 return
-            graph = ExecutionGraph(plan, self.store.get_execution_graph(oid)["nodes"])
-            current = graph.node(task_id)
-            if (current["state"] != "evaluating" or current.get("evaluation_id")
-                    or current.get("runtime_task_id") != target.get("runtime_task_id")
-                    or int(current.get("attempt", 0)) != int(target.get("attempt", 0))):
-                return
-            graph.apply_evaluation(
-                task_id, evaluation_id, evaluation["status"], evaluation["summary"], utcnow(),
-            )
-            record = self.store.commit_evaluation(
-                evaluation_id, oid, task_id,
-                runtime_task_id=target["runtime_task_id"],
-                agent_id=target["selected_agent_id"], attempt=int(target["attempt"]),
-                evaluator_version=EVALUATOR_VERSION, evaluation=evaluation,
-                metrics=metrics, snapshot=snapshot,
+            committed = self.store.commit_worker_evaluation(
+                evaluation_id, oid, worker_id, task_ids, anchor_task_id,
+                failed_task_id=None if evaluation["status"] == "accepted" else failed_task_id,
+                runtime_task_id=anchor["runtime_task_id"], agent_id=anchor["selected_agent_id"],
+                attempt=int(anchor["attempt"]), evaluator_version=EVALUATOR_VERSION,
+                evaluation=evaluation, metrics=metrics, snapshot=evaluation_snapshot,
                 context_truncated=bool(outcome.get("context_truncated")),
                 deterministic=bool(outcome.get("deterministic")),
             )
-            if record is None:
+            if committed is None:
                 return
-            if evaluation["status"] == "accepted" and runtime_task.get("workspace"):
-                self.project_state.accept_task_update(
-                    oid, plan, planned_task, runtime_task,
-                    target.get("selected_agent_id"),
-                )
-            event_type = ("freya.evaluation.failed" if technical_error
-                          else "freya.evaluation.completed")
-            evaluation_output = {
-                "decision": evaluation,
-                "deterministic": bool(outcome.get("deterministic")),
+            if evaluation["status"] == "accepted":
+                for task_id in task_ids:
+                    task, node = next((task, current_nodes[task["id"]]) for task in plan["tasks"]
+                                      if task["id"] == task_id)
+                    runtime_task = self.store.get_task(node["runtime_task_id"])
+                    if runtime_task.get("workspace"):
+                        self.project_state.accept_task_update(
+                            oid, plan, task, runtime_task, node.get("selected_agent_id"),
+                        )
+            for criterion in criterion_results:
+                criterion_event = {
+                    "worker_id": worker_id, "agent_id": agent_id,
+                    "evaluation_id": evaluation_id,
+                    "assigned_task_ids": task_ids,
+                    "criterion_id": criterion["criterion_id"],
+                    "origin_task_id": criterion["origin_task_id"],
+                    "criterion_status": criterion["status"],
+                    "reason": criterion["reason"], "evidence": criterion["evidence"],
+                    "message": criterion["reason"],
+                }
+                self.store.add_orchestration_event(oid, {
+                    **criterion_event, "event_type": "worker.evaluation.criterion_completed",
+                    "status": ("Success" if criterion["status"] == "satisfied" else
+                               "Blocked" if criterion["status"] == "unknown" else "Failed"),
+                })
+                if criterion["status"] == "unknown":
+                    self.store.add_orchestration_event(oid, {
+                        **criterion_event, "event_type": "worker.evaluation.insufficient_evidence",
+                        "status": "Blocked",
+                    })
+            for evaluator_event in outcome.get("events") or []:
+                self.store.add_orchestration_event(oid, {
+                    **evaluator_event, "status": evaluator_event.get("status", "Success"),
+                    "worker_id": worker_id, "assigned_task_ids": task_ids,
+                    "evaluation_id": evaluation_id,
+                })
+            output = {
+                "decision": evaluation, "deterministic": bool(outcome.get("deterministic")),
                 "context_truncated": bool(outcome.get("context_truncated")),
                 "metrics": metrics,
             }
             if evaluation["status"] != "accepted":
-                evaluation_output["input"] = self._evaluation_log_input(
+                output["input"] = self._evaluation_log_input(
                     outcome.get("context_snapshot") or {},
                 )
-            if evaluation["status"] == "error":
-                self.store.add_orchestration_event(oid, {
-                    "event_type": "evaluation.infrastructure_failed", "status": "Failed",
-                    "task_id": task_id, "evaluation_id": evaluation_id,
-                    "evaluation_status": "error", "message": evaluation["summary"],
-                })
-            for evaluator_event in outcome.get("events") or []:
-                self.store.add_orchestration_event(oid, {
-                    **evaluator_event, "status": evaluator_event.get("status", "Success"),
-                    "task_id": task_id, "evaluation_id": evaluation_id,
-                })
-            self.store.add_orchestration_event(oid, {
-                "event_type": event_type,
-                "status": "Failed" if evaluation["status"] != "accepted" else "Success",
-                "task_id": task_id, "plan_task_id": task_id,
-                "agent_id": target.get("selected_agent_id"),
-                "runtime_task_id": target.get("runtime_task_id"),
-                "evaluation_id": evaluation_id,
+            event_status = "Success" if evaluation["status"] == "accepted" else "Failed"
+            common = {
+                "worker_id": worker_id, "agent_id": agent_id,
+                "evaluation_id": evaluation_id, "assigned_task_ids": task_ids,
+                "failed_task_ids": failed_task_ids,
+                "failed_criterion_ids": failed_criterion_ids,
                 "evaluation_status": evaluation["status"],
                 "evaluator_version": EVALUATOR_VERSION,
-                "message": evaluation["summary"],
-                "output": evaluation_output,
+                "metrics": metrics, "message": evaluation["summary"], "output": output,
+            }
+            self.store.add_orchestration_event(oid, {
+                **common, "event_type": "worker.evaluation.completed", "status": event_status,
             })
-            if evaluation["status"] == "accepted":
-                self.store.add_orchestration_event(oid, {
-                    "event_type": "freya.task.succeeded", "status": "Success",
-                    "task_id": task_id, "plan_task_id": task_id,
-                    "agent_id": target.get("selected_agent_id"),
-                    "runtime_task_id": target.get("runtime_task_id"),
-                    "evaluation_id": evaluation_id,
-                    "evaluation_status": evaluation["status"],
-                    "message": "Semantic evaluation accepted the planned task.",
-                })
+            self.store.add_orchestration_event(oid, {
+                **common,
+                "event_type": "freya.evaluation.failed" if technical_error else "freya.evaluation.completed",
+                "status": event_status,
+            })
 
 
     def _recover_graph_node(self, oid: str, plan: dict, target: dict,
@@ -1836,6 +2182,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
         task_id = target["plan_task_id"]
         planned_task = next(task for task in plan["tasks"] if task["id"] == task_id)
         evaluation = self.store.get_evaluation(target["evaluation_id"])
+        worker_id = str(evaluation.get("worker_id") or worker_id_for_task(plan, task_id) or "")
+        assigned_task_ids = list(evaluation.get("evaluated_task_ids") or [task_id])
+        failed_criteria = [item for item in evaluation.get("criteria", [])
+                           if isinstance(item, dict) and item.get("status") != "satisfied"]
+        failed_task_ids = list(dict.fromkeys(
+            item.get("origin_task_id") for item in failed_criteria
+            if item.get("origin_task_id") in assigned_task_ids))
+        failed_criterion_ids = [item.get("criterion_id") for item in failed_criteria
+                                if isinstance(item.get("criterion_id"), str)]
         previous_runtime_task = self.store.get_task(target.get("runtime_task_id")) if target.get("runtime_task_id") else None
         workspace_state = self._recovery_workspace_state(previous_runtime_task)
         recoveries = self.store.list_recoveries(oid)
@@ -1863,6 +2218,16 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         "task_id": task_id, "evaluation_id": target["evaluation_id"],
                         "message": reason,
                     })
+                    if worker_id:
+                        self.store.set_worker_status(oid, worker_id, "failed",
+                                                     evaluation_id=target["evaluation_id"])
+                        self.store.add_orchestration_event(oid, {
+                            "event_type": "worker.recovery_completed", "status": "Failed",
+                            "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                            "failed_task_ids": failed_task_ids,
+                            "failed_criterion_ids": failed_criterion_ids,
+                            "evaluation_id": target["evaluation_id"], "message": reason,
+                        })
             return
         recovery_id = str(uuid4())
         with self.lock:
@@ -1871,8 +2236,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.recovery.started", "status": "Running",
                 "task_id": task_id, "evaluation_id": target["evaluation_id"],
+                "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
                 "attempt": target["attempt"], "recovery_id": recovery_id,
                 "message": "Freya started bounded semantic recovery.",
+            })
+            self.store.add_orchestration_event(oid, {
+                "event_type": "worker.recovery_started", "status": "Running",
+                "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                "failed_task_ids": failed_task_ids,
+                "failed_criterion_ids": failed_criterion_ids,
+                "evaluation_id": target["evaluation_id"], "recovery_id": recovery_id,
+                "message": "Recovery is mapping Worker criteria back to their originating Tasks.",
             })
         limits = {
             "max_semantic_attempts_per_task": self.config["max_semantic_attempts_per_task"],
@@ -1932,11 +2306,67 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 }
         retry_prompt = ""
         if decision["action"] in {"retry_same_agent", "retry_different_agent"}:
+            graph_nodes = self.store.get_execution_graph(oid)["nodes"]
+            worker_scope = set(assigned_task_ids)
+            retry_scope = {task_id}
+            changed = True
+            while changed:
+                changed = False
+                for candidate in plan.get("tasks", []):
+                    candidate_id = candidate["id"]
+                    if candidate_id not in worker_scope or candidate_id in retry_scope:
+                        continue
+                    if set(candidate.get("depends_on") or []) & retry_scope:
+                        node = next((item for item in graph_nodes
+                                     if item["plan_task_id"] == candidate_id), {})
+                        if node.get("state") == "runtime_success":
+                            retry_scope.add(candidate_id)
+                            changed = True
+            decision["affected_task_ids"] = list(dict.fromkeys([
+                *decision.get("affected_task_ids", []), *retry_scope,
+            ]))
             retry_prompt = build_retry_prompt(
                 planned_task, evaluation, decision["instructions"],
                 attempt=int(target["attempt"]) + 1,
                 workspace_state=workspace_state,
             )
+        elif decision["action"] == "gather_evidence":
+            graph_nodes = {item["plan_task_id"]: item
+                           for item in self.store.get_execution_graph(oid)["nodes"]}
+            task_by_id = {item["id"]: item for item in plan.get("tasks", [])}
+            candidates = []
+            for candidate_id in assigned_task_ids:
+                if candidate_id == task_id or graph_nodes.get(candidate_id, {}).get("state") != "runtime_success":
+                    continue
+                candidate = task_by_id.get(candidate_id, {})
+                operations = set(candidate.get("semantic_operations") or candidate.get("operations") or [])
+                capabilities = set(candidate.get("required_capabilities") or [])
+                tools = set(candidate.get("required_tools") or [])
+                if (operations == {"read_file"} and "filesystem.read" in capabilities
+                        and (not tools or tools <= {"read_file"})):
+                    candidates.append(candidate)
+            if not candidates:
+                decision = {
+                    **decision, "action": "fail", "instructions": "",
+                    "affected_task_ids": [task_id],
+                    "reason": "Missing evidence cannot be gathered within this Worker Assignment's existing read-only capabilities.",
+                }
+            else:
+                observer = candidates[-1]
+                decision["affected_task_ids"] = [task_id, observer["id"]]
+                missing = "; ".join(str(item) for item in evaluation.get("missing_evidence", [])[:10])
+                retry_prompt = (
+                    "WORKER EVIDENCE COLLECTION (READ ONLY)\n"
+                    f"Worker: {worker_id}\n"
+                    f"Missing evidence: {missing}\n"
+                    "Use only the existing read-only tools assigned to this Task. Read or test the current "
+                    "workspace state and report objective output for the listed criteria. Do not create, "
+                    "edit, overwrite, or delete files, and do not repeat an already successful mutation.\n"
+                    "Worker evaluation criteria:\n" + "\n".join(
+                        f"- {item.get('origin_task_id') or 'global'} / {item.get('criterion_id')}: "
+                        f"{item.get('criterion')}" for item in failed_criteria[:20]
+                    )
+                )
         with self.lock:
             run = self.store.get_orchestration(oid)
             if run["status"] != "Running":
@@ -1961,6 +2391,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             self.store.add_orchestration_event(oid, {
                 "event_type": "freya.recovery.decided", "status": "Running",
                 "task_id": task_id, "recovery_id": recovery_id,
+                "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                "failed_task_ids": failed_task_ids,
+                "failed_criterion_ids": failed_criterion_ids,
                 "action": decision["action"], "reason": decision["reason"],
                 "workspace_state": workspace_state,
                 "selected_strategy": decision["action"],
@@ -1977,6 +2410,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "task_id": task_id, "evaluation_id": target["evaluation_id"],
                     "message": decision["reason"],
                 })
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.recovery_completed", "status": "Failed",
+                    "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                    "failed_task_ids": failed_task_ids,
+                    "failed_criterion_ids": failed_criterion_ids,
+                    "evaluation_id": target["evaluation_id"], "recovery_id": recovery_id,
+                    "message": decision["reason"],
+                })
                 return
             if decision["action"] in {"retry_same_agent", "retry_different_agent"}:
                 self.store.add_orchestration_event(oid, {
@@ -1985,11 +2426,36 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "action": decision["action"], "next_attempt": int(target["attempt"]) + 1,
                     "message": "Freya scheduled a new, independently selected execution attempt.",
                 })
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.recovery_completed", "status": "retry_scheduled",
+                    "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                    "failed_task_ids": failed_task_ids,
+                    "failed_criterion_ids": failed_criterion_ids,
+                    "evaluation_id": target["evaluation_id"], "recovery_id": recovery_id,
+                    "action": decision["action"],
+                    "affected_task_ids": decision["affected_task_ids"],
+                    "message": decision["reason"],
+                })
+                return
+            if decision["action"] == "gather_evidence":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.recovery_completed", "status": "evidence_scheduled",
+                    "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                    "failed_task_ids": failed_task_ids,
+                    "failed_criterion_ids": failed_criterion_ids,
+                    "evaluation_id": target["evaluation_id"], "recovery_id": recovery_id,
+                    "action": "gather_evidence",
+                    "affected_task_ids": decision["affected_task_ids"],
+                    "message": "Freya scheduled a read-only observation Task using the existing assignment.",
+                })
+                return
                 return
 
         try:
-            accepted = {item["plan_task_id"] for item in self.store.get_execution_graph(oid)["nodes"]
-                        if item["state"] == "success"}
+            accepted = {item["plan_task_id"]
+                        for item in self.store.get_execution_graph(oid)["nodes"]
+                        if item["state"] in {"success", "runtime_success"}
+                        and item.get("evaluation_status") == "accepted"}
             historical = {item["plan_task_id"] for item in self.store.get_execution_graph(oid)["nodes"]}
             with self.recovery_lock:
                 revision = self.replanner.create_revision(
@@ -2029,6 +2495,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "plan_revision_id": revision_id, "revision": saved["revision"],
                     "resource_resolutions": revision.get("resource_resolutions", []),
                     "message": "Freya committed a validated effective-plan revision.",
+                })
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "worker.recovery_completed", "status": "replan_scheduled",
+                    "worker_id": worker_id, "assigned_task_ids": assigned_task_ids,
+                    "failed_task_ids": failed_task_ids,
+                    "failed_criterion_ids": failed_criterion_ids,
+                    "evaluation_id": target["evaluation_id"], "recovery_id": recovery_id,
+                    "affected_task_ids": decision["affected_task_ids"],
+                    "message": "Freya committed a bounded Worker recovery revision.",
                 })
         except Exception as exc:
             with self.lock:
@@ -2684,11 +3159,25 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 plan = run.get("effective_plan") or run["plan"]
                 assignments_by_task = worker_assignment_map(plan)
                 graph = ExecutionGraph(plan, persisted["nodes"])
+                active_task_ids = {node["plan_task_id"] for node in graph.serialize()
+                                   if node["state"] != "superseded"}
+                worker_groups = self._worker_groups(plan, active_task_ids)
+                self.store.ensure_worker_states(oid, worker_groups)
                 changed = False
 
                 for node in graph.active_nodes():
                     if node["state"] == "evaluating":
-                        continue
+                        legacy_runtime = self.store.get_task(node["runtime_task_id"])
+                        if legacy_runtime.get("status") == "Success" and not node.get("evaluation_id"):
+                            graph.restore_legacy_evaluating_node(node["plan_task_id"], utcnow())
+                            changed = True
+                            self.store.update_execution_attempt(
+                                oid, node["plan_task_id"], int(node.get("attempt", 0)),
+                                status="runtime_success",
+                            )
+                        else:
+                            continue
+                        node = graph.node(node["plan_task_id"])
                     runtime_task = self.store.get_task(node["runtime_task_id"])
                     previous = node["state"]
                     if graph.apply_runtime_status(
@@ -2724,7 +3213,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                                 "message": event_message,
                                 "error": event_error,
                             })
-                        if current in {"evaluating", "failed", "cancelled"}:
+                        if current in {"runtime_success", "failed", "cancelled"}:
                             runtime_config = runtime_task.get("config", {})
                             runtime_context = runtime_config.get("runtime_context", {})
                             active_context = runtime_context.get("active_task_context", {})
@@ -2739,18 +3228,48 @@ class Orchestrator(IntegrationOrchestrationMixin):
                                 "active_tools": list(active_context.get("active_tools") or []),
                                 "active_capabilities": list(active_context.get("active_capabilities") or []),
                                 "attempt": int(node.get("attempt", 0)),
-                                "evaluation_status": "pending" if current == "evaluating" else "not_applicable",
+                                "evaluation_status": "worker_pending" if current == "runtime_success" else "not_applicable",
                                 "message": (
-                                    "Runtime finished this task; semantic evaluation remains pending."
-                                    if current == "evaluating" else
+                                    "Runtime finished this Task successfully; the Worker Assignment is not evaluated until all assigned Tasks complete."
+                                    if current == "runtime_success" else
                                     "Runtime task ended without a semantic evaluation."
                                 ),
                             })
+                        if current in {"failed", "cancelled"}:
+                            failed_worker_id = worker_id_for_task(plan, node["plan_task_id"])
+                            if failed_worker_id:
+                                self.store.set_worker_status(
+                                    oid, failed_worker_id, "failed",
+                                    expected_statuses={"executing", "evaluation_pending"},
+                                    agent_id=node.get("selected_agent_id"),
+                                )
 
                 transitions = graph.refresh_dependencies(utcnow())
                 if transitions:
                     changed = True
                     self._record_graph_transitions(oid, transitions)
+                graph_nodes_by_id = {item["plan_task_id"]: item for item in graph.serialize()}
+                worker_states = {item["worker_id"]: item for item in self.store.list_workers(oid)}
+                for assignment in worker_groups:
+                    if any(graph_nodes_by_id[task_id]["state"] in {
+                            "failed", "blocked", "cancelled", "skipped"}
+                           for task_id in assignment["task_ids"]):
+                        worker_state = worker_states.get(assignment["worker_id"], {})
+                        if worker_state.get("status") not in {"failed", "accepted", "completed"}:
+                            changed_worker = self.store.set_worker_status(
+                                oid, assignment["worker_id"], "failed",
+                                expected_statuses={"executing", "evaluation_pending"},
+                            )
+                            if changed_worker:
+                                self.store.add_orchestration_event(oid, {
+                                    "event_type": "worker.execution_failed", "status": "Failed",
+                                    "worker_id": assignment["worker_id"],
+                                    "assigned_task_ids": assignment["task_ids"],
+                                    "failed_task_ids": [task_id for task_id in assignment["task_ids"]
+                                                        if graph_nodes_by_id[task_id]["state"] in {
+                                                            "failed", "blocked", "cancelled", "skipped"}],
+                                    "message": "A Task runtime failure prevents this Worker Assignment from reaching semantic evaluation.",
+                                })
                 if changed:
                     self.store.save_execution_graph(oid, graph.serialize())
 
@@ -2763,9 +3282,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         break
 
                 if recovery_target is None:
-                    for node in graph.serialize():
-                        if node["state"] == "evaluating" and not node.get("evaluation_id"):
-                            evaluation_target = node
+                    worker_states = {item["worker_id"]: item for item in self.store.list_workers(oid)}
+                    nodes_by_id = {item["plan_task_id"]: item for item in graph.serialize()}
+                    for assignment in worker_groups:
+                        assigned = [nodes_by_id[task_id] for task_id in assignment["task_ids"]]
+                        worker_state = worker_states.get(assignment["worker_id"], {})
+                        if (assigned and all(item["state"] == "runtime_success" for item in assigned)
+                                and worker_state.get("status") not in {"accepted", "completed", "failed"}):
+                            evaluation_target = assignment
                             break
 
 
@@ -2778,17 +3302,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
                             selection_target = task
                             break
 
-            if completed_graph is not None:
-                self._complete_or_integrate(oid, completed_graph, deadline)
-                return
-
-            if evaluation_target is not None:
-                self._evaluate_graph_node(oid, plan, evaluation_target, deadline)
-                continue
-
             if recovery_target is not None:
                 self._recover_graph_node(oid, plan, recovery_target, deadline)
                 continue
+
+            if evaluation_target is not None:
+                self._evaluate_worker_assignment(oid, plan, evaluation_target, deadline)
+                continue
+
+            if completed_graph is not None:
+                self._complete_or_integrate(oid, completed_graph, deadline)
+                return
 
             if selection_target is not None:
                 selected = self._select_graph_task(oid, selection_target, run)

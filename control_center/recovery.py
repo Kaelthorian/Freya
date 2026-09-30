@@ -23,9 +23,11 @@ from .security import sanitize
 from .transport import model_profile, model_request, request_json
 
 
-RECOVERY_VERSION = 3
+RECOVERY_VERSION = 4
 FAILURE_ANALYSIS_VERSION = 1
-RECOVERY_ACTIONS = {"retry_same_agent", "retry_different_agent", "replan_subgraph", "fail"}
+RECOVERY_ACTIONS = {
+    "retry_same_agent", "retry_different_agent", "replan_subgraph", "gather_evidence", "fail",
+}
 RECOVERY_FIELDS = {"action", "reason", "instructions", "exclude_agent_ids", "affected_task_ids"}
 REVISION_FIELDS = {"summary", "plan", "superseded_task_ids"}
 FAILURE_ANALYSIS_FIELDS = {"cause", "evidence_log_ids", "retryable", "recommended_action"}
@@ -850,6 +852,15 @@ class RecoveryController:
             decision = self._fail("The same semantic failure repeated; another retry is unsafe.", task_id)
         elif evaluation.get("status") == "error":
             decision = self._fail("Evaluator infrastructure errors are not task retries.", task_id)
+        elif (evaluation.get("status") == "blocked"
+              and evaluation.get("recommended_action") == "gather_evidence"
+              and evaluation.get("missing_evidence")):
+            decision = {
+                "action": "gather_evidence",
+                "reason": "The Worker result may be correct, but the assignment lacks direct verification evidence.",
+                "instructions": "Run a read-only observation of the relevant artifact or test result; do not repeat a successful mutation.",
+                "exclude_agent_ids": [], "affected_task_ids": [task_id],
+            }
         elif _workspace_has_missing_artifact(workspace_state):
             decision = self._fail(
                 "A required workspace artifact is missing; recovery cannot resolve an absent input "
