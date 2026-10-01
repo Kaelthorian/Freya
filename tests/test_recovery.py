@@ -66,6 +66,32 @@ def recovery_decision(action="retry_same_agent", *, task_id="a", excluded=None):
 
 
 class RecoveryContractTests(unittest.TestCase):
+    def test_resource_block_cannot_request_worker_retry_or_grant(self):
+        controller = RecoveryController(lambda *_: self.fail("Resource routing is system-owned."))
+        result = controller.decide(
+            planned_task=self.task(), execution_node=self.node(),
+            evaluation=evaluation("blocked") | {"reason": "required_capability_unavailable",
+                                                 "routing_target": "orchestrator"},
+            history=[], available_agents=[{"id": "agent-a", "enabled": True}],
+            plan=execution_plan([self.task()]), limits=self.limits(),
+        )
+        self.assertEqual(result["action"], "fail")
+        self.assertEqual(result["metrics"]["model_calls"], 0)
+        self.assertIn("orchestrator resource review", result["reason"])
+
+    def test_retry_prompt_targets_failed_fact_and_preserves_satisfied_work(self):
+        failure = evaluation() | {"criteria": [
+            {"criterion_id": "AC-1", "origin_task_id": "a", "status": "partial",
+             "criterion": "Division by zero works", "failed_facts": [{"id": "test_zero", "status": "failed"}],
+             "affected_artifacts": ["calculator.py"]},
+            {"criterion_id": "AC-2", "origin_task_id": "b", "status": "satisfied",
+             "criterion": "Addition works"}]}
+        prompt = build_retry_prompt(self.task(), failure, "Fix zero handling only.", attempt=2)
+        self.assertIn("test_zero", prompt)
+        self.assertIn("calculator.py", prompt)
+        self.assertIn("preserve satisfied", prompt)
+        self.assertNotIn("AC-2", prompt)
+
     def task(self):
         return planned_task("a")
 

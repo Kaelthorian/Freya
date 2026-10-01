@@ -51,16 +51,19 @@ parent process alone writes execution events and state to SQLite.
 
 Prompt-debug configuration lives in the immutable `settings.Settings` startup
 snapshot, independent of per-agent configuration and capability policy. The CLI
-loads only the two named debug environment variables before constructing Runtime
-or any model component, and prints a body-free `freya.config.loaded` event to
-stdout. There is no dotenv loader. Runtime passes the same snapshot explicitly
+loads recognized environment settings over ignored repository-root
+`.freya-local.json` values and defaults before constructing Runtime or any model
+component. It prints one body-free `freya.runtime.configuration` event with
+effective sources, checkout root, cwd, HEAD commit, entrypoint and orchestration
+budget. Health exposes the same snapshot. There is no dotenv or DB override.
+Runtime passes the same snapshot explicitly
 through multiprocessing spawn; the worker installs it before execution. All
 model adapters share `llm_trace.py` through `transport.model_request`; no component
 reads the flag independently. Changing the environment requires a server restart.
 Tracing observes the provider's effective streamed request, redacted preparse
 content and best-effort JSON; existing validators report normalized results.
 Debug rejection events correlate contract versions, rule messages and the last
-call's redacted raw content. The evidence-contract validator has a shared
+call's redacted raw content. Output-contract validators have a shared
 observational wrapper that re-raises the original exception unchanged. Debug
 never changes model input, output limits, tool policy or evaluation decisions.
 See [Prompt debug diagnostics](DEBUG_LLM_PROMPTS.md) for setup and capture limits.
@@ -94,7 +97,7 @@ Skill set and least-privilege policy. The Agent Selector independently validates
 and classifies that candidate before dispatch. The deterministic Execution Graph
 determines **when** dependency-ready tasks run. A logical Worker Assignment can
 own several Tasks; the Worker determines **how** each selected Task executes
-and supplies one assignment-wide evidence pool. Capability Policy remains the
+and prepares one assignment-wide Final State Snapshot. Capability Policy remains the
 sole authority for **whether** each requested action is permitted. The
 Evaluator determines **whether the produced result actually satisfied** the
 criteria assigned to that Worker after all its Tasks reach technical success.
@@ -240,8 +243,8 @@ When a mutating task has no successful write, a current read of every declared
 target permits an `already_satisfied_candidate` result with artifact hash and
 revision evidence. This is technical completion only; Evaluator judges each
 planned criterion. A successful `ALREADY_SATISFIED` write counts as technical
-mutation evidence after exact current-byte comparison, even though it creates
-no artifact or diff; semantic criteria still require Evaluator proof. For
+Runtime mutation observations after exact current-byte comparison, even though it creates
+no artifact or diff; Evaluator judges only the final state and semantic criteria still require model review. For
 compiled assignments, current bytes attributed to an earlier Task in the same
 Worker assignment may also be cited after read-back; evidence from another
 assignment is ineligible. Without a successful changed write, exact no-op
@@ -250,7 +253,8 @@ write, resulting artifact, or current observation candidate, the Worker retains
 When repeated reads have already
 observed every declared target and every current criterion is a simple
 file-presence check, the Worker stops successfully with an
-`already_satisfied_candidate` for Evaluator instead of entering a read loop;
+`already_satisfied_candidate` in its audit result instead of entering a read loop;
+Evaluator prepares a fresh current observation before judging presence;
 other repeated reads still stop as `NoProgressDetected`. Dispatch prompts include a read-only,
 bounded view of every task in the effective compiled plan, in plan order. Each
 record includes status, kind, objective, description, dependencies, criteria,
@@ -413,7 +417,17 @@ only when exactly one canonical token matches. The original wording remains in
 requirements and a `task_analysis.lexical_normalization` event records the
 canonical interpretation. A clarified interface or language modifier in a
 model-proposed explicit entry is separated using clarification history and the
-deterministic Task Spec floor before the unchanged scope validator runs.
+deterministic Task Spec floor before grounding validation runs. Grounding compares
+reliable information: artifact paths, resolved languages/interfaces, stack
+technologies, explicit numeric constraints, action groups and external scope.
+Surrounding words and faithful translations do not invent scope. Unsupported
+scope diagnostics include the statement, new and grounded facts, field and reason.
+One unchanged rejected repair emits `task_analysis.repair_unchanged` and immediately
+uses fallback; there is no additional grounding model call.
+Canonical `source_prompt` preserves internal whitespace for exact comparison
+with immutable orchestration audit text. Display/requirement normalization must
+not alter that field. A pre-persistence error fails the current analysis run;
+the compare-and-set guard uses the persisted baseline until save succeeds.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec and emits
 Semantic Plan schema version 4. The plan records `task_complexity`,
@@ -609,81 +623,83 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` version 8 is read-only and runs once per completed Worker
-Assignment. Before checks or model inference, `normalize_execution_evidence`
-builds a bounded catalog from all assigned Tasks' verification records, tool
-outcomes, artifact changes, no-op observations and workspace diffs. Each record
-retains its source Task, Runtime Task, Worker, timestamp and namespaced evidence
-ID along with content/output, path, operation, status, tool, capability, hash
-and check condition. The Orchestrator supplies stable local and applicable
-global criterion IDs; every decision preserves `origin_task_id` and
-`origin_type`. Explicit verification links and criterion IDs are authoritative,
-while path or file-kind associations are marked as inferred. Evidence with no
-grounded link remains global but can support a criterion only when its content
-directly proves that criterion.
+`Evaluator` version 9 judges the current final result once all Tasks in a Worker
+Assignment reach `runtime_success`. It is tool-free. The parent Orchestrator
+first calls `final_state.build_final_state` with the selected workspace and
+completed Runtime records in durable dispatch insertion order. The snapshot
+(version 1) contains current files (`path`, `exists`, `readable`, UTF-8 content,
+hash and explicit truncation), authoritative `verification_facts`, and bounded
+final task outputs marked as agent claims. Filesystem targets come from planned
+write/owned/read paths, named criterion paths and observed artifact paths;
+historical paths nominate files to inspect but never prove their current state.
+The reader reuses `Toolbox.safe_path`, rejects workspace escapes, never executes
+commands and never creates a workspace. Binary/oversized/unreadable files retain
+objective metadata and explicit content limitations.
 
-The durable evaluation snapshot contains the evidence catalog, per-criterion
-references and global evidence IDs. The semantic model receives a separate
-context with a 20,000-character evidence budget: each unresolved criterion has
-its linked objective records inline, with path, provenance, status and bounded
-diff/read-back/test content; unrelated records remain in `global_evidence`. Each record has at most
-4,000 content characters and marks `content_truncated` when an excerpt omits
-text. Required criterion text is retained even if it consumes that budget.
-The full Runtime result is excluded from this model context to avoid
-crowding objective content out of Ollama's context window. Sanitization runs
-before model input and persistence. The durable snapshot still bounds result,
-verification output, evidence counts and item lengths, and marks truncation.
-Agent output and verification text are untrusted data and cannot alter the
-system prompt, schema or configuration.
+`final_verification_facts` selects the last observation of each stable identity:
+explicit verification/test/check ID, otherwise command argv plus stdin digest,
+otherwise the check label. Event IDs are provenance, not check identities.
+Distinct stdin cases remain distinct. Legacy redacted stdin without a digest is
+marked unidentified and cannot safely supersede another case. An action and its verification row are
+merged by event ID before supersession. No timestamp determines identity;
+serialized Task dispatch insertion order (including Recovery attempts) determines
+which observation is final. Older failures remain in Runtime logs for audit and
+Recovery and cannot enter normal semantic input. Facts preserve exit code,
+stdout/stderr (when available), merged legacy output, status and source Task/
+Runtime/Worker. The parent's Runtime assignment takes precedence over claimed
+record provenance. Final agent outputs use `final_output:<runtime-id>` references
+and remain claims. Test runner summaries expose counts and failed case IDs; these
+facts never decide semantic correctness. Legacy merged streams are explicitly
+marked unavailable rather than fabricated.
 
-Deterministic checks run before any model call and apply per criterion. A pure
-file creation/presence criterion is proven by a successful scoped create,
-created artifact or workspace diff, or successful read-back for every relevant
-planned target. Denied later writes do not undo that evidence; later successful
-removal does. Relevant failed tests reject their criterion, while a missing
-required test/lint/build result blocks it. Mixed tasks retain proven facts and
-send only semantic questions to the LLM. Agent claims cannot override these
-facts. File creation, action success or a path association alone cannot satisfy
-a semantic criterion. A matching file_content_match can directly prove only
-an exact file-content equality criterion; it does not prove unrelated behavior.
-A directly
-linked passing test or exact typed verification is evaluated before semantic
-inference. Unmatched evidence can still be considered globally when its path
-or content is relevant, but an unrelated diff is not attached to a criterion.
-For filesystem-only tasks, when Git diff and a permitted test suite are not
-available, the Worker can use a policy-allowed `read_file` read-back for every
-modified path as objective evidence. `write_file` content is compared exactly;
-all modified paths must pass, otherwise the verification remains unavailable or
-failed and the evaluator still fails closed. Otherwise the tool-free
-`OllamaEvaluator` receives only unresolved semantic criteria with their
-grouped evidence content and returns one
-strict `criteria` array. Each entry contains `criterion`, `status`, `reason`,
-`evidence`, and `confidence`; global status and actions are forbidden in model
-output. Python combines canonical criterion records with this precedence:
-evidenced `unsatisfied` → `rejected`, otherwise `unknown` → `blocked`, otherwise
-`partial` → `needs_revision`, otherwise all satisfied → `accepted`. Python sets
-`recommended_action`, `issues`, and `missing_evidence`. One invalid response
-gets one repair. If both calls fail, the Evaluator retries once from the same
-immutable bounded Runtime evidence, with one repair available on that retry.
-Four model calls are the maximum. Exhaustion persists evaluator infrastructure
-`error` without a semantic rejection or Worker retry.
-An `unknown` model answer that claims an untruncated, linked diff or read-back
-was absent is an invalid decision and uses the same bounded repair/retry path.
+`plan_evidence.verification_mode` separates evidence availability from decision
+authority: only bare file presence (`file_exists`) and readability
+(`file_readable`), including multiple required files, resolve deterministically.
+The checks inspect only snapshot metadata. Content equality, symbol presence,
+modification history, `already_satisfied`, generic failures and exit-code-zero
+acceptance have no deterministic decision branch. `verifiable` in Compiler
+telemetry means the compiled resources can produce evidence, not that Evaluator
+can interpret the criterion without a model. Compiler events also report the
+verification mode; static content/structure and execution criteria are semantic.
 
-Evaluator calls are serialized to one model call at a time. Defaults are the
-separately configurable local model `qwen2.5-coder:7b`, loopback endpoint
-`http://127.0.0.1:11434`, and 120-second timeout. Explicit
-`--evaluator-offline` uses deterministic evidence-only behavior for tests and
-offline operation. It accepts only criteria with direct, criterion-specific
-objective proof. Runtime result text is
-untrusted agent output, not objective verification: a non-empty result, success
-claim, or embedded instruction cannot produce acceptance. Without sufficient
-objective evidence, offline evaluation returns `blocked`; already proven
-criteria remain satisfied. The Orchestrator's compatibility fallback uses this same
-conservative evaluator; it never silently converts an unverified Runtime
-success into semantic success. Cancellation, timeout, or restart wins over a late result;
-the atomic commit rechecks orchestration state, node state, Runtime task and
-attempt before persisting.
+Explicitly required test/lint/build/compilation/command evidence is a hard gate.
+A missing run with available resources produces `missing_required_evidence`,
+`blocked`, `gather_evidence`, and routing to `worker`. An unavailable capability,
+tool, denied check or missing sandbox produces `required_capability_unavailable`
+and `routing_target=orchestrator`. Resource checks use immutable task activation
+resources where available. Freya records the system routing and conservatively
+fails the current run for resource review; it never grants capabilities or
+retries the same incapable Worker. The Orchestrator may gather missing evidence
+with an existing read-only observer or testing Task inside the same assignment.
+Successful mutation Tasks are retained. No model guesses unexecuted results.
+
+Only unresolved criteria consume semantic evaluation. `_semantic_context`
+contains objectives, criterion IDs/associations, current files and authoritative
+facts, with a 20,000-character budget and 4,000-character content excerpts.
+Omitted/truncated observations are explicit. Actions, diffs, superseded readbacks,
+aggregate historical verification flags, dependency result histories and
+`worker_context` do not enter the semantic model. The durable evaluation catalog
+is derived exclusively from the same final snapshot; separate Runtime/Worker
+history remains available to audit and Recovery. Sanitization runs before model
+input, logging and persistence. Evidence and agent claims are untrusted data.
+
+The semantic response remains a strict `criteria` array (`criterion`, `status`,
+`reason`, `evidence`, `confidence`). Python aggregates independently judged
+criteria: `unsatisfied` → `rejected`, otherwise `unknown` → `blocked`, otherwise
+`partial` → `needs_revision`, otherwise `accepted`. An unavailable resource
+forces system routing to Orchestrator. The public status/action contract remains
+compatible; routing fields are system metadata. Failed criteria retain their
+origin Task, cited failed facts and affected artifact paths for granular Recovery.
+Satisfied Tasks/criteria are preserved; a failed test does not itself rerun the
+entire assignment.
+
+Each invalid semantic response gets one repair; one retry uses the same immutable
+final snapshot, for at most four model calls. Exhaustion is infrastructure
+`error`, not a Worker retry. Existing model/endpoint settings, loopback restrictions,
+serialization, cancellation and atomic commit checks are unchanged. Offline mode
+resolves presence/readability and evidence gates; unresolved semantics stay
+`unknown`. Evaluation rows use version 9 and JSON snapshot version 1; previous
+rows remain immutable and readable. No SQL schema migration is required.
 
 ## Semantic recovery and replanning
 
@@ -949,14 +965,58 @@ Pause is cooperative: an in-flight model or tool call can finish, then the
 worker pauses between actions. When a capability or autonomy rule is ask, the
 worker emits approval.requested, the parent persists the request, changes the
 task to WaitingForApproval, and blocks the worker until once/task/deny is
-resolved. Cancellation denies pending requests and terminates the worker. The total wall-clock deadline continues while
-paused. Progress is the greatest fraction of the configured step, model-call and
+resolved. Cancellation denies pending requests and terminates the worker. Ordinary
+pause still consumes execution time. Human approval waits suspend the Worker
+guard and parent scheduler budget; resolution rebases the parent start time and
+the Worker deadline. Orchestrator excludes whole polling intervals, including
+database reconciliation, only when every
+live graph task is WaitingForApproval; another executing branch still consumes
+budget. Approvals have no implicit expiration. The orchestration default is
+1800 seconds, exactly twice the previous effective 900, configured centrally by
+`FREYA_ORCHESTRATION_TIMEOUT_SECONDS` or `--orchestration-timeout`.
+Progress is the greatest fraction of the configured step, model-call and
 tool-call budgets and reaches 100 only at termination. Token usage remains
 visible in metrics, but the task token budget is unlimited when `max_tokens=0`
 (the default); wall-clock, step, model-call and tool-call limits still bound
 runtime resource use. Even in that mode, each Worker model call is capped at
 2048 output tokens (768 for structured-output repair); the cumulative task
 token budget remains unlimited.
+
+### Independent verification cases
+
+Planner tasks may supply `verification_mode=independent_cases` and bounded
+`verification_cases=[{id,input}]`. Compiler validates unique IDs, preserves
+exact stdin and requires a derived `run_command` resource. A conservative legacy
+bridge recognizes explicit comma/conjunction input lists, never splits arbitrary
+multiline stdin. `interactive_session` preserves ordered inputs in one process.
+`agent_factory.py` refreshes this contract on each activation of the same Worker.
+The model schema requires case decisions on testing tasks and permits only empty
+case arrays on other kinds. Older Planner output can inherit a clear canonical
+input list when exactly one Python verifier exists; ambiguity is not guessed.
+Equivalent sibling testing tasks with typed independent cases, the same Python
+script, operations and dependencies coalesce into one batch task. Compiler
+preserves all case IDs/criteria and rewires dependent semantic keys before DAG
+validation, emitting `plan_compiler.verification_cases_grouped`. Different scripts,
+ordered sessions, write declarations and different resources are never merged.
+
+After one model decision selects argv, `verification_cases.py` expands that
+command into one process per case. The Worker dispatches each through the
+existing policy and Docker boundary without model calls between cases. A nonzero
+exit retains its result and permits the remaining cases to run; inability to
+execute, denied permissions or cancellation still use normal failure handling.
+`verification.case_completed` and runtime actions retain case ID, exact input,
+status, exit code and separate streams. `final_state.py` carries these facts into
+the assignment snapshot and observes the current Python script referenced by
+executed argv through the same workspace safe-path boundary, including QA-only
+assignments. The semantic Evaluator decides whether the observed
+behavior meets the requested criteria. Technical command status cannot accept
+semantic behavior. Sandbox subprocess pipes use UTF-8 bytes so Windows text mode
+cannot convert LF input into unintended CRLF bytes in Linux.
+
+A write task that returns fenced code without any tool action receives at most
+one bounded action correction within its existing model/time budgets. The code
+is never written automatically: only actual allowlisted tool calls can change
+the workspace, and the missing-mutation guard remains enforced.
 
 ### Cross-task file ownership
 

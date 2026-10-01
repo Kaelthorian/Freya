@@ -26,6 +26,13 @@ Ollama and allowlisted tools → selected agent workspace.
   not retry unchanged with another agent.
 - Interactive behavior must use a dependent QA task and bounded `run_command`
   stdin. Never wait on a worker terminal or add a free-form shell.
+- Independent QA inputs must use stable `verification_cases` and one controlled
+  process per case; `interactive_session` alone preserves multiline session stdin.
+  Keep every case fact in the assignment Final State Snapshot and policy-check
+  every invocation. Human approval waits do not consume active execution budgets.
+- Load central `settings.py` once at the normal entrypoint and pass the snapshot
+  through spawn. Environment overrides ignored `.freya-local.json` and defaults;
+  debug defaults off and the orchestration budget defaults to 1800 seconds.
 - Run the tool-free Task Analyst before production planning. It resolves user
   intent and asks material questions, but never chooses agents, capabilities,
   Skills, dependencies or runtime IDs. Planner chooses strategy; Plan Compiler
@@ -65,6 +72,11 @@ Ollama and allowlisted tools → selected agent workspace.
   `runtime_success` and release its DAG dependents; once every Task assigned to
   that Worker reaches `runtime_success`, evaluate the Worker Assignment once.
   Only accepted Worker evidence enters global integration or orchestration success.
+- Prepare a current Final State Snapshot before tool-free Worker evaluation.
+  Evaluate final result only; historical actions/diffs remain audit/Recovery data.
+  Presence/readability and required-evidence gates are deterministic; content,
+  structure and execution meaning are semantic. Unavailable verification routes
+  to Orchestrator without granting resources or retrying the incapable Worker.
 - Keep Python support at 3.10+ and avoid runtime dependencies unless setup and
   documentation are updated.
 

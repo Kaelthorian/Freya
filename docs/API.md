@@ -4,6 +4,11 @@ All routes are same-origin under `/api` and return JSON errors as
 `{"error":"message"}`. Mutations accept `application/json`. SSE is
 `text/event-stream`.
 
+`GET /api/health` includes `configuration`, the non-secret startup snapshot:
+debug flag/source, orchestration budget/source, repository root, process cwd,
+HEAD commit and entrypoint. It mirrors stdout `freya.runtime.configuration`;
+changing environment/local settings requires server restart.
+
 `GET /api/capabilities` returns the structured capability registry used by the
 editor. `GET /api/config` includes it as `capability_catalog`. Agent JSON
 includes `capability_policy`; action rules use `mode` (`allow`, `deny`, or
@@ -353,7 +358,7 @@ to the tool-free semantic model. The model returns only per-criterion
 public status, action, issues, and missing evidence. The persisted public
 criterion shape remains `criterion`, `status`, `reason`, and `evidence`.
 One response repair and one bounded semantic retry (with its own repair) use at
-most four model calls on the same Runtime evidence. Metrics include
+most four model calls on the same immutable Final State Snapshot. Metrics include
 `criteria_total`, `criteria_deterministic`, `criteria_semantic`, `model_calls`,
 `repairs`, `evaluator_retries`, and `final_status`.
 Evaluator infrastructure failures persist as `status=error` with
@@ -571,9 +576,9 @@ hash, size, duration, status and available token counts. With
 `request_body`, component `structured_context`, `raw_response`, best-effort
 `parsed_response` and truncation metadata. `FREYA_DEBUG_PROMPT_MAX_CHARS`
 limits retained value characters (1000-4000000; default 4000000). It is loaded
-with the flag once at startup from the process environment, then explicitly
-propagated to workers. `.env` files are not loaded. The stdout startup event
-`freya.config.loaded` reports the effective boolean and source; it is independent
+with the flag once at startup using environment over ignored `.freya-local.json`
+over defaults, then explicitly propagated to workers. `.env` files are not loaded.
+The stdout startup event `freya.runtime.configuration` reports the effective boolean and source; it is independent
 of orchestration/task log streams.
 `llm.validation` events use the same call ID for Task Analyst and Planner
 contract decisions and other model-backed validators. With debug enabled,
@@ -644,33 +649,48 @@ structured response is invalid: `actions` contains bounded tool outcomes,
 including `changed` and `already_satisfied` for no-op writes; `artifacts` contains
 successful file changes, and `verification.evidence` may contain
 `command_execution` records with `command`, `exit_code`, `output` and
-`supports_acceptance_criteria`. A passed command record linked to every exact
-planned criterion produces deterministic acceptance. The Evaluator normalizes
-verification records, tool results, artifacts and workspace diffs into a
-bounded evidence catalog before making a decision. Its context includes
-`evidence_by_criterion` keyed by stable local criterion IDs and
-`global_evidence_ids` for records without a grounded association. Existing
-text links resolve to matching criterion IDs; explicit criterion metadata can
-recover a missing link. Each record retains available path, diff/read-back/
-output, status, source, tool, capability and event/timestamp provenance.
-Identical records are deduplicated.
-For a purely factual file creation/presence criterion, the Evaluator matches
-exact paths from planned `write_targets` or `owned_paths` against successful
-`filesystem.create` actions, created artifacts, created workspace diffs,
-successful read-back, or a matching file-content check. Every relevant target
-needs evidence. Later denied writes
-cannot undo an earlier creation; successful removal evidence prevents acceptance
-from stale creation records. Mixed criteria keep proven facts and send remaining
-semantic questions to the LLM. Diff and read-back contents appear in the
-bounded evidence catalog separately from action, artifact and plan-target
-metadata. Clipping evidence sets `context_truncated=true`. File creation proves
-presence only; semantic criteria require relevant content, verification or test
-evidence and remain subject to semantic
-evaluation. Criterion-scoped test results and exact typed checks take
-deterministic precedence. `evaluator.evidence_prepared` logs criterion IDs,
-evidence IDs, types, sources and inferred associations; an
-`evaluation.insufficient_evidence` event records why an unknown decision
-still requires evidence.
+`supports_acceptance_criteria`. Evaluator version 9 uses a parent-prepared `final_state` snapshot (version 1).
+The durable input includes current files, authoritative verification facts,
+criterion associations and explicit content limits. Current existence/readability
+for every required target are the only deterministic success checks. Content,
+structure, modification claims and test/command/lint/compile meaning go to the
+semantic model. `exit_code=0`, typed content checks and `symbol_presence` cannot
+accept a semantic criterion automatically. Historical actions, diffs,
+`already_satisfied`, old readbacks and superseded checks remain audit data.
+
+Independent verification tasks carry `verification_mode=independent_cases` and
+`verification_cases=[{"id":"case-id","input":"0\n"}]` through semantic and
+compiled plans into task config. IDs must be unique and bounded; at most 20
+cases and 16000 characters per input are allowed. Each case runs the same
+model-selected argv in a fresh Docker process through normal capability policy.
+`interactive_session` keeps a single multiline stdin invocation.
+Runtime `verification.case_completed` events and structured actions expose
+`case_id`, exact sanitized `input`, technical status, `exit_code`, `stdout` and
+`stderr`. Evaluator receives these fields in final verification facts; a failed
+case does not erase other results or automatically decide semantic correctness.
+
+Final facts supersede by explicit case/verification/test/check ID or command signature
+(argv plus stdin digest), then check label. Only the latest observation enters
+evaluation; distinct cases remain distinct. Facts retain source Task/Runtime/
+Worker, exit code, stdout/stderr and runner-reported counts/failed cases. Older
+records without separate streams retain merged output with `streams_unavailable`.
+
+A missing explicit verification produces `blocked` and `gather_evidence`.
+Evaluation APIs additionally expose system-owned `reason` and `routing_target`:
+`missing_required_evidence` routes to `worker` when current resources can gather
+it; `required_capability_unavailable` routes to `orchestrator`. Freya records this
+block and fails conservatively for resource review without granting permissions
+or automatically retrying the incapable Worker. Failed criterion rows retain
+`origin_task_id`, cited `failed_facts` and `affected_artifacts` for granular Recovery.
+Existing JSON evaluation rows remain readable; no SQL migration is needed.
+
+Events distinguish `evaluation.final_state_snapshot_created`,
+`evaluation.deterministic_fact`, `evaluation.criterion.deterministic`,
+`evaluation.criterion.semantic_started/completed`,
+`evaluation.missing_required_evidence`, `evaluation.capability_unavailable`,
+`evaluation.routed_to_orchestrator` and `evaluation.insufficient_evidence`.
+Snapshot events expose paths, existence/readability, hashes and truncation;
+content and output in stored snapshots/logs are bounded and sanitized.
 Runtime exceptions build
 this contract from the action ledger and skip model repair. An identical denied
 action is fingerprinted and answered locally with

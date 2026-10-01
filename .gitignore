@@ -10,3 +10,4 @@ __pycache__/
 !/data/agents/
 !/data/agents/*.json
 /test-artifacts/
+/.freya-local.json

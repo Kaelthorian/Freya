@@ -100,8 +100,8 @@ def run_in_sandbox(workspace: Path, argv: list[str], timeout_seconds: int,
         command.extend([SANDBOX_IMAGE, *argv])
         try:
             result = subprocess.run(
-                command, input=stdin or "", capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout_seconds + 5,
+                command, input=(stdin or "").encode("utf-8"), capture_output=True,
+                timeout=timeout_seconds + 5,
                 shell=False, env=host_env,
             )
         except subprocess.TimeoutExpired as exc:
@@ -116,6 +116,10 @@ def run_in_sandbox(workspace: Path, argv: list[str], timeout_seconds: int,
             raise SandboxUnavailable(f"Docker execution exceeded {timeout_seconds} seconds") from exc
         except OSError as exc:
             raise SandboxUnavailable(f"Docker execution unavailable: {exc}") from exc
+        # Binary pipes prevent Windows text-mode LF -> CRLF conversion of stdin.
+        result = subprocess.CompletedProcess(result.args, result.returncode,
+            result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout,
+            result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr)
         if result.returncode in {125, 126, 127}:
             raise SandboxUnavailable((result.stderr or "Docker sandbox could not start").strip()[:1000])
         return result

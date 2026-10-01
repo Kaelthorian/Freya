@@ -271,17 +271,51 @@ def _scope_tokens(text: Any) -> list[str]:
 
 
 def _unsupported_scope_terms(description: Any, evidence: str, supported_actions: set[str]) -> list[str]:
-    evidence_tokens = set(_scope_tokens(evidence))
-    unsupported = []
-    for token in _scope_tokens(description):
-        if token.startswith("action_"):
-            if token.removeprefix("action_") not in supported_actions:
-                unsupported.append(token.removeprefix("action_"))
-        elif token not in evidence_tokens and not any(
-                len(token) >= 5 and (token.startswith(item) or item.startswith(token))
-                for item in evidence_tokens if len(item) >= 5):
-            unsupported.append(token)
-    return list(dict.fromkeys(unsupported))
+    """Compare reliable information, never the surrounding natural-language words."""
+    added = _information_facts(str(description)) - _information_facts(evidence)
+    added.update("action:" + item["action"] for item in _action_facts(str(description), "explicit")
+                 if item["action"] not in supported_actions)
+    return sorted(added)
+
+
+def _information_facts(text: str) -> set[str]:
+    """Bounded structural grounding: artifacts, stack, interfaces, values and scope.
+
+    Free phrasing is not evidence of invention. Unknown prose is left to the
+    Analyst; clear product decisions and source-preservation gates remain strict.
+    """
+    facts = {"artifact:" + path.replace("\\", "/").casefold() for path in
+             re.findall(r"(?<![\w./\\-])[\w./\\-]+\.[A-Za-z][A-Za-z0-9]*(?![\w./\\-])", text)}
+    language = _detected_language(text)
+    if language:
+        facts.add("language:" + language.casefold())
+    for match in re.finditer(r"\b(?:consola|console|cli|command[- ]line|web|website|escritorio|desktop|gui|grafica)\b", _fold_text(text)):
+        interface = _detected_interface(match[0])
+        if interface:
+            facts.add("interface:" + interface)
+    folded = _fold_text(text)
+    for name in re.findall(r"\b(?:react|vue|angular|django|flask|fastapi|postgresql|postgres|mysql|sqlite|mongodb|redis)\b", folded):
+        facts.add("technology:" + ("postgresql" if name == "postgres" else name))
+    for name, pattern in {
+        "database": r"\b(?:database|base de datos)\b",
+        "authentication": r"\b(?:authentication|autenticacion|login)\b",
+        "responsive": r"\bresponsive\b",
+        "api": r"\bapi\b",
+    }.items():
+        if re.search(pattern, folded):
+            facts.add("scope:" + name)
+    from .plan_scope import semantic_categories
+    facts.update("scope:" + name for name in semantic_categories(text)
+                 if name in {"deployment", "publication", "network_action", "external_action"})
+    facts.update("value:" + value for value in re.findall(
+        r"\b(\d+)\s+(?:decimal(?:es|s)?|digits?|digitos?|seconds?|segundos?|items?)\b", folded))
+    return facts
+
+
+def _grounding_details(statement: str, evidence: str, unsupported: list[str]) -> dict[str, Any]:
+    return {"statement": sanitize(statement), "new_information_detected": unsupported,
+            "grounded_information": sorted(_information_facts(evidence)),
+            "reason": "The statement adds a structural value or scope decision absent from its source."}
 
 
 def _source_entry_schema() -> dict[str, Any]:
@@ -343,12 +377,14 @@ TASK_SPEC_MODEL_FIELDS = frozenset(TASK_SPEC_RESPONSE_FORMAT["properties"])
 
 class TaskSpecError(ValueError):
     def __init__(self, message: str, *, path: str = "$", expected: str = "valid Task Spec value",
-                 received: Any = None, error_type: str = "validation_error"):
+                 received: Any = None, error_type: str = "validation_error",
+                 grounding: dict[str, Any] | None = None):
         super().__init__(message)
         self.path = path
         self.expected = expected
         self.received = _received_summary(received)
         self.error_type = error_type
+        self.grounding = grounding or {}
 
     def diagnostic(self) -> dict[str, Any]:
         return {
@@ -357,6 +393,8 @@ class TaskSpecError(ValueError):
             "expected": self.expected,
             "received": self.received,
             "validation_message": sanitize(str(self))[:500],
+            **self.grounding,
+            **({"field": self.path} if self.grounding else {}),
         }
 
 
@@ -379,11 +417,12 @@ def _received_summary(value: Any) -> Any:
     return sanitize(repr(value))[:160]
 
 
-def _text(value: Any, name: str, *, required: bool = True) -> str:
+def _text(value: Any, name: str, *, required: bool = True,
+          preserve_whitespace: bool = False) -> str:
     if not isinstance(value, str):
         raise TaskSpecError(f"{name} must be text.", path=name, expected="string", received=value,
                             error_type="type_mismatch")
-    value = re.sub(r"\s+", " ", value).strip()
+    value = value.strip() if preserve_whitespace else re.sub(r"\s+", " ", value).strip()
     if required and not value:
         raise TaskSpecError(f"{name} must not be empty.", path=name, expected="non-empty string",
                             received=value, error_type="missing_value")
@@ -618,7 +657,7 @@ def validate_task_spec(value: Any) -> dict[str, Any]:
         raise TaskSpecError("Invalid Task Spec version.", path="version",
                             expected="positive integer", received=version,
                             error_type="version_mismatch")
-    source_prompt = _text(value.get("source_prompt"), "source_prompt")
+    source_prompt = _text(value.get("source_prompt"), "source_prompt", preserve_whitespace=True)
     objective = _text(value.get("objective", ""), "objective", required=status == "READY_FOR_PLANNING")
     user_intent = _text(value.get("user_intent", objective), "user_intent", required=False)
     deliverables = _entries(value.get("deliverables", []), "deliverables", source=True)
@@ -1107,11 +1146,12 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
             )
             if unsupported:
                 raise TaskSpecError(
-                    "A Task Analyst entry contains wording unsupported by its source.",
+                    "A Task Analyst entry adds information unsupported by its source.",
                     path=f"{field}[{index}].description",
                     expected="content grounded in the source prompt or clarification answers",
                     received=", ".join(unsupported[:8]),
                     error_type="unsupported_scope",
+                    grounding=_grounding_details(item["description"], evidence, unsupported),
                 )
 
     for index, item in enumerate(spec["assumptions"]):
@@ -1125,6 +1165,7 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
                 expected="assumptions grounded in user-provided information",
                 received=", ".join(unsupported[:8]),
                 error_type="unsupported_assumption",
+                grounding=_grounding_details(item["description"] + " " + item["reason"], full_evidence, unsupported),
             )
 
     for key, value in spec["context"].items():
@@ -1136,6 +1177,7 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
                 expected="context grounded in the source prompt or clarification answers",
                 received=", ".join(unsupported[:8]),
                 error_type="unsupported_context",
+                grounding=_grounding_details(str(key) + " " + str(value), full_evidence, unsupported),
             )
 
     for index, expectation in enumerate(spec["validation_expectations"]):
@@ -1147,6 +1189,7 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
                 expected="observable behavior derived from explicit or clarified intent",
                 received=", ".join(unsupported[:8]),
                 error_type="unsupported_validation",
+                grounding=_grounding_details(expectation, full_evidence, unsupported),
             )
 
     decision_evidence = " ".join([full_evidence, question_context])
@@ -1176,6 +1219,7 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
                 expected="a decision directly stated by the user",
                 received=", ".join(unsupported[:8]),
                 error_type="unsupported_decision",
+                grounding=_grounding_details(key + " " + value, decision_evidence, unsupported),
             )
 
     objective_unsupported = _unsupported_scope_terms(
@@ -1188,6 +1232,7 @@ def _validate_scope_candidate(spec: dict[str, Any], prompt: str,
             expected="an objective grounded in explicit or clarified intent",
             received=", ".join(objective_unsupported[:8]),
             error_type="unsupported_scope",
+            grounding=_grounding_details(spec["objective"], full_evidence, objective_unsupported),
         )
 
     combined_requirements = " ".join(item["description"] for item in spec["requirements"])
@@ -1746,6 +1791,16 @@ class TaskSpecAnalyst:
                     raise
                 except (ValueError, KeyError, TypeError) as repair_exc:
                     repair_error = record_invalid("repair", repair_exc, raw)
+                    def rejection_signature(error):
+                        return (error.get("error_path"), error.get("error_type"),
+                                error.get("new_information_detected") or error.get("received"))
+                    if rejection_signature(initial_error) == rejection_signature(repair_error):
+                        self.metrics["repair_made_no_meaningful_change"] = True
+                        self._event("task_analysis.repair_unchanged", "Failed",
+                                    "Repair retained the same rejected information; proceeding directly to fallback.",
+                                    field=repair_error.get("error_path"),
+                                    new_information_detected=repair_error.get("new_information_detected"),
+                                    validation_error=repair_error.get("error_type"))
                     self.metrics["fallback_used"] = True
                     from .llm_trace import record_validation
                     record_validation("task_analyst", "fallback",

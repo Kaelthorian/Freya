@@ -59,7 +59,8 @@ TASK_FIELDS = {
     "preferred_skills", "success_criteria",
 }
 TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools",
-                        "semantic_operations", "owned_paths", "write_targets", "foreign_write_targets"}
+                        "semantic_operations", "owned_paths", "write_targets", "foreign_write_targets",
+                        "verification_cases", "verification_mode"}
 TASK_KIND_VALUES = {
     "file_creation", "program_creation", "code_change", "review", "testing",
     "analysis", "external_action", "general",
@@ -97,6 +98,12 @@ PLAN_RESPONSE_FORMAT = {
                         "required": ["path", "owner_plan_task_id"], "additionalProperties": False}},
                     "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                     "task_characteristics": {"type": "object"},
+                    "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
+                    "verification_cases": {"type": "array", "maxItems": 20, "items": {
+                        "type": "object", "properties": {
+                            "id": {"type": "string", "maxLength": 100},
+                            "input": {"type": "string", "maxLength": 16000}},
+                        "required": ["id", "input"], "additionalProperties": False}},
                 },
                 "required": sorted(TASK_FIELDS | {"owned_paths"}),
                 "additionalProperties": False,
@@ -166,11 +173,34 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "owned_paths": {"type": "array", "items": {"type": "string"}},
         "write_targets": {"type": "array", "items": {"type": "string"}},
+        "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
+        "verification_cases": {"type": "array", "maxItems": 20, "items": {
+            "type": "object", "properties": {
+                "id": {"type": "string", "maxLength": 100},
+                "input": {"type": "string", "maxLength": 16000}},
+            "required": ["id", "input"], "additionalProperties": False}},
     }
     unsupported = {"type": "array", "items": {"type": "object", "properties": {
         "semantic_need": {"type": "string"},
         "reason": {"type": "string"},
     }, "required": ["semantic_need", "reason"], "additionalProperties": False}}
+    # Require case decisions on QA only. Requiring a nonempty-looking case
+    # contract on writers encouraged models to attach execution cases to tasks
+    # that deliberately have no execution resource.
+    implementation_fields = copy.deepcopy(task_fields)
+    implementation_fields['task_kind']['enum'] = sorted(TASK_KIND_VALUES - {'testing'})
+    implementation_fields['verification_cases']['maxItems'] = 0
+    testing_fields = copy.deepcopy(task_fields)
+    testing_fields['task_kind']['enum'] = ['testing']
+    for field in ('owned_paths', 'write_targets'):
+        testing_fields[field]['maxItems'] = 0
+    task_schemas = [
+        {'type': 'object', 'properties': implementation_fields,
+         'required': sorted(set(task_fields) - {'verification_mode', 'verification_cases'}),
+         'additionalProperties': False},
+        {'type': 'object', 'properties': testing_fields,
+         'required': sorted(task_fields), 'additionalProperties': False},
+    ]
     return {
         "type": "object",
         "properties": {
@@ -180,8 +210,7 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
             "decomposition_reason": {"type": "string"},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
-                      "items": {"type": "object", "properties": task_fields,
-            "required": sorted(task_fields), "additionalProperties": False}},
+                      "items": {'anyOf': task_schemas}},
             "unsupported_requirements": unsupported,
         },
         "required": ["summary", "task_complexity", "execution_strategy",
@@ -1185,6 +1214,16 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                     f"plan.tasks[{index}].task_characteristics must be a boolean object."
                 )
             normalized_task["task_characteristics"] = dict(characteristics)
+        if "verification_cases" in task or "verification_mode" in task:
+            from .verification_cases import normalize_cases, MODES
+            try:
+                normalized_task["verification_cases"] = normalize_cases(task.get("verification_cases", []))
+                mode = task.get("verification_mode", "independent_cases")
+                if mode not in MODES:
+                    raise ValueError("Unknown verification_mode.")
+                normalized_task["verification_mode"] = mode
+            except ValueError as exc:
+                raise PlanValidationError(str(exc)) from exc
         tasks.append(normalized_task)
     # Task count is the authoritative structural signal. Models sometimes label
     # an otherwise valid multi-task graph as simple; canonicalize that harmless
@@ -1709,6 +1748,15 @@ class Planner:
             "Each task has a meaningful key, task_kind, objective, description, "
             "depends_on (semantic task keys), semantic_needs, operations, success_criteria, "
             "owned_paths and write_targets. "
+            "For explicit verification inputs supply verification_mode=independent_cases and "
+            "verification_cases=[{id: stable case ID, input: exact bounded stdin string}] on the testing task. "
+            "Each independent input starts a fresh process; never concatenate separate cases into one stdin. "
+            "Put all independent cases of the same program in one testing task, never one task per input. "
+            "Testing tasks have empty owned_paths and write_targets and report results in their response. "
+            "Use verification_mode=interactive_session only for ordered inputs within one process. "
+            "Non-testing tasks must omit verification_cases or use an empty array; only testing tasks "
+            "may own execution cases. Do not add an empty-input case unless requested. "
+            "Preserve every requested case, including invalid input; do not merge them. "
             "task_kind must be one of " + json.dumps(sorted(TASK_KIND_VALUES)) + ". "
             "For a write task, choose a precise, "
             "workspace-relative exact file path; do not use broad patterns. Do not supply runtime IDs, "

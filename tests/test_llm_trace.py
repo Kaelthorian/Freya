@@ -371,22 +371,20 @@ class LlmTraceTests(unittest.TestCase):
             self.assertEqual("raw_response" in events[1], enabled)
             self.assertEqual("validation_message" in events[1], enabled)
 
-    def test_evidence_contract_rejection_preserves_rule_exception_and_call(self):
-        from control_center.evaluator import Evaluator, EvaluationValidationError
+    def test_semantic_unknown_is_not_rejected_by_readback_rationale_regex(self):
+        from control_center.evaluator import Evaluator
         initialize_settings(Settings(debug_llm_prompts=True))
         events = []
-        decision = {"criteria": [{"criterion": "Both lines", "status": "unknown", "reason": "No readback available"}]}
-        context = {"evidence_by_criterion": [{"criterion": "Both lines", "evidence": [
-            {"type": "file_readback", "output": "Hola mundo\nFreya funciona", "content_truncated": False}]}]}
+        decision = {"criteria": [{"criterion": "Both lines", "status": "unknown",
+                                 "reason": "No sufficient evidence available", "evidence": [], "confidence": 0.5}]}
         with bind_llm_trace(events.append):
             model_request(lambda *_a, **_k: {"message": {"content": json.dumps(decision)}}, "evaluator", "POST",
                           "http://127.0.0.1:11434/api/chat", {}, timeout=1)
-            with self.assertRaises(EvaluationValidationError):
-                Evaluator._validate_semantic_evidence_claims(decision, context)
-        self.assertEqual(events[1]["validation_stage"], "evidence_contract")
+            parsed = Evaluator._parse(decision, ["Both lines"])
+        self.assertEqual(parsed["criteria"][0]["status"], "unknown")
+        self.assertEqual(events[1]["validation_stage"], "output_contract")
         self.assertEqual(events[1]["llm_call_id"], events[0]["llm_call_id"])
-        self.assertEqual(events[1]["raw_response"], json.dumps(decision))
-        self.assertIn("Visible file_readback", events[1]["validation_message"])
+        self.assertEqual(events[1]["normalized_response"], parsed)
 
     def test_intent_matcher_uses_shared_debug_setting(self):
         from control_center.cross_task import CrossTaskIntentMatcher

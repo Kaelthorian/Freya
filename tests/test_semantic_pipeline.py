@@ -288,7 +288,7 @@ class SemanticPipelineTests(unittest.TestCase):
                          compiled["tasks"][-1]["success_criteria"])
 
     def test_semantic_schema_excludes_runtime_authority(self):
-        schema = semantic_plan_response_format({})["properties"]["tasks"]["items"]
+        schema = semantic_plan_response_format({})["properties"]["tasks"]["items"]["anyOf"][0]
         self.assertFalse(schema["additionalProperties"])
         self.assertNotIn("required_capabilities", schema["properties"])
         self.assertNotIn("required_tools", schema["properties"])
@@ -327,6 +327,7 @@ class PlanResponsibilityAndEvidenceTests(unittest.TestCase):
         self.assertEqual([item["evidence_type"] for item in classifications],
                          ["static_structure", "runtime_behavior"])
         self.assertTrue(all(item["verifiable"] for item in classifications))
+        self.assertEqual([item["verification_mode"] for item in classifications], ["semantic", "semantic"])
 
     def test_runtime_criterion_without_runtime_capability_is_rejected(self):
         implementation = task(

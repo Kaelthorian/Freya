@@ -72,9 +72,8 @@ class SettingsTests(unittest.TestCase):
         with patch("sys.stdout", output):
             report_startup_config(settings)
         lines = output.getvalue().splitlines()
-        self.assertEqual(json.loads(lines[0]), {"event_type": "freya.config.loaded", "debug_llm_prompts": True,
-                                              "source": "environment", "llm_provider": "ollama",
-                                              "debug_prompt_max_chars": DEFAULT_DEBUG_MAX_CHARS})
+        self.assertEqual(json.loads(lines[0]), settings.diagnostic_event())
+        self.assertEqual(json.loads(lines[0])["event_type"], "freya.runtime.configuration")
         self.assertEqual(lines[1], "Debug LLM prompts: ENABLED")
         self.assertNotIn("fixture", output.getvalue())
 
@@ -96,7 +95,7 @@ class SettingsTests(unittest.TestCase):
         output = io.StringIO()
         def runtime_fixture(*_args, **_kwargs):
             self.assertTrue(get_settings().debug_llm_prompts)
-            self.assertIn("freya.config.loaded", output.getvalue())
+            self.assertIn("freya.runtime.configuration", output.getvalue())
             return Mock()
         with ExitStack() as stack:
             stack.enter_context(patch.dict("os.environ", {"FREYA_DEBUG_LLM_PROMPTS": "true"}))

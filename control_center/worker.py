@@ -258,7 +258,10 @@ def strip_thinking(value: str) -> str:
 
 def clean(value: Any, token: str = "") -> Any:
     if isinstance(value, dict):
-        return {str(key): clean(item, token) for key, item in value.items()
+        return {str(key): (strip_private_content(item).replace(token, "[REDACTED]") if token
+                          else strip_private_content(item))
+                if key in {"input", "stdin", "stdout", "stderr"} and isinstance(item, str)
+                else clean(item, token) for key, item in value.items()
                 if str(key).lower() not in {"thinking", "reasoning", "analysis", "chain_of_thought"}}
     if isinstance(value, list):
         return [clean(item, token) for item in value]
@@ -1005,6 +1008,22 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
             raise TaskStopped("Maximum execution time reached (including paused time).")
         return remaining
 
+    original_approval_handler = approval_handler
+    approval_wait_seconds = 0.0
+    if original_approval_handler:
+        def approval_handler(request):
+            nonlocal deadline, approval_wait_seconds
+            waiting_since = time.monotonic()
+            try:
+                return original_approval_handler(request)
+            finally:
+                elapsed = max(0, time.monotonic() - waiting_since)
+                deadline += elapsed
+                approval_wait_seconds += elapsed
+                publish("event", event={"event_type": "task.approval_wait_completed",
+                        "duration_seconds": elapsed, "approval_wait_seconds": approval_wait_seconds,
+                        "execution_budget_suspended": True})
+
     token_limit = config.get("max_tokens", 0)
     token_limited = isinstance(token_limit, int) and token_limit > 0
 
@@ -1121,6 +1140,7 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
     runtime_actions: list[dict[str, Any]] = []
     runtime_artifacts: list[dict[str, Any]] = []
     workspace_mutation_required = _task_requires_workspace_mutation(task, effective)
+    unexecuted_code_repair_attempted = False
     command_evidence: list[dict[str, Any]] = []
     policy_denials: dict[str, int] = {}
     repeated_denial_feedback: dict[str, int] = {}
@@ -1222,12 +1242,33 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                     metrics["steps"] += 1
                     if not final:
                         raise ValueError("Model returned an empty final answer.")
+                    if (workspace_mutation_required and not runtime_actions
+                            and re.search(r'```(?!json\b)(?:[\w+-]+)?[ \t]*\r?\n', final, re.I)
+                            and not unexecuted_code_repair_attempted
+                            and metrics['model_calls'] < config.get('max_model_calls', 20)):
+                        unexecuted_code_repair_attempted = True
+                        publish('event', event={'event_type': 'worker.unexecuted_code_repair',
+                            'level': 'warning', 'reason':
+                            'Code in a response has not changed the workspace. One action correction is allowed.'})
+                        messages.extend([message, {'role': 'user', 'content':
+                            'The code you returned has not been saved or executed. Complete the PRIMARY TASK '
+                            'using the available workspace tools. Inspect an existing file before modifying it. '
+                            'Do not repeat code as a final answer or claim a write without an actual tool action. '
+                            'Capabilities and approvals are unchanged.'}])
+                        continue
                     success = True
                     break
             if not legacy:
                 message["tool_calls"] = calls
             messages.append(message)
             processed_calls: list[dict[str, Any]] = []
+            case_batch = False
+            if config.get("verification_mode") == "independent_cases" and config.get("verification_cases"):
+                from .verification_cases import expand_case_calls
+                calls, case_batch = expand_case_calls(calls, config["verification_cases"])
+                if case_batch:
+                    publish("event", event={"event_type": "verification.cases_started",
+                            "case_ids": [case["id"] for case in config["verification_cases"]]})
             for call_index, call in enumerate(calls):
                 guard()
                 if metrics["steps"] >= config.get("max_steps", 20):
@@ -1484,10 +1525,25 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                         "success": bool(result.success),
                         "exit_code": result.exit_code,
                         "output": str(result.output or "")[:4000],
+                        "stdout": result.stdout, "stderr": result.stderr,
+                         "content_truncated": len(str(result.output or "")) > 4000,
+                        "stdin_sha256": hashlib.sha256(safe_args["stdin"].encode()).hexdigest()
+                                        if isinstance(safe_args.get("stdin"), str) else None,
                         "error_class": result.error_class or "",
                         "changed": result.changed,
                         "already_satisfied": bool(result.already_satisfied),
+                        **({"case_id": call["verification_case"]["id"],
+                            "input": call["verification_case"]["input"]} if call.get("verification_case") else {}),
                     })
+                    if call.get("verification_case"):
+                        verification_state["attempted"] = True
+                        publish("event", event={"event_type": "verification.case_completed",
+                                "case_id": call["verification_case"]["id"],
+                                "input": call["verification_case"]["input"],
+                                "exit_code": result.exit_code, "stdout": result.stdout,
+                                "stderr": result.stderr, "success": result.success,
+                                "status": "passed" if result.success else "failed",
+                                "event_id": common["step_id"]})
                     if result.success and name == "run_command" and verification["enabled"]:
                         supported = _command_evidence_criteria(
                             verification.get("completion_criteria", []),
@@ -1511,6 +1567,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                 "command": list(safe_args.get("argv", [])),
                                 "exit_code": result.exit_code,
                                 "output": str(result.output or "")[:4000],
+                                "stdout": result.stdout, "stderr": result.stderr,
+                                "content_truncated": len(str(result.output or "")) > 4000,
+                                "stdin_sha256": hashlib.sha256(safe_args["stdin"].encode()).hexdigest()
+                                                if isinstance(safe_args.get("stdin"), str) else None,
                                 "supports_acceptance_criteria": supported,
                             }
                             command_evidence.append(evidence)
@@ -1523,7 +1583,7 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                             } for item in criteria):
                                 verification_state["passed"] = True
                                 verification_state["unavailable"] = False
-                                if verification["stop_after_acceptance_evidence"]:
+                                if verification["stop_after_acceptance_evidence"] and not case_batch:
                                     success = True
                                     auto_completed = True
                                     final = json.dumps({
@@ -1895,6 +1955,11 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                     })
                 if auto_completed:
                     break
+            if case_batch and len(processed_calls) == len(calls):
+                success = True
+                auto_completed = True
+                final = json.dumps({"summary": "Completed the requested independent verification cases.",
+                                    "actions": [], "artifacts": [], "verification": {}, "limitations": []})
             if auto_completed:
                 break
         if success and workspace_mutation_required:
@@ -2026,7 +2091,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                          "source": "runtime_verification",
                          "tool": result.name,
                          "capability": resolved_capability,
-                         "event_id": getattr(result, "event_id", "") or event_id}
+                         "event_id": getattr(result, "event_id", "") or event_id,
+                         "exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr,
+                        "content_truncated": len(str(result.output or "")) > 4000,
+                         "error_class": result.error_class}
                 if label.startswith("filesystem:read_file:"):
                     check.update(type="file_readback", path=label[len("filesystem:read_file:"):])
                 elif label.startswith("tests:"):
@@ -2066,6 +2134,7 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                     argv, label = test_command
                     record_verification(verify_tool("run_command", {"argv": argv}, "Run the available test suite."),
                                         "tests:" + label)
+                    verification_state["evidence"][-1]["command"] = list(argv)
                 else:
                     verification_state["unavailable"] = True
                     verification_state["skipped_with_reason"] += "No permitted test suite is available. "

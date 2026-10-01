@@ -2,54 +2,59 @@
 
 ## Investigation
 
-Previously `llm_trace.debug_enabled()` queried `os.getenv` for every call and
-validation event. It defaulted to false; true/1/yes/on parsing was already
-correct. Startup did not load `.env`, create a configuration snapshot, or report
-the effective setting. All production adapters already used the common tracer
-via `transport.model_request`; neither Evaluator nor agent configuration
-overrode the flag. Runtime spawned workers with the parent process environment,
-without an explicit debug-settings argument. Worker credential cleanup does not
-match `FREYA_DEBUG_LLM_PROMPTS`.
+The normal entrypoint is `python -m control_center`. Its parent process loads
+settings after CLI parsing, before Runtime and model adapters are constructed.
+An already-running server retains its startup snapshot. Setting a variable in
+another shell or editing source does not reconfigure that process. Historical
+false flags can therefore coexist with corrected code on disk.
 
-An assignment in a `.env` file, another shell, or a shell changed after server
-startup therefore did not reach the running server. A true value actually present
-in the server environment was already parsed as true. The original live process
-environment was not inspected, so its exact missing-variable scenario remains
-unverified. No private `.env`, runtime database or historical prompt log was read.
-
-Independent capture gaps: tracing preceded the transport's streaming/output
-adjustments, the default budget was 20000 characters (maximum 200000), and some
-evidence-contract errors after JSON parsing did not reach `llm.validation`.
+The inspected development process used this checkout, but its environment did
+not contain `FREYA_DEBUG_LLM_PROMPTS`. There was no dotenv or database loader.
+The ignored local configuration now makes the development setting durable
+across normal restarts; explicit environment values still take precedence.
 
 ## Configuration
 
 `control_center/settings.py` owns immutable `Settings`, reusable `parse_bool`,
-`get_settings` and startup initialization. Only the two named debug variables
-are queried. Runtime passes the same snapshot to `worker.process_main` through
+`get_settings` and startup initialization. Only the named debug and orchestration
+budget settings are queried. Runtime passes the same snapshot to `worker.process_main` through
 spawn; children install it before task execution. Every model component,
 including legacy Analyst calls, shares the common instrumentation.
 
-Precedence: process environment then default. There is no `.env`/`.env.local`
-loader or new dependency. True/1/yes/on enable debug, ignoring case and whitespace.
-False/0/no/off, empty, unset and unknown strings produce false. Empty values have
-source `environment`; absent values have source `default`. Default debug is false.
+Precedence: process environment, repository-root `.freya-local.json`, then
+default. The orchestration CLI option overrides its corresponding setting.
+There is no `.env`/`.env.local` loader or new dependency.
+True/1/yes/on enable debug, ignoring case and whitespace.
+False/0/no/off, empty and unknown strings produce false. An empty environment
+value overrides a local true value. Sources record the selected environment,
+local file or default; without either override, debug defaults to false.
 
-Set the flag in the launching terminal and restart the whole server:
+For durable local development, create the ignored `.freya-local.json` in the
+repository root (unknown setting keys fail startup):
+
+```json
+{"FREYA_DEBUG_LLM_PROMPTS":true,"FREYA_ORCHESTRATION_TIMEOUT_SECONDS":1800}
+```
+
+Alternatively set the flag in the launching terminal. Restart the whole server:
 
 ```powershell
 $env:FREYA_DEBUG_LLM_PROMPTS = "true"
 python -m control_center --port 8765 --workers 2 --data-dir .\data
 ```
 
-Before constructing Runtime, startup prints this JSON event on stdout:
+After acquiring the data-directory instance lock and before constructing Runtime,
+startup prints this JSON event on stdout:
 
 ```json
-{"event_type":"freya.config.loaded","debug_llm_prompts":true,"source":"environment","llm_provider":"ollama","debug_prompt_max_chars":4000000}
+{"event_type":"freya.runtime.configuration","debug_llm_prompts":true,"configuration_source":"environment","repo_root":"CHECKOUT","process_working_directory":"CWD","git_commit":"HEAD","entrypoint":"python -m control_center","orchestration_timeout_seconds":1800,"orchestration_timeout_source":"default","llm_provider":"ollama","debug_prompt_max_chars":4000000}
 ```
 
 It also prints `Debug LLM prompts: ENABLED`. No secrets or complete environment
 dump are logged. This console event is independent of orchestration/task SQLite
-logs. Both debug settings require server restart. Standalone library consumers
+logs. `GET /api/health.configuration` exposes the same non-secret snapshot.
+The commit identifies HEAD; local uncommitted edits are not a new commit.
+Settings changes require server restart. Standalone library consumers
 initialize lazily on first access and keep the resulting snapshot.
 
 ## Event format
@@ -115,10 +120,12 @@ Debug rejection events additionally include:
 }
 ```
 
-`evidence_contract` identifies post-parse evidence-claim rejection. The shared
-observer only logs and re-raises the original exception. It changes no matcher,
-criterion, semantic decision, recovery/retry, planning, integration or tool
-execution. `request_body.format` identifies the schema without repeating it in
+Evaluator version 9 validates the strict semantic `output_contract`; it no
+longer rejects an `unknown` rationale through diff/readback regexes. Normal
+semantic input contains the prepared final snapshot and authoritative facts.
+`evidence_contract` may occur in historical logs or other validators; it is not
+a current Evaluator decision stage. Observers log and re-raise contract errors
+without deciding criteria, changing Recovery, or executing tools. `request_body.format` identifies the schema without repeating it in
 each validation event.
 
 ## Redaction and limits
@@ -137,7 +144,7 @@ retained size. Check these markers before calling a capture complete. Redacted
 captures cannot reproduce credentials or private thinking. Debug increases local
 log/SQLite storage and API response sizes; keep it for development only.
 
-## Tests and remaining validation
+## Validation
 
 `tests/test_settings.py`: unset/boolean variants/invalid values, budgets, startup
 event, restart semantics, Runtime arguments and real spawned-worker propagation
@@ -150,13 +157,13 @@ effective request against a fake loopback streaming provider, raw/parsed/normali
 separation, output/evidence contract rejection, redaction, nested scopes and large
 prompt persistence/API sanitization. Fixtures are synthetic and disposable.
 
-Docker was unavailable and the user requested keeping the Docker requirement and
-leaving Python checks pending. Tests, compilation, CLI execution, actual startup
-and live Ollama/Qwen orchestration remain unverified. Static review does not
-prove runtime behavior. All six frontend `node --check` commands succeeded;
-they do not validate the Python changes. Focused validation is
-`python -m unittest tests.test_settings tests.test_llm_trace -v`, followed by the
-repository full checks, in the authorized Docker validation environment.
+`tests/test_run_contracts.py` starts the normal entrypoint against a temporary
+database and fake loopback provider, submits through the HTTP API, and checks
+the actual spawned Worker's flag, messages, response and startup identity.
+It also covers configuration precedence and active execution budgets.
+Run `python -m unittest tests.test_run_contracts tests.test_settings tests.test_llm_trace -v`.
+The case execution tests need the documented Docker image; absent Docker fails
+closed. The tracing fixtures do not require a real Ollama model.
 
 After restart in a development instance, submit:
 
@@ -169,4 +176,5 @@ Evaluator `request_body.messages`, `request_body.format`, `structured_context`,
 `raw_response` and correlated `llm.validation`. Repairs must have distinct IDs,
 their own request/response, and a link to the rejected call. Deterministic paths
 that make no model call emit no `llm.call`; debug never forces additional calls.
-This live regression has not been run against Qwen during this change.
+For live validation, use the normal entrypoint and a real installed Ollama model;
+the automatic test provider proves propagation, not provider availability.

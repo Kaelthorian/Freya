@@ -58,6 +58,12 @@ class ControlledRuntime:
                                            error="Controlled Runtime failure.")
                     continue
                 path = task["id"] + ".txt"
+                (self.workspace / path).write_text("observed by " + task["id"], encoding="utf-8")
+                for target_path in task.get("config", {}).get("task_owned_paths", []):
+                    target = self.workspace / target_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        target.write_text("current fixture file", encoding="utf-8")
                 self.store.update_task(task["id"], status=status, result={
                     "summary": "Controlled fixture completed.",
                     "actions": [{"tool": "read_file", "success": True}],
@@ -186,14 +192,14 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
         orchestrator = Orchestrator(
             self.store, runtime or IdleRuntime(), wait=wait,
             evaluator=evaluator, recovery=recovery,
-            config={"max_wallclock_seconds": 10},
+            config={"max_wallclock_seconds": 60},
         )
         return run["id"], orchestrator
 
     def execute_plan(self, plan, *, max_parallel_tasks=4, status_by_criterion=None,
-                     status_by_call=None, recovery=None, finish_status="Success"):
-        runtime = ControlledRuntime(self.store)
-        evaluator = RecordingEvaluator(status_by_criterion, status_by_call)
+                     status_by_call=None, recovery=None, finish_status="Success", evaluator=None, runtime=None):
+        runtime = runtime or ControlledRuntime(self.store)
+        evaluator = evaluator or RecordingEvaluator(status_by_criterion, status_by_call)
         oid, orchestrator = self.start_run(
             plan, runtime, lambda seconds: runtime.finish_active(status=finish_status),
             evaluator=evaluator, recovery=recovery,
@@ -202,7 +208,7 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
         orchestrator._complete_or_integrate = lambda *args, **kwargs: None
         run = self.store.get_orchestration(oid)
         orchestrator._run_graph(
-            oid, run, orchestrator.clock() + 10,
+            oid, run, orchestrator.clock() + 60,
             operational_prompt="Build the staged calculator.",
         )
         return oid, orchestrator, runtime, evaluator
@@ -419,13 +425,14 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
             item for item in observed_context["evidence_by_criterion"]
             if item["criterion"] == criterion
         )
-        source_evidence = next(item for item in criterion_evidence["evidence"]
-                               if item["source_task_id"] == "task-1")
-        self.assertEqual(source_evidence["worker_id"], "worker-1")
-        self.assertEqual(
-            source_evidence["content"],
-            "observed by " + source_evidence["source_runtime_task_id"],
-        )
+        self.assertTrue(criterion_evidence["evidence"])
+        state = observed_context["final_state"]
+        self.assertTrue(state["files"])
+        self.assertNotIn("worker_context", observed_context)
+        self.assertNotIn("runtime_task", observed_context)
+        for item in state["files"]:
+            if item["exists"]:
+                self.assertEqual(item["content"], (Path(call["runtime_task"]["workspace"]) / item["path"]).read_text(encoding="utf-8"))
 
     def test_runtime_failure_prevents_worker_semantic_evaluation(self):
         plan = compile_plan([
@@ -487,6 +494,71 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
                  for item in self.store.get_execution_graph(oid)["nodes"]}
         self.assertEqual(nodes["task-1"]["state"], "runtime_success")
         self.assertEqual(nodes["task-2"]["state"], "runtime_success")
+
+    def test_real_evaluator_preserves_good_task_and_recovers_only_failed_fact_origin(self):
+        criterion = "Division by zero is handled correctly."
+        plan = compile_plan([
+            semantic_task("create", "Create calculator.py", "create_file", "calculator.py",
+                          criteria=["calculator.py exists."]),
+            semantic_task("test", "Run pytest on calculator.py", "run_pytest", "calculator.py",
+                          depends=["create"], criteria=[criterion], task_kind="testing"),
+        ], global_criteria=["calculator.py exists."])
+        class FactRuntime(ControlledRuntime):
+            def finish_active(inner, seconds=None, status="Success"):
+                active = [task for task in inner.store.list_tasks(limit=10000)
+                          if task["status"] in {"Queued", "Running"}]
+                super(FactRuntime, inner).finish_active(seconds, status)
+                for task in active:
+                    if "execution.pytest" in task["config"].get("active_task_capabilities", []):
+                        inner.store.update_task(task["id"], verification={"evidence": [
+                            {"type": "test_result", "test_id": name, "check": name,
+                             "path": "calculator.py", "exit_code": code, "status": "passed" if code == 0 else "failed",
+                             "supports_acceptance_criteria": [criterion] if code else [],
+                             "source_task_id": "task-2"}
+                            for name, code in [("addition", 0), ("subtraction", 0), ("multiplication", 0),
+                                               ("division", 0), ("test_division_by_zero", 1)]]})
+        def review(_, context):
+            facts = context["final_state"]["verification_facts"]
+            failed = next(item for item in facts if item["status"] == "failed")
+            return {"criteria": [{"criterion": criterion, "status": "partial", "confidence": 1,
+                                  "reason": "The zero case needs revision; other operations passed.",
+                                  "evidence": [failed["id"]]}]}
+        recovery = FailRecovery()
+        oid, _, runtime, _ = self.execute_plan(plan, evaluator=Evaluator(review), recovery=recovery,
+                                               runtime=FactRuntime(self.store))
+        evaluation = self.store.list_evaluations(oid)[0]
+        good, failed = evaluation["criteria"][:2]
+        self.assertEqual(good["status"], "satisfied", evaluation)
+        self.assertEqual(failed["origin_task_id"], "task-2")
+        self.assertEqual([fact["test_id"] for fact in failed["failed_facts"]], ["test_division_by_zero"])
+        self.assertEqual(failed["affected_artifacts"], ["calculator.py"])
+        self.assertEqual(recovery.sources, ["task-2"])
+        self.assertEqual(len(runtime.submissions), 2)
+        nodes = {item["plan_task_id"]: item for item in self.store.get_execution_graph(oid)["nodes"]}
+        self.assertEqual(nodes["task-1"]["state"], "runtime_success")
+
+    def test_unavailable_required_verification_routes_without_worker_retry(self):
+        criterion = "All pytest tests pass."
+        plan = compile_plan([semantic_task("test", "Run pytest", "run_pytest", "calculator.py",
+                                           criteria=[criterion], task_kind="testing")], complexity="simple", global_criteria=[criterion])
+        class UnavailableRuntime(ControlledRuntime):
+            def finish_active(inner, seconds=None, status="Success"):
+                active = [task for task in inner.store.list_tasks(limit=10000)
+                          if task["status"] in {"Queued", "Running"}]
+                super(UnavailableRuntime, inner).finish_active(seconds, status)
+                for task in active:
+                    inner.store.update_task(task["id"], verification={"evidence": [
+                        {"check": "tests:pytest", "status": "unavailable", "error_class": "SandboxUnavailable"}]})
+        recovery = FailRecovery()
+        oid, _, runtime, _ = self.execute_plan(plan, evaluator=Evaluator(lambda *_: self.fail("No model")),
+                                               recovery=recovery, runtime=UnavailableRuntime(self.store))
+        evaluation = self.store.list_evaluations(oid)[0]
+        self.assertEqual(evaluation["routing_target"], "orchestrator", evaluation)
+        self.assertEqual(evaluation["reason"], "required_capability_unavailable")
+        self.assertEqual(recovery.sources, [])
+        self.assertEqual(len(runtime.submissions), 1)
+        self.assertTrue(any(item["event_type"] == "evaluation.routed_to_orchestrator"
+                            for item in self.store.get_orchestration(oid)["events"]))
 
     def test_single_worker_global_proof_can_be_reused_but_multi_worker_cannot(self):
         global_criterion = "The complete app is present and validated."

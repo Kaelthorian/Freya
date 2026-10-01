@@ -14,6 +14,7 @@ from unittest.mock import patch
 from control_center.agent_factory import AgentFactory
 from control_center.config import DEFAULT_CONFIG, normalize_agent
 from control_center.evaluator import Evaluator
+from control_center.final_state import build_final_state
 from control_center.execution_graph import ExecutionGraph
 from control_center.runtime import Runtime
 from control_center.storage import Store
@@ -106,6 +107,12 @@ class WorkerTests(unittest.TestCase):
             return next(replies)
         return run_task(task, self.root, self.events.append, lambda: None,
                         transport=transport, toolbox=toolbox, token=token)
+
+    def evaluate_result(self, evaluator, *, planned_task, runtime_task, **kwargs):
+        # Mirrors the parent preparation boundary; Evaluator never reads the workspace.
+        task = {**runtime_task, "final_state": build_final_state(
+            planned_task, [runtime_task], str(self.workspace))}
+        return evaluator.evaluate(planned_task=planned_task, runtime_task=task, **kwargs)
 
     @staticmethod
     def _structured_output():
@@ -265,7 +272,7 @@ class WorkerTests(unittest.TestCase):
         observation = result["result"]["already_satisfied_candidate"]["artifact_observations"][0]
         self.assertEqual(observation["source_task_id"], "task-1")
         self.assertEqual(result["workspace_changes"], 0)
-        evaluation = Evaluator(offline=True).evaluate(
+        evaluation = self.evaluate_result(Evaluator(offline=True),
             planned_task={
                 "id": "task-2", "objective": "Confirm the existing calculator file.",
                 "description": "Read calculator.html and confirm it exists.",
@@ -276,11 +283,9 @@ class WorkerTests(unittest.TestCase):
             runtime_task=result,
             execution_node={"selected_agent_id": "worker", "runtime_task_id": "runtime", "attempt": 1},
         )
-        self.assertEqual(evaluation["status"], "blocked")
-        evaluated_candidate = evaluation["context_snapshot"]["runtime_task"][
-            "already_satisfied_candidate"
-        ]["artifact_observations"][0]
-        self.assertEqual(evaluated_candidate["source_task_id"], "task-1")
+        self.assertEqual(evaluation["status"], "accepted")
+        self.assertTrue(evaluation["context_snapshot"]["final_state"]["files"][0]["exists"])
+        self.assertNotIn("runtime_task", evaluation["context_snapshot"])
 
     def test_anticipated_artifact_from_another_worker_does_not_bypass_mutation_contract(self):
         (self.workspace / "calculator.html").write_text(
@@ -313,7 +318,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["model_calls"], 3)
         self.assertTrue(any(item.get("event", {}).get("event_type") == "task.auto_completed"
                             for item in self.events))
-        evaluation = Evaluator(offline=True).evaluate(
+        evaluation = self.evaluate_result(Evaluator(offline=True),
             planned_task={
                 "id": "task-2", "objective": "Create a.js if absent",
                 "description": "Ensure a.js exists", "success_criteria": ["a.js exists"],
@@ -803,24 +808,22 @@ class WorkerTests(unittest.TestCase):
             "description": "Implement the four arithmetic operations.",
             "success_criteria": [criterion], "required_capabilities": [], "preferred_skills": [],
         }
-        evaluation = Evaluator(model=reject_incomplete_calculator).evaluate(
+        evaluation = self.evaluate_result(Evaluator(model=reject_incomplete_calculator),
             planned_task=planned_task,
             runtime_task=result,
             execution_node={"selected_agent_id": "calculator-worker",
                             "runtime_task_id": "calculator-runtime", "attempt": 1},
         )
         self.assertEqual(evaluation["status"], "needs_revision")
-        evaluator_evidence = (evaluator_input["global_evidence"] +
-                              [item for group in evaluator_input["evidence_by_criterion"]
-                               for item in group["evidence"]])
-        self.assertTrue(any(item.get("type") == "workspace_diff" and item.get("diff")
-                            for item in evaluator_evidence))
+        final_files = evaluator_input["final_state"]["files"]
+        self.assertTrue(any(item["path"] == "calculator.py" and item.get("content") for item in final_files))
+        self.assertNotIn("workspace_diff", json.dumps(evaluator_input))
         self.assertEqual(len(result["result"]["actions"]), 2)
         self.assertEqual(len(result["result"]["artifacts"]), 1)
 
     def test_created_javascript_duplicate_write_evaluates_and_unlocks_dependent_task(self):
         source = "export const add = (a, b) => a + b;\n"
-        criterion = "The JavaScript file should be created in the workspace."
+        criterion = "calculator.js exists."
         result = self.run_worker([
             answer(calls=[("write_file", {"path": "calculator.js", "content": source})]),
             answer(calls=[("write_file", {"path": "calculator.js", "content": source})]),
@@ -848,7 +851,7 @@ class WorkerTests(unittest.TestCase):
             "success_criteria": [criterion], "owned_paths": ["calculator.js"],
             "write_targets": ["calculator.js"], "semantic_operations": ["create_file"],
         }
-        outcome = Evaluator(lambda *_: self.fail("LLM must not be called")).evaluate(
+        outcome = self.evaluate_result(Evaluator(lambda *_: self.fail("LLM must not be called")),
             planned_task=plan_task,
             runtime_task={"status": result["status"], "result": result["result"],
                           "verification": result["verification"], "error": result["error"]},
@@ -901,7 +904,7 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(result["verification"]["passed"])
 
         evaluator = Evaluator(offline=True)
-        evaluation = evaluator.evaluate(
+        evaluation = self.evaluate_result(evaluator,
             planned_task={
                 "id": "T-1", "objective": "Create a calculator", "description": "Create calculator.py",
                 "success_criteria": [criterion], "required_capabilities": [], "preferred_skills": [],
@@ -912,9 +915,8 @@ class WorkerTests(unittest.TestCase):
         )
         self.assertEqual(evaluation["status"], "blocked")
         self.assertEqual(evaluation["criteria"][0]["status"], "unknown")
-        runtime_result = json.loads(evaluator.last_context["runtime_task"]["result"])
-        self.assertTrue(runtime_result["actions"][1]["already_satisfied"])
-        self.assertEqual(runtime_result["artifacts"], [])
+        self.assertNotIn("runtime_task", evaluator.last_context)
+        self.assertTrue(evaluator.last_context["final_state"]["files"][0]["exists"])
 
     def test_repeated_identical_already_satisfied_write_stops_on_second_request(self):
         content = "print('hola')\n"
@@ -1224,18 +1226,16 @@ class WorkerTests(unittest.TestCase):
         planned = {"id": "writer", "objective": "Implement add()",
                    "success_criteria": [criterion], "required_capabilities": ["filesystem.modify"]}
         def decision(_prompt, context):
-            evidence = context["global_evidence"] + [
-                item for group in context["evidence_by_criterion"] for item in group["evidence"]
-            ]
-            self.assertTrue(any(source.strip() in item.get("output", "") for item in evidence))
+            evidence = context["final_state"]["files"]
+            self.assertTrue(any(source.strip() in item.get("content", "").replace("\r\n", "\n") for item in evidence))
             return {"criteria": [{"criterion": criterion, "status": "satisfied",
                                   "reason": "The read source contains the implementation.",
                                   "evidence": ["read_file calculator.py"], "confidence": 1.0}]}
-        evaluation = Evaluator(model=decision).evaluate(
+        evaluation = self.evaluate_result(Evaluator(model=decision),
             planned_task=planned, runtime_task=result,
             execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime", "attempt": 1})
         self.assertEqual(evaluation["status"], "accepted")
-        without_semantic_review = Evaluator(offline=True).evaluate(
+        without_semantic_review = self.evaluate_result(Evaluator(offline=True),
             planned_task=planned, runtime_task=result,
             execution_node={"selected_agent_id": "agent", "runtime_task_id": "runtime", "attempt": 1})
         self.assertEqual(without_semantic_review["status"], "blocked")
@@ -1458,7 +1458,7 @@ document.querySelector("#calculate").addEventListener("click", () => {
         self.assertEqual(result["result"]["verification"]["evidence"][0]["check"],
                          "filesystem:read_file:calculator/index.html")
 
-        evaluation = Evaluator(offline=True).evaluate(
+        evaluation = self.evaluate_result(Evaluator(offline=True),
             planned_task=planned_task,
             runtime_task=result,
             execution_node={"selected_agent_id": "calculator-worker",
@@ -1466,7 +1466,7 @@ document.querySelector("#calculate").addEventListener("click", () => {
         )
         self.assertEqual(evaluation["status"], "accepted")
         self.assertEqual(evaluation["criteria"][0]["status"], "satisfied")
-        self.assertTrue(any(item.startswith("filesystem:read_file:calculator/index.html")
+        self.assertTrue(any(item.startswith("final_file:calculator/index.html")
                             for item in evaluation["criteria"][0]["evidence"]))
 
     def test_prose_wrapped_json_action_is_executed(self):

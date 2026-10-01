@@ -82,7 +82,9 @@ class Application:
     def _get(self, path, query):
         parts = path.strip("/").split("/")[1:]
         if parts == ["health"]:
+            from .settings import get_settings
             return {"status": "ok", "version": __version__, "database": "sqlite", "sse": True,
+                    "configuration": get_settings().diagnostic_event(),
                     "runtime": {"max_workers": self.runtime.max_workers}, "system": self.system()}
         if parts == ["config"]:
             return {"defaults": DEFAULT_CONFIG, "default_tools": DEFAULT_TOOLS,

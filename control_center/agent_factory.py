@@ -318,6 +318,8 @@ class AgentFactory:
             # Worker-enforced ownership is task-scoped and independent from
             # capability policy. Reads remain unaffected by this write scope.
             "task_owned_paths": list(task.get("owned_paths", [])),
+            "verification_cases": copy.deepcopy(task.get("verification_cases", [])),
+            "verification_mode": task.get("verification_mode", "interactive_session"),
             "task_foreign_write_targets": list(task.get("foreign_write_targets", [])),
             "task_planned_write_targets": list(task.get("_planned_write_targets", [])),
             "task_write_owners": dict(task.get("_write_owners", {})),

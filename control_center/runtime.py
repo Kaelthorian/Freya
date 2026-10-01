@@ -187,6 +187,9 @@ class Runtime:
             if worker is None or worker.get("approval_id") != approval_id:
                 raise ValueError("Approval is no longer attached to an active worker.")
             resolved = self.store.resolve_approval(approval_id, status, status)
+            waiting_since = worker.pop("approval_wait_started", None)
+            if waiting_since is not None:
+                worker["started"] += max(0, time.monotonic() - waiting_since)
             worker["approval_id"] = None
             worker["control"].put({"kind": "approval", "id": approval_id, "resolution": status})
             self.store.update_task(task_id, status="Running")
@@ -364,7 +367,8 @@ class Runtime:
                     return
                 for task_id, worker in list(self.active.items()):
                     # Enforce independently of the worker, even during blocked tools or pause.
-                    if time.monotonic() - worker["started"] >= worker["max_seconds"]:
+                    if (not worker.get("approval_id")
+                            and time.monotonic() - worker["started"] >= worker["max_seconds"]):
                         self._finish(task_id, {"status": "Failed", "error": "Maximum execution time reached (including paused time)."})
                         continue
                     try:
@@ -393,6 +397,7 @@ class Runtime:
                                         cross_task_request, approval["id"],
                                     )
                                 worker["approval_id"] = approval["id"]
+                                worker["approval_wait_started"] = time.monotonic()
                                 self.store.append_event(task_id, {
                                     "event_type": "approval.requested", "level": "warning",
                                     "status": "WaitingForApproval", "tool": approval["tool"],

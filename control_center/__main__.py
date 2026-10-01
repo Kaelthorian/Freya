@@ -11,7 +11,7 @@ from .api import Application
 from .http import ControlServer
 from .runtime import Runtime
 from .storage import Store
-from .settings import initialize_settings, report_startup_config
+from .settings import Settings, initialize_settings, report_startup_config, orchestration_timeout
 from .orchestrator import Orchestrator
 from .planner import (DEFAULT_PLANNER_ENDPOINT, DEFAULT_PLANNER_MODEL,
                       DEFAULT_PLANNER_TIMEOUT_SECONDS, OllamaPlanner, Planner)
@@ -40,12 +40,13 @@ class InstanceLock:
     def __init__(self, directory):
         directory.mkdir(parents=True, exist_ok=True)
         self.file = (directory / "server.lock").open("a+b")
-        self.file.seek(0)
-        if not self.file.read(1):
-            self.file.write(b"0")
-            self.file.flush()
-        self.file.seek(0)
         try:
+            # Windows rejects reads of a byte locked by another process.
+            # Inspect the size without reading the lock region.
+            if os.fstat(self.file.fileno()).st_size == 0:
+                self.file.write(b"0")
+                self.file.flush()
+            self.file.seek(0)
             if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -126,6 +127,8 @@ def main():
                         help="Maximum recovery and replanning model calls per orchestration (1-100)")
     parser.add_argument("--max-delegated-tasks", type=int, default=20,
                         help="Maximum planned tasks accepted by one orchestration (1-20)")
+    parser.add_argument("--orchestration-timeout", type=orchestration_timeout, default=None,
+                        help="Active orchestration budget in seconds (environment/local configuration/default otherwise)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.workers <= 8:
         parser.error("Use a port from 1 to 65535 and between 1 and 8 workers.")
@@ -140,12 +143,19 @@ def main():
             or not 1 <= args.max_integration_rounds <= 10
             or not 1 <= args.max_integration_model_calls <= 100):
         parser.error("Recovery or integration limits are outside their supported ranges.")
-    settings = initialize_settings()
-    report_startup_config(settings)
-    lock = InstanceLock(data_dir)
+    settings = initialize_settings(Settings.from_sources(ROOT))
+    if args.orchestration_timeout is not None:
+        from dataclasses import replace
+        settings = initialize_settings(replace(settings, orchestration_timeout_seconds=args.orchestration_timeout,
+                                               orchestration_timeout_source="command_line"))
+    try:
+        lock = InstanceLock(data_dir)
+    except (RuntimeError, OSError) as exc:
+        parser.exit(2, f"Freya could not start: {exc}\n")
     runtime = None
     server = None
     try:
+        report_startup_config(settings)
         store = Store(data_dir / "control_center.sqlite3")
         store.recover_interrupted_orchestrations()
         runtime = Runtime(store, data_dir, ROOT, max_workers=args.workers)
@@ -197,6 +207,7 @@ def main():
                                     integration_replanner=integration_replanner,
                                     result_integrator=result_integrator, config={
             "max_parallel_tasks": args.max_parallel_tasks,
+            "max_wallclock_seconds": settings.orchestration_timeout_seconds,
             "max_delegated_tasks": args.max_delegated_tasks,
             "max_semantic_attempts_per_task": args.max_semantic_attempts,
             "max_plan_revisions": args.max_plan_revisions,

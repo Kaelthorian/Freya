@@ -1100,7 +1100,7 @@ class Store(IntegrationStoreMixin):
         item["deterministic"] = bool(item["deterministic"])
         for field in ("confidence", "criteria", "issues", "missing_evidence",
                       "recommended_action", "evaluation_status", "failure_class",
-                      "recommended_runtime_action"):
+                      "recommended_runtime_action", "reason", "routing_target"):
             item[field] = evaluation.get(field)
         if include_snapshot:
             item["snapshot"] = snapshot
@@ -1175,6 +1175,19 @@ class Store(IntegrationStoreMixin):
             if row is None:
                 raise KeyError(evaluation_id)
             return self._evaluation(row, include_snapshot=include_snapshot)
+
+    def runtime_creation_order(self, task_ids: list[str]) -> list[str]:
+        """Durable insertion order for serialized Worker attempts (including recovery).
+
+        IDs and timestamps are not verification identities. No new database
+        column is needed: tasks is an ordinary SQLite rowid table.
+        """
+        if not task_ids:
+            return []
+        with self._connection() as c:
+            return [row["id"] for row in c.execute(
+                "SELECT id FROM tasks WHERE id IN (" + ",".join("?" for _ in task_ids)
+                + ") ORDER BY rowid", task_ids)]
 
     def initialize_execution_graph(self, oid: str, nodes: list[dict[str, Any]]) -> dict:
         """Atomically create exactly one durable node for every planned task."""

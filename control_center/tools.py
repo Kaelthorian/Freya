@@ -49,6 +49,8 @@ class ToolResult:
     owner_task_id: str = ""
     target_path: str = ""
     missing_fields: tuple[str, ...] = ()
+    stdout: str | None = None
+    stderr: str | None = None
 
 
 class ParentPathIsFile(Exception):
@@ -225,6 +227,7 @@ class Toolbox:
 
     def invoke(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         start = time.perf_counter()
+        self._command_streams = (None, None)
         args = arguments or {}
         blocking_path = ""
         try:
@@ -259,6 +262,8 @@ class Toolbox:
             exit_code=exit_code,
             error_class=error_class,
             blocking_path=blocking_path,
+            stdout=self._command_streams[0],
+            stderr=self._command_streams[1],
         )
 
     def git_repository_available(self) -> bool:
@@ -486,6 +491,7 @@ class Toolbox:
         sandbox_executable = ("python" if executable.startswith("python") or executable.startswith("py")
                               else executable)
         result = run_in_sandbox(self.workspace, [sandbox_executable, *normalized], timeout_seconds, stdin)
+        self._command_streams = (_clip(result.stdout or ""), _clip(result.stderr or ""))
         output = (result.stdout or "") + (result.stderr or "")
         if stdin is None and result.returncode != 0 and "EOFError" in output:
             output = (

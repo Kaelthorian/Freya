@@ -100,13 +100,27 @@ archival event reports archival `Success` separately from the run's final
 - Worker Runtime completion is technical only. A successful Task enters
   `runtime_success` and releases its DAG dependents. Once every Task in the
   compiled Worker Assignment reaches that state, Evaluator runs once over the
-  assignment evidence pool. Acceptance is shared by those Task nodes; a failed
+  assignment Final State Snapshot. Acceptance is shared by those Task nodes; a failed
   criterion maps to its origin Task for recovery. Global integration requires
   every active Task to reference an accepted Worker Evaluation.
-- Keep the Evaluator's durable evidence catalog separate from its compact model
-  input. Put bounded diff, read-back and test content beside each unresolved
-  criterion in the semantic input; preserve path, provenance and truncation
-  markers. A linked content hash alone cannot prove complex file semantics.
+- `final_state.py` prepares current file observations and authoritative final
+  verification facts in the parent before tool-free Evaluator runs. Evaluator
+  judges final state only: presence/readability are deterministic; content,
+  structure and execution meaning require semantic review. History stays in
+  audit/Recovery. Supersede checks by stable identity and dispatch order; preserve
+  independent stdin cases. Unavailable verification routes to Orchestrator and
+  never grants resources or retries the same incapable Worker.
+- `verification_cases.py` validates bounded IDs/inputs and expands one selected
+  command into independent controlled processes. Planner schema, Compiler,
+  AgentFactory activation and final facts must preserve the contract together.
+  Compiler may group equivalent sibling Python QA cases before ID allocation;
+  preserve criteria/dependencies and never merge ordered cases, writes or different scripts.
+  `interactive_session` keeps multiline stdin; never infer cases by line count.
+- `settings.py` owns startup debug and orchestration budgets. Normal CLI loads
+  environment over ignored root `.freya-local.json` over defaults before adapters
+  and Runtime; children receive the immutable snapshot. Keep diagnostics body-free.
+  Approval waits suspend Worker and parent limits; Orchestrator pauses its budget
+  only when all live graph work awaits approval. Ordinary pause still counts.
 - Compare model-proposed external work with explicit or clarified Task Spec
   intent before resolving tools. Do not infer deployment, publication, remote
   hosting or network side effects from web artifact creation. Preserve Task

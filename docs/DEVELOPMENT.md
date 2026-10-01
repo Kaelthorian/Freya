@@ -39,6 +39,15 @@ python -m control_center --max-parallel-tasks 4 --max-delegated-tasks 20
 If the total delegated-task limit is below the requested parallel value, the
 effective graph parallelism is clamped to that total limit.
 
+The orchestration execution budget defaults to 1800 seconds (previously 900).
+Set `FREYA_ORCHESTRATION_TIMEOUT_SECONDS` in the process environment or ignored
+repository-root `.freya-local.json`, or pass `--orchestration-timeout 1800`.
+Precedence is CLI, environment, local file, default; non-positive and non-finite
+values fail startup. This budget is separate from each model's inactivity/hard
+timeouts. Human approval waits do not consume Worker/parent execution budgets;
+Orchestrator excludes all-waiting approval intervals while concurrent executing
+branches and ordinary pause still consume time.
+
 The Planner and built-in Task Analyst use loopback Ollama with separate
 configuration:
 
@@ -78,6 +87,12 @@ before accepting the candidate. Inspect `task_analysis.contract_invalid` and
 the `fallback_*` metrics to identify the exact field if repair still fails.
 
 The Planner receives the ready Task Spec and a fresh `RuntimeResourceCatalog`.
+Grounding validates structural facts instead of exact words; inspect the
+statement, detected new information, grounded information and field in
+`task_analysis.contract_invalid`. Faithful translations are accepted. One
+unchanged rejected repair emits `task_analysis.repair_unchanged` before fallback.
+The canonical `source_prompt` retains internal whitespace so multiline input
+matches immutable audit text during persistence.
 The catalog is rebuilt from `capabilities.py` and worker schemas exposed by
 `Toolbox`. It provides semantic operation IDs and descriptions. Planner emits
 task meaning, dependencies, outcomes, criteria, semantic needs and exact
@@ -264,7 +279,7 @@ after a matching read-back of the new artifact.
 
 Semantic evaluation has separate local-model configuration. The Evaluator runs
 once after all active Tasks assigned to one Worker reach `runtime_success`; it
-receives their bounded evidence with Task, Runtime Task and Worker provenance.
+receives a current Final State Snapshot prepared by the parent, plus final verification facts with Task/Runtime/Worker provenance.
 Every assigned Task node references that one immutable evaluation.
 
 ```powershell
@@ -274,15 +289,20 @@ python -m control_center --evaluator-model qwen2.5-coder:7b `
 
 The evaluator endpoint is also loopback-only and the adapter exposes no tools.
 Use `--evaluator-offline` explicitly for deterministic evidence-only evaluation.
-Offline evaluation is conservative: acceptance requires configured verification
-to be requested, attempted and passed. Runtime result prose and agent claims are
-not objective evidence, but a successful controlled `run_command` can emit
-bounded `command_execution` evidence when its output directly satisfies a
-quoted-output, exit-code, or JSON completion criterion. Missing evidence returns
-`blocked`, including through the Orchestrator's default compatibility fallback.
-For filesystem-only tasks without Git or tests, the Worker may instead verify
-each modified file with an allowed `read_file` read-back; missing or mismatched
-read-back evidence remains blocked or failed.
+Offline evaluation resolves only current file presence/readability and required
+evidence gates. Content, structure and execution semantics remain `unknown`.
+`final_state.build_final_state` reads the current workspace with the existing
+safe-path boundary before evaluation; it cannot execute verification tools.
+Tests/commands/lint/compilation must run through the authorized Runtime sandbox.
+Their last stable check identity supersedes older outcomes; command signatures
+include stdin digest to preserve independent QA cases. A passing exit code is a
+fact and does not automatically accept a semantic criterion.
+
+Missing explicit evidence with available resources requests `gather_evidence`.
+Unavailable tools/capabilities route to Orchestrator, which records the resource
+block and fails conservatively for resource review without retrying the same
+Worker or granting permission. Existing read-only observer/testing Tasks may
+collect available evidence while preserving completed mutations.
 
 The built-in Task Analyst leaves an unnamed programming language and interface
 unspecified. The Planner chooses implementation strategy from the ready Task
@@ -297,19 +317,20 @@ Structured final responses receive one repair attempt even when
 the original answer is prose; if normalization is needed, `task.result_contract`
 stores a sanitized response preview, validation error, repair outcome and
 fallback status. A failed format repair is diagnostic and does not itself
-invalidate objective evidence. Exact criterion links from successful controlled
-commands are accepted deterministically.
+invalidate final-state evidence. Controlled command results require semantic interpretation.
 
-The semantic Evaluator input is assembled in `Evaluator._semantic_context`:
-linked `workspace_diff`, `file_readback`, `file_content_match` and test records
-from any Task in the same Worker Assignment carry bounded content beside the
-unresolved criterion. `worker_context` lists each Task's objective, criteria
-and Runtime outcome. A short diff remains complete; large excerpts set
-`content_truncated`. The snapshot returned by `Evaluator.evaluate` still
-contains the separate full bounded evidence catalog.
+The semantic input is assembled in `Evaluator._semantic_context`: unresolved
+criteria and stable references accompany bounded `final_state.files`,
+`verification_facts` and final task outputs marked as agent claims. It excludes
+Worker history, old readbacks, actions, diffs and `already_satisfied`. Snapshot
+content limits and omission markers are explicit. Durable snapshots also preserve
+current evidence associations for Integration and criterion/fact origins for
+Recovery. Compiler telemetry reports `verification_mode` separately from evidence
+availability. See [Architecture](ARCHITECTURE.md#semantic-evaluation).
 
-An identical write alone still does not populate the current-attempt read map
-and cannot satisfy an unrelated criterion. For compiled Worker assignments,
+An identical write alone does not populate the Worker's current-attempt read map.
+Evaluator presence checks separately observe the current file, independent of
+whether that write changed it. For compiled Worker assignments,
 `worker.py` additionally permits a zero-mutation candidate when current bytes
 are read and ProjectState attributes them to a completed task in the same
 assignment (or the current task's recovery attempt). It never borrows this
@@ -332,7 +353,8 @@ without exceeding the total model-call budget. The orchestration wall-clock dead
 is rechecked after each recovery or replanning call before more work starts.
 Use `--recovery-offline` for model-free deterministic behavior: a blocked
 evaluation with missing evidence requests a same-assignment read-only observer
-when one exists; otherwise `needs_revision`/`blocked` use the configured retry
+or an authorized testing Task when one exists; unavailable resources require
+Orchestrator review without a Worker retry; otherwise `needs_revision`/`blocked` use the configured retry
 policy, `rejected` requests a new dynamic agent variant, and evaluator errors
 fail. Same-agent retry reuses the exact generated ID;
 different-agent retry creates a new identity/Skill combination while preserving
@@ -460,6 +482,12 @@ is closed with the run.
 Open `http://127.0.0.1:8765`. Worker counts may be 1–8. A lock in the selected
 data directory prevents two schedulers from using one database. Stop with
 `Ctrl+C`; active and queued tasks are cancelled and logged.
+If another process owns `server.lock`, startup exits with code 2 and
+`Another server is already using this data directory.` without starting Runtime
+or emitting its configuration event. On Windows the lock region must not be
+read before acquiring it. Reuse the running server or stop its owning process
+before restarting; do not delete `server.lock` to bypass the lock. Its presence
+after shutdown is normal: closing the owning handle releases the OS lock.
 
 SQLite uses `data/control_center.sqlite3` by default and may create `-wal` and
 `-shm` files. Automatic workspaces use `data/workspaces/<random-id>/`. For a Freya orchestration, that directory is allocated once and shared by all dependent nodes (including any conditional QA or audit task); direct task submissions still get one directory per task. These
@@ -515,6 +543,15 @@ python -m control_center
 The endpoint validator accepts only loopback Ollama base URLs without embedded
 credentials, paths, query strings or fragments.
 
+Independent QA inputs belong in compiled task `verification_cases` with stable
+`id` and exact `input`, plus `verification_mode=independent_cases`. Each case
+starts a fresh Docker command from one model-selected argv; no model call occurs
+between cases. Explicit `interactive_session` keeps multiline stdin in one
+process. Compiler compatibility inference accepts only clear input lists.
+Inspect `verification.case_completed`, structured result actions, and Evaluator
+`final_state.verification_facts` for every case, including failed cases. Exit
+status is an observed fact; semantic correctness still requires Evaluator.
+
 ## Validate changes
 
 ```powershell
@@ -524,6 +561,7 @@ python -m unittest discover -s tests -p "test_execution_graph.py" -v
 python -m unittest discover -s tests -p "test_evaluator.py" -v
 python -m unittest discover -s tests -p "test_integration.py" -v
 python -m unittest tests.test_task_spec tests.test_activity tests.test_control_api -v
+python -m unittest tests.test_run_contracts tests.test_settings tests.test_llm_trace -v
 python -m compileall -q control_center
 node --check frontend\app.js
 node --check frontend\core.js
@@ -569,11 +607,19 @@ payload alongside `planning_metrics`.
 Execution-graph tests cover pure DAG transitions, sequential and parallel
 scheduling, joins, branch-local failure propagation, approval waits, paused
 agents, per-agent serialization, concurrency limits, cancellation and migration.
-Evaluator tests cover criterion-specific objective evidence, prompt injection,
+Evaluator tests cover current existence/readability, superseded verifications,
+semantic-only content/symbols, command/lint/compile facts, granular failures,
+resource routing, snapshot bounds, workspace path escapes and prompt injection,
 the reduced semantic schema, one repair per call and one bounded retry,
 Python aggregation, immutable persistence, API exposure, graph
 gating, duplicate prevention, technical failure, cancellation, timeout and
 restart recovery.
+For the final-state evaluation contract and Worker Assignment integration, run:
+
+```powershell
+python -m unittest tests.test_evaluator tests.test_semantic_pipeline tests.test_worker_assignments tests.test_llm_trace tests.test_recovery.RecoveryContractTests.test_resource_block_cannot_request_worker_retry_or_grant tests.test_recovery.RecoveryContractTests.test_retry_prompt_targets_failed_fact_and_preserves_satisfied_work -q
+```
+
 Integration tests cover deterministic preconditions, exact global criteria,
 hard evidence precedence, prompt injection, strict schema/one repair,
 canonical status/action normalization, exact direct-proof fast path, safe
@@ -632,15 +678,19 @@ $env:FREYA_DEBUG_LLM_PROMPTS = "true"
 python -m control_center --port 8765 --workers 2 --data-dir .\data
 ```
 
-Startup prints `freya.config.loaded` with `debug_llm_prompts`, `source`
-(`environment` or `default`), provider and capture budget, followed by
+Startup prints `freya.runtime.configuration` with `debug_llm_prompts`,
+`configuration_source`, checkout root, cwd, HEAD commit, entrypoint, active
+orchestration budget and capture budget, followed by
 `Debug LLM prompts: ENABLED` or `DISABLED`. This event is on server stdout;
 it is not attached to an orchestration or stored in the task log API.
 `settings.Settings` loads once at startup and is explicitly passed to spawned
 workers. All model components share that snapshot. Changing the variable in
 another terminal or after startup does not reconfigure a running server.
-Freya does not load `.env` or `.env.local`; the precedence is process environment
-then default. No dotenv dependency is needed. Unset/empty/false/0/no/off are false;
+`GET /api/health` includes this same snapshot under `configuration`.
+Freya does not load `.env` or `.env.local`; precedence is process environment,
+ignored repository-root `.freya-local.json`, then default. For persistent local
+debugging, use `{"FREYA_DEBUG_LLM_PROMPTS":true}` in that JSON file and restart.
+No dotenv dependency is needed. Unset/empty/false/0/no/off are false;
 true/1/yes/on are true, ignoring case and surrounding whitespace. Other strings
 fail closed to false. Debug defaults to false.
 

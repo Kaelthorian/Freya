@@ -8,7 +8,7 @@ bounded task runtime and workspace-scoped programming tools.
 ```text
 .
 ├── control_center/           web API, scheduler, workers, tools and SQLite
-│   ├── __main__.py           system Task Analyst and Planner/Evaluator/Recovery/Integration configuration
+│   ├── __main__.py           CLI, exclusive data-directory lock and system model configuration
 │   ├── http.py / api.py      HTTP/SSE adapter and application routes
 │   ├── runtime.py            queue, workspace selection and process lifecycle
 │   ├── task_spec.py          canonical intent, clarification questions, revisions and deterministic rendering
@@ -25,7 +25,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── agent_selector.py     deterministic capability gates, scoring and explainable ranking
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── project_state.py      per-orchestration artifact metadata, bounded context snapshots and accepted updates
-│   ├── evaluator.py          Worker evidence aggregation/criterion mapping, objective checks, status aggregation and tool-free Ollama adapter
+│   ├── final_state.py        parent-owned current file snapshot and authoritative verification fact extraction
+│   ├── evaluator.py          final-state criterion mapping, presence/readability gates, semantic decisions and tool-free Ollama adapter
 │   ├── recovery.py           origin-aware Worker recovery, read-only evidence gathering, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier contract, direct-proof decision, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and explicit local-to-global criterion proof mapping
@@ -37,7 +38,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── sandbox.py            disposable workspace copy and restricted Docker execution
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── llm_trace.py          redacted, bounded model-call tracing and debug prompt capture
-│   ├── settings.py           immutable startup observability settings, boolean parsing and spawn snapshot
+│   ├── settings.py           central startup debug/budget settings, local/env precedence and spawn snapshot
+│   ├── verification_cases.py bounded case contracts, compatible QA task grouping and deterministic batch expansion
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
@@ -92,7 +94,10 @@ selects them.
    task meaning, kind, dependencies, outcomes, criteria, durable `owned_paths` and `write_targets`.
    `plan_compiler.py` calls `plan_scope.py` to remove work not supported by
    explicit Task Spec intent, then verifies unsupported claims and assigns one
-   permanent plan-task owner per concrete write path without merging tasks. It derives
+   permanent plan-task owner per concrete write path. Before ID allocation, equivalent
+   sibling Python QA tasks with typed independent cases can be grouped; their criteria
+   and dependent links are preserved. Tasks with writes, ordered cases or distinct
+   scripts remain separate. It derives
    an exact runtime write grant when a task declares a foreign target and depends
    transitively on its permanent owner; this never transfers ownership. It is the
    only component that maps semantic operations to concrete capabilities and tools,
@@ -127,7 +132,7 @@ selects them.
    capability to tool mapping. Unknown operations and unsupported actions fail
    closed. The policy engine still decides each invocation.
    The Worker records current file hashes before existing-file writes and
-   returns zero-write candidates to Evaluator only when declared targets were
+   records zero-write Runtime candidates only when declared targets were
    read. `tools.py` compares `edit_file` candidate bytes before writing;
    `worker.py` records diffs and mutations only for material changes and stops
    repeated no-op edits on one artifact. `orchestrator.py` adds a bounded
@@ -152,8 +157,8 @@ selects them.
    `agent_selector.py` then validates and classifies that generated
    candidate before delegation. Runtime `Success` enters `runtime_success` and
    releases DAG dependencies. `orchestrator.py` waits until all active Tasks in
-   one compiled Worker Assignment finish, aggregates their bounded evidence
-   with task/runtime/worker provenance, then calls `evaluator.py` once for that
+   one compiled Worker Assignment finish, calls `final_state.build_final_state`
+   for current files and authoritative verification facts, then calls `evaluator.py` once for that
    Worker. One immutable evaluation is referenced by every assigned Task node;
    failed criteria retain their origin Task so Recovery can select the right
    subgraph. A single Worker evaluation may also satisfy identical global
@@ -167,16 +172,18 @@ selects them.
    of protected, historical or independent work before committing the effective
    plan, without changing the original snapshot.
    Runtime command output that directly satisfies an observable completion
-   criterion is promoted to bounded verification evidence and can satisfy that
-   exact criterion deterministically. Invalid structured final text receives
+   criterion is promoted to bounded verification evidence; Evaluator interprets
+   its meaning semantically against the final result. Invalid structured final text receives
    one repair attempt; runtime exceptions instead build a factual contract from
    the action ledger without model repair. `task.result_contract` logs sanitized
    diagnostics, while `freya.evaluation.completed` logs Python-aggregated
    criterion decisions and bounded input evidence for non-accepted outcomes.
    Evaluator sends only unresolved semantic criteria to Ollama with bounded
-   objective diff/read-back/test content inline per criterion. It omits the
-   duplicate full Runtime result and bounds contract repair plus one retry to
-   four calls on the same Runtime evidence.
+   current files and final test/command/lint/compile facts. It omits execution
+   history and resolves only bare existence/readability plus required evidence
+   gates deterministically. Unavailable resources route to Orchestrator for
+   resource review without granting permissions. Repair plus one retry is bounded
+   to four calls on the same immutable final snapshot.
    The worker also stops byte-identical duplicate writes without requiring read-back and reports
    missing-file reads without repeating them unchanged; semantic recovery then
    fails deterministic absent-artifact inputs instead of rotating agents.
@@ -221,10 +228,12 @@ selects them.
 | Persistent field or metric | `schema.sql`, `storage.py`, `tests/test_control_storage.py` |
 | Orchestration project metadata, artifact revisions or context queries | `project_state.py`, `storage.py`, `schema.sql`, `worker.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_project_state.py` |
 | Scheduling, workspaces, pause or cancellation | `runtime.py`, `tests/test_control_runtime.py` |
+| Startup configuration, debug propagation or active orchestration budget | `settings.py`, `__main__.py`, `runtime.py`, `orchestrator.py`, `tests/test_settings.py`, `tests/test_run_contracts.py`, `docs/DEBUG_LLM_PROMPTS.md` |
+| Independent test inputs or multiline interactive sessions | `verification_cases.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `worker.py`, `final_state.py`, `tests/test_run_contracts.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
 | No-op file edits, mutation accounting or repeated edit loops | `tools.py` (`tool_edit_file`), `worker.py` (`PolicyToolbox.invoke`, `run_task`), `tests/test_tools.py`, `tests/test_capabilities.py`, `tests/test_control_runtime.py` |
-| Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
+| Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `final_state.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Planner scope, resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `plan_scope.py`, `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_plan_scope.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |
 | Task responsibility overlap, shared write targets or criterion verifiability | `planner.py`, `plan_evidence.py`, `plan_compiler.py`, `runtime_resources.py`, `tests/test_semantic_pipeline.py` |

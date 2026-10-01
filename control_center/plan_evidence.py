@@ -19,6 +19,30 @@ EXTERNAL_STATE = "external_state"
 TASK_OUTPUT = "task_output"
 
 
+def verification_mode(criterion: str) -> str:
+    """Decision authority is separate from the ability to gather evidence.
+
+    Only a bare presence/readability assertion is resolved without a model.
+    Content, structure and execution results always require semantic judgment.
+    """
+    text = _fold(str(criterion or "").strip())
+    path = r"[\w./\\-]+\.[a-z0-9]+"
+    nouns = r"(?:files?|archivos?|artifacts?|artefactos?)"
+    prefix = r"(?:(?:the|a|an|el|la|los|las|un|una)\s+)?"
+    adjective = r"(?:(?:project|required|requested|output|expected|del proyecto)\s+)?"
+    named = r"(?:" + nouns + r"\s+)?" + path
+    multiple = named + r"(?:(?:,\s*|\s+and\s+|\s+y\s+)" + named + r")*"
+    subject = prefix + r"(?:" + multiple + r"|" + adjective + nouns + r"(?:\s+del proyecto)?)"
+    readable = r"(?:\s+and\s+(?:is readable|can be read)|\s+y\s+(?:es legible|puede leerse))"
+    if re.fullmatch(subject + r"\s+(?:exists?|exist|existe[n]?)" + readable + r"[.!]?", text):
+        return "file_readable"
+    if re.fullmatch(subject + r"\s+(?:(?:is|are|esta[n]?)\s+)?(?:readable|legible[s]?)[.!]?", text):
+        return "file_readable"
+    if re.fullmatch(subject + r"\s+(?:(?:is|are|ha(?:ve|s)? been|fue(?:ron)?|estan?)\s+)?(?:exists?|exist|existe[n]?|created|present|saved|cread[oa]s?|guardad[oa]s?)(?:\s+(?:in|en)\s+(?:the |el )?(?:workspace|project|proyecto))?[.!]?", text):
+        return "file_exists"
+    return "semantic"
+
+
 def _fold(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value.casefold())
     return "".join(character for character in normalized

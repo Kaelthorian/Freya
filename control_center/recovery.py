@@ -636,6 +636,12 @@ def build_retry_prompt(planned_task: dict[str, Any], evaluation: dict[str, Any],
         "A response-format repair or normalization is a diagnostic, separate from whether the objective passed.",
         "Recovery instructions: " + str(instructions).strip(),
     ]
+    failed = [item for item in evaluation.get("criteria", [])
+              if isinstance(item, dict) and item.get("status") != "satisfied"
+              and item.get("origin_task_id", planned_task.get("id")) == planned_task.get("id")]
+    if failed:
+        lines.append("Correct only these failed criteria; preserve satisfied criteria and artifacts: " +
+                     json.dumps(sanitize(failed), ensure_ascii=False, separators=(",", ":"))[:4000])
     if issues:
         lines.append("Issues: " + "; ".join(issues))
     if missing:
@@ -850,6 +856,8 @@ class RecoveryController:
             decision = self._fail("The semantic attempt budget for this task is exhausted.", task_id)
         elif repeated >= 2:
             decision = self._fail("The same semantic failure repeated; another retry is unsafe.", task_id)
+        elif evaluation.get("routing_target") == "orchestrator":
+            decision = self._fail("required_capability_unavailable: orchestrator resource review required.", task_id)
         elif evaluation.get("status") == "error":
             decision = self._fail("Evaluator infrastructure errors are not task retries.", task_id)
         elif (evaluation.get("status") == "blocked"

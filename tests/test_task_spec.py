@@ -966,7 +966,7 @@ class TaskSpecTests(unittest.TestCase):
             self.assertEqual(skill["use_when"], "When checking a small CLI arithmetic program.")
             self.assertNotIn("PRIVATE_WORKER_INSTRUCTION", json.dumps(context))
             format_schema = semantic_plan_response_format(context)
-            properties = format_schema["properties"]["tasks"]["items"]["properties"]
+            properties = format_schema["properties"]["tasks"]["items"]["anyOf"][0]["properties"]
             self.assertIn("operations", properties)
             self.assertIn("task_kind", properties)
             self.assertNotIn("required_capabilities", properties)

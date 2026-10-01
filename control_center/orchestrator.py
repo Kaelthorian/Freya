@@ -21,6 +21,8 @@ from .recovery import (FAILURE_ANALYSIS_VERSION, RECOVERY_VERSION,
                        deterministic_failure_diagnosis,
                        semantic_failure_fingerprint)
 from .security import sanitize
+from .final_state import build_final_state, criterion_paths
+from .settings import get_settings
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .plan_compiler import planned_write_target_grants
@@ -80,7 +82,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         self.integration_lock = threading.Lock()
         self.config = {"max_rounds": 6, "max_delegated_tasks": MAX_PLAN_TASKS,
                        "max_parallel_tasks": 4, "max_model_calls": 12,
-                       "max_wallclock_seconds": 900,
+                       "max_wallclock_seconds": get_settings().orchestration_timeout_seconds,
                        "max_semantic_attempts_per_task": 3,
                        "max_plan_revisions": 2, "max_recovery_actions": 8,
                        "max_recovery_model_calls": 16, "max_integration_rounds": 2,
@@ -1637,55 +1639,10 @@ class Orchestrator(IntegrationOrchestrationMixin):
         """Build a bounded, sanitized record of the evidence shown to evaluation."""
         if not isinstance(snapshot, dict):
             return {}
-        planned = snapshot.get("planned_task")
-        planned = planned if isinstance(planned, dict) else {}
-        runtime = snapshot.get("runtime_task")
-        runtime = runtime if isinstance(runtime, dict) else {}
-        verification = runtime.get("verification")
-        verification = verification if isinstance(verification, dict) else {}
-        evidence = []
-        raw_evidence = verification.get("evidence", [])
-        if not isinstance(raw_evidence, list):
-            raw_evidence = []
-        for item in raw_evidence[:8]:
-            if not isinstance(item, dict):
-                continue
-            bounded = {
-                key: item[key] for key in ("check", "status", "type", "tool", "exit_code")
-                if key in item
-            }
-            for key in ("path", "capability", "evidence_id", "source_task_id",
-                        "source_runtime_task_id", "worker_id", "timestamp"):
-                if isinstance(item.get(key), str):
-                    bounded[key] = item[key][:500]
-            for key in ("command", "supports_acceptance_criteria"):
-                value = item.get(key)
-                if isinstance(value, list):
-                    bounded[key] = [str(part)[:300] for part in value[:10]]
-            bounded["output"] = str(item.get("output") or "")[:1_200]
-            evidence.append(bounded)
-        result = str(runtime.get("result") or "")
-        return sanitize({
-            "planned_task": {
-                key: planned.get(key)
-                for key in ("id", "objective", "description", "success_criteria", "worker_context")
-                if key in planned
-            },
-            "runtime_task": {
-                "status": runtime.get("status"),
-                "error": str(runtime.get("error") or "")[:1_000],
-                "result_preview": result[:3_000],
-                "verification": {
-                    key: verification.get(key)
-                    for key in ("requested", "attempted", "passed", "failed", "unavailable")
-                    if key in verification
-                } | {
-                    "skipped_with_reason": str(verification.get("skipped_with_reason") or "")[:1_000],
-                    "evidence": evidence,
-                },
-            },
-            "context_truncated": bool(snapshot.get("context_truncated")),
-        })
+        return sanitize({"planned_task": snapshot.get("planned_task", {}),
+                         "final_state": snapshot.get("final_state", {}),
+                         "evidence_gaps": snapshot.get("evidence_gaps", []),
+                         "context_truncated": bool(snapshot.get("context_truncated"))})
 
     @staticmethod
     def _worker_groups(plan: dict[str, Any],
@@ -1723,7 +1680,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
     def _worker_evaluation_input(self, oid: str, plan: dict, assignment: dict,
                                  nodes: list[dict], run: dict,
                                  anchor_task_id: str) -> tuple[dict, dict, dict, dict, list[dict]]:
-        """Aggregate every assigned Task result without dropping evidence provenance."""
+        """Keep execution history for audit and prepare a separate current snapshot."""
         worker_id = assignment["worker_id"]
         task_ids = list(assignment["task_ids"])
         task_by_id = {item["id"]: item for item in plan["tasks"]}
@@ -1876,8 +1833,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             } for task, _, _ in task_runs],
             "workspace_state": workspace_state,
         }
-        # Keep model-facing task context bounded; detailed read/diff content remains
-        # in the evidence catalog with its full source provenance.
+        # Keep audit/Recovery context bounded. This history never enters semantic input.
         rendered_worker_context = json.dumps(
             sanitize(worker_context), ensure_ascii=False, separators=(",", ":"), default=str,
         )
@@ -1918,12 +1874,34 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "success_criteria": unique_criteria,
             "acceptance_criteria": acceptance_criteria,
             "owned_paths": owned_paths, "write_targets": write_targets,
+            "read_targets": list(dict.fromkeys(path for task, _, _ in task_runs
+                                              for path in task.get("read_targets", []))),
             "worker_context": worker_context,
         }
+        planned["required_capabilities"] = list(dict.fromkeys(
+            capability for task, _, runtime in task_runs
+            for capability in runtime.get("config", {}).get("active_task_capabilities", task.get("required_capabilities", []))))
+        planned["required_tools"] = list(dict.fromkeys(
+            tool for task, _, runtime in task_runs
+            for tool in runtime.get("config", {}).get("active_task_tools", task.get("required_tools", []))))
+        planned["resources_by_criterion"] = {
+            criterion["criterion"]: {
+                "capabilities": next((runtime.get("config", {}).get("active_task_capabilities", task.get("required_capabilities", [])) for task, _, runtime in task_runs
+                                      if task["id"] == criterion["origin_task_id"]), planned["required_capabilities"]),
+                "tools": next((runtime.get("config", {}).get("active_task_tools", task.get("required_tools", [])) for task, _, runtime in task_runs
+                               if task["id"] == criterion["origin_task_id"]), planned["required_tools"]),
+            } for criterion in criteria
+        }
+        # Serialized dispatch insertion order includes later Recovery attempts.
+        snapshot_runs = [{**runtime, "source_task_id": task["id"]} for task, _, runtime in task_runs]
+        execution_order = self.store.runtime_creation_order([runtime["id"] for runtime in snapshot_runs])
+        order = {runtime_id: index for index, runtime_id in enumerate(execution_order)}
+        snapshot_runs.sort(key=lambda runtime: order[runtime["id"]])
+        final_state = build_final_state(planned, snapshot_runs, workspace or anchor_runtime.get("workspace"))
         runtime_aggregate = {
             "id": anchor_runtime["id"], "status": "Success", "agent_id": agent_id,
             "workspace": anchor_runtime.get("workspace"),
-            "result": combined_result, "verification": verification,
+            "result": combined_result, "verification": verification, "final_state": final_state,
             "error": "", "finished_at": max(
                 (str(runtime.get("finished_at") or "") for _, _, runtime in task_runs), default=""),
         }
@@ -1936,7 +1914,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
 
     def _evaluate_worker_assignment(self, oid: str, plan: dict, assignment: dict,
                                    deadline: float) -> None:
-        """Evaluate one complete Worker Assignment over its accumulated runtime evidence."""
+        """Evaluate one complete Worker Assignment against its prepared final state."""
         worker_id = assignment["worker_id"]
         task_ids = list(assignment["task_ids"])
         evaluation_id = str(uuid4())
@@ -2047,6 +2025,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
             return
 
         base_evaluation = {key: outcome[key] for key in EVALUATION_FIELDS if key in outcome}
+        base_evaluation.update({key: outcome[key] for key in ("reason", "routing_target") if key in outcome})
         by_criterion = {str(item.get("criterion") or "").strip().casefold(): item
                         for item in base_evaluation.get("criteria", []) if isinstance(item, dict)}
         criterion_results = []
@@ -2064,6 +2043,17 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 "status": decision["status"], "reason": decision["reason"],
                 "evidence": list(decision.get("evidence") or []),
             })
+        final_facts = runtime_aggregate["final_state"].get("verification_facts", [])
+        for item in criterion_results:
+            cited = " ".join(item["evidence"])
+            linked_facts = [fact for fact in final_facts if fact.get("id") in cited
+                            or item["criterion_id"] in fact.get("supports_acceptance_criterion_ids", [])
+                            or item["criterion"] in fact.get("supports_acceptance_criteria", [])]
+            if item["status"] != "satisfied":
+                item["failed_facts"] = [fact for fact in linked_facts if fact.get("status") == "failed"][:8]
+                item["affected_artifacts"] = list(dict.fromkeys(
+                    [*criterion_paths(item["criterion"]),
+                     *(fact["path"] for fact in linked_facts if fact.get("path"))]))
         evaluation = dict(base_evaluation)
         evaluation["criteria"] = criterion_results
         evaluation["worker_id"] = worker_id
@@ -2265,14 +2255,29 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     current_agents = [self.store.get_agent(current_agent_id)]
                 except KeyError:
                     current_agents = []
-            with self.recovery_lock:
-                decision = self.recovery.decide(
-                    planned_task=planned_task, execution_node=target,
-                    evaluation=evaluation, history=history,
-                    available_agents=current_agents, plan=plan, limits=limits,
-                    can_create_agent=True,
-                    workspace_state=workspace_state,
-                )
+            if evaluation.get("routing_target") == "orchestrator":
+                self.store.add_orchestration_event(oid, {
+                    "event_type": "evaluation.routed_to_orchestrator", "status": "Blocked",
+                    "worker_id": worker_id, "task_id": task_id,
+                    "evaluation_id": evaluation["id"], "reason": evaluation.get("reason"),
+                    "routing_target": "orchestrator",
+                    "message": "Required verification is unavailable under the current resource contract. Freya cannot grant it automatically.",
+                })
+                decision = {
+                    "action": "fail", "reason": "required_capability_unavailable: orchestrator resource review required.",
+                    "instructions": "", "exclude_agent_ids": [], "affected_task_ids": [task_id],
+                    "fingerprint": semantic_failure_fingerprint(task_id, current_agent_id or "", evaluation),
+                    "metrics": {"model_calls": 0},
+                }
+            else:
+                with self.recovery_lock:
+                    decision = self.recovery.decide(
+                        planned_task=planned_task, execution_node=target,
+                        evaluation=evaluation, history=history,
+                        available_agents=current_agents, plan=plan, limits=limits,
+                        can_create_agent=True,
+                        workspace_state=workspace_state,
+                    )
         except Exception as exc:
             decision = {
                 "action": "fail", "reason": "Recovery decision failed strict validation: " + str(exc),
@@ -2336,14 +2341,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
             task_by_id = {item["id"]: item for item in plan.get("tasks", [])}
             candidates = []
             for candidate_id in assigned_task_ids:
-                if candidate_id == task_id or graph_nodes.get(candidate_id, {}).get("state") != "runtime_success":
+                if graph_nodes.get(candidate_id, {}).get("state") not in {"runtime_success", "recovery_pending"}:
                     continue
                 candidate = task_by_id.get(candidate_id, {})
                 operations = set(candidate.get("semantic_operations") or candidate.get("operations") or [])
                 capabilities = set(candidate.get("required_capabilities") or [])
                 tools = set(candidate.get("required_tools") or [])
-                if (operations == {"read_file"} and "filesystem.read" in capabilities
-                        and (not tools or tools <= {"read_file"})):
+                if ((operations == {"read_file"} and "filesystem.read" in capabilities
+                     and (not tools or tools <= {"read_file"}))
+                    or (candidate.get("task_kind") == "testing"
+                        and any(capability.startswith("execution.") for capability in capabilities)
+                        and "run_command" in tools
+                        and not capabilities & {"filesystem.create", "filesystem.modify", "filesystem.overwrite"})):
                     candidates.append(candidate)
             if not candidates:
                 decision = {
@@ -3003,6 +3012,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "runtime_task_id": request.get("owner_runtime_task_id"),
                     "attempt": 1,
                 }
+                runtime_task = {**runtime_task, "final_state": build_final_state(
+                    planned, [runtime_task], runtime_task.get("workspace"))}
                 with self.evaluator_lock:
                     outcome = self.evaluator.evaluate(
                         planned_task=planned, runtime_task=runtime_task,
@@ -3140,6 +3151,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         if not operational_prompt:
             raise ValueError("Execution graph has no Task Analyst operational prompt.")
         while True:
+            poll_started = self.clock()
             if self.clock() >= deadline:
                 self._timeout(oid)
                 return
@@ -3538,15 +3550,29 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     })
                 self.store.save_execution_graph(oid, graph.serialize())
 
-            if self.clock() >= deadline:
-                self._timeout(oid)
-                return
             # Interleave selection and dispatch. A newly dispatched task is now
             # visible to the next AgentSelector workload calculation, so fill
             # remaining slots before yielding to the polling wait.
             if dispatched and slots > 0:
                 continue
-            self.wait(min(.2, max(0, deadline - self.clock())))
+            deadline = self._wait_graph_poll(oid, deadline, poll_started=poll_started)
+
+    def _wait_graph_poll(self, oid: str, deadline: float, *, poll_started: float | None = None) -> float:
+        """Suspend the active budget only while all live work awaits human approval.
+
+        Work on another branch and ordinary pause still consume active budget.
+        The approval contract has no implicit expiration policy.
+        """
+        before = self.clock() if poll_started is None else poll_started
+        nodes = self.store.get_execution_graph(oid)["nodes"]
+        live = [self.store.get_task(node["runtime_task_id"])
+                for node in nodes if node.get("runtime_task_id")
+                and node.get("state") in {"running", "waiting_for_approval"}]
+        waiting = bool(live) and all(task["status"] == "WaitingForApproval" for task in live)
+        self.wait(.2 if waiting else min(.2, max(0, deadline - self.clock())))
+        if waiting:
+            deadline += max(0, self.clock() - before)
+        return deadline
 
     def _run(self, oid, answers: dict[str, str] | None = None):
         from .llm_trace import bind_llm_trace
@@ -3652,7 +3678,11 @@ class Orchestrator(IntegrationOrchestrationMixin):
         except Exception as exc:
             with self.lock:
                 current = self.store.get_orchestration(oid)
-                expected_spec = locals().get("spec", run.get("task_spec"))
+                # An accepted but not-yet-persisted spec cannot be the CAS
+                # baseline when save_task_spec itself fails.
+                expected_spec = (locals().get("spec", run.get("task_spec"))
+                                 if locals().get("updated") is not None or reuse_ready
+                                 else run.get("task_spec"))
                 if current.get("task_spec") != expected_spec:
                     return
             self._fail_planning(oid, exc, planning_metrics)

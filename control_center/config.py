@@ -62,6 +62,8 @@ DEFAULT_CONFIG = {
     "worker_assignment": {},
     "active_task_capabilities": [],
     "active_task_tools": [],
+    "verification_cases": [],
+    "verification_mode": "interactive_session",
     "task_owned_paths": [],
     "task_foreign_write_targets": [],
     "task_planned_write_targets": [],
@@ -216,6 +218,10 @@ def normalize_agent(data: dict, existing: dict | None = None, *,
     if not allow_provenance and scope_fields & set(incoming):
         raise ValueError("Task write scope is reserved for Freya-generated agents.")
     config.update(incoming)
+    from .verification_cases import normalize_cases, MODES
+    config["verification_cases"] = normalize_cases(config["verification_cases"])
+    if config["verification_mode"] not in MODES:
+        raise ValueError("Unknown verification mode.")
     config["worker_assignment"] = _normalize_worker_assignment(config.get("worker_assignment"))
     for field in ("active_task_capabilities", "active_task_tools"):
         value = config.get(field)

@@ -12,9 +12,10 @@ from .task_spec import validate_task_spec, _action_matches, _scope_tokens
 from .cross_task import CrossTaskRequestError, normalize_owned_paths, owned_path_key
 from .plan_evidence import (
     COMPILATION_RESULT, RUNTIME_BEHAVIOR, TEST_RESULT, classify_criterion,
-    evidence_is_supported,
+    evidence_is_supported, verification_mode,
 )
 from .security import sanitize
+from .verification_cases import normalize_cases, explicit_cases, group_case_tasks, MODES
 
 
 WRITE_CAPABILITIES = {"filesystem.create", "filesystem.modify", "filesystem.overwrite"}
@@ -226,6 +227,7 @@ def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                 catalog, "plan_compiler.criterion_classified",
                 task_key=keys[index], task_id=f"task-{index + 1}",
                 criterion=criterion[:300], evidence_type=evidence_type,
+                verification_mode=verification_mode(criterion),
                 required_capabilities=list(capabilities), verifiable=supported,
                 reason=reason,
             )
@@ -249,6 +251,7 @@ def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                 _compiler_event(
                     catalog, "plan_compiler.criterion_reassigned",
                     criterion=criterion[:300], evidence_type=evidence_type,
+                    verification_mode=verification_mode(criterion),
                     source_task_key=keys[index], source_task_id=f"task-{index + 1}",
                     target_task_key=keys[target], target_task_id=f"task-{target + 1}",
                     reason="one compatible dependent verifier exists",
@@ -258,6 +261,7 @@ def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                 catalog, "plan_compiler.plan_repair_required",
                 task_key=keys[index], task_id=f"task-{index + 1}",
                 criterion=criterion[:300], evidence_type=evidence_type,
+                verification_mode=verification_mode(criterion),
                 required_capabilities=list(capabilities), compatible_verifiers=len(candidates),
                 reason=reason,
             )
@@ -631,6 +635,14 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
             raise PlanValidationError("Semantic task references are ambiguous.")
         keys.append(key)
     dependency_indexes = _dependency_indexes(raw_tasks, keys)
+    if value.get('execution_strategy', 'single_worker') == 'single_worker':
+        try:
+            raw_tasks, keys, case_groups = group_case_tasks(raw_tasks, keys)
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
+        for group in case_groups:
+            _compiler_event(resource_catalog, 'plan_compiler.verification_cases_grouped', **group)
+        dependency_indexes = _dependency_indexes(raw_tasks, keys)
     _validate_decomposition(value, raw_tasks, dependency_indexes, resource_catalog)
     preliminary_resources = [
         compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
@@ -641,6 +653,12 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
     _reconcile_criterion_evidence(
         raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog)
     write_owners = _assign_write_owners(raw_tasks, resource_catalog)
+    # Compatibility for older/injected planners that omit the typed case field.
+    # Read canonical intent only, and assign a global input list only when its
+    # Python verifier is unambiguous. Never infer capabilities from case inputs.
+    canonical_cases = explicit_cases(spec.get("user_intent", ""))
+    python_verifiers = [item for item in raw_tasks if item.get("task_kind") == "testing"
+                        and "run_python_script" in item.get("operations", [])]
     tasks = []
     for index, item in enumerate(raw_tasks, 1):
         resolved = []
@@ -684,6 +702,21 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
                                           [f"The result of {item['objective']} is verified."]}
         if task_kind is not None:
             compiled_task["task_kind"] = task_kind
+        if task_kind == "testing" or item.get("verification_cases"):
+            try:
+                mode = item.get("verification_mode", "independent_cases")
+                if mode not in MODES:
+                    raise ValueError("Unknown verification mode.")
+                cases = normalize_cases(item.get("verification_cases", []))
+                if not cases and mode == "independent_cases":
+                    cases = (canonical_cases if canonical_cases and len(python_verifiers) == 1
+                             else explicit_cases(compiled_task["description"]))
+                if cases:
+                    if "run_command" not in required_tools:
+                        raise ValueError("Verification cases require a compiled run_command resource.")
+                    compiled_task.update(verification_cases=cases, verification_mode=mode)
+            except ValueError as exc:
+                raise PlanValidationError(str(exc)) from exc
         tasks.append(compiled_task)
     # The global obligations come from the canonical user intent. Model-proposed
     # checks may add detail, but cannot replace the user's validation expectation.
