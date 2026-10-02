@@ -29,6 +29,10 @@ from control_center.agent_context import (build_agent_context, build_effective_a
 from control_center.cross_task import (CrossTaskRequestError, normalize_intent_text,
                                        normalize_owned_path, owned_path_key)
 from control_center.project_state import MAX_HASH_BYTES, query_project_snapshot
+from control_center.worker_finalization import (
+    FORCED_FINALIZATION_FORMAT, FORCED_FINALIZATION_PROMPT,
+    ForcedFinalizationInvalidOutput, finalization_context, validate_forced_finalization,
+)
 
 
 READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff", "project_context"}
@@ -124,7 +128,11 @@ class TaskStopped(RuntimeError):
 
 
 class NoProgressDetected(TaskStopped):
-    """The worker repeated read-only actions without changing the workspace."""
+    """The worker repeated reads, no-op edits or incomplete requests without progress."""
+
+
+class ForcedFinalizationBudgetExhausted(TaskStopped):
+    """No terminal model call fits the existing execution budgets."""
 
 
 class BlockedActionCycle(TaskStopped):
@@ -1161,6 +1169,7 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
     mutation_failure = ""
     already_satisfied_candidate: dict[str, Any] | None = None
     cross_task_request: dict[str, Any] | None = None
+    forced_finalization: dict[str, Any] | None = None
     try:
         while True:
             remaining = guard()
@@ -1465,9 +1474,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                 "without correcting its required fields ({} attempts, {} steps)."
                             ).format(repeat_count, metrics["steps"])
                             telemetry["no_progress_detected"] = True
+                            telemetry["no_progress_trigger"] = "repeated_incomplete_cross_task_request"
                             telemetry["stop_reason"] = no_progress_reason
                             publish("event", event={
-                                "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                "event_type": "task.no_progress", "level": "warning", "status": "Stopped",
                                 "step_id": step_id, "tool": name,
                                 "reason": "The worker stopped after the same incomplete cross-task request was repeated.",
                                 "output": {"pattern": "repeated_incomplete_cross_task_request",
@@ -1839,9 +1849,11 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                         "({} read-only actions, {} steps)."
                                     ).format(pattern, telemetry["no_progress_actions"], metrics["steps"])
                                     telemetry["no_progress_detected"] = True
+                                    telemetry["no_progress_trigger"] = (
+                                        "repeated_read" if same_action_count >= 3 else "alternating_read_cycle")
                                     telemetry["stop_reason"] = no_progress_reason
                                     publish("event", event={
-                                        "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                        "event_type": "task.no_progress", "level": "warning", "status": "Stopped",
                                         "step_id": step_id, "tool": name,
                                         "reason": "The worker stopped after repeated successful read-only actions produced no workspace progress.",
                                         "output": {"pattern": pattern, "repeat_count": same_action_count,
@@ -1872,9 +1884,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                     "without new evidence or workspace progress ({} steps)."
                                 ).format(path, metrics["steps"])
                                 telemetry["no_progress_detected"] = True
+                                telemetry["no_progress_trigger"] = "repeated_noop_edit"
                                 telemetry["stop_reason"] = no_progress_reason
                                 publish("event", event={
-                                    "event_type": "task.no_progress", "level": "error", "status": "Failed",
+                                    "event_type": "task.no_progress", "level": "warning", "status": "Stopped",
                                     "step_id": step_id, "tool": name, "path": path,
                                     "reason": "Repeated no-op edits produced no workspace progress.",
                                     "output": {"pattern": "repeated_noop_edit", "repeat_count": noop_edit_counts[path_key],
@@ -2218,6 +2231,99 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                      "output": verification_state})
         elif not verification_state["requested"]:
             verification_state["skipped_with_reason"] = "Verification disabled by configuration."
+    except NoProgressDetected as exc:
+        # The action loop is over. Neither verification tools nor result-format
+        # repair may restart it; termination consumes at most one remaining call.
+        telemetry["no_progress_detected"] = True
+        telemetry["no_progress_reason"] = str(exc)
+        terminal_event = {
+            "task_id": task.get("id"),
+            "trigger": telemetry.get("no_progress_trigger", "no_progress"),
+            "steps": metrics["steps"], "workspace_changes": telemetry["workspace_changes"],
+        }
+        publish("event", event={**terminal_event, "event_type": "worker.no_progress_detected",
+                                 "level": "warning", "status": "Stopped", "reason": str(exc),
+                                 "no_progress_actions": telemetry["no_progress_actions"]})
+        publish("event", event={**terminal_event, "event_type": "worker.forced_finalization.started",
+                                 "level": "info", "status": "Running", "tools": []})
+        try:
+            remaining = guard()
+            token_budget = token_limit - metrics["total_tokens"] if token_limited else -1
+            if metrics["model_calls"] >= config.get("max_model_calls", 20) or (token_limited and token_budget <= 0):
+                raise ForcedFinalizationBudgetExhausted("No model-call or token budget remains for terminal output.")
+            context = finalization_context(
+                task, effective["capability_policy"], visible_tool_names, runtime_actions,
+                verification_state, observed_files, modified_paths, telemetry, metrics,
+                str(exc), verification.get("completion_criteria", []),
+            )
+            refs = set(context["evidence_ref_catalog"])
+            remaining = guard()
+            metrics["model_calls"] += 1
+            update()
+            terminal_id = uuid.uuid4().hex
+            call_metrics: dict[str, Any] = {}
+            response = model_request(transport, "worker", "POST",
+                config.get("endpoint", "http://127.0.0.1:11434").rstrip("/") + "/api/chat",
+                {"model": config["model"], "messages": [
+                    {"role": "system", "content": FORCED_FINALIZATION_PROMPT},
+                    {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+                ], "tools": [], "format": FORCED_FINALIZATION_FORMAT, "stream": False, "think": False,
+                 "options": {"temperature": config.get("temperature", 0),
+                             "num_ctx": config.get("context_window", 8192),
+                             "num_predict": min(token_budget, model_profile("worker").repair_output_tokens)
+                                            if token_limited else model_profile("worker").repair_output_tokens}},
+                timeout=min(remaining, model_profile("worker").inactivity_timeout), hard_timeout=remaining,
+                token=token, telemetry=call_metrics, stage="forced_finalization", call_id=terminal_id,
+                prompt_name="worker_forced_finalization", structured_context=context)
+            guard()
+            for key, source in (("prompt_tokens", "prompt_eval_count"), ("generated_tokens", "eval_count")):
+                value = response.get(source, 0) or 0
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                    raise ValueError("Ollama returned invalid terminal usage metrics.")
+                metrics[key] += int(value)
+            metrics["total_tokens"] = metrics["prompt_tokens"] + metrics["generated_tokens"]
+            if token_limited and metrics["total_tokens"] > token_limit:
+                raise TaskStopped("Maximum cumulative tokens exceeded by terminal provider usage.")
+            raw = response.get("message")
+            if not isinstance(raw, dict) or raw.get("tool_calls") or not isinstance(raw.get("content"), str):
+                raise ForcedFinalizationInvalidOutput("Terminal response must contain JSON content and no tool calls.")
+            forced_finalization = validate_forced_finalization(strip_thinking(raw["content"]), refs)
+            from .llm_trace import record_validation
+            record_validation("worker", "accepted", detail="Execution termination contract validated.",
+                              normalized_response=forced_finalization)
+            success = forced_finalization["decision"] == "COMPLETED"
+            final = forced_finalization["summary"]
+            telemetry["forced_finalization_decision"] = forced_finalization["decision"]
+            telemetry["failure_class"] = "" if success else "operational_blocker"
+            telemetry["stop_reason"] = "forced_finalization_completed" if success else "forced_finalization_blocked"
+            if not success:
+                error = "ForcedFinalizationBlocked: " + forced_finalization["reason"]
+                if forced_finalization["missing_capability"]:
+                    error += " Missing capability: " + forced_finalization["missing_capability"]
+            verification_state["skipped_with_reason"] += (
+                " Execution stopped at no-progress; tool-free finalization retained existing evidence "
+                "without running additional verification."
+            )
+            publish("event", event={**terminal_event, **forced_finalization,
+                    "event_type": "worker.forced_finalization.completed",
+                    "level": "info" if success else "warning",
+                    "status": "ExecutionComplete" if success else "Blocked",
+                    "llm_call_id": terminal_id,
+                    "semantic_acceptance": "pending_evaluator" if success else "not_evaluated",
+                    "transport": call_metrics.get("transport", {})})
+        except Exception as terminal_error:
+            from .llm_trace import record_validation
+            if isinstance(terminal_error, ForcedFinalizationInvalidOutput):
+                record_validation("worker", "rejected", detail=f"{type(terminal_error).__name__}: {terminal_error}")
+            forced_finalization = None
+            success = False
+            telemetry["runtime_exception"] = True
+            telemetry["failure_class"] = type(terminal_error).__name__
+            error = f"{type(terminal_error).__name__}: {terminal_error}"
+            telemetry["stop_reason"] = error
+            publish("event", event={**terminal_event, "event_type": "worker.forced_finalization.failed",
+                    "level": "error", "status": "Failed", "error_type": type(terminal_error).__name__,
+                    "error": error, "repair_attempted": False})
     except CrossTaskWait as exc:
         telemetry["stop_reason"] = "CROSS_TASK_MODIFICATION_REQUIRED"
         telemetry["cross_task_request_id"] = exc.request.get("request_id")
@@ -2247,7 +2353,21 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
             telemetry["stop_reason"] = error
     result_output: Any = final
     if effective["output"]["format"] == "structured":
-        if telemetry.get("runtime_exception"):
+        if forced_finalization is not None:
+            result_output = {
+                "summary": forced_finalization["summary"], "actions": runtime_actions,
+                "artifacts": runtime_artifacts, "verification": verification_state,
+                "limitations": [] if success else [error],
+                "forced_finalization": forced_finalization,
+            }
+            if workspace_diffs:
+                result_output["workspace_diffs"] = workspace_diffs
+            publish("event", event={"event_type": "task.result_contract", "level": "info",
+                    "status": "Success", "message": "Built the runtime result from a validated terminal decision.",
+                    "output": {"deterministic_runtime_result": True, "model_repair_skipped": True,
+                               "forced_finalization_decision": forced_finalization["decision"],
+                               "task_execution_successful": success}})
+        elif telemetry.get("runtime_exception"):
             failure = telemetry.get("failure_class") or type(error).__name__
             limitation = "Runtime failure class: {}.".format(failure)
             if error:

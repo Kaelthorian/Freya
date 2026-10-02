@@ -21,8 +21,9 @@ _last_component: ContextVar[str] = ContextVar("freya_last_llm_component", defaul
 _last_prompt_name: ContextVar[str] = ContextVar("freya_last_llm_prompt_name", default="")
 _last_call_debug: ContextVar[dict[str, Any]] = ContextVar("freya_last_llm_debug", default={})
 PROMPT_VERSIONS = {
-    "task_analyst": "task-spec-v1", "planner": "semantic-plan-v4",
+    "task_analyst": "task-spec-v1", "planner": "semantic-plan-v5",
     "worker": "worker-v1", "evaluator": "evaluator-v1",
+    "worker_forced_finalization": "worker-finalization-v1",
     "failure_analyzer": "failure-analysis-v1", "recovery_replanner": "recovery-v1",
     "global_verifier": "global-verification-v1",
     "integration_replanner": "integration-replan-v1",

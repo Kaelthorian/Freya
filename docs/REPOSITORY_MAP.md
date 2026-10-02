@@ -17,8 +17,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── planner.py            semantic strategy and legacy plan schema compatibility
 │   ├── plan_scope.py         semantic scope guard and bounded pre-resolution plan snapshot
 │   ├── plan_evidence.py      criterion evidence classification and capability compatibility
+│   ├── plan_granularity.py   conservative mechanical-prerequisite fusion before runtime IDs and ownership
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
-│   ├── plan_compiler.py      scope/evidence reconciliation, write-overlap guard, ownership, resource derivation, IDs and DAG validation
+│   ├── plan_compiler.py      scope/granularity/evidence reconciliation, write-overlap guard, ownership, resources, IDs and DAG validation
 │   ├── worker_assignment.py deterministic logical Worker groups for compiled tasks
 │   ├── cross_task.py         exact file ownership validation and bounded reusable-intent matching
 │   ├── agent_factory.py      dynamic agents, freya-core assignment, task policy and provenance
@@ -34,6 +35,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── integration_storage.py integration persistence and compatible revision-table migration
 │   ├── orchestrator.py       atomic lifecycle, bounded graph scheduling, cancellation and integration
 │   ├── worker.py             bounded Ollama/tool loop, action fingerprints, provenance-bearing verification ledger and per-agent policy
+│   ├── worker_finalization.py strict tool-free execution termination contract and historical evidence context
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
 │   ├── sandbox.py            disposable workspace copy and restricted Docker execution
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
@@ -135,7 +137,9 @@ selects them.
    records zero-write Runtime candidates only when declared targets were
    read. `tools.py` compares `edit_file` candidate bytes before writing;
    `worker.py` records diffs and mutations only for material changes and stops
-   repeated no-op edits on one artifact. `orchestrator.py` adds a bounded
+   repeated no-op edits on one artifact. `worker_finalization.py` handles the
+   single tool-free terminal decision after no-progress, without semantic
+   evaluation or additional actions. `orchestrator.py` adds a bounded
    snapshot of every effective plan task, current graph status, the active task
    scope, accepted summaries and relevant artifacts from the same assignment,
    direct predecessor outcome summaries, and current-task non-goals to each
@@ -233,6 +237,7 @@ selects them.
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
 | Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
 | No-op file edits, mutation accounting or repeated edit loops | `tools.py` (`tool_edit_file`), `worker.py` (`PolicyToolbox.invoke`, `run_task`), `tests/test_tools.py`, `tests/test_capabilities.py`, `tests/test_control_runtime.py` |
+| Tool-free Worker termination after no-progress | `worker_finalization.py`, `worker.py`, `llm_trace.py`, `tests/test_worker_finalization.py`, `tests/test_worker_assignments.py`, `docs/WORKER_FINALIZATION.md` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `final_state.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |
 | Capability mapping or authorization | `capabilities.py`, `policy.py`, `worker.py`, `tests/test_capabilities.py` |
 | Planner scope, resource descriptions, global tool IDs, capability compatibility, aliases or unsupported needs | `plan_scope.py`, `runtime_resources.py`, `capabilities.py`, `tools.py`, `skills.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `orchestrator.py`, `tests/test_plan_scope.py`, `tests/test_runtime_resources.py`, `tests/test_task_spec.py` |

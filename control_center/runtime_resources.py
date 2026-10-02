@@ -470,7 +470,10 @@ class RuntimeResourceCatalog:
                            "message": "planner skill preference ignored; freya-core selected"}
                 if warning not in self.preferred_skill_warnings:
                     self.preferred_skill_warnings.append(warning)
-            raw_operations = task.get("operations", [])
+            raw_operations = task.get("operations", task.get("semantic_operations", []))
+            if ("operations" in task and "semantic_operations" in task
+                    and task["operations"] != task["semantic_operations"]):
+                raise ValueError("operations and semantic_operations must not contradict each other.")
             if not isinstance(raw_operations, list) or any(
                     not isinstance(item, str) or not item.strip() for item in raw_operations):
                 raise ValueError(f"Semantic task {index} operations must be a list of operation IDs.")

@@ -103,7 +103,7 @@ check fail closed. Workers receive a deterministic rendering of the Task Spec,
 never an independent `operational_prompt`. The old Analyst v3 path is retained
 for injected compatibility adapters and historical tests.
 
-Semantic Plan schema version 4 is compiled into runtime plan schema version 4.
+Semantic Plan schema version 5 is compiled into runtime plan schema version 4.
 The Runtime Resource Catalog owns the canonical semantic-operation to
 capability to tool mapping; `plan_compiler.py` alone applies it. Each semantic
 task includes `task_kind`; AgentFactory consumes that compiled classification.
@@ -115,7 +115,13 @@ external actions fail closed. A real structural contradiction can receive one
 bounded repair; an unknown or unsupported resource cannot.
 The Compiler owns the single scope reconciliation and semantic-plan validation
 pass. It verifies Planner `unsupported_requirements` against requested intent
-and the runtime catalog before resource resolution. Task nodes are never merged.
+and the runtime catalog before resource resolution. Before runtime identities
+are generated, `plan_granularity.py` combines mechanical single-consumer
+filesystem prerequisites with their logical successor. Independently useful
+checkpoints and approval/security/phase/recovery boundaries remain separate;
+existing compiled plans are not rewritten. See
+[PLAN_GRANULARITY.md](PLAN_GRANULARITY.md) for the algorithm, advisory ranges,
+events, converter example and focused regression command.
 The unique creator owns a path; one writer or one explicit owner also resolves
 deterministically. Unordered tasks cannot share a write target; use a real
 dependency for a sequential create/modify or modify/modify handoff. Such
@@ -384,6 +390,15 @@ are visible together. A `NoProgressDetected` report means the worker repeated
 successful read-only actions or no-op edits on one artifact without new evidence
 or a material workspace change; raising
 `max_steps` alone is not a corrective action.
+The Worker stops operational actions and requests one tool-free terminal
+decision, as specified in [Worker forced finalization](WORKER_FINALIZATION.md).
+`COMPLETED` means execution has ended and permits dependents to run; the
+assignment-wide Evaluator still determines correctness after all its Tasks.
+`BLOCKED` preserves the operational reason and optional missing capability for
+the existing failure/Recovery path. Watch `worker.no_progress_detected`,
+`worker.forced_finalization.started` and `.completed` (or `.failed`), together
+with the existing detection and execution events. This call uses remaining
+budgets and has zero repairs; it never runs further verification tools.
 `BlockedActionCycle` stops a worker after it repeats a policy-denied action
 under unchanged state, or after the existing bounded guard sees three blocked
 decisions. The first materially identical request after a denial is intercepted
@@ -421,6 +436,14 @@ tool and policy regressions with `python -m unittest tests.test_tools
 tests.test_capabilities -v`; the Worker regressions are in
 `tests/test_control_runtime.py` under `WorkerTests.test_noop_edit_*` and
 `WorkerTests.test_different_noop_edits_on_same_file_stop_before_step_limit`.
+`tests/test_worker_finalization.py` covers the strict terminal contract, no tool
+dispatch or verification after detection, budget/cancellation failures, actual
+same-size byte changes, and a converter edit followed by no-ops and independent
+QA cases. `WorkerAssignmentRuntimeTests.test_forced_completion_unlocks_three_case_qa_and_evaluates_assignment_once`
+exercises the real Worker, scheduler and assignment gate with synthetic model
+responses and sandbox process results. These fixtures do not claim a live
+Ollama/Qwen run or actual converter execution. Run Python regressions only in
+the required ephemeral Docker copy; if Docker is unavailable, leave them pending.
 Orchestration timeouts also emit failure analysis.
 
 Docker receives an ephemeral workspace copy for every Python, pytest, unittest,

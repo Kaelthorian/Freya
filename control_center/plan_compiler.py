@@ -16,6 +16,7 @@ from .plan_evidence import (
 )
 from .security import sanitize
 from .verification_cases import normalize_cases, explicit_cases, group_case_tasks, MODES
+from .plan_granularity import EXPECTED_TASK_RANGES, normalize_task_granularity
 
 
 WRITE_CAPABILITIES = {"filesystem.create", "filesystem.modify", "filesystem.overwrite"}
@@ -55,8 +56,8 @@ def _validate_decomposition(plan: dict[str, Any], tasks: list[dict[str, Any]],
     if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 1000:
         raise PlanValidationError("decomposition_reason must explain the worker decision.")
     count = len(tasks)
-    # Semantic tasks are checkpoints, not worker allocations. A cohesive chain
-    # can contain many tasks and still occupy one execution slot.
+    # Task granularity is normalized separately, regardless of Worker count.
+    # Meaningful checkpoints may still share one execution slot.
     if strategy == "single_worker" or count == 1:
         _compiler_event(catalog, "plan_compiler.decomposition_validated", task_count=count,
                         task_complexity=complexity, execution_strategy=strategy)
@@ -141,7 +142,7 @@ def _responsibility_similarity(first: dict[str, Any], second: dict[str, Any]) ->
 def _validate_write_scope_overlaps(tasks: list[dict[str, Any]], keys: list[str],
                                    resources: list[dict[str, Any]],
                                    dependencies: list[set[int]],
-                                   catalog: RuntimeResourceCatalog) -> None:
+                                   catalog: RuntimeResourceCatalog, *, publish_validated: bool = True) -> None:
     """Reject shared writable paths unless task dependencies impose an order."""
     ancestors = _dependency_ancestors(dependencies)
     writers: dict[str, list[tuple[int, str]]] = {}
@@ -177,8 +178,9 @@ def _validate_write_scope_overlaps(tasks: list[dict[str, Any]], keys: list[str],
                     raise PlanValidationError(
                         f"Two creators claim {path}: task-{left + 1}, task-{right + 1}")
                 if ordered:
-                    _compiler_event(catalog, "plan_compiler.overlap_validated",
-                                    reason="dependency_ordered_write_handoff", **details)
+                    if publish_validated:
+                        _compiler_event(catalog, "plan_compiler.overlap_validated",
+                                        reason="dependency_ordered_write_handoff", **details)
                     continue
                 _compiler_event(catalog, "plan_compiler.overlap_detected",
                                 reason="unordered_tasks_share_write_target", **details)
@@ -643,7 +645,41 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
         for group in case_groups:
             _compiler_event(resource_catalog, 'plan_compiler.verification_cases_grouped', **group)
         dependency_indexes = _dependency_indexes(raw_tasks, keys)
+    # Preserve the existing multi-Worker delegation gate. Normalization only
+    # combines single-Worker tasks, so this decision cannot change afterwards.
     _validate_decomposition(value, raw_tasks, dependency_indexes, resource_catalog)
+    # Validate declared resources and conflicting writers before normalization:
+    # a merge is never allowed to conceal unsupported operations or a race.
+    preliminary_resources = [
+        compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
+        for item in raw_tasks
+    ]
+    _validate_write_scope_overlaps(
+        raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog,
+        publish_validated=False)
+    expected = EXPECTED_TASK_RANGES.get(value.get("task_complexity"))
+    if expected and len(raw_tasks) > expected[1]:
+        _compiler_event(resource_catalog, "plan_compiler.granularity_warning",
+                        stage="before_normalization", task_count=len(raw_tasks),
+                        task_complexity=value["task_complexity"], expected_range=list(expected),
+                        reason="task_count_exceeds_normal_range_attempting_safe_merges")
+    try:
+        raw_tasks, keys, granularity = normalize_task_granularity(value, raw_tasks, keys, spec)
+    except ValueError as exc:
+        raise PlanValidationError(str(exc)) from exc
+    resource_catalog.granularity_summary = granularity
+    for merge in granularity["merges"]:
+        _compiler_event(resource_catalog, "plan_compiler.tasks_merged", **merge)
+    _compiler_event(resource_catalog, "plan_compiler.granularity_analyzed", **granularity)
+    if expected and len(raw_tasks) > expected[1]:
+        justification = str(value.get("granularity_reason") or "").strip()
+        _compiler_event(resource_catalog, "plan_compiler.granularity_warning",
+                        stage="after_normalization", task_count=len(raw_tasks),
+                        task_complexity=value["task_complexity"], expected_range=list(expected),
+                        justification=justification,
+                        reason="above_normal_range_justified" if justification else
+                               "explicit_granularity_justification_missing")
+    dependency_indexes = _dependency_indexes(raw_tasks, keys)
     preliminary_resources = [
         compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
         for item in raw_tasks
@@ -702,6 +738,8 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
                                           [f"The result of {item['objective']} is verified."]}
         if task_kind is not None:
             compiled_task["task_kind"] = task_kind
+        if "granularity" in item:
+            compiled_task["granularity"] = copy.deepcopy(item["granularity"])
         if task_kind == "testing" or item.get("verification_cases"):
             try:
                 mode = item.get("verification_mode", "independent_cases")
@@ -749,7 +787,7 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
                           "summary": str(value.get("summary") or spec["objective"]).strip(),
                           "complexity": "simple" if len(tasks) == 1 else "multi_step",
                           **({field: value[field] for field in
-                              ("task_complexity", "execution_strategy", "decomposition_reason")
+                              ("task_complexity", "execution_strategy", "decomposition_reason", "granularity_reason")
                               if field in value}),
                           "tasks": tasks, "write_owners": write_owners,
                           "success_criteria": global_criteria,

@@ -237,7 +237,7 @@ to Global Verification; task-level `success_criteria` belong to the local
 Evaluator. Exact matching text may create a proof link without copying a global
 criterion into a task.
 
-This Semantic Plan schema is version 4. Each task includes a `task_kind` for
+This Semantic Plan schema is version 5. Each task includes a `task_kind` for
 AgentFactory. Its `operations` are registered semantic IDs, not runtime tools
 or permissions. The Plan Compiler maps
 `modify_file` to `filesystem.modify`/`edit_file`, `create_file` to
@@ -250,6 +250,19 @@ repair. The Planner owns `task_kind`; the Task Analyst records only canonical
 user intent. A write adds read-back verification, overwrite requires explicit
 replacement intent, and a Python mention in a debugging task does not
 reclassify it as program creation.
+
+A Task may contain several `operations` and `semantic_needs`. Optional
+`granularity` contains bounded explanatory text in `logical_outcome`,
+`independent_value` and `preserve_boundary`; optional plan-level
+`granularity_reason` justifies counts above advisory ranges. These declarations
+do not grant access. Before runtime IDs and ownership, Compiler absorbs only
+safe mechanical prerequisites into their direct logical successor. Meaningful
+checkpoints and independent QA remain separate. Existing orchestration logs
+publish `planner.granularity_summary`, `plan_compiler.granularity_analyzed`,
+`plan_compiler.tasks_merged` and `plan_compiler.granularity_warning`. Merge events
+include proposed positional `source_task_ids`, generated `result_task_id`,
+reason and operations; analyzed/summary events include before/after counts,
+complexity and ID mapping. See [PLAN_GRANULARITY.md](PLAN_GRANULARITY.md).
 
 For example, the compiler persists a runtime task equivalent to:
 
@@ -600,6 +613,20 @@ Logs group delegated runtime events by `orchestration_id` when present, so one F
 and relevant status/tool/input/output/error/duration fields. Approval events include a sanitized action summary, capability, tool, resource and approval ID. Successful `write_file` and `edit_file` actions also emit a `workspace.diff` event with a bounded unified diff preview in `output`; Logs render it as Code diff. An identical `write_file` produces no `workspace.diff`, no workspace progress and an action result with `already_satisfied=true`, `changed=false`. A no-progress stop emits `task.no_progress` and the terminal task event includes `failure_class`, `stop_reason`, `no_progress_detected`, `no_progress_actions` and `workspace_changes`. Completed task JSON includes verification with requested, attempted, passed, failed, unavailable and skipped reason evidence. Clients should send
 `Last-Event-ID` or `after` when reconnecting and refresh their current resource
 from the JSON route; SSE is a change signal and durable event replay.
+
+No-progress detection also emits `worker.no_progress_detected` and
+`worker.forced_finalization.started` before the one tool-free terminal decision.
+`worker.forced_finalization.completed` contains `decision`, `summary`, `reason`,
+`evidence_refs`, `missing_capability`, `trigger`, `steps`, `workspace_changes`
+and `llm_call_id`. `COMPLETED` is technical Runtime `Success` and releases
+dependents through `runtime_success`; semantic acceptance stays pending until
+assignment-wide evaluation. `BLOCKED` is Runtime `Failed` with the operational
+reason and optional missing capability, without a permission grant. Invalid
+output fails explicitly as `ForcedFinalizationInvalidOutput`; failures emit
+`worker.forced_finalization.failed` with `error_type` and
+`repair_attempted=false`. Structured results retain the validated decision in
+`forced_finalization` alongside the actual action ledger and existing
+verification evidence. See [Worker forced finalization](WORKER_FINALIZATION.md).
 
 `GET /api/orchestrations/{id}/logs` returns the complete persisted event stream
 for the specified Freya run, combining all delegated runtime logs and

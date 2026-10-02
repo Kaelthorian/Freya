@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 from control_center.execution_graph import ExecutionGraph
@@ -15,6 +17,9 @@ from control_center.evaluator import EVALUATOR_VERSION, Evaluator
 from control_center.storage import Store
 from control_center.task_spec import deterministic_task_spec
 from control_center.worker_assignment import worker_assignment_map
+from control_center.worker import run_task
+from tests.test_control_runtime import answer
+from tests.test_worker_finalization import CONVERTER, converter_replies
 
 
 class IdleRuntime:
@@ -158,7 +163,9 @@ def semantic_task(key, objective, operation, path, depends=(), criteria=None,
         "operations": [operation],
         "owned_paths": [path] if operation == "create_file" else [],
         "write_targets": [path] if operation in {"create_file", "modify_file"} else [],
-        "success_criteria": criteria or [f"{path} exists."],
+        # Assignment lifecycle fixtures model independently useful checkpoints,
+        # rather than empty scaffolds that Compiler now absorbs into a successor.
+        "success_criteria": criteria or [f"{path} contains the initial component source."],
     }
     return value
 
@@ -218,6 +225,77 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
             oid, next(task for task in plan["tasks"] if task["id"] == task_id),
             self.store.get_orchestration(oid),
         )
+
+    def test_forced_completion_unlocks_three_case_qa_and_evaluates_assignment_once(self):
+        owner = self
+        evaluator = RecordingEvaluator()
+        cases = [{"id": "zero", "input": "0\n"}, {"id": "hundred", "input": "100\n"},
+                 {"id": "invalid", "input": "invalid\n"}]
+        qa_task = semantic_task(
+            "verify", "Run temperature_converter.py with independent inputs 0, 100 and invalid",
+            "run_python_script", "temperature_converter.py", depends=["modify"],
+            criteria=["The converter reports Fahrenheit and handles invalid input."], task_kind="testing")
+        qa_task.update(verification_mode="independent_cases", verification_cases=cases)
+        plan = compile_plan([
+            semantic_task("create", "Create temperature_converter.py", "create_file", "temperature_converter.py"),
+            semantic_task("modify", "Implement the converter", "modify_file", "temperature_converter.py",
+                          depends=["create"], criteria=["The converter defines conversion and error handling."]),
+            qa_task,
+        ])
+
+        class TerminalRuntime(ControlledRuntime):
+            def __init__(self, store):
+                super().__init__(store)
+                self.worker_results = {}
+                self.qa_inputs = []
+
+            def submit(self, *args, **kwargs):
+                owner.assertEqual(evaluator.calls, [], "Evaluator must wait for all three Tasks.")
+                return super().submit(*args, **kwargs)
+
+            def finish_active(self, seconds=None, status="Success"):
+                active = [task for task in self.store.list_tasks(limit=10000)
+                          if task["status"] == "Running"]
+                for task in active:
+                    task_id = task["config"]["provenance"]["plan_task_id"]
+                    if task_id == "task-1":
+                        continue
+                    replies = (converter_replies("current fixture file") if task_id == "task-2" else
+                               [answer(calls=[("run_command", {
+                                   "argv": ["python", "temperature_converter.py"]})])])
+                    responses = iter(replies)
+
+                    def sandbox(workspace, argv, timeout_seconds, stdin):
+                        self.qa_inputs.append(stdin)
+                        stdout = {"0\n": "Fahrenheit: 32.00\n", "100\n": "Fahrenheit: 212.00\n",
+                                  "invalid\n": "Invalid temperature\n"}[stdin]
+                        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+                    with patch("control_center.tools.run_in_sandbox", side_effect=sandbox):
+                        result = run_task(task, self.workspace.parent, lambda event: None, lambda: None,
+                                          transport=lambda *args, **kwargs: next(responses),
+                                          approval_handler=lambda request: "approved_once")
+                    owner.assertEqual(result["status"], "Success", result["error"])
+                    self.worker_results[task_id] = result
+                super().finish_active(seconds, status)
+                for task in active:
+                    result = self.worker_results.get(task["config"]["provenance"]["plan_task_id"])
+                    if result:
+                        self.store.update_task(task["id"], status=result["status"], result=result["result"],
+                                               verification=result["verification"], error=result["error"])
+
+        runtime = TerminalRuntime(self.store)
+        oid, _orchestrator, runtime, evaluator = self.execute_plan(plan, runtime=runtime, evaluator=evaluator)
+        self.assertEqual(len(runtime.submissions), 3)
+        self.assertEqual(len({task["agent_id"] for task in runtime.submissions}), 1)
+        self.assertEqual(runtime.worker_results["task-2"]["result"]["forced_finalization"]["decision"], "COMPLETED")
+        self.assertEqual(runtime.worker_results["task-2"]["workspace_changes"], 1)
+        self.assertEqual(runtime.qa_inputs, [case["input"] for case in cases])
+        self.assertEqual((runtime.workspace / "temperature_converter.py").read_text(encoding="utf-8"), CONVERTER)
+        self.assertEqual({node["state"] for node in self.store.get_execution_graph(oid)["nodes"]}, {"runtime_success"})
+        self.assertEqual(len(evaluator.calls), 1)
+        self.assertEqual(evaluator.calls[0]["execution_node"]["assigned_task_ids"], ["task-1", "task-2", "task-3"])
+        self.assertEqual(len(self.store.list_evaluations(oid)), 1)
 
     def test_three_tasks_reuse_one_worker_and_refresh_task_tools(self):
         plan = compile_plan([

@@ -37,6 +37,13 @@ def answer(content="Finished.", calls=None, **metrics):
     return result
 
 
+def terminal_answer(decision="COMPLETED", reason="No further operational action is needed.",
+                    missing_capability=None):
+    return answer(json.dumps({"decision": decision, "summary": "Worker execution stopped.",
+                             "reason": reason, "evidence_refs": [],
+                             "missing_capability": missing_capability}))
+
+
 class FakeOllama:
     def __init__(self, responses=None):
         owner = self
@@ -151,13 +158,13 @@ class WorkerTests(unittest.TestCase):
         target.write_text("<button>7</button><button>8</button><button>9</button>", encoding="utf-8")
         calls = [("edit_file", {"path": "calculator.html", "old": str(value), "new": str(value)})
                  for value in (7, 8, 9, 7, 8)]
-        result = self.run_worker([answer(calls=[call]) for call in calls],
+        result = self.run_worker([answer(calls=[call]) for call in calls[:3]] + [terminal_answer()],
                                  tools=["edit_file"],
                                  config={"permissions": "workspace", "verification": {"enabled": False},
                                          "output": self._structured_output(), "max_steps": 20},
                                  prompt="Update calculator.html")
-        self.assertEqual(result["status"], "Failed")
-        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertEqual(result["status"], "Success")
+        self.assertEqual(result["failure_class"], "")
         self.assertTrue(result["no_progress_detected"])
         self.assertLess(result["steps"], 20)
         self.assertEqual(result["workspace_changes"], 0)
@@ -432,9 +439,10 @@ class WorkerTests(unittest.TestCase):
             answer(calls=[("read_file", {"path": "owner.txt"}),
                           ("edit_file", incomplete)]),
             answer(calls=[("edit_file", incomplete)]),
+            terminal_answer("BLOCKED", "The required cross-task request details are incomplete."),
         ], config=config, tools=["read_file", "edit_file"], prompt="Update the owned cache file")
         self.assertEqual(result["status"], "Failed")
-        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertEqual(result["failure_class"], "operational_blocker")
         self.assertTrue(result["no_progress_detected"])
         self.assertLess(result["steps"], config.get("max_steps", 20))
         events = [item["event"] for item in self.events
@@ -1530,10 +1538,10 @@ document.querySelector("#calculate").addEventListener("click", () => {
         self.assertTrue(result["verification"]["passed"])
 
     def test_repeated_successful_reads_stop_as_no_progress_before_step_limit(self):
-        responses = [answer(calls=[("list_files", {"path": "."})]) for _ in range(4)]
+        responses = [answer(calls=[("list_files", {"path": "."})]) for _ in range(3)] + [terminal_answer()]
         result = self.run_worker(responses, tools=["list_files"], config={"max_steps": 20})
-        self.assertEqual(result["status"], "Failed")
-        self.assertEqual(result["failure_class"], "no_progress")
+        self.assertEqual(result["status"], "Success")
+        self.assertEqual(result["failure_class"], "")
         self.assertTrue(result["no_progress_detected"])
         self.assertLess(result["steps"], 20)
         no_progress = [event["event"] for event in self.events

@@ -430,7 +430,7 @@ not alter that field. A pre-persistence error fails the current analysis run;
 the compare-and-set guard uses the persisted baseline until save succeeds.
 
 `Planner.create_plan_for_spec` receives the canonical Task Spec and emits
-Semantic Plan schema version 4. The plan records `task_complexity`,
+Semantic Plan schema version 5. The plan records `task_complexity`,
 `execution_strategy` and a concrete `decomposition_reason` independently of
 task count. One worker handles cohesive work even across several files or steps;
 multiple workers require a benefit beyond delegation and integration cost.
@@ -468,8 +468,16 @@ The Compiler rejects a declared multi-worker graph whose tasks are a simple
 implementation chain, overlap the same write target, or cite only file/step
 count as justification. One bounded Planner repair may consolidate those tasks.
 For `single_worker`, semantic task count does not imply delegation count: the
-Compiler retains all valid task checkpoints and assigns them to one logical
-worker slot. `worker_assignment.py` deterministically groups dependent steps
+Compiler retains independently meaningful checkpoints and assigns them to one
+logical worker slot. Before assigning runtime IDs, `plan_granularity.py`
+absorbs only mechanical, single-consumer filesystem prerequisites into their
+direct logical successor. It unions operations/resources, preserves meaningful
+final criteria and regenerates ownership, criterion links and assignments from
+the normalized graph. QA, parallel work, independently useful producers and
+explicit approval/security/phase/recovery boundaries remain separate. Existing
+compiled graphs and Recovery references are untouched. Advisory Task ranges and
+granularity events are described in [PLAN_GRANULARITY.md](PLAN_GRANULARITY.md).
+`worker_assignment.py` deterministically groups dependent steps
 for `multi_worker` and separates independent branches or QA/review roles.
 The compiled plan persists `execution_strategy`, `task_count`, `worker_count`
 and `worker_assignments` (`worker_id` plus ordered `task_ids`).
@@ -1077,12 +1085,25 @@ policy denials, unavailable or unknown tools, invalid requests, approval
 denials, non-applicable tools and forbidden paths do not retry. If the worker has
 not changed the workspace and repeats the same read-only action three times,
 or alternates the same two read-only actions for three cycles, it emits
-`task.no_progress` and fails early with `NoProgressDetected`; increasing the
-step budget is not treated as a fix. Three successful no-op `edit_file` calls
+`task.no_progress` and stops the action loop with `NoProgressDetected`; increasing
+the step budget is not treated as a fix. Three successful no-op `edit_file` calls
 on the same artifact also stop early, even when their replacement arguments
 differ. A new file read, newly supported acceptance criterion, or material
 write resets that edit counter. Writes and process execution are never
 automatically retried.
+
+`NoProgressDetected` enters the [Worker forced-finalization contract](WORKER_FINALIZATION.md).
+The Worker makes one terminal LLM call with `tools=[]` and a strict
+`COMPLETED`/`BLOCKED` JSON schema, using accumulated, sanitized evidence only.
+No verification tool or format-repair call follows it. `COMPLETED` returns
+technical Runtime `Success`, which becomes `runtime_success` and releases DAG
+dependents; it does not establish semantic correctness. Evaluator still runs
+once after every Task in that Worker Assignment reaches `runtime_success`.
+`BLOCKED` returns `Failed` with its operational reason and missing capability,
+without granting permissions. Invalid output fails as
+`ForcedFinalizationInvalidOutput`. The terminal call consumes remaining call,
+token and time budgets; exhausted budgets never extend execution. Other failure
+paths, including `BlockedActionCycle`, retain their existing behavior.
 
 Git inspection is applicability-aware. Only a checkout rooted in the assigned
 workspace advertises `git_diff`; a parent checkout is outside its boundary.
@@ -1190,12 +1211,14 @@ failure handling; autonomy records decision preferences without granting
 capabilities; verification and output define evidence and result shape. The
 default output remains text for legacy compatibility, while structured
 output is strictly validated as summary/actions/artifacts/verification/limitations.
-Any invalid structured response, including prose, receives one repair attempt.
+An ordinary invalid structured response, including prose, receives one repair attempt.
 If fallback normalization is needed, `task.result_contract` logs a bounded,
 sanitized preview and repair details; format failure stays separate from task
 limitations and objective success. Runtime exceptions skip model repair and
 build the factual contract from the action ledger, artifacts, verification,
 workspace diffs and failure class. Verification state is persisted separately.
+Forced-finalization decisions instead build the factual result directly from
+the ledger plus validated terminal metadata, with zero repair attempts.
 
 The worker classifies recoverable, environment, policy, approval, invalid,
 unavailable and unknown-tool requests. A fingerprint includes tool, capability,

@@ -27,9 +27,10 @@ from .plan_scope import PlannerScopeError, semantic_plan_snapshot
 from .cross_task import (MAX_OWNED_PATHS, CrossTaskRequestError,
                          normalize_owned_paths, owned_path_key)
 from .worker_assignment import worker_assignments
+from .plan_granularity import GRANULARITY_FIELDS, normalize_granularity
 
 
-SEMANTIC_PLAN_SCHEMA_VERSION = 4
+SEMANTIC_PLAN_SCHEMA_VERSION = 5
 PLAN_SCHEMA_VERSION = 4
 MAX_PLAN_TASKS = 20
 # User prompts are accepted without an application-level character limit.
@@ -60,7 +61,7 @@ TASK_FIELDS = {
 }
 TASK_METADATA_FIELDS = {"task_kind", "task_characteristics", "semantic_needs", "required_tools",
                         "semantic_operations", "owned_paths", "write_targets", "foreign_write_targets",
-                        "verification_cases", "verification_mode"}
+                        "verification_cases", "verification_mode", "granularity"}
 TASK_KIND_VALUES = {
     "file_creation", "program_creation", "code_change", "review", "testing",
     "analysis", "external_action", "general",
@@ -98,6 +99,9 @@ PLAN_RESPONSE_FORMAT = {
                         "required": ["path", "owner_plan_task_id"], "additionalProperties": False}},
                     "task_kind": {"type": "string", "enum": sorted(TASK_KIND_VALUES)},
                     "task_characteristics": {"type": "object"},
+                    "granularity": {"type": "object", "properties": {
+                        field: {"type": "string", "maxLength": 1000}
+                        for field in sorted(GRANULARITY_FIELDS)}, "additionalProperties": False},
                     "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
                     "verification_cases": {"type": "array", "maxItems": 20, "items": {
                         "type": "object", "properties": {
@@ -110,6 +114,7 @@ PLAN_RESPONSE_FORMAT = {
             },
         },
         "write_owners": {"type": "object", "additionalProperties": {"type": "string"}},
+        "granularity_reason": {"type": "string", "minLength": 1, "maxLength": 1000},
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "criterion_links": {"type": "object", "properties": {
             "global": {"type": "array", "items": {"type": "object", "properties": {
@@ -173,6 +178,9 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "owned_paths": {"type": "array", "items": {"type": "string"}},
         "write_targets": {"type": "array", "items": {"type": "string"}},
+        "granularity": {"type": "object", "properties": {
+            field: {"type": "string", "maxLength": 1000} for field in sorted(GRANULARITY_FIELDS)},
+            "additionalProperties": False},
         "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
         "verification_cases": {"type": "array", "maxItems": 20, "items": {
             "type": "object", "properties": {
@@ -196,10 +204,10 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
         testing_fields[field]['maxItems'] = 0
     task_schemas = [
         {'type': 'object', 'properties': implementation_fields,
-         'required': sorted(set(task_fields) - {'verification_mode', 'verification_cases'}),
+         'required': sorted(set(task_fields) - {'verification_mode', 'verification_cases', 'granularity'}),
          'additionalProperties': False},
         {'type': 'object', 'properties': testing_fields,
-         'required': sorted(task_fields), 'additionalProperties': False},
+         'required': sorted(set(task_fields) - {'granularity'}), 'additionalProperties': False},
     ]
     return {
         "type": "object",
@@ -208,6 +216,7 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
             "task_complexity": {"type": "string", "enum": ["simple", "multi_step", "complex"]},
             "execution_strategy": {"type": "string", "enum": ["single_worker", "multi_worker"]},
             "decomposition_reason": {"type": "string"},
+            "granularity_reason": {"type": "string", "minLength": 1, "maxLength": 1000},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_PLAN_TASKS,
                       "items": {'anyOf': task_schemas}},
@@ -1113,7 +1122,7 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
     """Return a stable representation while enforcing field types and bounds."""
     raw = _object(value, PLAN_FIELDS, "plan", optional={CRITERION_LINKS_FIELD, "write_owners",
         "task_complexity", "execution_strategy", "decomposition_reason",
-        "task_count", "worker_count", "worker_assignments"})
+        "task_count", "worker_count", "worker_assignments", "granularity_reason"})
     complexity = _text(raw["complexity"], "plan.complexity", 32).casefold().replace("-", "_")
     if complexity not in {"simple", "multi_step"}:
         raise PlanValidationError("plan.complexity must be simple or multi_step.")
@@ -1171,6 +1180,11 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
                 task["semantic_needs"], f"plan.tasks[{index}].semantic_needs",
                 MAX_CRITERIA, identifiers=False,
             )
+        if "granularity" in task:
+            try:
+                normalized_task["granularity"] = normalize_granularity(task["granularity"])
+            except ValueError as exc:
+                raise PlanValidationError(str(exc)) from exc
         if "owned_paths" in task:
             try:
                 normalized_task["owned_paths"] = normalize_owned_paths(task["owned_paths"])
@@ -1250,6 +1264,8 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
     if "decomposition_reason" in raw:
         result["decomposition_reason"] = _text(
             raw["decomposition_reason"], "plan.decomposition_reason", 1000)
+    if "granularity_reason" in raw:
+        result["granularity_reason"] = _text(raw["granularity_reason"], "plan.granularity_reason", 1000)
     if "write_owners" in raw:
         owners = raw["write_owners"]
         if not isinstance(owners, dict):
@@ -1745,6 +1761,28 @@ class Planner:
             "benefit than delegation, context handoff and integration cost. State that concrete "
             "benefit in decomposition_reason; for single_worker state why one owner suffices. "
             "Do not split a small feature into scaffold, logic and finalization tasks. "
+            "TASK is a meaningful unit of progress, recovery and evidence/evaluation, not a tool call, "
+            "capability, semantic operation, filesystem operation or implementation step. "
+            "Do not create a separate Task for each technical operation. One Task may require multiple "
+            "operations and semantic_needs; Compiler derives all required capabilities/tools for it. "
+            "Group consecutive operations that jointly produce one logical artifact or outcome: "
+            "create_file plus writing implementation is one implement-file Task; directory setup plus "
+            "creating/populating component files is one create-component Task; reading/modifying/saving "
+            "configuration is one update-configuration Task. Parent directories are implicit in file "
+            "creation; do not invent a mkdir operation absent from the runtime catalog. "
+            "Before separating a Task ask: if it completed and no successor ever ran, would its result "
+            "still be meaningful progress? If not, group it with its logical successor. Do not propose "
+            "empty files/directories, placeholders or incomplete scaffolds as separate outcomes unless "
+            "the user expressly requires that intermediate state or it has independent value. "
+            "Use optional granularity.logical_outcome for a shared component outcome, "
+            "granularity.independent_value for a concrete independently useful result and "
+            "granularity.preserve_boundary for an actual user phase, approval, policy/security or "
+            "independent recovery/rollback boundary. These declarations never grant permission. "
+            "Keep independently valuable shared artifacts, parallel work, distinct Workers and "
+            "separable verification apart. Normally implementation and its testing are two Tasks. "
+            "For simple work normally use 1-2 Tasks, multi_step 2-5; complex may use more. "
+            "These are advisory ranges, not rigid limits: if exceeded provide an explicit "
+            "granularity_reason explaining the independent outcomes or preserved boundaries. "
             "Each task has a meaningful key, task_kind, objective, description, "
             "depends_on (semantic task keys), semantic_needs, operations, success_criteria, "
             "owned_paths and write_targets. "
@@ -1762,8 +1800,9 @@ class Planner:
             "workspace-relative exact file path; do not use broad patterns. Do not supply runtime IDs, "
             "Within one plan, one concrete writable path has one permanent plan-task owner. "
             "owned_paths declares lasting responsibility; write_targets declares files this task "
-            "intends to write, including files owned by another task. Keep distinct task nodes "
-            "distinct, even when they write the same file. The unique creator owns a created file. "
+            "intends to write, including files owned by another task. Keep independently meaningful "
+            "tasks distinct, even when they write the same file; absorb mechanical prerequisites "
+            "into their logical outcome. The unique creator owns a created file. "
             "A later modifier of that file declares it in write_targets and leaves owned_paths empty. "
             "Give each task one primary responsibility and only the write targets needed for it. "
             "Two tasks that write the same path must have a real dependency order and distinct sequential "
@@ -1989,6 +2028,13 @@ class Planner:
                     "write_targets": list(task.get("write_targets", [])),
                     "foreign_write_targets": list(task.get("foreign_write_targets", [])),
                 } for task in compiled["tasks"]]
+                granularity = copy.deepcopy(resource_catalog.granularity_summary)
+                granularity["task_count_after"] = len(compiled["tasks"])
+                self.metrics["granularity_summary"] = granularity
+                self.metrics.setdefault("planner_events", []).append({
+                    "event_type": "planner.granularity_summary",
+                    "message": "Logical Task granularity analyzed before runtime assignment.",
+                    **granularity})
                 preferred_skill_warnings = resource_catalog.preferred_skill_warnings_for_tasks(
                     compiled["tasks"])
                 self.metrics["preferred_skill_warnings"] = preferred_skill_warnings

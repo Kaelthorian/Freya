@@ -50,14 +50,12 @@ class SemanticPipelineTests(unittest.TestCase):
         self.assertFalse(analyst.metrics["fallback_used"])
         self.assertEqual(analyst.metrics["model_calls"], 1)
         self.assertEqual(planner.metrics["model_calls"], 1)
-        self.assertEqual(len(compiled["tasks"]), 2)
+        self.assertEqual(len(compiled["tasks"]), 1)
         self.assertEqual(compiled["tasks"][0]["owned_paths"], ["calculator.js"])
-        self.assertEqual(compiled["tasks"][1]["owned_paths"], [])
-        self.assertEqual(compiled["tasks"][1]["foreign_write_targets"],
-                         [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
+        self.assertEqual(compiled["tasks"][0]["semantic_operations"], ["create_file", "modify_file"])
         self.assertIn("task_analysis.semantic_normalization",
                       [event["event_type"] for event in analyst.diagnostic_events])
-        self.assertIn("plan_compiler.foreign_write_routed",
+        self.assertIn("plan_compiler.tasks_merged",
                       [event["event_type"] for event in planner.metrics["compiler_events"]])
         self.assertEqual({fact["action"] for entry in spec["requirements"]
                           for fact in _action_facts(entry["description"], entry["source"])},
@@ -104,7 +102,7 @@ class SemanticPipelineTests(unittest.TestCase):
         self.assertIn({"description": "interfaz web", "source": "clarified"}, spec["constraints"])
         self.assertEqual(spec["user_decisions"]["interface"], "web")
 
-    def test_direct_create_modify_same_path_keeps_distinct_plan_tasks(self):
+    def test_mechanical_create_modify_same_path_merges_before_ownership(self):
         semantic = {"summary": "Implement", "success_criteria": [],
                     "unsupported_requirements": [], "tasks": [
                         task("create", "create_file"),
@@ -112,16 +110,13 @@ class SemanticPipelineTests(unittest.TestCase):
                              criterion="calculator.js contains all requested operation handlers.")]}
         catalog = RuntimeResourceCatalog.build()
         compiled = compile_semantic_plan(semantic, web_spec(), resource_catalog=catalog)
-        self.assertEqual(len(compiled["tasks"]), 2)
+        self.assertEqual(len(compiled["tasks"]), 1)
         self.assertEqual(compiled["tasks"][0]["owned_paths"], ["calculator.js"])
-        self.assertEqual(compiled["tasks"][1]["owned_paths"], [])
-        self.assertEqual(compiled["tasks"][1]["depends_on"], ["task-1"])
+        self.assertEqual(compiled["tasks"][0]["depends_on"], [])
         self.assertEqual(compiled["write_owners"], {"calculator.js": "task-1"})
-        self.assertEqual(compiled["tasks"][1]["foreign_write_targets"],
-                         [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
-        self.assertEqual(planned_write_target_grants(compiled, "task-2"),
-                         [{"path": "calculator.js", "owner_plan_task_id": "task-1"}])
-        self.assertNotIn("plan_compiler.tasks_coalesced",
+        self.assertEqual(compiled["tasks"][0]["foreign_write_targets"], [])
+        self.assertEqual(planned_write_target_grants(compiled, "task-1"), [])
+        self.assertIn("plan_compiler.tasks_merged",
                       [event["event_type"] for event in catalog.compiler_events])
 
     def test_dependency_without_exact_foreign_write_target_does_not_grant(self):
@@ -147,7 +142,7 @@ class SemanticPipelineTests(unittest.TestCase):
         self.assertEqual(compiled["tasks"][0]["foreign_write_targets"], [])
 
     def test_two_modifiers_without_creator_request_one_bounded_repair(self):
-        first = task("first", "modify_file")
+        first = task("first", "modify_file", criterion="The source defines the initial usable component.")
         second = task("second", "modify_file")
         original = {"summary": "Implement", "success_criteria": [],
                     "unsupported_requirements": [], "tasks": [first, second]}
@@ -192,10 +187,11 @@ class SemanticPipelineTests(unittest.TestCase):
         planner = Planner(decide)
         result = planner.create_plan_for_spec(web_spec())
         self.assertEqual(len(calls), 1)
-        self.assertEqual(len(result["tasks"]), 3)
-        self.assertEqual(result["tasks"][1]["owned_paths"], [])
-        self.assertEqual(result["tasks"][2]["objective"], "Review result")
-        self.assertEqual(planner.metrics.get("planner_events", []), [])
+        self.assertEqual(len(result["tasks"]), 2)
+        self.assertEqual(result["tasks"][0]["owned_paths"], ["calculator.js"])
+        self.assertEqual(result["tasks"][1]["objective"], "Review result")
+        self.assertFalse(any(event["event_type"] == "planner.repair_requested"
+                             for event in planner.metrics.get("planner_events", [])))
 
     def test_false_unsupported_claim_uses_one_repair(self):
         original = {"summary": "Implement", "success_criteria": [], "tasks": [
@@ -396,7 +392,7 @@ class PlanResponsibilityAndEvidenceTests(unittest.TestCase):
         self.assertIn("plan_compiler.overlap_validated",
                       [item["event_type"] for item in catalog.compiler_events])
 
-    def test_create_then_modify_same_target_remains_valid(self):
+    def test_create_then_modify_same_target_normalizes_to_one_valid_task(self):
         creator = task("scaffold", "create_file", path="a.js",
                        criterion="The a.js file exists.")
         modifier = task("implement", "modify_file", path="a.js", dependencies=("scaffold",),
@@ -405,7 +401,9 @@ class PlanResponsibilityAndEvidenceTests(unittest.TestCase):
         modifier["write_targets"] = ["a.js"]
         compiled = compile_semantic_plan(self.plan(creator, modifier), web_spec())
         self.assertEqual(compiled["write_owners"], {"a.js": "task-1"})
-        self.assertEqual(compiled["tasks"][1]["depends_on"], ["task-1"])
+        self.assertEqual(len(compiled["tasks"]), 1)
+        self.assertEqual(compiled["tasks"][0]["depends_on"], [])
+        self.assertEqual(compiled["tasks"][0]["semantic_operations"], ["create_file", "modify_file"])
 
     def test_runtime_criterion_moves_to_one_dependent_testing_task(self):
         implementation = task(

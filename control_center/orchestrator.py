@@ -1156,7 +1156,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 if isinstance(diagnostic, dict) and isinstance(diagnostic.get("event_type"), str):
                     self.store.add_orchestration_event(oid, {
                         **diagnostic, "phase": "plan_compiler", "actor_type": "runtime",
-                        "status": "Success" if compiler.get("status") == "Success" else "Warning",
+                        "status": "Success" if compiler.get("status") == "Success" and
+                            diagnostic["event_type"] != "plan_compiler.granularity_warning" else "Warning",
                         "message": diagnostic.get("message", "Plan Compiler recorded a bounded decision."),
                     })
             for adjustment in compiler.get("scope_adjustments", []):
@@ -1211,7 +1212,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
             if isinstance(diagnostic, dict) and isinstance(diagnostic.get("event_type"), str):
                 self.store.add_orchestration_event(oid, {
                     **diagnostic, "phase": "planner", "actor_type": "runtime",
-                    "status": "Success", "message": "Planner completed a bounded semantic repair step.",
+                    "status": "Success", "message": diagnostic.get(
+                        "message", "Planner completed a bounded semantic repair step."),
                 })
 
     def _fail_planning(self, oid: str, exc: Exception,

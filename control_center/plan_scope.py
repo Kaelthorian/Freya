@@ -91,7 +91,8 @@ def semantic_plan_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(tasks, list):
         return {"invalid_tasks_type": type(tasks).__name__}
     fields = ("key", "task_kind", "objective", "description", "semantic_needs", "operations",
-              "depends_on", "success_criteria", "owned_paths", "write_targets")
+              "semantic_operations", "depends_on", "success_criteria", "owned_paths", "write_targets",
+              "granularity")
     result = []
     for item in tasks[:20]:
         if not isinstance(item, dict):
@@ -104,11 +105,16 @@ def semantic_plan_snapshot(value: Any) -> dict[str, Any]:
                 compact[field] = raw[:300]
             elif isinstance(raw, list):
                 compact[field] = [str(value)[:200] for value in raw[:12]]
+            elif field == "granularity" and isinstance(raw, dict):
+                compact[field] = {name: text[:300] for name, text in raw.items()
+                                  if name in {"logical_outcome", "independent_value", "preserve_boundary"}
+                                  and isinstance(text, str)}
         result.append(compact)
     return sanitize({"tasks": result, "task_count": len(tasks),
                      "task_complexity": value.get("task_complexity"),
                      "execution_strategy": value.get("execution_strategy"),
-                     "decomposition_reason": value.get("decomposition_reason")})
+                     "decomposition_reason": value.get("decomposition_reason"),
+                     "granularity_reason": str(value.get("granularity_reason") or "")[:1000]})
 
 
 def reconcile_plan_scope(task_spec: dict[str, Any], value: Any
