@@ -15,6 +15,7 @@ from typing import Any
 
 from .security import sanitize
 from .sandbox import SandboxUnavailable, run_in_sandbox
+from .python_execution import PythonExecutionManager, ExecutionFailure
 
 
 MAX_FILE_BYTES = 512_000
@@ -22,7 +23,7 @@ MAX_WRITE_BYTES = 1_000_000
 MAX_OUTPUT_CHARS = 20_000
 MAX_STDIN_CHARS = 16_000
 MAX_SEARCH_HITS = 200
-IGNORED_DIRECTORIES = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache"}
+IGNORED_DIRECTORIES = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", "runtime_envs"}
 
 
 def _clip(value: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -51,6 +52,8 @@ class ToolResult:
     missing_fields: tuple[str, ...] = ()
     stdout: str | None = None
     stderr: str | None = None
+    program_started: bool | None = None
+    environment_available: bool | None = None
 
 
 class ParentPathIsFile(Exception):
@@ -78,11 +81,20 @@ class Toolbox:
         project_root: Path,
         workspace: Path,
         timeout_seconds: int = 30,
+        orchestration_id: str | None = None,
+        runtime_env_root: Path | None = None,
+        execution_event=None,
+        python_dependencies=(),
     ) -> None:
         self.project_root = project_root.resolve()
         self.workspace = workspace.resolve()
         self.timeout_seconds = timeout_seconds
         self.workspace.mkdir(parents=True, exist_ok=True)
+        # Library callers own cleanup explicitly; production supplies the orchestration ID.
+        owner = orchestration_id or ("workspace-" + hashlib.sha256(str(self.workspace).encode()).hexdigest()[:24])
+        self.python_execution = PythonExecutionManager(
+            runtime_env_root or self.project_root / "data" / "runtime_envs", owner,
+            execution_event, python_dependencies)
 
     def safe_path(self, path: str) -> Path:
         if not isinstance(path, str) or not path.strip():
@@ -93,6 +105,8 @@ class Toolbox:
         target = (self.workspace / candidate).resolve()
         if target != self.workspace and self.workspace not in target.parents:
             raise ValueError("Path is outside the task workspace: {}".format(path))
+        if hasattr(self, "python_execution") and (target == self.python_execution.root or self.python_execution.root in target.parents):
+            raise ValueError("Runtime environments are infrastructure, not workspace artifacts.")
         return target
 
     @property
@@ -243,6 +257,12 @@ class Toolbox:
         except ParentPathIsFile as exc:
             output, success, exit_code = "ParentPathIsFile: {}".format(exc), False, None
             blocking_path = exc.blocking_path
+        except ExecutionFailure as exc:
+            return ToolResult(name, _clip(str(exc) + "\n" + exc.stdout + exc.stderr), False,
+                time.perf_counter() - start, error_class=exc.error_class,
+                stdout=_clip(exc.stdout), stderr=_clip(exc.stderr),
+                program_started=exc.program_started,
+                environment_available=exc.error_class == "PROCESS_TIMEOUT")
         except SandboxUnavailable as exc:
             output, success, exit_code = f"SandboxUnavailable: {exc}", False, None
         except Exception as exc:  # Keep a tool failure observable to the model.
@@ -462,8 +482,10 @@ class Toolbox:
                     if not module_args or module_args[0] != "discover":
                         raise ValueError("Only unittest discovery within the workspace is allowed.")
                     normalized = ["-m", module] + self._validate_unittest_discovery(module_args)
+                elif module == "ruff" and module_args == ["check", "."]:
+                    normalized = ["-m", module, *module_args]
                 else:
-                    raise ValueError("Allowed Python modules: unittest, pytest, py_compile.")
+                    raise ValueError("Allowed Python modules: unittest, pytest, py_compile, ruff check.")
             else:
                 script = self.safe_path(command[0])
                 if not script.is_file() or script.suffix.lower() != ".py":
@@ -490,7 +512,14 @@ class Toolbox:
 
         sandbox_executable = ("python" if executable.startswith("python") or executable.startswith("py")
                               else executable)
-        result = run_in_sandbox(self.workspace, [sandbox_executable, *normalized], timeout_seconds, stdin)
+        if sandbox_executable == "git":
+            result = run_in_sandbox(self.workspace, [sandbox_executable, *normalized], timeout_seconds, stdin)
+        else:
+            from .settings import get_settings
+            if get_settings().python_execution_backend != "venv":
+                raise ExecutionFailure("ENVIRONMENT_UNAVAILABLE", "Unsupported Python execution backend")
+            python_args = ["-m", "ruff", *normalized] if executable == "ruff" else normalized
+            result = self.python_execution.run(self.workspace, python_args, timeout_seconds, stdin)
         self._command_streams = (_clip(result.stdout or ""), _clip(result.stderr or ""))
         output = (result.stdout or "") + (result.stderr or "")
         if stdin is None and result.returncode != 0 and "EOFError" in output:
@@ -499,7 +528,12 @@ class Toolbox:
                 "terminal. Retry with run_command stdin containing bounded newline-delimited test input.\n\n"
                 + output
             )
-        return _clip(output or "Command completed with no output."), result.returncode == 0, result.returncode
+        return ToolResult("run_command", _clip(output or "Command completed with no output."),
+            result.returncode == 0, 0, exit_code=result.returncode,
+            stdout=self._command_streams[0], stderr=self._command_streams[1],
+            error_class=("interactive_input_required" if "INTERACTIVE_INPUT_REQUIRED" in output else
+                         "PROGRAM_FAILURE" if result.returncode else ""),
+            program_started=True, environment_available=True)
 
     def _validate_unittest_discovery(self, args: list[str]) -> list[str]:
         if len(args) < 1 or args[0] != "discover":

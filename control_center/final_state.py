@@ -14,6 +14,7 @@ from typing import Any
 
 from .security import sanitize
 from .tools import Toolbox, MAX_FILE_BYTES
+from .python_execution import INFRASTRUCTURE_ERRORS
 
 SNAPSHOT_VERSION = 1
 MAX_FILES = 100
@@ -125,10 +126,11 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
             if isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 status = "passed" if exit_code == 0 else "failed"
             if row.get("policy_decision") in {"deny", "denied"} or row.get("error_class") in {
-                    "SandboxUnavailable", "policy_denied", "approval_denied", "unknown_tool"}:
+                    *INFRASTRUCTURE_ERRORS, "policy_denied", "approval_denied", "unknown_tool"} or row.get("program_started") is False:
                 status = "unavailable"
             fact = {key: row[key] for key in (
                 "check", "tool", "capability", "exit_code", "command", "path",
+                "program_started", "environment_available",
                 "test_id", "case_id", "input", "check_id", "verification_id", "event_id", "error_class",
                 "stdin_sha256", "stdin_identity_unavailable", "supports_acceptance_criteria", "criterion_id",
                 "supports_acceptance_criterion_ids", "source_task_id",
@@ -141,6 +143,10 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
                         source_task_id=runtime.get("source_task_id") or row.get("source_task_id"),
                         worker_id=runtime.get("config", {}).get(
                             "worker_assignment", {}).get("worker_id") or row.get("worker_id"))
+            if status == "unavailable":
+                fact.update(kind="execution_environment", type="execution_environment",
+                            program_started=False, environment_available=False, exit_code=None,
+                            verification_kind=kind)
             for field in ("stdout", "stderr", "output"):
                 if isinstance(row.get(field), str):
                     value = sanitize(row[field])
@@ -185,7 +191,8 @@ def build_final_state(planned_task: dict[str, Any], runtime_tasks: list[dict[str
                      *((runtime.get("verification") or result.get("verification") or {}).get("evidence") or [])]:
             if isinstance(item, dict) and item.get("path"):
                 targets.append(item["path"])
-    targets = list(dict.fromkeys(path for path in targets if isinstance(path, str)))
+    targets = list(dict.fromkeys(path for path in targets if isinstance(path, str)
+                                and "runtime_envs" not in Path(path.replace("\\", "/")).parts))
     snapshot: dict[str, Any] = {"snapshot_version": SNAPSHOT_VERSION, "files": [],
                               "verification_facts": final_verification_facts(runtime_tasks),
                               "task_outputs": [], "context_truncated": len(targets) > MAX_FILES}

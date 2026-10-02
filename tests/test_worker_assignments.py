@@ -271,7 +271,7 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
                                   "invalid\n": "Invalid temperature\n"}[stdin]
                         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
-                    with patch("control_center.tools.run_in_sandbox", side_effect=sandbox):
+                    with patch("control_center.python_execution.PythonExecutionManager.run", side_effect=sandbox):
                         result = run_task(task, self.workspace.parent, lambda event: None, lambda: None,
                                           transport=lambda *args, **kwargs: next(responses),
                                           approval_handler=lambda request: "approved_once")

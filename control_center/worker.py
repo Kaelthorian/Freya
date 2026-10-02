@@ -33,6 +33,7 @@ from control_center.worker_finalization import (
     FORCED_FINALIZATION_FORMAT, FORCED_FINALIZATION_PROMPT,
     ForcedFinalizationInvalidOutput, finalization_context, validate_forced_finalization,
 )
+from control_center.python_execution import INFRASTRUCTURE_ERRORS
 
 
 READ_TOOLS = {"list_files", "read_file", "search_code", "git_diff", "project_context"}
@@ -49,6 +50,7 @@ REASONS = {
     "project_context": "Query accepted project metadata without reading file contents.",
 }
 NON_RETRYABLE_ERROR_CLASSES = {
+    *INFRASTRUCTURE_ERRORS,
     "policy_denied", "repeated_policy_denied", "blocked_action_cycle",
     "unknown_tool", "tool_unavailable", "invalid_request", "approval_denied",
     "not_applicable", "path_forbidden", "destructive_action_denied",
@@ -364,7 +366,12 @@ class PolicyToolbox(Toolbox):
 
     def __init__(self, project_root: Path, workspace: Path, config: dict[str, Any],
                  enabled: list[str]) -> None:
-        super().__init__(project_root, workspace)
+        provenance = config.get("provenance") or {}
+        runtime_context = config.get("runtime_context") or {}
+        super().__init__(project_root, workspace,
+            orchestration_id=provenance.get("orchestration_id") or runtime_context.get("python_environment_owner"),
+            runtime_env_root=Path(runtime_context["python_runtime_env_root"]) if runtime_context.get("python_runtime_env_root") else None,
+            python_dependencies=runtime_context.get("python_dependencies", ()))
         self.config = config
         self.policy = PolicyEngine(config.get("capability_policy") or policy_from_legacy(config, enabled), self.workspace,
                                    hard_max_bytes=1_000_000)
@@ -1009,6 +1016,8 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
     def publish(kind: str, **values: Any) -> None:
         emit(sanitize(clean({"kind": kind, **values}, token)))
 
+    box.python_execution.emit = lambda event: publish("event", event=event)
+
     def guard() -> float:
         checkpoint()
         remaining = deadline - time.monotonic()
@@ -1536,6 +1545,8 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                         "exit_code": result.exit_code,
                         "output": str(result.output or "")[:4000],
                         "stdout": result.stdout, "stderr": result.stderr,
+                        "program_started": result.program_started,
+                        "environment_available": result.environment_available,
                          "content_truncated": len(str(result.output or "")) > 4000,
                         "stdin_sha256": hashlib.sha256(safe_args["stdin"].encode()).hexdigest()
                                         if isinstance(safe_args.get("stdin"), str) else None,
@@ -1552,7 +1563,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                 "input": call["verification_case"]["input"],
                                 "exit_code": result.exit_code, "stdout": result.stdout,
                                 "stderr": result.stderr, "success": result.success,
-                                "status": "passed" if result.success else "failed",
+                                "status": "unavailable" if result.program_started is False else "passed" if result.success else "failed",
+                                "program_started": result.program_started,
+                                "environment_available": result.environment_available,
+                                "error_class": result.error_class,
                                 "event_id": common["step_id"]})
                     if result.success and name == "run_command" and verification["enabled"]:
                         supported = _command_evidence_criteria(
@@ -1578,6 +1592,8 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                                 "exit_code": result.exit_code,
                                 "output": str(result.output or "")[:4000],
                                 "stdout": result.stdout, "stderr": result.stderr,
+                                "program_started": result.program_started,
+                                "environment_available": result.environment_available,
                                 "content_truncated": len(str(result.output or "")) > 4000,
                                 "stdin_sha256": hashlib.sha256(safe_args["stdin"].encode()).hexdigest()
                                                 if isinstance(safe_args.get("stdin"), str) else None,
@@ -2106,8 +2122,12 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                          "capability": resolved_capability,
                          "event_id": getattr(result, "event_id", "") or event_id,
                          "exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr,
+                         "program_started": result.program_started,
+                         "environment_available": result.environment_available,
                         "content_truncated": len(str(result.output or "")) > 4000,
                          "error_class": result.error_class}
+                if result.program_started is False or result.error_class in INFRASTRUCTURE_ERRORS:
+                    check.update(type="execution_environment", status="unavailable")
                 if label.startswith("filesystem:read_file:"):
                     check.update(type="file_readback", path=label[len("filesystem:read_file:"):])
                 elif label.startswith("tests:"):

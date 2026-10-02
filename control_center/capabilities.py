@@ -135,7 +135,7 @@ class CapabilityResolver:
             executable = Path(argv[0].replace("\\", "/")).name.lower().removesuffix(".exe")
             command = argv[1:]
             if executable in {"python", "python3", "py"} and command[:1] == ["-m"]:
-                modules = {"pytest": "execution.pytest", "unittest": "execution.unittest", "py_compile": "execution.py_compile"}
+                modules = {"pytest": "execution.pytest", "unittest": "execution.unittest", "py_compile": "execution.py_compile", "ruff": "execution.ruff"}
                 if len(command) > 1 and command[1] in modules:
                     return modules[command[1]]
                 raise ValueError("Unknown or unsupported Python module")

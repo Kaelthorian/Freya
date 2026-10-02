@@ -59,6 +59,6 @@ passed test or current file observation.
 
 LLM tracing uses stage `forced_finalization`, prompt name
 `worker_forced_finalization`, version `worker-finalization-v1`, and the existing
-global debug setting. Tests cover deterministic model and sandbox fixtures;
-they require the repository's ephemeral Docker validation environment. A live
+global debug setting. Tests cover deterministic model and backend fixtures;
+`tests.test_python_execution` additionally runs real venv processes. A live
 Ollama/Qwen converter run is a separate integration check.

@@ -2,7 +2,8 @@
 
 This directory owns the local web API, SQLite state and spawned execution
 runtime. `frontend/` is its browser client; `tools.py` owns workspace-scoped
-filesystem operations and `sandbox.py` runs commands and Git in Docker copies.
+filesystem operations. `python_execution.py` runs Python/tests/Ruff in one lazy
+orchestration venv; `sandbox.py` retains Docker copies for Git inspection.
 
 `task_spec.py` owns the production tool-free canonical intent contract,
 clarification questions, sequential revisions and deterministic rendering. It
@@ -184,9 +185,11 @@ archival event reports archival `Success` separately from the run's final
 - Keep `freya-core` validation and compact rendering in `skills.py`; its tool
   declarations never execute tools or modify policy. Task
   records must retain immutable Skill snapshots and versions.
-- All agent Python, test, Ruff and Git commands go through `sandbox.py` on a
-  disposable workspace copy. Docker failure is `SandboxUnavailable`; never
-  fall back to host execution or copy command writes into the real workspace.
+- Python, tests and Ruff go through `python_execution.py` using absolute venv
+  Python and cwd=workspace. Runtime owns creation/dependencies/cache/cleanup;
+  models never activate or administer environments. Preserve environment facts
+  separately from program failures. A venv is not OS containment. Git alone
+  retains the optional Docker copy. See `../docs/PYTHON_EXECUTION.md`.
 - Preserve spawned-process containment and descendant cleanup for cancel,
   restart, timeout and shutdown.
 - Never persist secret values or private model thinking. `secret_env` contains

@@ -257,7 +257,7 @@ class WorkerForcedFinalizationTests(unittest.TestCase):
         replies = converter_replies("# stub\n")
         replies.insert(2, answer(calls=[("run_command", {
             "argv": ["python", "temperature_converter.py"], "stdin": "0\n"})]))
-        with patch("control_center.tools.run_in_sandbox", return_value=subprocess.CompletedProcess(
+        with patch("control_center.python_execution.PythonExecutionManager.run", return_value=subprocess.CompletedProcess(
                 ["python", "temperature_converter.py"], 0, "Fahrenheit: 32.00\n", "")) as execution:
             result = self.run_worker(replies, tools=["read_file", "edit_file", "run_command"], config={
                 "permissions": "execute", "verification": {
@@ -369,7 +369,7 @@ class WorkerForcedFinalizationTests(unittest.TestCase):
                       "invalid\n": "Invalid temperature\n"}[stdin]
             return subprocess.CompletedProcess(argv, 0, output, "")
 
-        with patch("control_center.tools.run_in_sandbox", side_effect=sandbox) as execution:
+        with patch("control_center.python_execution.PythonExecutionManager.run", side_effect=sandbox) as execution:
             qa = self.run_worker([answer(calls=[("run_command", {
                 "argv": ["python", "temperature_converter.py"]})])], tools=["run_command"], config={
                     "permissions": "execute", "verification_mode": "independent_cases",

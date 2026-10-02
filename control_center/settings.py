@@ -43,6 +43,7 @@ class Settings:
     process_working_directory: str = ""
     git_commit: str | None = None
     entrypoint: str = "python -m control_center"
+    python_execution_backend: str = "venv"
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> Settings:
@@ -53,10 +54,13 @@ class Settings:
         except (TypeError, ValueError):
             limit = DEFAULT_DEBUG_MAX_CHARS
         timeout = environment.get("FREYA_ORCHESTRATION_TIMEOUT_SECONDS")
+        backend = environment.get("FREYA_PYTHON_EXECUTION_BACKEND", "venv").strip().lower()
+        if backend != "venv":
+            raise ValueError("FREYA_PYTHON_EXECUTION_BACKEND currently supports only venv.")
         return cls(parse_bool(flag), max(1000, min(limit, MAX_DEBUG_CHARS)),
                    "environment" if flag is not None else "default",
                    orchestration_timeout(timeout) if timeout is not None else DEFAULT_ORCHESTRATION_TIMEOUT_SECONDS,
-                   "environment" if timeout is not None else "default")
+                   "environment" if timeout is not None else "default", python_execution_backend=backend)
 
     @classmethod
     def from_sources(cls, repo_root: Path, environment: Mapping[str, str] | None = None) -> Settings:
@@ -68,7 +72,7 @@ class Settings:
         local_path = repo_root / LOCAL_SETTINGS_FILE
         local = json.loads(local_path.read_text(encoding="utf-8")) if local_path.is_file() else {}
         names = {"FREYA_DEBUG_LLM_PROMPTS", "FREYA_DEBUG_PROMPT_MAX_CHARS",
-                 "FREYA_ORCHESTRATION_TIMEOUT_SECONDS"}
+                 "FREYA_ORCHESTRATION_TIMEOUT_SECONDS", "FREYA_PYTHON_EXECUTION_BACKEND"}
         if not isinstance(local, dict) or set(local) - names:
             raise ValueError("Local Freya configuration contains unknown settings.")
         effective = {**{key: str(value).lower() for key, value in local.items()}, **environment}
@@ -90,6 +94,7 @@ class Settings:
 
     def diagnostic_event(self) -> dict[str, object]:
         return {"event_type": "freya.runtime.configuration", "debug_llm_prompts": self.debug_llm_prompts,
+                "python_execution_backend": self.python_execution_backend,
                 "configuration_source": self.debug_llm_prompts_source,
                 "repo_root": self.repo_root, "process_working_directory": self.process_working_directory,
                 "git_commit": self.git_commit, "entrypoint": self.entrypoint,

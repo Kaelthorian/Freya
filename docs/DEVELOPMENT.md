@@ -5,17 +5,18 @@
 - Python 3.10 or later.
 - Ollama running locally with at least one installed model.
 - A modern browser. Node is needed only for JavaScript syntax validation.
-- Docker Desktop with a running Linux engine for agent Python, test, Ruff and Git commands.
+- Python execution uses a temporary venv; Docker is required only for optional Git inspection.
 
-Build the local sandbox image before allowing agent command execution:
+For optional Docker Git inspection, build the local image:
 
 ```powershell
 docker build -t freya-sandbox:py311 .\sandbox
 docker image inspect freya-sandbox:py311
 ```
 
-If Docker or the image is unavailable, `run_command` and Git inspection fail
-with `SandboxUnavailable`; Freya never executes agent code on the host.
+Python/tests/Ruff use the venv backend without Docker. Git inspection fails
+with `SandboxUnavailable` when Docker/image is absent. Python runs with host
+account permissions; see [Python execution](PYTHON_EXECUTION.md).
 
 The runtime uses the Python standard library. If `psutil` is installed,
 `/api/health` reports CPU and RAM; otherwise telemetry is unavailable.
@@ -299,7 +300,7 @@ Offline evaluation resolves only current file presence/readability and required
 evidence gates. Content, structure and execution semantics remain `unknown`.
 `final_state.build_final_state` reads the current workspace with the existing
 safe-path boundary before evaluation; it cannot execute verification tools.
-Tests/commands/lint/compilation must run through the authorized Runtime sandbox.
+Tests/commands/lint/compilation must run through the authorized Runtime backend.
 Their last stable check identity supersedes older outcomes; command signatures
 include stdin digest to preserve independent QA cases. A passing exit code is a
 fact and does not automatically accept a semantic criterion.
@@ -441,13 +442,14 @@ dispatch or verification after detection, budget/cancellation failures, actual
 same-size byte changes, and a converter edit followed by no-ops and independent
 QA cases. `WorkerAssignmentRuntimeTests.test_forced_completion_unlocks_three_case_qa_and_evaluates_assignment_once`
 exercises the real Worker, scheduler and assignment gate with synthetic model
-responses and sandbox process results. These fixtures do not claim a live
-Ollama/Qwen run or actual converter execution. Run Python regressions only in
-the required ephemeral Docker copy; if Docker is unavailable, leave them pending.
+responses and injected execution-backend results. These fixtures do not claim a live
+Ollama/Qwen run or actual converter execution. `tests.test_python_execution`
+also exercises real Python venvs, converter stdin cases, timeout and cleanup.
 Orchestration timeouts also emit failure analysis.
 
-Docker receives an ephemeral workspace copy for every Python, pytest, unittest,
-py_compile, Ruff or Git command. The container has no network, Docker socket,
+Only Git inspection receives an ephemeral Docker workspace copy. Python, pytest,
+unittest, py_compile and Ruff use the orchestration venv described in
+[Python execution](PYTHON_EXECUTION.md). For optional Git inspection, the container has no network, Docker socket,
 host HOME/USERPROFILE, inherited secrets or host project mount. Its root is
 read-only, and memory, PID, CPU and time limits apply. Only `HOME=/tmp`,
 `TMPDIR=/tmp`, `PYTHONDONTWRITEBYTECODE`, `PYTHONNOUSERSITE`,
@@ -568,7 +570,7 @@ credentials, paths, query strings or fragments.
 
 Independent QA inputs belong in compiled task `verification_cases` with stable
 `id` and exact `input`, plus `verification_mode=independent_cases`. Each case
-starts a fresh Docker command from one model-selected argv; no model call occurs
+starts a fresh venv Python process from one model-selected argv; no model call occurs
 between cases. Explicit `interactive_session` keeps multiline stdin in one
 process. Compiler compatibility inference accepts only clear input lists.
 Inspect `verification.case_completed`, structured result actions, and Evaluator
@@ -774,8 +776,8 @@ local end-to-end run.
   `worker.evaluation.*` events.
 - When textual model output contains several JSON actions, only the first runs;
   later actions are regenerated after the actual tool result.
-- `run_command` is allowlisted and uses argv without a shell. Agent code runs
-  inside Docker on a disposable copy. If Docker cannot start, inspect
+- `run_command` is allowlisted and uses argv without a shell. Python uses a
+  temporary orchestration venv. For optional Git Docker failures, inspect
   `SandboxUnavailable` and check the daemon and local image.
 - A non-accepted evaluation briefly enters `recovery_pending`. Inspect the
   recovery action and attempt history before treating it as terminal. Offline

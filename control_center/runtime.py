@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import json
 import os
 import queue
 import signal
@@ -100,6 +101,30 @@ class Runtime:
         self.active: dict[str, dict[str, Any]] = {}
         self.paused: set[str] = set()
         self.last_error: str | None = None
+        self._python_cleanup_at = 0.0
+
+    def cleanup_python_environments(self) -> None:
+        from .python_execution import cleanup_runtime_environments
+        def status_for(owner):
+            # A worker may still be stopping after a terminal transition.
+            for task_id in [*self.pending, *self.active]:
+                task = self.store.get_task(task_id)
+                config = task.get("config", {})
+                if owner in {config.get("provenance", {}).get("orchestration_id"),
+                             config.get("runtime_context", {}).get("python_environment_owner")}:
+                    return "Running"
+            try:
+                return self.store.get_orchestration(owner)["status"]
+            except KeyError:
+                return None
+        def emit(event):
+            try:
+                self.store.get_orchestration(event["orchestration_id"])
+                self.store.add_orchestration_event(event["orchestration_id"], event)
+            except KeyError:
+                # Orphan/standalone cleanups remain observable without a DB owner.
+                print(json.dumps(sanitize(event)), flush=True)
+        cleanup_runtime_environments(self.data_dir / "runtime_envs", status_for, emit)
 
     def start(self) -> None:
         with self.lock:
@@ -108,6 +133,7 @@ class Runtime:
             if self.closed:
                 raise RuntimeError("Runtime is shut down.")
             self.store.recover_interrupted()
+            self.cleanup_python_environments()
             self.thread = threading.Thread(target=self._loop, name="control-center-scheduler", daemon=True)
             self.thread.start()
 
@@ -135,6 +161,10 @@ class Runtime:
             else:
                 workspace = self.data_dir / "workspaces" / uuid.uuid4().hex
                 workspace.mkdir(parents=True, exist_ok=False)
+            runtime_context = dict(runtime_context or {})
+            runtime_context["python_runtime_env_root"] = str(self.data_dir / "runtime_envs")
+            runtime_context["python_environment_owner"] = (agent.get("config", {}).get("provenance", {}).get("orchestration_id")
+                                                           or "standalone-" + uuid.uuid4().hex)
             task = self.store.create_task(
                 agent_id, prompt, str(workspace), runtime_context=runtime_context,
             )
@@ -304,6 +334,11 @@ class Runtime:
         }
         persisted = {key: value for key, value in fields.items() if key in allowed_fields}
         self.store.update_task(task_id, **persisted)
+        owner = task.get("config", {}).get("runtime_context", {}).get("python_environment_owner", "")
+        if owner.startswith("standalone-") and fields.get("status") != "WaitingForApproval":
+            from .python_execution import PythonExecutionManager
+            PythonExecutionManager(self.data_dir / "runtime_envs", owner,
+                lambda event: self.store.append_event(task_id, event)).cleanup()
         self.store.append_event(task_id, {"event_type": "task." + fields["status"].lower(),
                                           "status": fields["status"], "level": "error" if fields["status"] == "Failed" else "info",
                                           "error": fields.get("error", ""), "output": fields.get("result", ""),
@@ -346,6 +381,9 @@ class Runtime:
         while not self.closed:
             try:
                 self._schedule_until_error()
+                if time.monotonic() - self._python_cleanup_at > 5:
+                    self.cleanup_python_environments()
+                    self._python_cleanup_at = time.monotonic()
             except Exception as exc:
                 # A malformed task or transient persistence failure cannot kill the
                 # scheduler silently and leave uncontrolled workers behind.

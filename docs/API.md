@@ -541,9 +541,10 @@ creates a file even when `content` is empty, and creates missing parent director
 automatically. If a parent path is already a file, it fails with
 `error_class=ParentPathIsFile` and names the blocking path. The worker stops the
 current tool-call batch at that error so the model can change strategy; another
-write under the same blocker is not executed. A command runs only inside a
-disposable Docker copy of the workspace; Docker failure returns
-`error_class=SandboxUnavailable` with no host fallback. A
+write under the same blocker is not executed. Python/tests/Ruff use the runtime
+venv with workspace cwd; Git retains Docker inspection. Infrastructure failures
+have no program exit code, and produce `execution_environment` facts with
+`status=unavailable`, `program_started=false`, `environment_available=false`. A
 successful command can add a `command_execution` item to
 `verification.evidence` when its bounded output directly supports a quoted
 output, exit-code, or JSON completion criterion. The Planner adds
@@ -689,7 +690,7 @@ Independent verification tasks carry `verification_mode=independent_cases` and
 `verification_cases=[{"id":"case-id","input":"0\n"}]` through semantic and
 compiled plans into task config. IDs must be unique and bounded; at most 20
 cases and 16000 characters per input are allowed. Each case runs the same
-model-selected argv in a fresh Docker process through normal capability policy.
+model-selected argv in a fresh venv Python process through normal capability policy.
 `interactive_session` keeps a single multiline stdin invocation.
 Runtime `verification.case_completed` events and structured actions expose
 `case_id`, exact sanitized `input`, technical status, `exit_code`, `stdout` and

@@ -110,7 +110,7 @@ advisory ranges, criterion links/ownership, boundaries and invalid graphs.
 Related semantic-pipeline and Worker-assignment fixtures distinguish meaningful
 checkpoints from bare scaffolding.
 
-Run Python validation only in an ephemeral Docker copy, including
+Run Python validation from the repository root, including
 `python -m unittest tests.test_plan_granularity tests.test_semantic_pipeline
 tests.test_plan_decomposition tests.test_worker_assignments -v`, then the full
 suite, compilation and CLI checks. The injected Planner converter regression

@@ -37,7 +37,8 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── worker.py             bounded Ollama/tool loop, action fingerprints, provenance-bearing verification ledger and per-agent policy
 │   ├── worker_finalization.py strict tool-free execution termination contract and historical evidence context
 │   ├── tools.py              workspace-scoped filesystem, command and applicability-aware Git tools
-│   ├── sandbox.py            disposable workspace copy and restricted Docker execution
+│   ├── python_execution.py   lazy orchestration venv, dependencies, processes and cleanup
+│   ├── sandbox.py            disposable Docker copy for read-only Git inspection
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── llm_trace.py          redacted, bounded model-call tracing and debug prompt capture
 │   ├── settings.py           central startup debug/budget settings, local/env precedence and spawn snapshot
@@ -60,9 +61,10 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── dialogs.js            agent, Skill, task and workspace-folder forms
 │   └── components.js / icons.js
 ├── tests/                    API, storage, runtime, activity, transport, policy, Skill and tool tests
-├── sandbox/Dockerfile        local Python, pytest, Ruff and Git sandbox image
+├── sandbox/Dockerfile        optional legacy Docker image for Git inspection
 ├── data/
 │   ├── agents/              versioned pipeline-agent presets and legacy Task Analyst export
+│   ├── runtime_envs/        ignored orchestration venvs and dependency state (generated)
 │   └── (runtime files)      ignored databases, logs, locks and workspaces
 └── docs/                     architecture, API and operating instructions
 ```
@@ -151,13 +153,14 @@ selects them.
    `agent_context.py` includes `agent.md` for generated agents;
    ProjectState verifies reported symbols after acceptance.
    `tools.py` resolves filesystem paths inside the assigned workspace. For
-   Python, pytest, unittest, py_compile, Ruff and read-only Git, it sends an
-   allowlisted command to `sandbox.py`; Docker receives only a disposable
-   workspace copy. `run_command` changes are discarded. Persistent edits use
+   Python, pytest, unittest, py_compile and Ruff, it sends the policy-approved
+   command to `python_execution.py`, using an orchestration venv and workspace
+   cwd. Read-only Git retains the Docker copy in `sandbox.py`. Persistent edits use
    `write_file` or `edit_file` through Policy. `write_file` creates parent
    directories for nested file paths and reports `ParentPathIsFile` when a file
    blocks one; the worker stops that call batch so it can change strategy. A
-   missing Docker daemon/image produces `SandboxUnavailable`.
+   missing Python/dependency setup produces unavailable environment evidence;
+   Docker errors apply only to Git inspection. See [Python execution](PYTHON_EXECUTION.md).
    `agent_selector.py` then validates and classifies that generated
    candidate before delegation. Runtime `Success` enters `runtime_success` and
    releases DAG dependencies. `orchestrator.py` waits until all active Tasks in
@@ -235,7 +238,8 @@ selects them.
 | Startup configuration, debug propagation or active orchestration budget | `settings.py`, `__main__.py`, `runtime.py`, `orchestrator.py`, `tests/test_settings.py`, `tests/test_run_contracts.py`, `docs/DEBUG_LLM_PROMPTS.md` |
 | Independent test inputs or multiline interactive sessions | `verification_cases.py`, `planner.py`, `plan_compiler.py`, `agent_factory.py`, `worker.py`, `final_state.py`, `tests/test_run_contracts.py` |
 | Ollama streaming, timeouts, output limits or provider telemetry | `transport.py`, adapter callers in `task_analyst.py`, `planner.py`, `worker.py`, `evaluator.py`, `recovery.py`, `integration.py`, `tests/test_transport.py` |
-| Tool implementation, dynamic tool prompt, Docker isolation or controlled stdin | `tools.py`, `sandbox.py`, `sandbox/Dockerfile`, `worker.py`, `agent_context.py`, `tests/test_tools.py`, `tests/test_core_sandbox.py` |
+| Tool implementation, Python environment lifecycle, dependencies or controlled stdin | `tools.py`, `python_execution.py`, `runtime.py`, `orchestrator.py`, `worker.py`, `final_state.py`, `tests/test_python_execution.py`, `tests/test_tools.py` |
+| Optional Git Docker isolation | `sandbox.py`, `sandbox/Dockerfile`, `tests/test_core_sandbox.py` |
 | No-op file edits, mutation accounting or repeated edit loops | `tools.py` (`tool_edit_file`), `worker.py` (`PolicyToolbox.invoke`, `run_task`), `tests/test_tools.py`, `tests/test_capabilities.py`, `tests/test_control_runtime.py` |
 | Tool-free Worker termination after no-progress | `worker_finalization.py`, `worker.py`, `llm_trace.py`, `tests/test_worker_finalization.py`, `tests/test_worker_assignments.py`, `docs/WORKER_FINALIZATION.md` |
 | Runtime evidence, structured response diagnostics or repeated policy denial | `worker.py`, `final_state.py`, `evaluator.py`, `recovery.py`, `tests/test_control_runtime.py`, `tests/test_evaluator.py`, `tests/test_recovery.py` |

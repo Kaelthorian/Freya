@@ -12,7 +12,7 @@ from .config import validate_endpoint
 from .security import sanitize
 from .transport import model_profile, model_request, request_json
 from .final_state import criterion_paths
-from .plan_evidence import verification_mode
+from .plan_evidence import verification_mode, classify_criterion, RUNTIME_BEHAVIOR
 
 
 EVALUATOR_VERSION = 9
@@ -186,13 +186,13 @@ def normalize_final_state_evidence(final_state: dict[str, Any],
             record["path"] = clip(path, 500)
         for key in ("tool", "capability", "event_id", "timestamp", "evidence_id", "result",
                     "source_task_id", "source_runtime_task_id", "worker_id",
-                    "pattern", "condition", "content_sha256", "error_class", "kind", "test_id"):
+                    "pattern", "condition", "content_sha256", "error_class", "kind", "test_id", "verification_kind"):
             value = raw.get(key)
             if isinstance(value, str) and value:
                 record[key] = clip(value, 500)
         if isinstance(raw.get("id"), str) and raw["id"]:
             record["source_record_id"] = clip(raw["id"], 200)
-        for key in ("match", "success", "changed", "content_truncated"):
+        for key in ("match", "success", "changed", "content_truncated", "program_started", "environment_available"):
             if isinstance(raw.get(key), bool):
                 record[key] = raw[key]
         if isinstance(raw.get("exit_code"), int) and not isinstance(raw.get("exit_code"), bool):
@@ -639,8 +639,10 @@ class Evaluator:
             item.get("check", ""), item.get("type", ""), item.get("tool", ""), item.get("capability", ""), command_text,
         )).casefold()
         if kind == "command":
-            return (item.get("tool") == "run_command" and isinstance(item.get("exit_code"), int)
-                    and not isinstance(item.get("exit_code"), bool))
+            return (item.get("tool") == "run_command" and (
+                    item.get("type") == "execution_environment" or
+                    item.get("error_class") == "PROCESS_TIMEOUT" and item.get("program_started") is True or
+                    isinstance(item.get("exit_code"), int) and not isinstance(item.get("exit_code"), bool)))
         if kind == "pytest":
             return item.get("type") == "pytest_result" or bool(re.search(r"\bpytest\b", descriptor))
         if kind == "unittest":
@@ -651,7 +653,7 @@ class Evaluator:
         if kind == "lint":
             return bool(re.search(r"\b(?:lint|ruff|flake8|pylint|eslint)\b", descriptor))
         if kind == "compilation":
-            return item.get("kind") == "compilation"
+            return item.get("kind") == "compilation" or item.get("verification_kind") == "compilation"
         if kind == "build":
             return bool(re.search(r"\b(?:build|compile|package)\b", descriptor))
         return False
@@ -698,13 +700,20 @@ class Evaluator:
                     ["final_file:" + path for path in paths], "deterministic"))
                 continue
             required = Evaluator._required_objective_evidence(criterion)
+            resources = (planned.get("resources_by_criterion") or {}).get(criterion, {})
+            execution_required = any(str(capability).startswith("execution.") for capability in
+                                     resources.get("capabilities", planned.get("required_capabilities") or []))
+            if not required and (classify_criterion(criterion) == RUNTIME_BEHAVIOR or execution_required) and any(
+                    item.get("type") == "execution_environment" for item in facts):
+                required = ["command"]
             gaps = []
             for requirement in required:
                 matching = [item for item in facts if Evaluator._evidence_matches_requirement(item, requirement)]
                 named_tests = re.findall(r"\btest_[\w]+\b", criterion)
                 if named_tests:
                     matching = [item for item in matching if any(name in json.dumps(item) for name in named_tests)]
-                if any(item.get("status") in {"passed", "failed"} for item in matching):
+                if (any(item.get("status") in {"passed", "failed"} for item in matching)
+                        and not any(item.get("status") == "unavailable" for item in matching)):
                     continue
                 resources = (planned.get("resources_by_criterion") or {}).get(criterion, {})
                 capabilities = set(resources.get("capabilities", planned.get("required_capabilities") or []))

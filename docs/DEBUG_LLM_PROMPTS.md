@@ -162,7 +162,7 @@ database and fake loopback provider, submits through the HTTP API, and checks
 the actual spawned Worker's flag, messages, response and startup identity.
 It also covers configuration precedence and active execution budgets.
 Run `python -m unittest tests.test_run_contracts tests.test_settings tests.test_llm_trace -v`.
-The case execution tests need the documented Docker image; absent Docker fails
+The case execution tests use the orchestration venv backend; unavailable Python fails
 closed. The tracing fixtures do not require a real Ollama model.
 
 After restart in a development instance, submit:

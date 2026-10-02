@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from control_center.agent_factory import AgentFactory
-from control_center.sandbox import SANDBOX_IMAGE, run_in_sandbox
+from control_center.sandbox import SANDBOX_IMAGE, SandboxUnavailable, run_in_sandbox
 from control_center.skills import CORE_TOOLS, SkillConfigurationError
 from control_center.storage import Store
 from control_center.tools import Toolbox
@@ -54,12 +54,11 @@ class SandboxTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_absent_docker_fails_closed_without_host_execution(self):
+    def test_optional_docker_backend_fails_closed_without_host_execution(self):
         (self.workspace / "script.py").write_text("print('unsafe')", encoding="utf-8")
         with patch("control_center.sandbox.shutil.which", return_value=None):
-            result = self.box.invoke("run_command", {"argv": ["python", "script.py"]})
-        self.assertFalse(result.success)
-        self.assertEqual(result.error_class, "SandboxUnavailable")
+            with self.assertRaises(SandboxUnavailable):
+                run_in_sandbox(self.workspace, ["python", "script.py"], 5)
 
     def test_snapshot_is_disposable_and_docker_has_no_host_environment(self):
         (self.workspace / "script.py").write_text("print('hello')", encoding="utf-8")
@@ -79,8 +78,8 @@ class SandboxTests(unittest.TestCase):
         with patch("control_center.sandbox.shutil.which", return_value="docker"), \
              patch("control_center.sandbox.subprocess.run", side_effect=fake_run), \
              patch.dict(os.environ, {"FREYA_TEST_SECRET": "do-not-forward"}):
-            result = self.box.invoke("run_command", {"argv": ["python", "script.py"]})
-        self.assertTrue(result.success, result.output)
+            result = run_in_sandbox(self.workspace, ["python", "script.py"], 5)
+        self.assertEqual(result.returncode, 0, result.stdout)
         self.assertFalse((self.workspace / "generated.txt").exists())
         self.assertEqual(outside.read_text(encoding="utf-8"), "safe")
         args = observed["command"]
@@ -154,9 +153,9 @@ print(json.dumps(result))
 '''
         (self.workspace / "probe.py").write_text(script, encoding="utf-8")
         with patch.dict(os.environ, {"FREYA_TEST_SECRET": "do-not-forward"}):
-            result = self.box.invoke("run_command", {"argv": ["python", "probe.py"]})
-        self.assertTrue(result.success, result.output)
-        observed = json.loads(result.output)
+            result = run_in_sandbox(self.workspace, ["python", "probe.py"], 5)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        observed = json.loads(result.stdout)
         for label in ("relative", "absolute", "pathlib", "remove", "rmtree", "network",
                       "child", "system", "docker_socket", "secret", "userprofile"):
             self.assertFalse(observed[label], label)

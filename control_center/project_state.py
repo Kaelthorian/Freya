@@ -21,7 +21,7 @@ from .storage import utcnow
 
 
 PROJECT_STATE_SCHEMA_VERSION = 1
-IGNORED_DIRECTORIES = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache"}
+IGNORED_DIRECTORIES = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", "runtime_envs"}
 MAX_HASH_BYTES = 1_000_000
 MAX_TEXT_BYTES = 1_000_000
 MAX_QUERY_RESULTS = 30

@@ -555,6 +555,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                         "summary": graph.summary(),
                     })
             self._archive_dynamic_agents(oid)
+            self._cleanup_python_environment(oid)
             return self.store.get_orchestration(oid)
 
     def resolve_cross_task_approval(self, approval_id: str, resolution: str) -> dict[str, Any]:
@@ -3579,7 +3580,31 @@ class Orchestrator(IntegrationOrchestrationMixin):
     def _run(self, oid, answers: dict[str, str] | None = None):
         from .llm_trace import bind_llm_trace
         with bind_llm_trace(lambda event: self.store.add_orchestration_event(oid, event)):
-            return self._run_impl(oid, answers)
+            try:
+                return self._run_impl(oid, answers)
+            finally:
+                self._cleanup_python_environment(oid)
+
+    def _cleanup_python_environment(self, oid):
+        data_dir = getattr(self.runtime, "data_dir", None)
+        if not isinstance(data_dir, (str, Path)):
+            return
+        import sqlite3
+        try:
+            run = self.store.get_orchestration(oid)
+        except (KeyError, sqlite3.Error):
+            # Preserve the original fatal exception; startup can clean once state is readable.
+            print(json.dumps({"event_type": "python_env.cleanup.failed",
+                              "orchestration_id": oid, "error_class": "state_unavailable"}), flush=True)
+            return
+        if run["status"] not in ORCHESTRATION_TERMINAL_STATUSES:
+            return
+        if any(self.store.get_task(row["task_id"])["status"] in ACTIVE_DELEGATED_TASK_STATUSES
+               for row in run.get("delegations", []) if row.get("task_id")):
+            return
+        from .python_execution import PythonExecutionManager
+        PythonExecutionManager(Path(data_dir) / "runtime_envs", oid,
+            lambda event: self.store.add_orchestration_event(oid, event)).cleanup()
 
     def _run_impl(self, oid, answers: dict[str, str] | None = None):
         # The injected legacy decision callback retains its historical test API.

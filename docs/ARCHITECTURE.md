@@ -1009,7 +1009,7 @@ ordered sessions, write declarations and different resources are never merged.
 
 After one model decision selects argv, `verification_cases.py` expands that
 command into one process per case. The Worker dispatches each through the
-existing policy and Docker boundary without model calls between cases. A nonzero
+existing policy and orchestration venv without model calls between cases. A nonzero
 exit retains its result and permits the remaining cases to run; inability to
 execute, denied permissions or cancellation still use normal failure handling.
 `verification.case_completed` and runtime actions retain case ID, exact input,
@@ -1136,12 +1136,12 @@ prevents later actions from relying on invented tool results.
   directory; task submission checks it again.
 - Tool dispatch is allowlisted. `run_command` uses argv with `shell=False` and
   accepts only workspace Python/tests, Ruff, and scoped read-only Git commands.
-- `run_command` and `git_diff` execute only in a disposable Docker copy of the
-  workspace. The container has no network or Docker socket, a read-only root,
-  no host HOME/USERPROFILE or inherited credentials, and memory, CPU, PID and
-  time limits. It mounts only the copy; results are never copied back. Docker
-  or image failure is `SandboxUnavailable`, without host fallback. Persistent
-  edits use Policy-checked filesystem tools.
+- Python, tests and Ruff use the orchestration-owned venv in
+  `python_execution.py`, absolute interpreter paths and workspace cwd. A venv
+  provides dependency isolation, not filesystem/network/resource containment.
+  Execute permission therefore trusts code with the host account permissions.
+  Git inspection retains the Docker copy in `sandbox.py`. See
+  [Python execution](PYTHON_EXECUTION.md) for lifecycle and evidence boundaries.
 - Secrets are environment references named `ACC_SECRET_...`. The worker reads
   the selected value for the Ollama Authorization header, registers it for
   redaction, then removes credential-like variables before tool subprocesses.

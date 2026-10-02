@@ -51,9 +51,12 @@ Ollama and allowlisted tools → selected agent workspace.
 - Keep reusable Skills declarative. `skills.py` validates and resolves them;
   the temporary `freya-core` Skill declares registered tools directly and
   never grants a capability. Every dynamic agent receives it.
-- Execute agent Python, tests, Ruff and Git only in an ephemeral Docker copy of
-  the assigned workspace. Never fall back to host execution or copy command
-  writes back. Missing Docker/image must fail as `SandboxUnavailable`.
+- Execute agent Python, tests and Ruff through the lazy orchestration-owned
+  venv in `python_execution.py`, with the user workspace as cwd. A venv isolates
+  dependencies, not OS permissions. Keep argv/policy/stdin/timeout checks.
+  Git inspection still uses the optional Docker copy in `sandbox.py`.
+  Preserve the environment across evaluation/recovery; clean it only after
+  terminal orchestration state and stopped children. See `docs/PYTHON_EXECUTION.md`.
 - Treat Git inspection as workspace-applicable only: non-Git task workspaces
   must not advertise `git_diff` or inject Git Inspection guidance.
 - Stop workers that repeat successful read-only actions without workspace

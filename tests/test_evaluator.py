@@ -361,6 +361,30 @@ class EvaluatorTests(unittest.TestCase):
             checks=[{"check": "tests:pytest", "status": "unavailable", "error_class": "SandboxUnavailable"}],
             capabilities=["execution.pytest"], tools=["run_command"])
         self.assertEqual(outcome["routing_target"], "orchestrator")
+
+    def test_python_infrastructure_never_becomes_unsatisfied_program_evidence(self):
+        for error in ("PYTHON_NOT_AVAILABLE", "DEPENDENCY_SETUP_FAILED", "ENVIRONMENT_UNAVAILABLE"):
+            for criterion in ("Script runs correctly.", "The program handles invalid input correctly.",
+                              "Invalid input is handled gracefully."):
+                outcome, seen = self.run_evaluation([criterion], checks=[{
+                    "tool": "run_command", "command": ["python", "temperature_converter.py"],
+                    "status": "failed", "exit_code": 1, "program_started": False,
+                    "environment_available": False, "error_class": error}],
+                    capabilities=["execution.python_script"], tools=["run_command"])
+                self.assertEqual(outcome["criteria"][0]["status"], "unknown")
+                self.assertEqual(outcome["routing_target"], "orchestrator")
+                self.assertEqual(seen, [])
+
+    def test_one_unavailable_case_is_not_hidden_by_another_successful_case(self):
+        outcome, seen = self.run_evaluation(["Script runs correctly."], checks=[
+            {"tool": "run_command", "command": ["python", "converter.py"], "case_id": "zero",
+             "exit_code": 0, "program_started": True},
+            {"tool": "run_command", "command": ["python", "converter.py"], "case_id": "hundred",
+             "program_started": False, "error_class": "ENVIRONMENT_UNAVAILABLE"}],
+            capabilities=["execution.python_script"], tools=["run_command"])
+        self.assertEqual(outcome["criteria"][0]["status"], "unknown")
+        self.assertEqual(outcome["routing_target"], "orchestrator")
+        self.assertEqual(seen, [])
         self.assertEqual(seen, [])
 
     def test_technical_failure_record_is_not_semantic_rejection(self):
