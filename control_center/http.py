@@ -140,9 +140,31 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Stream not found.")
         if task_id:
             store.get_task(task_id)
-        after = int(self.headers.get("Last-Event-ID") or query.get("after", "0"))
-        if after < 0:
-            raise ValueError("Invalid cursor.")
+        cursor = self.headers.get("Last-Event-ID") or query.get("after", "")
+        if task_id:
+            after = int(cursor or 0)
+            if after < 0:
+                raise ValueError("Invalid cursor.")
+            runtime_after, orchestration_after = after, 0
+        else:
+            # New global cursors keep each table's independent sequence. A
+            # legacy numeric cursor resumes runtime events and replays the
+            # orchestration stream, which was invisible to older clients.
+            runtime_after, orchestration_after = 0, 0
+            if cursor:
+                if cursor.isdecimal():
+                    runtime_after = int(cursor)
+                else:
+                    values = {}
+                    for part in cursor.split(";"):
+                        key, separator, value = part.partition("=")
+                        if not separator or key not in {"runtime", "orchestration"} or not value.isdecimal():
+                            raise ValueError("Invalid cursor.")
+                        values[key] = int(value)
+                    if set(values) != {"runtime", "orchestration"}:
+                        raise ValueError("Invalid cursor.")
+                    runtime_after = values["runtime"]
+                    orchestration_after = values["orchestration"]
         if not self.server.sse_slots.acquire(blocking=False):
             raise ApiError(503, "Too many event connections.")
         try:
@@ -156,16 +178,49 @@ class Handler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + 50
             heartbeat = time.monotonic()
             while not self.server.stopping.is_set() and time.monotonic() < deadline:
-                events = store.list_events(task_id=task_id, after=after, limit=200)
-                for event in events:
-                    data = json.dumps(sanitize(event), ensure_ascii=False, allow_nan=False)
-                    self.wfile.write(f"id: {event['id']}\nevent: update\ndata: {data}\n\n".encode("utf-8"))
-                    after = event["id"]
+                if task_id:
+                    events = store.list_events(task_id=task_id, after=runtime_after,
+                                               limit=200, runtime_only=True)
+                else:
+                    events = store.list_events(
+                        runtime_after=runtime_after, orchestration_after=orchestration_after,
+                        limit=400, per_source_limit=200,
+                    )
+                if task_id:
+                    for event in events:
+                        data = json.dumps(sanitize(event), ensure_ascii=False, allow_nan=False)
+                        self.wfile.write(f"id: {event['id']}\nevent: update\ndata: {data}\n\n".encode("utf-8"))
+                        runtime_after = event["id"]
+                elif events:
+                    # Advance only through the per-source prefixes actually
+                    # delivered. This keeps an interrupted connection from
+                    # skipping an event when source timestamps are out of ID
+                    # order; an already-sent event can be replayed after an
+                    # interrupted batch until the source prefix is complete.
+                    candidates = {
+                        source: sorted(int(item["source_id"]) for item in events if item["source"] == source)
+                        for source in ("runtime", "orchestration")
+                    }
+                    delivered = {"runtime": set(), "orchestration": set()}
+                    frontier = {"runtime": runtime_after, "orchestration": orchestration_after}
+                    for event in events:
+                        source = event["source"]
+                        source_id = int(event["source_id"])
+                        delivered[source].add(source_id)
+                        for candidate_id in candidates[source]:
+                            if candidate_id in delivered[source]:
+                                frontier[source] = candidate_id
+                            else:
+                                break
+                        data = json.dumps(sanitize(event), ensure_ascii=False, allow_nan=False)
+                        event_cursor = f"runtime={frontier['runtime']};orchestration={frontier['orchestration']}"
+                        self.wfile.write(f"id: {event_cursor}\nevent: update\ndata: {data}\n\n".encode("utf-8"))
+                    runtime_after, orchestration_after = frontier["runtime"], frontier["orchestration"]
                 if events or time.monotonic() - heartbeat > 10:
                     self.wfile.write(b": heartbeat\n\n")
                     self.wfile.flush()
                     heartbeat = time.monotonic()
-                if len(events) < 200:
+                if len(events) < (200 if task_id else 400):
                     self.server.stopping.wait(0.4)
         except (ConnectionError, TimeoutError, OSError):
             pass

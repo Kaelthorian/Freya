@@ -696,6 +696,7 @@ main:has(.mission-control) + .page-footer { padding-block: 8px; }
 
 .mission-workflow { padding: 0; }
 .mission-workflow .mission-panel-heading { min-height: 31px; padding-block: 4px; border-bottom: 0; }
+.mission-workflow-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .mission-workflow-body { display: grid; grid-template-columns: minmax(250px, .8fr) minmax(0, 1.7fr); align-items: center; gap: 13px; padding: 0 10px 9px; }
 .mission-workflow-copy { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 0 9px; min-width: 0; }
 .mission-workflow-copy strong { grid-row: span 2; color: var(--green); font-size: 28px; font-weight: 650; }

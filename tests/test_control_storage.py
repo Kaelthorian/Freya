@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from control_center.config import normalize_agent, TOOL_CATALOG
 from control_center.storage import Store
@@ -161,6 +162,102 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(planner_events[0]["who"], "orchestrator")
         self.assertEqual({item["orchestration_id"] for item in grouped}, {run["id"]})
         self.assertEqual({item["agent_name"] for item in grouped if item.get("source") != "orchestration"}, {"Coder", "Auditor"})
+
+    def test_unified_log_reader_merges_sources_filters_then_applies_global_limit(self):
+        agent = self.agent("Log source")
+        run = self.store.create_orchestration("Unified event stream")
+        other_run = self.store.create_orchestration("Separate event stream")
+        times = [f"2026-01-01T00:00:{second:02d}+00:00" for second in range(1, 14)]
+        for index in (0, 2, 4, 6, 8, 10, 12):
+            self.store.append_event(None, {
+                "agent_id": agent["id"], "orchestration_id": run["id"],
+                "event_type": f"runtime.{index}", "timestamp": times[index],
+            })
+        for index in (1, 3, 5, 7, 9):
+            with patch("control_center.storage.utcnow", return_value=times[index]):
+                self.store.add_orchestration_event(run["id"], {
+                    "event_type": f"freya.phase.{index}", "status": "Planning",
+                })
+        with patch("control_center.storage.utcnow", return_value=times[11]):
+            self.store.add_orchestration_event(other_run["id"], {
+                "event_type": "freya.other", "status": "Planning",
+            })
+
+        all_events = self.store.list_events(orchestration_id=run["id"], limit=None)
+        self.assertEqual([event["event_type"] for event in all_events], [
+            "runtime.0", "freya.phase.1", "runtime.2", "freya.phase.3",
+            "runtime.4", "freya.phase.5", "runtime.6", "freya.phase.7",
+            "runtime.8", "freya.phase.9", "runtime.10", "runtime.12",
+        ])
+        self.assertEqual([event["event_type"] for event in self.store.list_events(
+            orchestration_id=run["id"], limit=5)],
+            [event["event_type"] for event in all_events[:5]])
+        self.assertEqual({event["source"] for event in all_events}, {"runtime", "orchestration"})
+        self.assertTrue(all(event["log_id"].startswith(event["source"] + ":") for event in all_events))
+        self.assertEqual(len({event["log_id"] for event in all_events}), len(all_events))
+
+    def test_unified_logs_preserve_colliding_source_ids_and_find_failed_orchestration_events(self):
+        agent = self.agent("Log source")
+        run = self.store.create_orchestration("Terminal event coverage")
+        other_run = self.store.create_orchestration("Other run")
+        for index in range(10):
+            self.store.append_event(None, {
+                "agent_id": agent["id"], "orchestration_id": run["id"],
+                "event_type": f"runtime.{index}", "timestamp": f"2026-01-01T00:00:{index:02d}+00:00",
+            })
+            with patch("control_center.storage.utcnow", return_value=f"2026-01-01T00:01:{index:02d}+00:00"):
+                self.store.add_orchestration_event(run["id"], {
+                    "event_type": "freya.failed" if index == 0 else f"freya.phase.{index}",
+                    "status": "Failed" if index == 0 else "Planning",
+                    "message": "Compiler rejected the plan" if index == 0 else "Phase recorded",
+                    "agent_id": agent["id"], "tool": "run_command" if index == 0 else None,
+                })
+        with patch("control_center.storage.utcnow", return_value="2026-01-01T00:02:00+00:00"):
+            self.store.add_orchestration_event(other_run["id"], {
+                "event_type": "freya.other", "status": "Planning",
+            })
+
+        events = self.store.list_events(limit=None)
+        runtime_ids = {event["source_id"] for event in events if event["source"] == "runtime"}
+        orchestration_ids = {event["source_id"] for event in events if event["source"] == "orchestration"}
+        self.assertTrue(runtime_ids & orchestration_ids)
+        self.assertEqual(len({event["log_id"] for event in events}), len(events))
+        failures = self.store.list_events(error_only=True)
+        failure = next(event for event in failures if event["event_type"] == "freya.failed")
+        self.assertEqual(failure["source"], "orchestration")
+        self.assertEqual(failure["level"], "ERROR")
+        self.assertEqual(failure["raw_status"], "Failed")
+        self.assertEqual(failure["status"], "Failed")
+        selected = self.store.list_events(agent_id=agent["id"], level="error", tool="run_command",
+                                          date_from="2026-01-01", date_to="2026-01-01")
+        self.assertEqual([event["event_type"] for event in selected], ["freya.failed"])
+        self.assertEqual(len(self.store.list_events(orchestration_id=run["id"], limit=None)), 20)
+        self.assertNotIn("freya.other", [event["event_type"] for event in self.store.list_events(
+            orchestration_id=run["id"], limit=None)])
+
+    def test_task_log_reader_keeps_runtime_default_and_can_include_linked_orchestration_events(self):
+        agent = self.agent("Task log source")
+        task = self.task(agent)
+        run = self.store.create_orchestration("Link task and orchestration evidence")
+        self.store.transition_orchestration(run["id"], "Queued", "Running")
+        self.store.add_delegation(run["id"], agent["id"], "Implement", task["id"])
+        runtime_event = self.store.append_event(task["id"], {
+            "event_type": "verification.case_completed", "status": "Passed",
+        })
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "evaluator.evidence_prepared", "status": "Evaluating",
+            "task_id": "plan-task-1", "runtime_task_id": task["id"],
+        })
+
+        default_events = self.store.list_events(task_id=task["id"], limit=None)
+        self.assertTrue(all(event["source"] == "runtime" for event in default_events))
+        self.assertIn(runtime_event["id"], [event["id"] for event in default_events])
+        included = self.store.list_events(task_id=task["id"], include_orchestration=True, limit=None)
+        self.assertEqual({event["source"] for event in included}, {"runtime", "orchestration"})
+        evidence_event = next(event for event in included
+                              if event["event_type"] == "evaluator.evidence_prepared")
+        self.assertEqual(evidence_event["runtime_task_id"], task["id"])
+        self.assertEqual(evidence_event["orchestration_id"], run["id"])
 
     def test_runtime_events_include_complete_actor_trace(self):
         agent = self.agent("Programmer", role="Programmer")

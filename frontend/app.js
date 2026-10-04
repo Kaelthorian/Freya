@@ -297,7 +297,7 @@ function restoreUI(saved) {
 async function render(navigation = false) {
   const current = route();
   if (current.page === 'freya') { location.hash = '#/dashboard'; return; }
-  const sequence = ++renderSequence, saved = preserveUI();
+  const sequence = ++renderSequence;
   updateChrome();
   try {
     let html;
@@ -311,6 +311,7 @@ async function render(navigation = false) {
     else if (current.page === 'settings') html = settings();
     else html = empty('search', 'This page does not exist', 'Return to the dashboard to continue.', '<a class="button primary" href="#/dashboard">Open dashboard</a>');
     if (sequence !== renderSequence) return;
+    const saved = navigation ? null : preserveUI();
     main.innerHTML = html;
     if (navigation) window.scrollTo({ top: 0, behavior: 'instant' }); else restoreUI(saved);
   } catch (error) {
@@ -387,7 +388,7 @@ document.addEventListener('click', async event => {
         toast('All logs copied to the clipboard.');
         return;
       }
-      const clipboardText = api('/logs?limit=10000').then(events => events.map(e => e.timestamp + ' [' + e.level + '] Task ' + (e.task_id || 'system') + ' Agent ' + (e.agent_name || e.agent_id || '—') + ' ' + e.event_type + (e.tool ? ' · ' + e.tool : '') + (e.capability ? ' · capability=' + e.capability : '') + (e.policy_decision ? ' · policy=' + e.policy_decision : '') + (e.error ? ' · ' + e.error : '')).join('\n'));
+      const clipboardText = api('/logs?limit=10000').then(events => serialize({ event_count: events.length, events }));
       if (navigator.clipboard?.write && typeof ClipboardItem === 'function') {
         try {
           const item = new ClipboardItem({ 'text/plain': clipboardText.then(text => new Blob([text], { type: 'text/plain' })) });

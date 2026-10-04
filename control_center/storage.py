@@ -2347,58 +2347,97 @@ class Store(IntegrationStoreMixin):
 
     def list_events(self, task_id: str | None = None, after: int = 0,
                     limit: int | None = 200, **filters: Any) -> list[dict]:
+        """Read one normalized stream over runtime and orchestration events.
+
+        ``after`` remains the runtime event cursor for compatibility. Global
+        SSE supplies independent source cursors and a per-source page size.
+        Limits are applied only after both sources have been normalized and
+        merged, so a page is a page of the unified stream.
+        """
         bounded_limit = None if limit is None else max(1, min(int(limit), 10000))
-        where, params = ["e.id > ?"], [max(0, int(after))]
-        for column, value in (("e.task_id", task_id), ("e.agent_id", filters.get("agent_id")),
-                              ("e.level", filters.get("level")), ("e.tool", filters.get("tool")),
-                              ("d.orchestration_id", filters.get("orchestration_id"))):
-            if value:
-                where.append(column + "=?")
-                params.append(str(value).upper() if column.endswith(".level") else value)
-        if filters.get("error_only"):
-            where.append("(e.level IN ('ERROR','CRITICAL') OR (e.error IS NOT NULL AND e.error != ''))")
-        if filters.get("date_from"):
-            where.append("e.timestamp >= ?")
-            params.append(filters["date_from"])
-        if filters.get("date_to"):
-            end = str(filters["date_to"])
-            if len(end) == 10:
-                end = (datetime.fromisoformat(end) + timedelta(days=1)).date().isoformat()
-                where.append("e.timestamp < ?")
-            else:
-                where.append("e.timestamp <= ?")
-            params.append(end)
+        runtime_after = max(0, int(filters.get("runtime_after", after)))
+        orchestration_after = max(0, int(filters.get("orchestration_after", 0)))
+        per_source_limit = filters.get("per_source_limit")
+        if per_source_limit is not None:
+            per_source_limit = max(1, min(int(per_source_limit), 10000))
+        date_from = str(filters.get("date_from") or "")
+        date_to = str(filters.get("date_to") or "")
+        date_to_exclusive = None
+        if len(date_to) == 10:
+            date_to_exclusive = (datetime.fromisoformat(date_to) + timedelta(days=1)).date().isoformat()
+
+        def matches(event: dict) -> bool:
+            if task_id:
+                task_ids = {str(value) for value in (
+                    event.get("task_id"), event.get("runtime_task_id"),
+                ) if value is not None}
+                if str(task_id) not in task_ids:
+                    return False
+            for key in ("agent_id", "tool", "orchestration_id"):
+                expected = filters.get(key)
+                if expected and str(event.get(key) or "") != str(expected):
+                    return False
+            expected_level = filters.get("level")
+            if expected_level and str(event.get("level") or "").upper() != str(expected_level).upper():
+                return False
+            timestamp = str(event.get("timestamp") or "")
+            if date_from and timestamp < date_from:
+                return False
+            if date_to_exclusive and timestamp >= date_to_exclusive:
+                return False
+            if date_to and not date_to_exclusive and timestamp > date_to:
+                return False
+            if filters.get("error_only"):
+                status = str(event.get("status") or "").casefold()
+                event_type = str(event.get("event_type") or "").casefold()
+                if not (
+                    str(event.get("level") or "").upper() in {"ERROR", "CRITICAL"}
+                    or bool(event.get("error"))
+                    or status in {"failed", "denied"}
+                    or any(marker in event_type for marker in ("failed", "blocked", "denied"))
+                ):
+                    return False
+            return True
+
         with self._connection() as connection:
-            order = "DESC" if filters.get("newest") else "ASC"
-            query = (
+            runtime_where = ["e.id > ?"]
+            runtime_params: list[Any] = [runtime_after]
+            if task_id:
+                runtime_where.append("e.task_id=?")
+                runtime_params.append(task_id)
+            runtime_query = (
                 "SELECT e.id,e.payload_json,t.agent_name AS task_agent_name,t.agent_role AS task_agent_role,"
                 "t.workspace AS task_workspace,a.name AS current_agent_name,a.role AS current_agent_role,"
-                "d.orchestration_id,o.prompt AS orchestration_prompt,o.status AS orchestration_status,"
+                "(SELECT d.orchestration_id FROM orchestration_delegations d "
+                " WHERE d.task_id=e.task_id ORDER BY d.created_at DESC LIMIT 1) AS orchestration_id,"
+                "o.prompt AS orchestration_prompt,o.status AS orchestration_status,"
                 "o.created_at AS orchestration_created_at FROM log_events e "
-                "LEFT JOIN tasks t ON t.id=e.task_id "
-                "LEFT JOIN agents a ON a.id=e.agent_id "
-                "LEFT JOIN orchestration_delegations d ON d.task_id=e.task_id "
-                "LEFT JOIN orchestration_runs o ON o.id=d.orchestration_id WHERE "
-                + " AND ".join(where)
-                + " ORDER BY e.id " + order
+                "LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN agents a ON a.id=e.agent_id "
+                "LEFT JOIN orchestration_runs o ON o.id=(SELECT d.orchestration_id "
+                " FROM orchestration_delegations d WHERE d.task_id=e.task_id "
+                " ORDER BY d.created_at DESC LIMIT 1) WHERE " + " AND ".join(runtime_where)
+                + " ORDER BY e.id ASC"
             )
-            query_params = list(params)
-            if bounded_limit is not None:
-                query += " LIMIT ?"
-                query_params.append(bounded_limit)
-            rows = connection.execute(query, query_params)
-            result = []
-            for row in rows:
-                payload = dict(_load(row["payload_json"]), id=row["id"])
+            if per_source_limit is not None:
+                runtime_query += " LIMIT ?"
+                runtime_params.append(per_source_limit)
+            result: list[dict] = []
+            for row in connection.execute(runtime_query, runtime_params):
+                payload = _load(row["payload_json"])
+                if not isinstance(payload, dict):
+                    payload = {}
+                source_id = int(row["id"])
+                payload.update({"id": source_id, "source_id": source_id,
+                                "log_id": f"runtime:{source_id}", "source": "runtime"})
                 payload["agent_name"] = row["task_agent_name"] or row["current_agent_name"] or payload.get("agent_id", "—")
-                payload.setdefault("source", "runtime")
                 payload.setdefault("runtime_task_id", payload.get("task_id"))
                 if not payload.get("agent_role"):
                     payload["agent_role"] = row["task_agent_role"] or row["current_agent_role"]
                 if not payload.get("workspace"):
                     payload["workspace"] = row["task_workspace"]
-                if not payload.get("orchestration_id"):
-                    payload["orchestration_id"] = row["orchestration_id"]
+                effective_orchestration_id = row["orchestration_id"] or payload.get("orchestration_id")
+                if effective_orchestration_id:
+                    payload["orchestration_id"] = effective_orchestration_id
                 payload.update({
                     key: value for key, value in self._trace_fields(
                         payload, source="runtime", trace_id=payload.get("orchestration_id") or payload.get("task_id"),
@@ -2406,86 +2445,98 @@ class Store(IntegrationStoreMixin):
                         workspace=payload.get("workspace"), timestamp=payload.get("timestamp"),
                     ).items() if value is not None and payload.get(key) is None
                 })
-                if row["orchestration_id"]:
-                    payload["orchestration_id"] = row["orchestration_id"]
-                    payload["orchestration_prompt"] = row["orchestration_prompt"] or ""
-                    payload["orchestration_status"] = row["orchestration_status"] or ""
-                    payload["orchestration_created_at"] = row["orchestration_created_at"] or ""
-                result.append(payload)
-            orchestration_id = filters.get("orchestration_id")
-            if orchestration_id:
-                orchestration_where = ["oe.orchestration_id=?"]
-                orchestration_params: list[Any] = [str(orchestration_id)]
-                if filters.get("agent_id"):
-                    orchestration_where.append("oe.agent_id=?")
-                    orchestration_params.append(str(filters["agent_id"]))
-                if filters.get("date_from"):
-                    orchestration_where.append("oe.timestamp >= ?")
-                    orchestration_params.append(filters["date_from"])
-                if filters.get("date_to"):
-                    end = str(filters["date_to"])
-                    if len(end) == 10:
-                        end = (datetime.fromisoformat(end) + timedelta(days=1)).date().isoformat()
-                        orchestration_where.append("oe.timestamp < ?")
+                if effective_orchestration_id:
+                    if row["orchestration_id"] == effective_orchestration_id:
+                        run_prompt = row["orchestration_prompt"]
+                        run_status = row["orchestration_status"]
+                        run_created_at = row["orchestration_created_at"]
                     else:
-                        orchestration_where.append("oe.timestamp <= ?")
-                    orchestration_params.append(end)
-                if filters.get("error_only"):
-                    orchestration_where.append(
-                        "(oe.status IN ('Failed','Denied') OR lower(oe.event_type) LIKE '%failed%' "
-                        "OR lower(oe.event_type) LIKE '%blocked%' OR lower(oe.event_type) LIKE '%denied%')"
-                    )
-                orchestration_rows = connection.execute(
+                        run = connection.execute(
+                            "SELECT prompt,status,created_at FROM orchestration_runs WHERE id=?",
+                            (effective_orchestration_id,),
+                        ).fetchone()
+                        run_prompt = run["prompt"] if run else ""
+                        run_status = run["status"] if run else ""
+                        run_created_at = run["created_at"] if run else ""
+                    payload["orchestration_prompt"] = run_prompt or ""
+                    payload["orchestration_status"] = run_status or ""
+                    payload["orchestration_created_at"] = run_created_at or ""
+                if matches(payload):
+                    result.append(payload)
+
+            orchestration_rows = []
+            include_orchestration = bool(filters.get("include_orchestration"))
+            task_runtime_only = bool(task_id) and not include_orchestration
+            if not filters.get("runtime_only") and not task_runtime_only:
+                orchestration_query = (
                     "SELECT oe.*,a.name AS orchestration_agent_name,a.role AS orchestration_agent_role,"
-                    "o.config_json AS orchestration_config_json "
+                    "o.config_json AS orchestration_config_json,o.prompt AS orchestration_prompt,"
+                    "o.status AS orchestration_status,o.created_at AS orchestration_created_at "
                     "FROM orchestration_events oe LEFT JOIN agents a ON a.id=oe.agent_id "
                     "LEFT JOIN orchestration_runs o ON o.id=oe.orchestration_id "
-                    "WHERE " + " AND ".join(orchestration_where) + " ORDER BY oe.id ASC",
-                    orchestration_params,
+                    "WHERE oe.id > ? ORDER BY oe.id ASC"
                 )
-                for row in orchestration_rows:
-                    payload = _load(row["payload_json"])
-                    if not isinstance(payload, dict):
-                        payload = {}
-                    runtime_task = None
-                    runtime_task_id = payload.get("runtime_task_id")
-                    if runtime_task_id:
-                        runtime_task = connection.execute(
-                            "SELECT agent_id,agent_name,agent_role,workspace FROM tasks WHERE id=?",
-                            (runtime_task_id,),
-                        ).fetchone()
-                    payload.update({
-                        "id": "orchestration:" + str(row["id"]),
-                        "log_id": "orchestration:" + str(row["id"]),
-                        "source": "orchestration",
-                        "orchestration_id": row["orchestration_id"],
-                        "timestamp": row["timestamp"],
-                        "event_type": row["event_type"],
-                        "status": row["status"] or payload.get("status") or "INFO",
-                        "level": str(payload.get("level") or
-                                     ("ERROR" if str(row["status"] or "").casefold() in {"failed", "denied"} else "INFO")).upper(),
-                        "agent_id": row["agent_id"] or payload.get("agent_id") or (runtime_task["agent_id"] if runtime_task else None),
-                        "agent_name": row["orchestration_agent_name"] or payload.get("agent_name") or (runtime_task["agent_name"] if runtime_task else None) or row["agent_id"] or "—",
-                        "agent_role": row["orchestration_agent_role"] or payload.get("agent_role") or (runtime_task["agent_role"] if runtime_task else None),
-                        "task_id": row["task_id"] or payload.get("task_id"),
-                        "message": row["message"] or payload.get("message") or payload.get("reason") or "",
-                    })
-                    if not payload.get("workspace") and runtime_task:
-                        payload["workspace"] = runtime_task["workspace"]
-                    if not payload.get("workspace"):
-                        config = _load(row["orchestration_config_json"]) or {}
-                        payload["workspace"] = config.get("workspace_path")
-                    payload.setdefault("runtime_task_id", payload.get("task_id"))
-                    payload.update({
-                        key: value for key, value in self._trace_fields(
-                            payload, source="orchestration", trace_id=row["orchestration_id"],
-                            agent_name=payload.get("agent_name"), actor_role=payload.get("actor_role"),
-                            workspace=payload.get("workspace"), timestamp=row["timestamp"],
-                        ).items() if value is not None and payload.get(key) is None
-                    })
+                orchestration_params: list[Any] = [orchestration_after]
+                if per_source_limit is not None:
+                    orchestration_query += " LIMIT ?"
+                    orchestration_params.append(per_source_limit)
+                orchestration_rows = connection.execute(orchestration_query, orchestration_params)
+            for row in orchestration_rows:
+                payload = _load(row["payload_json"])
+                if not isinstance(payload, dict):
+                    payload = {}
+                source_id = int(row["id"])
+                runtime_task_id = payload.get("runtime_task_id")
+                runtime_task = connection.execute(
+                    "SELECT agent_id,agent_name,agent_role,workspace FROM tasks WHERE id=?",
+                    (runtime_task_id,),
+                ).fetchone() if runtime_task_id else None
+                status = row["status"] or payload.get("status")
+                raw_status = status
+                level = str(payload.get("level") or "INFO").upper()
+                if str(status or "").casefold() in {"failed", "denied"}:
+                    level = "ERROR"
+                payload.update({
+                    "id": f"orchestration:{source_id}",
+                    "source_id": source_id,
+                    "log_id": f"orchestration:{source_id}",
+                    "source": "orchestration",
+                    "orchestration_id": row["orchestration_id"],
+                    "timestamp": row["timestamp"],
+                    "event_type": row["event_type"],
+                    "status": status,
+                    "level": level,
+                    "agent_id": row["agent_id"] or payload.get("agent_id") or (runtime_task["agent_id"] if runtime_task else None),
+                    "agent_name": row["orchestration_agent_name"] or payload.get("agent_name") or (runtime_task["agent_name"] if runtime_task else None) or row["agent_id"] or "—",
+                    "agent_role": row["orchestration_agent_role"] or payload.get("agent_role") or (runtime_task["agent_role"] if runtime_task else None),
+                    "task_id": row["task_id"] or payload.get("task_id"),
+                    "message": row["message"] or payload.get("message") or payload.get("reason") or "",
+                })
+                if raw_status is not None:
+                    payload["raw_status"] = raw_status
+                if not payload.get("workspace") and runtime_task:
+                    payload["workspace"] = runtime_task["workspace"]
+                if not payload.get("workspace"):
+                    config = _load(row["orchestration_config_json"]) or {}
+                    payload["workspace"] = config.get("workspace_path")
+                payload.setdefault("runtime_task_id", payload.get("task_id"))
+                payload.update({
+                    key: value for key, value in self._trace_fields(
+                        payload, source="orchestration", trace_id=row["orchestration_id"],
+                        agent_name=payload.get("agent_name"), actor_role=payload.get("actor_role"),
+                        workspace=payload.get("workspace"), timestamp=row["timestamp"],
+                    ).items() if value is not None and payload.get(key) is None
+                })
+                payload["orchestration_prompt"] = row["orchestration_prompt"] or ""
+                payload["orchestration_status"] = row["orchestration_status"] or ""
+                payload["orchestration_created_at"] = row["orchestration_created_at"] or ""
+                if matches(payload):
                     result.append(payload)
-            result.sort(key=lambda item: (str(item.get("timestamp") or ""), str(item.get("id") or "")),
-                        reverse=bool(filters.get("newest")))
+
+            result.sort(key=lambda item: (
+                str(item.get("timestamp") or ""), str(item.get("source") or ""),
+                int(item.get("source_id") or 0),
+            ), reverse=bool(filters.get("newest")))
             return result if bounded_limit is None else result[:bounded_limit]
 
     def metrics(self, agent_id: str | None = None) -> dict:

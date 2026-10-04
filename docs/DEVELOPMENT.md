@@ -55,7 +55,7 @@ The Planner and built-in Task Analyst use loopback Ollama with separate
 configuration:
 
 ```powershell
-python -m control_center --planner-model qwen2.5-coder:7b `
+python -m control_center --planner-model phi4:14b `
   --planner-endpoint http://127.0.0.1:11434 --planner-timeout 120 `
   --task-analyst-model qwen2.5-coder:7b `
   --task-analyst-endpoint http://127.0.0.1:11434 --task-analyst-timeout 120
@@ -330,7 +330,7 @@ receives a current Final State Snapshot prepared by the parent, plus final verif
 Every assigned Task node references that one immutable evaluation.
 
 ```powershell
-python -m control_center --evaluator-model qwen2.5-coder:7b `
+python -m control_center --evaluator-model phi4:14b `
   --evaluator-endpoint http://127.0.0.1:11434 --evaluator-timeout 120
 ```
 

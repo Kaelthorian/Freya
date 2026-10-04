@@ -69,6 +69,16 @@ class ApiTests(unittest.TestCase):
         connection.close()
         return response.status, json.loads(data)
 
+    @staticmethod
+    def read_sse_event(response):
+        event_id = None
+        while True:
+            line = response.readline().decode()
+            if line.startswith("id:"):
+                event_id = line.partition(":")[2].strip()
+            elif line.startswith("data:"):
+                return event_id, json.loads(line.partition(":")[2].strip())
+
     def test_gpu_telemetry_reads_nvidia_smi_metrics_and_caches_them(self):
         app = Application(self.store, self.runtime, self.directory)
         result = subprocess.CompletedProcess(
@@ -287,6 +297,106 @@ class ApiTests(unittest.TestCase):
         text = "".join(lines)
         self.assertIn(f"id: {second['id']}", text)
         self.assertNotIn("test.first", text)
+
+    def test_task_logs_include_orchestration_rows_only_when_requested(self):
+        agent = self.request("POST", "/api/agents", {"name": "Task log API"})[1]
+        task = self.store.create_task(agent["id"], "Calculator task", "workspace")
+        run = self.store.create_orchestration("Build calculator")
+        self.store.transition_orchestration(run["id"], "Queued", "Running")
+        self.store.add_delegation(run["id"], agent["id"], "Implement calculator", task["id"])
+        self.store.add_orchestration_event(run["id"], {
+            "event_type": "evaluator.evidence_prepared", "status": "Evaluating",
+            "task_id": "calculator-task", "runtime_task_id": task["id"],
+        })
+
+        status, runtime_only = self.request("GET", f"/api/logs?task_id={task['id']}")
+        self.assertEqual(status, 200)
+        self.assertTrue(all(event["source"] == "runtime" for event in runtime_only))
+        status, linked = self.request(
+            "GET", f"/api/logs?task_id={task['id']}&include_orchestration=true")
+        self.assertEqual(status, 200)
+        self.assertIn("orchestration", [event["source"] for event in linked])
+
+    def test_calculator_global_logs_and_sse_include_runtime_and_terminal_events_with_replay_cursor(self):
+        run = self.store.create_orchestration(
+            "Build a simple calculator with add, subtract, multiply and divide.")
+        agent = self.store.create_agent(normalize_agent({"name": "Calculator worker"}))
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
+        connection.request("GET", "/api/events")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.readline().decode().startswith("retry:"))
+        self.assertTrue(response.readline().decode().startswith(":"))
+        self.assertIn(response.readline().decode(), {"\n", "\r\n"})
+
+        terminal_events = [
+            ("freya.completed", "Success"),
+            ("freya.failed", "Failed"),
+            ("freya.cancelled", "Cancelled"),
+            ("freya.interrupted", "Failed"),
+        ]
+        for index, (event_type, status) in enumerate(terminal_events):
+            with patch("control_center.storage.utcnow", return_value=f"2026-01-01T00:00:0{index}+00:00"):
+                self.store.add_orchestration_event(run["id"], {
+                    "event_type": event_type, "status": status, "message": event_type,
+                })
+        self.store.append_event(None, {
+            "agent_id": agent["id"], "orchestration_id": run["id"],
+            "event_type": "verification.case_started", "status": "Running",
+            "timestamp": "2026-01-01T00:00:05+00:00", "input": "5 + 3",
+        })
+        self.store.append_event(None, {
+            "agent_id": agent["id"], "orchestration_id": run["id"],
+            "event_type": "verification.case_completed", "status": "Passed",
+            "timestamp": "2026-01-01T00:00:04+00:00", "output": "8",
+        })
+
+        status, logs = self.request("GET", f"/api/logs?orchestration_id={run['id']}&limit=10")
+        self.assertEqual(status, 200)
+        self.assertEqual({event["event_type"] for event in logs},
+                         {event_type for event_type, _ in terminal_events} |
+                         {"verification.case_started", "verification.case_completed"})
+        self.assertEqual({event["source"] for event in logs}, {"runtime", "orchestration"})
+        self.assertEqual(len({event["log_id"] for event in logs}), len(logs))
+        failed = next(event for event in logs if event["event_type"] == "freya.failed")
+        self.assertEqual(failed["level"], "ERROR")
+        self.assertEqual(failed["raw_status"], "Failed")
+
+        first_cursor, first_event = self.read_sse_event(response)
+        self.assertEqual(first_event["event_type"], "freya.completed")
+        self.assertEqual(first_event["source"], "orchestration")
+        self.assertEqual(first_cursor, "runtime=0;orchestration=1")
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
+        connection.request("GET", "/api/events", headers={"Last-Event-ID": first_cursor})
+        response = connection.getresponse()
+        replayed = [self.read_sse_event(response) for _ in range(5)]
+        self.assertEqual([event["event_type"] for _, event in replayed], [
+            "freya.failed", "freya.cancelled", "freya.interrupted",
+            "verification.case_completed", "verification.case_started",
+        ])
+        final_cursor = replayed[-1][0]
+        self.assertEqual(replayed[-2][0], "runtime=0;orchestration=4")
+        self.assertEqual(final_cursor, "runtime=2;orchestration=4")
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=0.8)
+        connection.request("GET", "/api/events", headers={"Last-Event-ID": final_cursor})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        # The connection banner is not an event. With the final composite
+        # cursor, this stream must not replay any terminal event.
+        banner = response.readline().decode()
+        self.assertTrue(banner.startswith("retry:"))
+        self.assertTrue(response.readline().decode().startswith(":"))
+        self.assertIn(response.readline().decode(), {"\n", "\r\n"})
+        try:
+            next_line = response.readline().decode()
+        except (TimeoutError, OSError):
+            next_line = ""
+        self.assertNotIn("data:", next_line)
+        connection.close()
 
 
 if __name__ == "__main__":

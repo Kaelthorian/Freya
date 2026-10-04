@@ -237,9 +237,11 @@ selects them.
    `project_state.py` supplies generated workers a bounded metadata snapshot
    and a read-only metadata query; only the parent persists it, and only after
    Evaluator acceptance of grounded worker candidates.
-6. The parent persists events, steps, metrics, approvals and terminal state. SSE clients
-   replay changes using monotonic event IDs; WaitingForApproval blocks the worker
-   until a durable once/task/deny resolution arrives.
+6. The parent persists events, steps, metrics, approvals and terminal state.
+   Storage exposes a unified, source-aware read model over runtime and
+   orchestration event tables. Global SSE replays both sources with a composite
+   cursor; task SSE retains its numeric runtime cursor. WaitingForApproval blocks
+   the worker until a durable once/task/deny resolution arrives.
 
 ## Where to make changes
 

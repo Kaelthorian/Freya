@@ -196,12 +196,18 @@ class Application:
         if len(parts) == 2 and parts[0] == "tasks":
             task = self.store.get_task(parts[1])
             task["timeline"] = self.store.list_steps(parts[1])
-            task["events"] = self.store.list_events(task_id=parts[1], limit=10000)
+            task["events"] = self.store.list_events(task_id=parts[1], limit=10000, runtime_only=True)
             return self._public_task(task)
         if parts == ["logs"]:
             filters = {k: v for k, v in query.items() if k in {"agent_id", "level", "tool", "date_from", "date_to", "orchestration_id"} and v}
             filters["error_only"] = query.get("error_only", "").lower() in {"true", "1"}
             filters["newest"] = "after" not in query
+            # Task log pagination historically exposes runtime events. Clients
+            # can explicitly request related orchestration events as well.
+            if query.get("task_id") and query.get("include_orchestration", "").lower() not in {"true", "1"}:
+                filters["runtime_only"] = True
+            elif query.get("task_id"):
+                filters["include_orchestration"] = True
             return self.store.list_events(task_id=query.get("task_id") or None, after=int(query.get("after", 0)),
                                           limit=self._limit(query), **filters)
         if parts == ["metrics"]:
