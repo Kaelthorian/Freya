@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import csv
+import math
 import os
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 from . import __version__
@@ -30,6 +34,9 @@ class Application:
         self.data_dir = data_dir.resolve()
         self.lock = threading.RLock()
         self._psutil = None
+        self._gpu_lock = threading.Lock()
+        self._gpu_sample = None
+        self._gpu_sampled_at = 0.0
         try:
             import psutil
             psutil.cpu_percent()
@@ -37,14 +44,57 @@ class Application:
         except ImportError:
             pass
 
+    def _gpu_telemetry(self) -> dict:
+        unavailable = {"gpu_available": False, "gpu_name": None,
+                       "gpu_percent": None, "gpu_memory_used_bytes": None,
+                       "gpu_memory_total_bytes": None, "gpu_temperature_c": None}
+        with self._gpu_lock:
+            sampled_at = time.monotonic()
+            if self._gpu_sample is not None and sampled_at - self._gpu_sampled_at < 2.0:
+                return dict(self._gpu_sample)
+            metrics = unavailable
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                     "--format=csv,noheader,nounits"],
+                    check=True, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=1.0,
+                )
+                row = next(csv.reader(result.stdout.splitlines()), [])
+                if len(row) >= 5:
+                    name = row[0].strip()
+                    percent, used_mib, total_mib = (float(value.strip()) for value in row[1:4])
+                    if (name and all(math.isfinite(value) for value in (percent, used_mib, total_mib))
+                            and 0 <= percent <= 100 and used_mib >= 0 and total_mib > 0):
+                        temperature = None
+                        try:
+                            parsed_temperature = float(row[4].strip())
+                            if math.isfinite(parsed_temperature) and 0 <= parsed_temperature <= 150:
+                                temperature = parsed_temperature
+                        except ValueError:
+                            pass
+                        metrics = {
+                            "gpu_available": True, "gpu_name": name,
+                            "gpu_percent": percent,
+                            "gpu_memory_used_bytes": int(used_mib * 1024 * 1024),
+                            "gpu_memory_total_bytes": int(total_mib * 1024 * 1024),
+                            "gpu_temperature_c": temperature,
+                        }
+            except (OSError, subprocess.SubprocessError, csv.Error, ValueError):
+                pass
+            self._gpu_sample = metrics
+            self._gpu_sampled_at = sampled_at
+            return dict(metrics)
+
     def system(self) -> dict:
+        gpu = self._gpu_telemetry()
         if self._psutil is None:
             return {"available": False, "cpu_percent": None, "ram_percent": None,
-                    "ram_used_bytes": None, "ram_total_bytes": None}
+                    "ram_used_bytes": None, "ram_total_bytes": None, **gpu}
         memory = self._psutil.virtual_memory()
         return {"available": True, "cpu_percent": self._psutil.cpu_percent(),
                 "ram_percent": memory.percent, "ram_used_bytes": memory.used,
-                "ram_total_bytes": memory.total}
+                "ram_total_bytes": memory.total, **gpu}
 
     @staticmethod
     def _public_task(task: dict) -> dict:

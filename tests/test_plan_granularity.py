@@ -4,7 +4,8 @@ from __future__ import annotations
 import copy
 import unittest
 
-from control_center.plan_compiler import compile_semantic_plan
+from control_center.plan_compiler import compile_semantic_plan, OverfragmentedPlan
+from control_center.plan_evidence import verification_mode
 from control_center.plan_granularity import normalize_task_granularity
 from control_center.planner import Planner, semantic_plan_response_format, validate_plan
 from control_center.runtime_resources import RuntimeResourceCatalog
@@ -133,12 +134,36 @@ class PlanGranularityTests(unittest.TestCase):
                  criteria=["The config content contains the requested setting."])]))
         self.assertEqual(len(compiled["tasks"]), 2)
 
-    def test_implementation_objective_is_not_mechanical_merely_for_weak_presence_checks(self):
+    def test_pure_create_presence_merge_does_not_depend_on_objective_similarity(self):
         compiled = self.compile(plan([
             task("implement", "create_file", objective="Implement app.py"),
             task("extend", "modify_file", depends=["implement"],
                  criteria=["The source contains an additional method."])]))
-        self.assertEqual(len(compiled["tasks"]), 2)
+        self.assertEqual(len(compiled["tasks"]), 1)
+
+    def test_real_planner_presence_variants_merge(self):
+        for criterion in ("temperature_converter.py exists.", "`temperature_converter.py` exists.",
+                          "The file temperature_converter.py is created in the workspace.",
+                          "The file `temperature_converter.py` is created in the workspace.",
+                          "El archivo temperature_converter.py existe.",
+                          "El archivo `temperature_converter.py` fue creado."):
+            with self.subTest(criterion=criterion):
+                proposal = converter_plan()
+                proposal["tasks"][0]["success_criteria"] = [criterion]
+                compiled = self.compile(proposal, deterministic_task_spec(CONVERTER_REQUEST))
+                self.assertEqual(compiled["task_count"], 2)
+                self.assertEqual(compiled["tasks"][0]["semantic_operations"], ["create_file", "modify_file"])
+                self.assertEqual(len(self.events("plan_compiler.tasks_merged")), 1)
+
+    def test_semantic_presence_with_backticks_is_not_a_mechanical_microtask(self):
+        criterion = "`app.py` exists and already implements the authentication layer correctly."
+        self.assertEqual(verification_mode(criterion), "semantic")
+        proposal = plan([
+            task("create", "create_file", criteria=[criterion]),
+            task("extend", "modify_file", depends=["create"], criteria=["The source contains an additional method."])])
+        tasks, _, summary = normalize_task_granularity(proposal, proposal["tasks"], ["create", "extend"], self.spec)
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(summary["merges"], [])
 
     def test_implementation_and_verification_remain_separate(self):
         semantic = converter_plan()
@@ -174,7 +199,8 @@ class PlanGranularityTests(unittest.TestCase):
         first = task("create", "create_file")
         modify = task("modify", "modify_file", depends=["create"], criteria=["The source contains new logic."])
         inspect = task("inspect", "read_file", depends=["create"], kind="review", criteria=["The source content is reviewed."])
-        compiled = self.compile(plan([first, modify, inspect]))
+        compiled = self.compile(plan([first, modify, inspect],
+            granularity_reason="The shared producer has multiple consumers for modification and independent review."))
         self.assertEqual(len(compiled["tasks"]), 3)
         self.assertEqual(self.events("plan_compiler.tasks_merged"), [])
         preserved = self.events("plan_compiler.granularity_analyzed")[0]["preserved_boundaries"]
@@ -191,7 +217,8 @@ class PlanGranularityTests(unittest.TestCase):
             task("shared", "create_file", "shared.py"),
             task("create", "create_file"),
             task("implement", "modify_file", depends=["shared", "create"],
-                 criteria=["The source contains the requested application logic."])]))
+                 criteria=["The source contains the requested application logic."])],
+            granularity_reason="A shared module is an independent dependency required by the final implementation."))
         self.assertEqual(len(compiled["tasks"]), 3)
         self.assertEqual(self.events("plan_compiler.tasks_merged"), [])
 
@@ -214,6 +241,7 @@ class PlanGranularityTests(unittest.TestCase):
         semantic = converter_plan()
         semantic["tasks"][0]["depends_on"] = ["prefix"]
         semantic["tasks"].insert(0, prefix)
+        semantic["granularity_reason"] = "The independent prefix API and controlled QA form separately recoverable outcomes."
         compiled = self.compile(semantic, deterministic_task_spec(CONVERTER_REQUEST))
         self.assertEqual([item["depends_on"] for item in compiled["tasks"]],
                          [[], ["task-1"], ["task-2"]])
@@ -272,10 +300,18 @@ class PlanGranularityTests(unittest.TestCase):
         for criterion in ("The source contains a public API.", "app.py exists and contains working logic.",
                           "The source contains a handler for empty input.", "The source contains no placeholders."):
             with self.subTest(criterion=criterion):
-                compiled = self.compile(plan([
+                tasks = [
                     task("create", "create_file", criteria=[criterion]),
-                    task("extend", "modify_file", depends=["create"], criteria=["The source defines an additional method."])]))
-                self.assertEqual(len(compiled["tasks"]), 2)
+                    task("extend", "modify_file", depends=["create"], criteria=["The source defines an additional method."])]
+                # "working logic" requires runtime proof under the existing
+                # evidence policy; retain that claim and provide a real verifier.
+                if "working logic" in criterion:
+                    tasks.append(task("verify", "run_python_script", depends=["extend"], kind="testing",
+                                      criteria=["The command records stdout and exit code."]))
+                compiled = self.compile(plan(tasks,
+                    granularity_reason="The independent public API is extended then receives controlled QA verification."))
+                self.assertEqual(len(compiled["tasks"]), len(tasks))
+                self.assertEqual(self.events("plan_compiler.tasks_merged"), [])
 
     def test_shared_folder_alone_is_not_a_logical_component_boundary(self):
         compiled = self.compile(plan([
@@ -315,11 +351,27 @@ class PlanGranularityTests(unittest.TestCase):
                 else:
                     self.assertEqual(warnings, [])
 
-    def test_missing_granularity_justification_is_diagnostic_not_a_hard_limit(self):
-        compiled = self.compile(plan([task(str(index), "create_file", f"{index}.py") for index in range(3)]))
-        self.assertEqual(len(compiled["tasks"]), 3)
+    def test_simple_single_worker_excess_without_justification_is_rejected(self):
+        with self.assertRaises(OverfragmentedPlan):
+            self.compile(plan([task(str(index), "create_file", f"{index}.py") for index in range(3)]))
         self.assertEqual(self.events("plan_compiler.granularity_warning")[-1]["reason"],
-                         "explicit_granularity_justification_missing")
+                         "explicit_granularity_justification_missing_or_invalid")
+        self.assertEqual(self.events("plan_compiler.overfragmented")[-1]["stage"], "after_normalization")
+
+    def test_vague_reason_or_unprotected_microtasks_cannot_bypass_enforcement(self):
+        for reason in ("There are multiple files and many steps.",
+                       "Independent modules and QA need separate progress units."):
+            with self.subTest(reason=reason), self.assertRaises(OverfragmentedPlan):
+                self.compile(plan([task(str(index), "create_file", f"{index}.py") for index in range(3)],
+                                  granularity_reason=reason))
+
+    def test_three_tasks_with_real_boundary_and_reason_are_preserved(self):
+        compiled = self.compile(plan([
+            task("create", "create_file", granularity={"preserve_boundary": "Human approval checkpoint."}),
+            task("populate", "modify_file", depends=["create"], criteria=["The source contains the requested logic."]),
+            task("audit", "read_file", depends=["populate"], kind="review", criteria=["The source content is reviewed."])],
+            granularity_reason="Human approval separates creation from implementation and independent audit."))
+        self.assertEqual(compiled["task_count"], 3)
 
     def test_global_presence_criteria_keep_auxiliary_local_links_after_merge(self):
         semantic = converter_plan()

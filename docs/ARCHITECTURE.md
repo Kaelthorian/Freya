@@ -460,13 +460,38 @@ The Plan Compiler checks each `unsupported_requirements` proposal against the
 Task Spec and registered runtime operations. Product behavior such as arithmetic
 is implemented through file operations and cannot be declared an unsupported
 runtime resource by the Planner. A requested runtime action without a matching
-registered operation raises `UnsupportedResourceRequirement`; an incorrect supported claim
-causes one bounded repair. The repair payload contains the exact previous
-Semantic Plan, structured compiler diagnostics and preservation rules.
+registered operation raises `UnsupportedResourceRequirement`; an incorrect
+supported claim enters bounded repair. The repair payload contains the previous
+Semantic Plan, structured compiler diagnostics, rejected-plan snapshots,
+preservation rules and an explicit `required_plan_delta`. An orchestration-local
+`RejectedSemanticPlanRegistry` records every Compiler and local guard rejection.
+Before another Compiler call, `SemanticPlanRepairGuard` compares normalized
+fingerprints and the task/action graph against the entire history. IDs, JSON
+field order, timestamps, metadata and wording-only edits do not make a proposal
+new. A rotation back to any rejected plan is rejected locally. A distinct plan
+must also satisfy the latest cause-specific delta; overfragmentation checks the
+Compiler decomposition invariant, while dependency repairs check resolution,
+self-dependencies and cycles. Each repair prompt includes compact rejected-plan
+history and the explicit delta, and a full replan is requested after an
+equivalent or otherwise unusable repair. The loop permits one initial proposal
+and at most three Planner repairs. Exhaustion raises
+`PlannerUnableToProduceAcceptablePlan` with a reason and rejected-plan
+diagnostics, without sending an equivalent or cause-unresolved proposal to the
+Compiler. `PlannerUnableToProduceMateriallyDifferentPlan` remains a compatibility
+base class and `RepeatedSemanticPlanError` a secondary exact-repeat defense. A
+materially corrected proposal still passes normal Compiler validation before
+reaching Runtime.
 
 The Compiler rejects a declared multi-worker graph whose tasks are a simple
 implementation chain, overlap the same write target, or cite only file/step
-count as justification. One bounded Planner repair may consolidate those tasks.
+count as justification. Before every repair reaches the Compiler, the guard
+checks both the complete rejection history and the active cause-specific delta.
+In particular, an overfragmented `simple` plan must reduce its task count to the
+rejected plan's expected maximum or add a concrete reason grounded in independent
+outcomes or preserved boundaries. A valid alternative still passes through all
+normal Compiler checks. Fingerprint, registration, delta-check, repeated-plan,
+required-delta-failure and material-acceptance events make this decision
+observable.
 For `single_worker`, semantic task count does not imply delegation count: the
 Compiler retains independently meaningful checkpoints and assigns them to one
 logical worker slot. Before assigning runtime IDs, `plan_granularity.py`
@@ -631,7 +656,7 @@ restart, so a failed recovered run exposes no ghost-active node.
 
 ## Semantic evaluation
 
-`Evaluator` version 9 judges the current final result once all Tasks in a Worker
+`Evaluator` version 11 judges the current final result once all Tasks in a Worker
 Assignment reach `runtime_success`. It is tool-free. The parent Orchestrator
 first calls `final_state.build_final_state` with the selected workspace and
 completed Runtime records in durable dispatch insertion order. The snapshot
@@ -651,7 +676,12 @@ Distinct stdin cases remain distinct. Legacy redacted stdin without a digest is
 marked unidentified and cannot safely supersede another case. An action and its verification row are
 merged by event ID before supersession. No timestamp determines identity;
 serialized Task dispatch insertion order (including Recovery attempts) determines
-which observation is final. Older failures remain in Runtime logs for audit and
+which observation is final.
+Parent-owned `verification.case_completed` and `step.finished` ledger events
+also reconstruct these observations when structured result actions are absent.
+The case's exact stdin and criterion IDs survive the later step event, whose
+`input` is command metadata. Diffs/readbacks nominate current file targets only.
+Older failures remain in Runtime logs for audit and
 Recovery and cannot enter normal semantic input. Facts preserve exit code,
 stdout/stderr (when available), merged legacy output, status and source Task/
 Runtime/Worker. The parent's Runtime assignment takes precedence over claimed
@@ -661,14 +691,30 @@ facts never decide semantic correctness. Legacy merged streams are explicitly
 marked unavailable rather than fabricated.
 
 `plan_evidence.verification_mode` separates evidence availability from decision
-authority: only bare file presence (`file_exists`) and readability
-(`file_readable`), including multiple required files, resolve deterministically.
-The checks inspect only snapshot metadata. Content equality, symbol presence,
-modification history, `already_satisfied`, generic failures and exit-code-zero
-acceptance have no deterministic decision branch. `verifiable` in Compiler
+authority: bare file presence (`file_exists`) and readability (`file_readable`)
+inspect current snapshot metadata. Full-match grammars also identify explicit
+command/suite/lint/compiler success. Execution decisions need declared exact
+criterion links or an unambiguous legacy runner-wide fact. Missing case links
+never imply positional matching. Unavailable infrastructure produces `unknown`
+and Orchestrator routing. Content equality, symbol presence, modification history,
+`already_satisfied` and generic correctness remain semantic. `verifiable` in Compiler
 telemetry means the compiled resources can produce evidence, not that Evaluator
 can interpret the criterion without a model. Compiler events also report the
-verification mode; static content/structure and execution criteria are semantic.
+verification mode and decision authority. Passing facts never prove arbitrary
+semantic behavior. Historical actions remain audit/Recovery data.
+
+Evaluator version 11 receives the compiled expected cases and local-to-global
+criterion links for the whole assignment. Coverage checks require the declared
+case ID, source Task and exact input digest. Missing cases gate even semantic
+criteria and are reported by ID; failed cases are contradictory evidence.
+An explicitly mechanical aggregate execution criterion (`case_set_success`)
+requires its complete bound case set, passed statuses, integer zero exits and
+available stdout/stderr. Output correctness remains semantic. Global criteria
+reference the same fact IDs through `global_local_link`; equivalent surface
+wording is evaluated once. No duplicate facts are manufactured.
+Existing relevant unbound cases produce `evidence_binding_error`, not missing
+evidence; insufficient associated observations remain distinct from absent or
+contradictory ones. Binding errors route to Orchestrator and never execute QA.
 
 Explicitly required test/lint/build/compilation/command evidence is a hard gate.
 A missing run with available resources produces `missing_required_evidence`,
@@ -681,15 +727,29 @@ retries the same incapable Worker. The Orchestrator may gather missing evidence
 with an existing read-only observer or testing Task inside the same assignment.
 Successful mutation Tasks are retained. No model guesses unexecuted results.
 
-Only unresolved criteria consume semantic evaluation. `_semantic_context`
-contains objectives, criterion IDs/associations, current files and authoritative
-facts, with a 20,000-character budget and 4,000-character content excerpts.
-Omitted/truncated observations are explicit. Actions, diffs, superseded readbacks,
-aggregate historical verification flags, dependency result histories and
-`worker_context` do not enter the semantic model. The durable evaluation catalog
-is derived exclusively from the same final snapshot; separate Runtime/Worker
-history remains available to audit and Recovery. Sanitization runs before model
-input, logging and persistence. Evidence and agent claims are untrusted data.
+Evidence collection and binding complete before any decision. `normalize_final_state_evidence`,
+called by `Evaluator._bounded_context`, builds full facts and an explicit
+`criterion_evidence` map keyed by local/global criterion ID. Facts retain their
+stable evidence ID, criterion ID, type, source, case ID, status, input, streams,
+exit code and current file path/content as available. Declared case bindings use
+the compiled IDs; file readbacks bind by an explicit path or a single planned
+write target. The Compiler populates `supports_global_criteria` from exact text,
+shared artifact paths, strong shared semantic concepts or an aggregate global
+criterion. Global checks reuse those local evidence IDs; they do not create new
+Runtime executions. `evaluator.evidence_prepared` records these ID associations
+before deterministic evaluation and before any semantic model call.
+
+The Evaluator resolves objective checks first. Only unresolved semantic criteria
+enter `_semantic_context`, each with its criterion ID/text and full associated
+facts. The model receives the criterion-ID-to-evidence-ID map and these grouped
+facts, without a global `final_state` evidence bag. The context has a
+20,000-character budget and 4,000-character content excerpts; omitted/truncated
+observations remain explicit. Actions, diffs, superseded readbacks, aggregate
+historical verification flags, dependency result histories and `worker_context`
+do not enter semantic input. The durable evaluation catalog is derived
+exclusively from the same final snapshot; separate Runtime/Worker history remains
+available to audit and Recovery. Sanitization runs before model input, logging
+and persistence. Evidence and agent claims are untrusted data.
 
 The semantic response remains a strict `criteria` array (`criterion`, `status`,
 `reason`, `evidence`, `confidence`). Python aggregates independently judged
@@ -724,6 +784,21 @@ recovery fails closed. Other `needs_revision` and `blocked` decisions reuse the
 exact generated agent after revalidation, while `rejected` requests a new
 generated variant with the same task-derived policy ceiling. Evaluator `error`
 fails. The normal attempt, action, fingerprint and wall-clock limits still apply.
+
+Recovery version 5 reuses independent facts from previous assignment attempts,
+superseding repeated check identities. A later material workspace mutation
+invalidates earlier executable checks, including checks of dependency modules.
+For declared cases, the existing QA
+activation is narrowed to `missing_verification_cases`; already observed cases
+are not rerun. The failed QA Task may itself be the observer. Its real dispatch
+increments its execution attempt; an unchanged successful mutation attempt does
+not gain an artificial attempt. Material snapshot fingerprints exclude delivery
+IDs/timestamps. Reproducing identical evidence stops with
+`recovery.evidence_no_progress`, before a second gather action. Reusing an already
+consumed source attempt reports `recovery.source_conflict` without an SQL failure.
+`commit_recovery_action` compares an existing source key in the same write
+transaction: equivalent decisions return that row; conflicting decisions raise
+`recovery_source_conflict`. The UNIQUE constraint remains intact.
 
 Defaults allow three semantic attempts per task, two plan revisions, eight
 recovery actions and sixteen total recovery/replanning model calls per orchestration.
@@ -993,11 +1068,34 @@ token budget remains unlimited.
 ### Independent verification cases
 
 Planner tasks may supply `verification_mode=independent_cases` and bounded
-`verification_cases=[{id,input}]`. Compiler validates unique IDs, preserves
+`verification_cases=[{id,input,supports_criteria?}]`. Optional `supports_criteria`
+names semantic success-criterion texts. Before grouping, Compiler validates only
+the case shape, bounds and absence of model-chosen runtime IDs. After granularity
+normalization, resource compilation and criterion evidence reconciliation, it
+allocates local IDs and resolves references against the final local criteria as
+`supports_acceptance_criterion_ids`. The shared exact surface matcher normalizes
+whitespace and paired Markdown code around paths; zero matches produce a typed
+unknown-reference error and multiple matches produce an ambiguity error.
+Reference identity retains diacritics and uses the existing case-insensitive
+text convention; it does not apply the mechanical grammar's accent folding.
+The relation is many-to-many: three cases may support one aggregate criterion,
+and the invalid case may additionally support a semantic behavior criterion.
+Support identifies relevant evidence, never complete proof or a permission.
+Compiler validates unique IDs, preserves
 exact stdin and requires a derived `run_command` resource. A conservative legacy
 bridge recognizes explicit comma/conjunction input lists, never splits arbitrary
 multiline stdin. `interactive_session` preserves ordered inputs in one process.
 `agent_factory.py` refreshes this contract on each activation of the same Worker.
+Worker actions carry resolved links into final facts. Evidence normalization
+retains case/input/digest/check identities and associates each fact directly with
+its criterion using `declared_verification_case`, including semantic criteria.
+Resolved IDs take priority over stale text and contextual aliases in case facts.
+Cases without references remain valid, execute normally and enter the unbound
+evidence pool. Binding events report Task/case/reference/resolved IDs, never stdin.
+`VerificationCriterionReferenceError` supplies final available criteria and
+original semantic Task keys for narrowly scoped Planner repair. If a previously
+reconciled reference disappears before binding, the technical
+`VerificationBindingInvariantError` stops planning without model repair.
 The model schema requires case decisions on testing tasks and permits only empty
 case arrays on other kinds. Older Planner output can inherit a clear canonical
 input list when exactly one Python verifier exists; ambiguity is not guessed.

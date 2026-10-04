@@ -200,14 +200,200 @@ export async function freya() {
     '<section class="panel"><form id="freya-form" class="stack-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="5" required placeholder="Describe the outcome you want...">' + esc(state.freyaDraft.prompt || '') + '</textarea><label for="freya-workspace">Workspace folder (existing files)</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="' + esc(state.freyaDraft.workspace_path || '') + '" placeholder="Select an existing folder, or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><p class="small muted workspace-help">A selected folder is used directly, so Freya can act on its existing files. Leave it empty to create an isolated workspace.</p><button class="button primary" type="submit">Ask Freya</button></form></section>' +
     clarificationForms + '<section class="panel freya-overview"><div class="freya-section-heading"><div><span class="eyebrow">LIVE OVERVIEW</span><h2>Freya activity</h2><p>Live execution and completed rows remain visible until you submit a new task.</p></div><span class="subtle-tag">' + label + '</span></div>' + table + '</section>' + activityPanel;
 }
-export function dashboard() {
+const NODE_PRESENTATION = {
+  success: ['✓', 'DONE', 'complete'], runtime_success: ['✓', 'RUNTIME DONE', 'complete'],
+  running: ['●', 'RUNNING', 'running'], evaluating: ['●', 'EVALUATING', 'running'],
+  ready: ['○', 'READY', 'waiting'], pending: ['○', 'PENDING', 'muted'],
+  waiting_for_approval: ['!', 'WAITING APPROVAL', 'waiting'], recovery_pending: ['!', 'RECOVERY', 'waiting'],
+  failed: ['!', 'FAILED', 'error'], blocked: ['×', 'BLOCKED', 'error'],
+  cancelled: ['×', 'CANCELLED', 'muted'], skipped: ['×', 'SKIPPED', 'muted'],
+  superseded: ['×', 'SUPERSEDED', 'muted'],
+};
+
+function nodePresentation(value) {
+  const [symbol, label, tone] = NODE_PRESENTATION[value] || ['·', 'STATE UNAVAILABLE', 'muted'];
+  return `<span class="mission-state ${tone}"><i aria-hidden="true">${symbol}</i>${label}</span>`;
+}
+
+function missionPercent(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : null;
+}
+
+function missionProgress(value, label = 'Worker progress', compactMode = false, tone = 'running') {
+  const percent = missionPercent(value);
+  if (percent === null) return '';
+  return `<div class="mission-progress ${compactMode ? 'compact' : ''} ${tone}" title="Reported by the task runtime"><div><span>${esc(label)}</span><strong class="mono">${number(percent)}%</strong></div><span class="mission-progress-track"><i style="width:${percent}%"></i></span></div>`;
+}
+
+function missionRequestForm() {
+  const draft = state.freyaDraft || {};
+  return `<details class="mission-request" data-detail="mission-request"><summary><span class="mission-request-mark">+</span><strong>New request</strong><span>Send a task to Freya</span><span class="mission-request-expand">OPEN</span></summary><form id="freya-form" class="mission-request-form"><label for="freya-prompt">What do you need?</label><textarea id="freya-prompt" name="prompt" rows="2" required placeholder="Describe the outcome you want...">${esc(draft.prompt || '')}</textarea><label for="freya-workspace">Workspace folder</label><div class="workspace-input-row"><input id="freya-workspace" name="workspace_path" value="${esc(draft.workspace_path || '')}" placeholder="Select an existing folder, or leave empty for an isolated workspace"><button type="button" class="button secondary" data-action="freya-workspace">Choose folder</button></div><p class="small muted workspace-help">An empty path creates an isolated workspace for this orchestration.</p><button class="button primary" type="submit">Ask Freya</button></form></details>`;
+}
+
+function missionClarificationForm(run) {
+  const questions = run?.task_spec?.clarification_questions || [];
+  if (run?.status !== 'NeedsClarification' || !questions.length) return '';
+  return `<section class="panel mission-clarification"><div class="mission-panel-heading"><div><span class="eyebrow">WAITING FOR YOUR INPUT</span><h2>Clarify this request</h2><p>${esc(taskTitle(run.prompt))}</p></div>${badge(run.status)}</div><form class="stack-form freya-clarification-form" data-run-id="${esc(run.id)}">${questions.map(question => `<label for="${esc(run.id + '-' + question.id)}">${esc(question.question)}</label><textarea id="${esc(run.id + '-' + question.id)}" name="${esc(question.id)}" rows="2" maxlength="4000" ${question.required ? 'required' : ''}></textarea>`).join('')}<button class="button primary" type="submit">Respond and continue</button></form></section>`;
+}
+
+function missionResource(label, value, detail = '') {
+  const percent = missionPercent(value);
+  if (percent === null) return `<div class="mission-resource unavailable"><div><span>${esc(label)}</span><strong>Unavailable</strong></div>${detail ? `<small>${esc(detail)}</small>` : ''}</div>`;
+  return `<div class="mission-resource"><div><span>${esc(label)}</span><strong class="mono">${number(percent)}%</strong></div><span class="mission-resource-track"><i style="width:${percent}%"></i></span>${detail ? `<small>${esc(detail)}</small>` : ''}</div>`;
+}
+
+function missionSteps(planTasks, graphNodes, taskById, agentById) {
+  if (!planTasks.length) return `<div class="mission-empty">${graphNodes.length ? 'No planned steps are available.' : 'The workflow graph is not available for this run yet.'}</div>`;
+  const nodesById = new Map(graphNodes.map(node => [node.plan_task_id, node]));
+  const plansById = new Map(planTasks.map(task => [task.id, task]));
+  return `<ol class="mission-steps">${planTasks.map((task, index) => {
+    const node = nodesById.get(task.id), currentState = node?.state || 'unknown';
+    const title = taskTitle(task.objective || task.description || task.title || task.id, 100);
+    const runtimeTask = node?.runtime_task_id ? taskById.get(node.runtime_task_id) : null;
+    const agent = node?.selected_agent_id ? agentById.get(node.selected_agent_id) : null;
+    const dependencies = (node?.depends_on || task.depends_on || []).map(id => plansById.get(id)?.objective || plansById.get(id)?.description || id);
+    const progressValue = ['running', 'evaluating', 'runtime_success', 'success'].includes(currentState) ? runtimeTask?.progress : null;
+    const progressTone = NODE_PRESENTATION[currentState]?.[2] || 'muted';
+    return `<li class="mission-step ${progressTone}"><span class="mission-step-marker" aria-hidden="true">${NODE_PRESENTATION[currentState]?.[0] || '·'}</span><div class="mission-step-body"><div class="mission-step-main"><strong>${esc(title)}</strong><span class="mono">${esc(task.id || `STEP ${index + 1}`)}</span>${nodePresentation(currentState)}</div><div class="mission-step-meta">${dependencies.length ? `<span>After ${esc(dependencies.map(item => taskTitle(item, 48)).join(' · '))}</span>` : '<span>Workflow entry point</span>'}${agent ? `<span>Agent <a href="#/agents/${esc(agent.id)}">${esc(agent.name)}</a></span>` : ''}${node?.runtime_task_id ? `<a href="#/logs?task_id=${encodeURIComponent(node.runtime_task_id)}">Task logs</a>` : ''}</div>${progressValue != null ? missionProgress(progressValue, 'Runtime progress', true, progressTone) : ''}${node?.error ? `<p class="mission-inline-error">${esc(uiText(node.error))}</p>` : ''}</div></li>`;
+  }).join('')}</ol>`;
+}
+
+function missionAgentsTable(agents) {
+  if (!agents.length) return `<div class="mission-empty">No agents are configured. <a href="#/agents">Open agent settings</a>.</div>`;
+  const ordered = agents.slice().sort((a, b) => Number(Boolean(b.current_task)) - Number(Boolean(a.current_task)) || String(a.name).localeCompare(String(b.name)));
+  return `<div class="mission-table-scroll"><table class="mission-table"><thead><tr><th>ID</th><th>AGENT</th><th>ROLE</th><th>STATUS</th><th>CURRENT TASK</th><th>PROGRESS</th></tr></thead><tbody>${ordered.map(agent => {
+    const current = agent.current_task, status = current?.status || agent.status || 'Unknown';
+    const progress = status === 'Running' ? missionProgress(current?.progress, 'Runtime', true, 'running') : '';
+    return `<tr><td class="mono muted">${esc(String(agent.id || '').slice(0, 8) || '—')}</td><td><a class="mission-agent-link" href="#/agents/${esc(agent.id)}">${esc(agent.name)}</a></td><td>${esc(agent.role || 'Agent')}</td><td>${badge(status)}</td><td>${current ? `<a class="mission-task-link" href="#/logs?task_id=${encodeURIComponent(current.id)}">${esc(taskTitle(current.prompt, 72))}</a>` : `<span class="muted">${agent.enabled ? 'Available' : 'Disabled'}</span>`}</td><td>${progress || '<span class="muted">—</span>'}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+function missionLogPreview(event) {
+  const level = String(event.level || 'INFO').toLowerCase();
+  const message = event.error || event.message || event.what || event.event_type || 'System event';
+  return `<div class="mission-log-preview ${['error', 'critical'].includes(level) ? 'error' : level === 'warning' ? 'warning' : ''}"><time class="mono">${activityClock(event.timestamp)}</time><span class="mission-log-level">${esc(event.level || 'INFO')}</span><span class="mission-log-message">${esc(taskTitle(message, 112))}</span><span class="mission-log-agent">${esc(event.agent_name || event.agent_id?.slice(0, 8) || 'SYSTEM')}</span></div>`;
+}
+
+export async function dashboard() {
   const m = state.metrics || {}, h = state.health || {}, system = h.system || {};
-  return `${heading('Operations dashboard', 'A clear view of your agents, runs, and resources.', button('Assign task', 'assign', 'play', '', 'secondary') + button('Programmer preset', 'create-programmer', 'cpu', '', 'secondary') + button('Create agent', 'create-agent', 'plus', '', 'primary'), 'OVERVIEW')}
-    <div class="stats-grid">${stat('Total agents', number(m.total_agents), 'agents', `<span class="mini-dot"></span> ${number(m.active_agents)} active · ${number(m.running_agents)} running`)}${stat('Runs completed', number(m.total_tasks), 'tasks', `<span class="text-green">${number(m.successful_tasks)} succeeded</span><span class="note-separator">·</span>${number(m.failed_tasks)} failed`)}${stat('Tokens used', compact(m.total_tokens), 'bolt', `${number(m.model_calls)} model calls`)}${stat('Average time', duration(m.avg_duration_seconds), 'clock', `Per completed task`)}</div>
-    <div class="dashboard-grid"><section class="panel activity-panel">${panelHeading('Execution activity', 'Actual history for the last 7 days · UTC', '<span class="subtle-tag">Last 7 days</span>')}${chartTabs()}<div class="chart-body">${chart(m.history, state.chart)}</div></section>
-    <section class="panel runtime-panel">${panelHeading('System status', 'Local infrastructure', `<span class="online-dot"></span>`)}<div class="runtime-status">${icon('cpu')}<div><strong>Agent Runtime</strong><span>${h.status === 'ok' ? 'Online' : 'Connecting'}</span></div><span class="badge success">Local</span></div><div class="resource"><div><span>CPU</span><strong class="mono">${system.cpu_percent == null ? 'N/A' : `${number(system.cpu_percent)}%`}</strong></div><div class="resource-track"><span style="width:${Math.min(100, Math.max(0, system.cpu_percent || 0))}%"></span></div></div><div class="resource"><div><span>Memory</span><strong class="mono">${system.ram_percent == null ? 'N/A' : `${number(system.ram_percent)}%`}</strong></div><div class="resource-track"><span style="width:${Math.min(100, Math.max(0, system.ram_percent || 0))}%"></span></div><p>${system.ram_total_bytes ? `${bytes(system.ram_used_bytes)} of ${bytes(system.ram_total_bytes)}` : 'Telemetry is unavailable on this system'}</p></div><div class="runtime-facts"><div><span>Concurrent workers</span><strong>${number(h.runtime?.max_workers)}</strong></div><div><span>Database</span><strong>${esc(h.database || '—')}</strong></div><div><span>Agents with errors</span><strong class="${m.error_agents ? 'text-red' : ''}">${number(m.error_agents)}</strong></div></div></section></div>
-    <section class="panel recent-tasks">${panelHeading('Recent runs', 'From the first step to the final result', '<a class="text-link" href="#/logs">View all task logs ' + icon('arrow') + '</a>')}${taskTable(state.tasks.slice(0, 5), { small: true })}</section>
-    <section class="agents-preview">${panelHeading('Your agents', `${number(m.total_agents)} agents in this workspace`, '<a class="text-link" href="#/agents">Manage agents ' + icon('arrow') + '</a>')}${state.agents.length ? `<div class="agent-grid">${state.agents.slice(0, 3).map(agentCard).join('')}</div>` : `<div class="onboarding-strip"><div class="onboarding-icon">${icon('agents')}</div><div><h3>Your agent team starts here</h3><p>Connect a model, choose its tools, and assign its first task.</p></div>${button('Create your first agent', 'create-agent', 'plus', '', 'secondary')}</div>`}</section>`;
+  const runs = (state.orchestrations || []).slice().sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  const activeRun = runs.find(run => FREYA_ORCHESTRATION_ACTIVE.has(run.status));
+  const selectedRun = activeRun || (state.freyaRunId && runs.find(run => run.id === state.freyaRunId)) || runs[0] || null;
+  const plan = selectedRun?.effective_plan || selectedRun?.plan || null;
+  let graph = { nodes: [], summary: selectedRun?.graph_summary || null };
+  let logEvents = [];
+  const requests = [];
+  if (selectedRun) requests.push(api(`/orchestrations/${encodeURIComponent(selectedRun.id)}/graph`).then(value => { graph = value; }).catch(() => {}));
+  requests.push(api('/logs?limit=24').then(value => { logEvents = Array.isArray(value) ? value : []; }).catch(() => {}));
+  await Promise.all(requests);
+
+  const graphNodes = graph.nodes || [], taskById = new Map((state.tasks || []).map(task => [task.id, task]));
+  const agentById = new Map((state.agents || []).map(agent => [agent.id, agent]));
+  const planTasks = Array.isArray(plan?.tasks) ? plan.tasks : [];
+  const activeNode = graphNodes.find(node => ['running', 'waiting_for_approval', 'evaluating'].includes(node.state) && node.runtime_task_id);
+  const latestNode = graphNodes.slice().reverse().find(node => node.runtime_task_id);
+  const taskNode = activeNode || (!activeRun ? latestNode : null);
+  let currentTask = taskNode?.runtime_task_id ? taskById.get(taskNode.runtime_task_id) : null;
+  if (!currentTask && taskNode?.runtime_task_id) {
+    try { currentTask = await api(`/tasks/${encodeURIComponent(taskNode.runtime_task_id)}`); taskById.set(currentTask.id, currentTask); } catch {}
+  }
+  const standaloneLiveTask = (state.tasks || []).find(liveTask);
+  if (!activeRun && standaloneLiveTask && !liveTask(currentTask)) currentTask = standaloneLiveTask;
+  if (!currentTask && !activeRun && !selectedRun) currentTask = state.tasks?.[0] || null;
+  const taskIsLive = currentTask ? liveTask(currentTask) : false;
+  const taskLabel = taskIsLive || (activeRun && Boolean(taskNode)) ? 'CURRENT TASK' : currentTask ? 'LATEST TASK' : 'CURRENT TASK';
+  const currentTaskBelongsToRun = Boolean(selectedRun && currentTask && graphNodes.some(node => node.runtime_task_id === currentTask.id));
+  const currentAgent = currentTask ? agentById.get(currentTask.agent_id) : null;
+  const currentAgentName = currentAgent?.name || currentTask?.agent_name || '';
+  const currentTitle = currentTask?.prompt || selectedRun?.prompt || '';
+  const currentId = currentTask?.id || selectedRun?.id || '';
+  const taskStarted = currentTask?.started_at || currentTask?.created_at || selectedRun?.created_at;
+  const elapsedSeconds = taskIsLive && taskStarted ? Math.max(0, (Date.now() - new Date(taskStarted).getTime()) / 1000) : Number(currentTask?.duration_seconds ?? selectedRun?.duration_seconds) || 0;
+  const currentStatus = currentTask?.status || selectedRun?.status || 'Idle';
+  const taskProgress = currentTask && currentTask.status !== 'Queued' ? currentTask.progress : null;
+  const taskDependencies = (taskNode?.depends_on || []).map(id => planTasks.find(task => task.id === id)?.objective || id);
+
+  const summary = graph.summary || selectedRun?.graph_summary || null;
+  const counts = summary?.counts || graphNodes.reduce((all, node) => { all[node.state] = (all[node.state] || 0) + 1; return all; }, {});
+  const totalNodes = Number(summary?.total) || graphNodes.length;
+  const completedNodes = (Number(counts.success) || 0) + (Number(counts.runtime_success) || 0);
+  const runningNodes = (Number(counts.running) || 0) + (Number(counts.evaluating) || 0);
+  const queuedNodes = graphNodes.filter(node => ['ready', 'pending'].includes(node.state));
+  const runtimeQueuedTasks = graphNodes.length ? [] : (state.tasks || []).filter(task => task.status === 'Queued');
+  const issueNodes = graphNodes.filter(node => ['failed', 'blocked', 'recovery_pending'].includes(node.state));
+  const queueCount = queuedNodes.length + runtimeQueuedTasks.length;
+  const activeRunTaskIds = new Set(graphNodes.map(node => node.runtime_task_id).filter(Boolean));
+  const allPendingApprovals = Array.isArray(state.approvals) ? state.approvals : [];
+  logEvents.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+  const runErrors = logEvents.filter(event => {
+    const issueSignal = ['ERROR', 'CRITICAL'].includes(String(event.level || '').toUpperCase()) ||
+      String(event.policy_decision || '').toLowerCase().includes('denied') ||
+      /denied|timeout|validation\.failed|dependency\.failed/i.test(String(event.event_type || '')) ||
+      String(event.status || '').toLowerCase() === 'denied';
+    const belongsToSelectedRun = !selectedRun || event.orchestration_id === selectedRun.id || activeRunTaskIds.has(event.task_id);
+    return issueSignal && belongsToSelectedRun;
+  });
+  const issues = [];
+  issueNodes.slice(0, 4).forEach(node => {
+    const step = planTasks.find(task => task.id === node.plan_task_id);
+    issues.push(`<article class="mission-issue"><div>${nodePresentation(node.state)}<a href="${node.runtime_task_id ? `#/logs?task_id=${encodeURIComponent(node.runtime_task_id)}` : '#/logs'}">${esc(step?.objective || node.plan_task_id)}</a></div><p>${esc(uiText(node.error || node.waiting_reason || 'No additional detail recorded.'))}</p></article>`);
+  });
+  const currentTaskIssue = currentTask && (['Failed', 'Blocked'].includes(currentTask.status) || Boolean(currentTask.error));
+  const currentTaskIssueRepresented = currentTaskIssue && (issueNodes.some(node => node.runtime_task_id === currentTask.id) || runErrors.some(event => event.task_id === currentTask.id));
+  if (currentTaskIssue && !currentTaskIssueRepresented) issues.unshift(`<article class="mission-issue"><div>${badge(currentTask.status || 'Failed')}<a href="#/logs?task_id=${encodeURIComponent(currentTask.id)}">${esc(taskTitle(currentTask.prompt, 72))}</a></div><p>${esc(uiText(currentTask.error || currentTask.status || 'Task failed.'))}</p></article>`);
+  if (selectedRun?.status === 'Failed' && !issueNodes.length && !currentTaskIssue && !runErrors.length) issues.push(`<article class="mission-issue"><div>${badge('Failed')}<a href="#/logs?orchestration_id=${encodeURIComponent(selectedRun.id)}">Freya orchestration</a></div><p>${esc(uiText(selectedRun.error || 'Failure recorded; no additional detail is available.'))}</p></article>`);
+  const runFailureUnreported = selectedRun?.status === 'Failed' && !issueNodes.length && !currentTaskIssue && !runErrors.length;
+  const existingIssueCount = issueNodes.length + runErrors.length + (currentTaskIssue && !currentTaskIssueRepresented ? 1 : 0) + Number(runFailureUnreported);
+  runErrors.slice(0, Math.max(0, 3 - issues.length)).forEach(event => issues.push(`<article class="mission-issue"><div><span class="mission-state error"><i>!</i>${esc(event.level)}</span><a href="#/logs?${event.task_id ? `task_id=${encodeURIComponent(event.task_id)}` : selectedRun ? `orchestration_id=${encodeURIComponent(selectedRun.id)}` : ''}">${esc(event.event_type || 'Runtime error')}</a></div><p>${esc(uiText(event.error || event.message || event.what || 'Recorded error event.'))}</p></article>`));
+  if (!issues.length) issues.push('<div class="mission-no-issues"><span>✓</span><strong>No active issues recorded</strong></div>');
+
+  const workflowPct = totalNodes ? Math.min(100, completedNodes / totalNodes * 100) : null;
+  const segment = (count, tone) => count && totalNodes ? `<i class="${tone}" style="width:${Math.min(100, count / totalNodes * 100)}%"></i>` : '';
+  const waitingNodes = (Number(counts.waiting_for_approval) || 0) + (Number(counts.recovery_pending) || 0);
+  const errorNodes = (Number(counts.failed) || 0) + (Number(counts.blocked) || 0);
+  const otherNodes = Math.max(0, totalNodes - completedNodes - runningNodes - waitingNodes - queuedNodes.length - errorNodes);
+  const workflowBar = workflowPct === null ? '<div class="mission-workflow-track empty"><i></i></div>' : `<div class="mission-workflow-track">${segment(completedNodes, 'complete')}${segment(runningNodes, 'running')}${segment(waitingNodes, 'waiting')}${segment(queuedNodes.length, 'queued')}${segment(errorNodes, 'error')}${segment(otherNodes, 'other')}</div>`;
+  const workflowDetail = totalNodes ? `${number(completedNodes)} / ${number(totalNodes)} execution tasks complete · ${number(runningNodes)} running · ${number(queuedNodes.length)} queued · ${number(waitingNodes)} waiting · ${number(errorNodes)} failed or blocked` : selectedRun ? `${selectedRun.status} · Task graph not available yet` : currentTask ? `Standalone task · ${currentTask.status} · No workflow graph is available` : runtimeQueuedTasks.length ? `${number(runtimeQueuedTasks.length)} standalone tasks queued` : 'No workflow has been submitted';
+  const latestEvents = logEvents.slice(0, 2);
+  const eventList = logEvents.length ? logTable(logEvents.slice(0, 24)) : '<div class="mission-empty">No log events are available yet.</div>';
+  const runtimeCapacity = Number(h.runtime?.max_workers);
+  const resourceFact = runtimeCapacity > 0 ? `${number(m.running_tasks)} / ${number(runtimeCapacity)} worker slots in use` : `${number(m.running_tasks)} active runtime tasks`;
+  const ramDetail = system.ram_total_bytes ? `${bytes(system.ram_used_bytes)} / ${bytes(system.ram_total_bytes)}` : '';
+  const gpuDetail = system.gpu_memory_total_bytes
+    ? `${system.gpu_temperature_c == null ? 'Temp unavailable' : `Temp ${number(system.gpu_temperature_c)}°C`} · VRAM ${bytes(system.gpu_memory_used_bytes)} / ${bytes(system.gpu_memory_total_bytes)} · ${system.gpu_name}`
+    : 'Requires NVIDIA nvidia-smi';
+  const selectedRunStatus = selectedRun?.status || (taskIsLive ? currentTask.status : 'Idle');
+  const dashboardStatus = activeRun?.status || (taskIsLive ? currentTask.status : selectedRunStatus);
+
+  return `<div class="mission-control">
+    <header class="mission-header"><div><span class="eyebrow">FREYA · MISSION CONTROL</span><h1>Operations dashboard</h1><p>Live workflow state, agents, queue, issues, resources and logs.</p></div><span class="mission-run-status">${badge(dashboardStatus)}</span></header>
+    ${missionRequestForm()}
+    ${missionClarificationForm(selectedRun)}
+    <div class="mission-workflow-review-grid">
+      <section class="panel mission-workflow"><div class="mission-panel-heading"><div><span class="eyebrow">GLOBAL WORKFLOW</span><h2>${esc(selectedRun ? taskTitle(selectedRun.prompt, 100) : 'Workflow progress')}</h2></div><span class="subtle-tag">${esc(selectedRunStatus)}</span></div><div class="mission-workflow-body"><div class="mission-workflow-copy"><strong>${workflowPct === null ? '—' : `${number(workflowPct)}%`}</strong><span>${esc(workflowDetail)}</span></div>${workflowBar}</div></section>
+      ${dashboardApprovals(allPendingApprovals)}
+    </div>
+    <div class="mission-primary-grid">
+      <section class="panel mission-current"><div class="mission-panel-heading"><div><span class="eyebrow">${taskLabel}</span><h2>${currentTitle ? esc(taskTitle(currentTitle, 112)) : 'No task running'}</h2></div>${badge(currentStatus)}</div>
+        <div class="mission-current-meta"><span class="mono">${currentId ? `ID ${esc(currentId)}` : 'Ready for a new request'}</span>${currentAgent ? `<a href="#/agents/${esc(currentAgent.id)}">Agent ${esc(currentAgentName)}</a>` : currentAgentName ? `<span>Agent ${esc(currentAgentName)}</span>` : selectedRun && !currentTask ? '<span>Agent Freya · Orchestrator</span>' : ''}${currentTask?.priority ? `<span>Priority ${esc(currentTask.priority)}</span>` : ''}${taskStarted ? `<span>Elapsed ${duration(elapsedSeconds)}</span>` : ''}</div>
+        ${taskProgress !== null && taskProgress !== undefined ? missionProgress(taskProgress, 'Runtime progress', false, ['Failed', 'Error', 'Blocked'].includes(currentStatus) ? 'error' : currentStatus === 'Success' ? 'complete' : 'running') : '<div class="mission-no-progress">No task progress percentage is available.</div>'}
+        ${currentTask ? `<div class="mission-current-facts"><span>${number(currentTask.steps)} steps used</span><span>${compact(currentTask.total_tokens)} tokens</span>${currentTask.model_calls != null ? `<span>${number(currentTask.model_calls)} model calls</span>` : ''}${taskDependencies.length ? `<span>Depends on ${esc(taskDependencies.map(item => taskTitle(item, 48)).join(' · '))}</span>` : ''}</div>` : selectedRun ? `<div class="mission-current-facts"><span>Orchestration ${esc(selectedRunStatus)}</span><a href="#/logs?orchestration_id=${encodeURIComponent(selectedRun.id)}">Open run logs</a></div>` : '<div class="mission-current-facts"><span>Use New request to start an orchestration.</span></div>'}
+        ${taskIsLive && currentTask ? `<div class="mission-current-actions"><a class="text-link" href="#/logs?task_id=${encodeURIComponent(currentTask.id)}">Inspect task logs ${icon('arrow')}</a>${currentTaskBelongsToRun && selectedRun && FREYA_ORCHESTRATION_ACTIVE.has(selectedRun.status) ? button('Stop Freya', 'cancel-orchestration', 'stop', `data-id="${esc(selectedRun.id)}"`, 'small-button danger-quiet') : button('Cancel task', 'cancel-task', 'stop', `data-id="${esc(currentTask.id)}"`, 'small-button danger-quiet')}</div>` : ''}
+      </section>
+      <section class="panel mission-metrics"><div class="mission-panel-heading"><div><span class="eyebrow">SYSTEM RESOURCES</span><h2>Runtime telemetry</h2></div></div><div class="mission-resource-grid">${missionResource('GPU', system.gpu_available ? system.gpu_percent : null, gpuDetail)}${missionResource('RAM', system.available ? system.ram_percent : null, ramDetail)}<div class="mission-runtime-fact"><span>WORKERS</span><strong>${resourceFact}</strong></div><div class="mission-runtime-fact"><span>QUEUE</span><strong>${number(queueCount)} tasks</strong></div><div class="mission-runtime-fact"><span>ACTIVE AGENTS</span><strong>${number(m.active_agents)} / ${number(m.total_agents)}</strong></div><div class="mission-runtime-fact"><span>TOKENS · ALL RUNS</span><strong>${compact(m.total_tokens)}</strong></div></div></section>
+    </div>
+    <div class="mission-work-grid">
+      <section class="panel mission-step-panel"><div class="mission-panel-heading"><div><span class="eyebrow">TASK STEPS</span><h2>Execution pipeline</h2><p>Step states come from the persisted workflow graph.</p></div><span class="subtle-tag">${number(planTasks.length)} planned</span></div>${missionSteps(planTasks, graphNodes, taskById, agentById)}</section>
+      <div class="mission-side-stack">
+        <section class="panel mission-queue"><div class="mission-panel-heading"><div><span class="eyebrow">WHAT'S NEXT</span><h2>Queue</h2></div><span class="subtle-tag">${number(queueCount)}</span></div>${queuedNodes.length ? `<ul class="mission-queue-list">${queuedNodes.slice(0, 5).map(node => { const step = planTasks.find(task => task.id === node.plan_task_id); const dependencies = (node.depends_on || []).map(id => planTasks.find(task => task.id === id)?.objective || id); const agent = node.selected_agent_id ? agentById.get(node.selected_agent_id) : null; return `<li><div>${nodePresentation(node.state)}<strong>${esc(taskTitle(step?.objective || node.plan_task_id, 72))}</strong></div><p>${dependencies.length ? `Waiting for ${esc(dependencies.map(item => taskTitle(item, 42)).join(' · '))}` : 'Ready to start'}${agent ? ` · ${esc(agent.name)}` : ''}</p></li>`; }).join('')}</ul>` : runtimeQueuedTasks.length ? `<ul class="mission-queue-list">${runtimeQueuedTasks.slice(0, 5).map(task => `<li><div>${badge(task.status)}<strong>${esc(taskTitle(task.prompt, 72))}</strong></div><p>${task.agent_name ? `Agent ${esc(task.agent_name)}` : 'Queued task'} · <a href="#/logs?task_id=${encodeURIComponent(task.id)}">${esc(String(task.id).slice(0, 12))}</a></p></li>`).join('')}</ul>` : `<div class="mission-empty">${totalNodes ? 'No queued steps.' : 'Queue details appear after the workflow plan is created.'}</div>`}</section>
+        <section class="panel mission-issues"><div class="mission-panel-heading"><div><span class="eyebrow">ATTENTION</span><h2>Issues</h2></div><span class="subtle-tag ${existingIssueCount ? 'has-issues' : ''}">${number(existingIssueCount)}</span></div><div class="mission-issue-list">${issues.join('')}</div></section>
+      </div>
+    </div>
+    <section class="panel mission-agents"><div class="mission-panel-heading"><div><span class="eyebrow">ACTIVE AGENTS</span><h2>Agent status</h2></div><a class="text-link" href="#/agents">Manage agents ${icon('arrow')}</a></div>${missionAgentsTable(state.agents || [])}</section>
+    <details class="panel mission-console" data-detail="mission-console"><summary><span class="mission-console-title"><span class="eyebrow">LIVE LOGS</span><strong>Console</strong><span class="subtle-tag">${number(logEvents.length)} recent events</span></span><span class="mission-console-preview">${latestEvents.length ? latestEvents.map(missionLogPreview).join('') : '<span class="muted">Waiting for system events.</span>'}</span><span class="mission-console-summary-actions">${button('Copy all logs', 'copy-logs', 'copy', 'type="button"', 'small-button secondary')}<span class="mission-console-expand">EXPAND</span></span></summary><div class="mission-console-body"><div class="mission-console-toolbar"><span>Newest events first · live updates via SSE</span><a class="text-link" href="#/logs">Open full log explorer ${icon('arrow')}</a></div>${eventList}</div></details>
+  </div>`;
 }
 
 export function skills() {
@@ -251,7 +437,7 @@ export async function taskDetail(id) {
   const task = await api(`/tasks/${id}`), attrs = `data-id="${esc(id)}"`;
   const copyAction = button('Copy to clipboard', 'copy-task-details', 'copy', attrs, 'secondary');
   const actions = copyAction + (liveTask(task) ? button(task.status === 'Paused' ? 'Resume agent' : 'Pause agent', task.status === 'Paused' ? 'resume-agent' : 'pause-agent', task.status === 'Paused' ? 'play' : 'pause', `data-id="${esc(task.agent_id)}"`, 'secondary') + button('Cancel', 'cancel-task', 'stop', attrs, 'danger') : button('Run again', 'retry-task', 'refresh', attrs, 'primary'));
-  return `<a class="back-link" href="#/logs">${icon('back')} Logs</a>${heading('Run details', task.id, actions, 'TASK EXECUTION')}<section class="panel task-overview"><div class="task-title-row"><h2>${esc(task.prompt)}</h2>${badge(task.status)}</div><div class="task-metadata"><span>${icon('agents')}<a href="#/agents/${esc(task.agent_id)}">${esc(task.agent_name)}</a></span><span>${icon('clock')}${date(task.started_at || task.created_at)}</span><span>${icon('cpu')}${esc(task.config.model)}</span></div>${progress(task)}<p class="small muted">The percentage shows the step budget used; it does not estimate the time remaining.</p><div class="task-stats"><div><span>Duration</span><strong>${duration(task.duration_seconds)}</strong></div><div><span>Steps</span><strong>${number(task.steps)}</strong></div><div><span>Tokens</span><strong>${compact(task.total_tokens)}</strong></div><div><span>Model / tools</span><strong>${number(task.model_calls)} / ${number(task.tool_calls)}</strong></div><div><span>Finished</span><strong class="small">${date(task.finished_at)}</strong></div></div><details data-detail="workspace-${esc(id)}" class="workspace-detail"><summary>${icon('folder')} Run workspace</summary><code>${esc(task.workspace)}</code></details></section>${task.status === 'Paused' ? '<div class="notice">Pause requested: the runtime waits between actions and keeps this run active.</div>' : task.status === 'WaitingForApproval' ? '<div class="notice">This run is waiting for a human approval. Open Approvals to resolve it.</div>' : ''}${task.error ? `<div class="error-banner">${icon('alert')}<div><strong>Run error</strong><p>${esc(uiText(task.error))}</p></div></div>` : ''}${task.result ? `<section class="panel task-result">${panelHeading('Result', 'Final response from the agent')}<pre>${esc(serialize(task.result))}</pre></section>` : ''}<section class="panel">${panelHeading('Execution Timeline', 'Persisted actions, tools, and results', `<span class="subtle-tag">${number((task.events || task.timeline || []).length)} events</span>`)}${timeline(task.events || task.timeline || [])}</section>`;
+  return `<a class="back-link" href="#/logs">${icon('back')} Logs</a>${heading('Run details', task.id, actions, 'TASK EXECUTION')}<section class="panel task-overview"><div class="task-title-row"><h2>${esc(task.prompt)}</h2>${badge(task.status)}</div><div class="task-metadata"><span>${icon('agents')}<a href="#/agents/${esc(task.agent_id)}">${esc(task.agent_name)}</a></span><span>${icon('clock')}${date(task.started_at || task.created_at)}</span><span>${icon('cpu')}${esc(task.config.model)}</span></div>${progress(task)}<p class="small muted">The percentage shows the step budget used; it does not estimate the time remaining.</p><div class="task-stats"><div><span>Duration</span><strong>${duration(task.duration_seconds)}</strong></div><div><span>Steps</span><strong>${number(task.steps)}</strong></div><div><span>Tokens</span><strong>${compact(task.total_tokens)}</strong></div><div><span>Model / tools</span><strong>${number(task.model_calls)} / ${number(task.tool_calls)}</strong></div><div><span>Finished</span><strong class="small">${date(task.finished_at)}</strong></div></div><details data-detail="workspace-${esc(id)}" class="workspace-detail"><summary>${icon('folder')} Run workspace</summary><code>${esc(task.workspace)}</code></details></section>${task.status === 'Paused' ? '<div class="notice">Pause requested: the runtime waits between actions and keeps this run active.</div>' : task.status === 'WaitingForApproval' ? '<div class="notice">This run is waiting for a human approval. Resolve it from the Operations Dashboard.</div>' : ''}${task.error ? `<div class="error-banner">${icon('alert')}<div><strong>Run error</strong><p>${esc(uiText(task.error))}</p></div></div>` : ''}${task.result ? `<section class="panel task-result">${panelHeading('Result', 'Final response from the agent')}<pre>${esc(serialize(task.result))}</pre></section>` : ''}<section class="panel">${panelHeading('Execution Timeline', 'Persisted actions, tools, and results', `<span class="subtle-tag">${number((task.events || task.timeline || []).length)} events</span>`)}${timeline(task.events || task.timeline || [])}</section>`;
 }
 
 export async function logs() {
@@ -259,24 +445,33 @@ export async function logs() {
   return `${heading('Logs', 'Tasks and their complete execution record in one place.', button('Refresh', 'refresh', 'refresh', '', 'secondary') + button('Copy all logs', 'copy-logs', 'copy', '', 'secondary'), 'OBSERVABILITY / LOGS')}<section class="panel"><form class="log-filters" id="log-filters"><label>Agent<select name="agent_id" data-filter="logs">${agentOptions(f.agent_id)}</select></label><label>Task ID<input name="task_id" value="${esc(f.task_id || '')}" placeholder="Task ID" data-filter="logs"></label><label>Level<select name="level" data-filter="logs"><option value="">All levels</option>${['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].map(v => `<option ${f.level === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label><label>Tool<select name="tool" data-filter="logs"><option value="">All tools</option>${state.tools.map(t => `<option ${f.tool === t.name ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label><label>From<input type="datetime-local" name="date_from" value="${esc(f.date_from || '')}" data-filter="logs"></label><label>To<input type="datetime-local" name="date_to" value="${esc(f.date_to || '')}" data-filter="logs"></label><label class="checkbox-label"><input type="checkbox" name="error_only" data-filter="logs" ${f.error_only ? 'checked' : ''}>Errors only</label>${button('Clear filters', 'clear-logs', '', '', 'small-button')}</form><div class="log-list-meta"><span>${number(events.length)} events · tasks and execution details</span><span>${icon('shield')} Sensitive content is sanitized by the server</span></div><div class="log-table-header" aria-hidden="true"><span>Date and time</span><span>Level</span><span>Event / tool</span><span>Agent</span><span></span></div>${groupedLogTable(events, state.tasks)}</section>`;
 }
 
+function approvalCard(item) {
+  const cross = item.cross_task_modification;
+  const details = cross
+    ? '<span>Target file</span><code>' + esc(cross.target_path) + '</code>'
+      + '<span>File owner task</span><code>' + esc(cross.target_owner_plan_task_id) + '</code>'
+      + '<span>Operation</span><code>' + esc(cross.requested_operation) + '</code>'
+      + '<span>Requested change</span><span>' + esc(cross.requested_change) + '</span>'
+      + '<span>Why</span><span>' + esc(cross.reason) + '</span>'
+      + '<span>Needed for</span><span>' + esc(cross.needed_for) + '</span>'
+      + '<span>Blocking</span><span>' + (cross.blocking ? 'Yes' : 'No') + '</span>'
+    : '<span>Capability</span><code>' + esc(item.capability) + '</code><span>Tool</span><code>' + esc(item.tool) + '</code><span>Resource</span><code>' + esc(item.resource || '.') + '</code><span>Reason</span><span>' + esc(item.reason) + '</span><span>Arguments</span><pre>' + esc(serialize(item.arguments || {})) + '</pre>';
+  const actions = cross
+    ? '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve this change once</button><button class="button secondary" data-action="approve-file-intent" data-id="' + esc(item.id) + '">Approve similar purpose for this file</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>'
+    : '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve once</button><button class="button secondary" data-action="approve-task" data-id="' + esc(item.id) + '">Approve for task</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>';
+  return '<article class="panel approval-card"><div class="approval-card-header"><div><span class="eyebrow">' + (cross ? 'CROSS-TASK FILE CHANGE' : 'PENDING APPROVAL') + '</span><h2>' + esc(item.action_summary || item.capability) + '</h2></div>' + badge(item.status || 'pending') + '</div><div class="key-values">' + details + '<span>Created</span><span>' + date(item.created_at, true) + '</span></div><div class="approval-actions">' + actions + '</div></article>';
+}
+
+function dashboardApprovals(items) {
+  const content = items.length
+    ? '<div class="approval-list">' + items.map(approvalCard).join('') + '</div>'
+    : '<div class="mission-no-approvals"><strong>No actions are waiting for review.</strong><span>Pending human decisions will appear here.</span></div>';
+  return '<section class="panel mission-approvals" id="dashboard-approvals"><div class="mission-panel-heading"><div><span class="eyebrow">HUMAN REVIEW</span><h2>Pending approvals</h2><p>Review requests before continuing.</p></div><span class="subtle-tag">' + number(items.length) + ' waiting</span></div>' + content + '</section>';
+}
+
 export function approvals() {
   const items = state.approvals || [];
-  const cards = items.length ? '<div class="approval-list">' + items.map(item => {
-    const cross = item.cross_task_modification;
-    const details = cross
-      ? '<span>Target file</span><code>' + esc(cross.target_path) + '</code>'
-        + '<span>File owner task</span><code>' + esc(cross.target_owner_plan_task_id) + '</code>'
-        + '<span>Operation</span><code>' + esc(cross.requested_operation) + '</code>'
-        + '<span>Requested change</span><span>' + esc(cross.requested_change) + '</span>'
-        + '<span>Why</span><span>' + esc(cross.reason) + '</span>'
-        + '<span>Needed for</span><span>' + esc(cross.needed_for) + '</span>'
-        + '<span>Blocking</span><span>' + (cross.blocking ? 'Yes' : 'No') + '</span>'
-      : '<span>Capability</span><code>' + esc(item.capability) + '</code><span>Tool</span><code>' + esc(item.tool) + '</code><span>Resource</span><code>' + esc(item.resource || '.') + '</code><span>Reason</span><span>' + esc(item.reason) + '</span><span>Arguments</span><pre>' + esc(serialize(item.arguments || {})) + '</pre>';
-    const actions = cross
-      ? '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve this change once</button><button class="button secondary" data-action="approve-file-intent" data-id="' + esc(item.id) + '">Approve similar purpose for this file</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>'
-      : '<button class="button primary" data-action="approve-once" data-id="' + esc(item.id) + '">Approve once</button><button class="button secondary" data-action="approve-task" data-id="' + esc(item.id) + '">Approve for task</button><button class="button danger-quiet" data-action="deny-approval" data-id="' + esc(item.id) + '">Deny</button>';
-    return '<article class="panel approval-card"><div class="approval-card-header"><div><span class="eyebrow">' + (cross ? 'CROSS-TASK FILE CHANGE' : 'PENDING APPROVAL') + '</span><h2>' + esc(item.action_summary || item.capability) + '</h2></div>' + badge(item.status || 'pending') + '</div><div class="key-values">' + details + '<span>Created</span><span>' + date(item.created_at, true) + '</span></div><div class="approval-actions">' + actions + '</div></article>';
-  }).join('') + '</div>' : '<section class="panel big-empty">' + empty('check', 'No pending approvals', 'Tasks continue automatically when their configured capabilities and autonomy allow them.') + '</section>';
+  const cards = items.length ? '<div class="approval-list">' + items.map(approvalCard).join('') + '</div>' : '<section class="panel big-empty">' + empty('check', 'No pending approvals', 'Tasks continue automatically when their configured capabilities and autonomy allow them.') + '</section>';
   return heading('Approvals', 'Review actions that are waiting for a human decision.', '', 'WORKSPACE / APPROVALS') + cards;
 }
 

@@ -290,7 +290,13 @@ class PythonExecutionTests(unittest.TestCase):
         from tests.test_control_runtime import answer
         from tests.test_evaluator import planned, runtime, node, semantic
         (self.workspace / "temperature_converter.py").write_text(CONVERTER)
-        cases = [{"id": "zero", "input": "0"}, {"id": "hundred", "input": "100"}, {"id": "invalid", "input": "abc"}]
+        criterion = "The script runs correctly for 0, 100 and invalid input."
+        criterion_id = "lc-temperature"
+        cases = [
+            {"id": "zero", "input": "0", "supports_acceptance_criterion_ids": [criterion_id]},
+            {"id": "hundred", "input": "100", "supports_acceptance_criterion_ids": [criterion_id]},
+            {"id": "invalid", "input": "abc", "supports_acceptance_criterion_ids": [criterion_id]},
+        ]
         config = {**copy.deepcopy(DEFAULT_CONFIG), "permissions": "execute",
                   "output": {"format": "structured", "include": ["summary", "actions", "artifacts", "verification", "limitations"]},
                   "verification_mode": "independent_cases", "verification_cases": cases,
@@ -302,21 +308,25 @@ class PythonExecutionTests(unittest.TestCase):
             transport=lambda *args, **kwargs: answer(calls=[("run_command", {"argv": ["python", "temperature_converter.py"]})]))
         self.assertEqual(result["status"], "Success", result["error"])
         self.assertEqual(len(result["result"]["actions"]), 3)
-        criterion = "The script runs correctly for 0, 100 and invalid input."
         plan = {**planned([criterion]), "required_capabilities": ["execution.python_script"], "required_tools": ["run_command"]}
+        plan["acceptance_criteria"] = [{"id": criterion_id, "criterion": criterion}]
         run = runtime(result=result["result"], verification=result["verification"])
         run["final_state"] = build_final_state(plan, [run], str(self.workspace))
         seen = []
         def evaluate(prompt, context):
             seen.append(context)
-            facts = context["final_state"]["verification_facts"]
+            criterion_row = next(item for item in context["semantic_criteria"]
+                                 if item["criterion"] == criterion)
+            facts = [item for item in criterion_row["evidence"]
+                     if item.get("type") == "command_execution"]
             self.assertEqual(len(facts), 3)
             self.assertTrue(all(fact["program_started"] and fact["environment_available"] for fact in facts))
-            self.assertIn("32.00", facts[0]["stdout"])
-            self.assertIn("212.00", facts[1]["stdout"])
-            self.assertIn("Invalid input.", facts[2]["stdout"])
+            output_by_case = {fact["case_id"]: fact["stdout"] for fact in facts}
+            self.assertIn("32.00", output_by_case["zero"])
+            self.assertIn("212.00", output_by_case["hundred"])
+            self.assertIn("Invalid input.", output_by_case["invalid"])
             response = semantic([criterion])
-            response["criteria"][0]["evidence"] = [fact["id"] for fact in facts]
+            response["criteria"][0]["evidence"] = [fact["evidence_id"] for fact in facts]
             return response
         outcome = Evaluator(evaluate).evaluate(planned_task=plan, runtime_task=run, execution_node=node())
         self.assertEqual(outcome["status"], "accepted")

@@ -11,3 +11,4 @@ __pycache__/
 !/data/agents/*.json
 /test-artifacts/
 /.freya-local.json
+/.codex-tmp/

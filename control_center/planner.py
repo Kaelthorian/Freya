@@ -5,10 +5,11 @@ can allow a worker action, and preferred Skills are non-binding selection hints.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import re
 import time
-import copy
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -28,11 +29,17 @@ from .cross_task import (MAX_OWNED_PATHS, CrossTaskRequestError,
                          normalize_owned_paths, owned_path_key)
 from .worker_assignment import worker_assignments
 from .plan_granularity import GRANULARITY_FIELDS, normalize_granularity
+from .verification_cases import case_response_format, criterion_reference_matches
+from .security import sanitize
 
 
 SEMANTIC_PLAN_SCHEMA_VERSION = 5
 PLAN_SCHEMA_VERSION = 4
 MAX_PLAN_TASKS = 20
+# Bound the entire orchestration-local repair loop: one initial proposal and
+# at most three Planner repairs, regardless of Compiler or local guard rejects.
+MAX_SEMANTIC_PLAN_REPAIRS = 3
+MAX_SEMANTIC_PLAN_ATTEMPTS = MAX_SEMANTIC_PLAN_REPAIRS + 1
 # User prompts are accepted without an application-level character limit.
 # The model/provider context window and HTTP transport remain the practical
 # boundaries for safely processing extremely large requests.
@@ -103,11 +110,7 @@ PLAN_RESPONSE_FORMAT = {
                         field: {"type": "string", "maxLength": 1000}
                         for field in sorted(GRANULARITY_FIELDS)}, "additionalProperties": False},
                     "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
-                    "verification_cases": {"type": "array", "maxItems": 20, "items": {
-                        "type": "object", "properties": {
-                            "id": {"type": "string", "maxLength": 100},
-                            "input": {"type": "string", "maxLength": 16000}},
-                        "required": ["id", "input"], "additionalProperties": False}},
+                    "verification_cases": case_response_format(compiled=True),
                 },
                 "required": sorted(TASK_FIELDS | {"owned_paths"}),
                 "additionalProperties": False,
@@ -182,11 +185,7 @@ def semantic_plan_response_format(context: dict[str, Any]) -> dict[str, Any]:
             field: {"type": "string", "maxLength": 1000} for field in sorted(GRANULARITY_FIELDS)},
             "additionalProperties": False},
         "verification_mode": {"type": "string", "enum": ["independent_cases", "interactive_session"]},
-        "verification_cases": {"type": "array", "maxItems": 20, "items": {
-            "type": "object", "properties": {
-                "id": {"type": "string", "maxLength": 100},
-                "input": {"type": "string", "maxLength": 16000}},
-            "required": ["id", "input"], "additionalProperties": False}},
+        "verification_cases": case_response_format(),
     }
     unsupported = {"type": "array", "items": {"type": "object", "properties": {
         "semantic_need": {"type": "string"},
@@ -651,8 +650,820 @@ class PlanValidationError(ValueError):
     """The proposed plan does not satisfy the versioned plan contract."""
 
 
+class RepeatedSemanticPlanError(PlanValidationError):
+    """A candidate repeats a Semantic Plan rejected by the Compiler."""
+
+    def __init__(self, previous_error: dict[str, Any] | None = None):
+        self.previous_error = sanitize(previous_error or {})
+        super().__init__(
+            "Planner repeated a Semantic Plan that the Compiler had already rejected. "
+            "A complete, different plan is required."
+        )
+
+
+def _fingerprint_text(value: Any) -> str:
+    """Normalize prose and punctuation without changing the plan's intent fields."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE))
+
+
+def _fingerprint_path(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"/+", "/", value.strip().replace("\\", "/")).rstrip("/").casefold()
+
+
+def _fingerprint_operation(value: Any, *, structural: bool = False) -> str:
+    """Collapse renamed descriptive operations to their action family.
+
+    Registered runtime operations keep their executable identity except for the
+    generic file/action verbs. This catches renamed planner labels without
+    treating, for example, two different test runners as interchangeable.
+    """
+    normalized = _fingerprint_text(value)
+    if not normalized:
+        return ""
+    words = normalized.split()
+    first = words[0]
+    token = "_".join(words)
+    if token in SEMANTIC_OPERATION_CAPABILITIES:
+        if structural and token == "create_file":
+            return "action:create"
+        if structural and token == "modify_file":
+            return "action:implement"
+        if structural and token in {"read_file", "list_workspace", "search_workspace"}:
+            return "action:read"
+        return "runtime:" + token
+    if first in {"create", "make", "generate", "build", "scaffold"}:
+        return "action:create"
+    if first in {"implement", "develop", "code", "write"}:
+        return "action:implement"
+    if first in {"test", "verify", "validate", "check"}:
+        return "action:test"
+    if first in {"modify", "update", "edit", "refactor"}:
+        return "action:modify"
+    if first in {"read", "inspect", "analyze", "review", "list", "search"}:
+        return "action:read"
+    return "descriptor:" + normalized
+
+
+def _fingerprint_case(case: Any) -> Any:
+    if not isinstance(case, dict):
+        return case
+    # Case IDs are generated labels. Inputs and declared criterion text carry
+    # the actual verification semantics and therefore remain in the digest.
+    return {
+        "input": case.get("input"),
+        "expected": case.get("expected"),
+        "supports_criteria": sorted(
+            _fingerprint_text(item) for item in case.get("supports_criteria", [])
+            if isinstance(item, str)
+        ),
+    }
+
+
+def _semantic_plan_projection(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep semantic plan fields and discard generated IDs and arbitrary metadata."""
+    raw_tasks = value.get("tasks")
+    tasks = raw_tasks if isinstance(raw_tasks, list) else []
+    positions = {
+        task["key"]: index for index, task in enumerate(tasks)
+        if isinstance(task, dict) and isinstance(task.get("key"), str)
+    }
+    projected_tasks = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            projected_tasks.append({"invalid_type": type(task).__name__})
+            continue
+        dependencies = task.get("depends_on", [])
+        if isinstance(dependencies, list):
+            dependencies = sorted(
+                f"task:{positions[item]}" if isinstance(item, str) and item in positions
+                else f"unknown:{_fingerprint_text(item)}"
+                for item in dependencies
+            )
+        else:
+            dependencies = {"invalid_type": type(dependencies).__name__}
+        granularity = task.get("granularity", {})
+        projected_tasks.append({
+            "task_kind": _fingerprint_text(task.get("task_kind")),
+            "objective": _fingerprint_text(task.get("objective")),
+            "description": _fingerprint_text(task.get("description")),
+            "semantic_needs": sorted(
+                _fingerprint_text(item) for item in task.get("semantic_needs", [])
+                if isinstance(item, str)
+            ),
+            "operations": sorted(
+                _fingerprint_operation(item) for item in task.get("operations", [])
+            ) if isinstance(task.get("operations", []), list) else [],
+            "semantic_operations": sorted(
+                _fingerprint_operation(item) for item in task.get("semantic_operations", [])
+            ) if isinstance(task.get("semantic_operations", []), list) else [],
+            "dependencies": dependencies,
+            "write_targets": sorted(
+                _fingerprint_path(item) for item in task.get("write_targets", [])
+                if isinstance(item, str)
+            ),
+            "owned_paths": sorted(
+                _fingerprint_path(item) for item in task.get("owned_paths", [])
+                if isinstance(item, str)
+            ),
+            "success_criteria": sorted(
+                _fingerprint_text(item) for item in task.get("success_criteria", [])
+                if isinstance(item, str)
+            ),
+            "verification_mode": _fingerprint_text(task.get("verification_mode")),
+            "verification_cases": sorted(
+                (_fingerprint_case(item) for item in task.get("verification_cases", [])),
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+            ) if isinstance(task.get("verification_cases", []), list) else [],
+            "granularity": {
+                key: _fingerprint_text(text) for key, text in granularity.items()
+                if key in GRANULARITY_FIELDS and isinstance(text, str)
+            } if isinstance(granularity, dict) else {},
+        })
+    return {
+        "task_count": len(tasks) if isinstance(raw_tasks, list) else None,
+        "task_complexity": _fingerprint_text(value.get("task_complexity")),
+        "execution_strategy": _fingerprint_text(value.get("execution_strategy")),
+        "granularity_reason": _fingerprint_text(value.get("granularity_reason")),
+        "decomposition_reason": _fingerprint_text(value.get("decomposition_reason")),
+        "unsupported_requirements": sorted(
+            ({
+                "semantic_need": _fingerprint_text(item.get("semantic_need")),
+                "reason": _fingerprint_text(item.get("reason")),
+            } for item in value.get("unsupported_requirements", [])
+              if isinstance(item, dict)),
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+        ) if isinstance(value.get("unsupported_requirements", []), list) else [],
+        "success_criteria": sorted(
+            _fingerprint_text(item) for item in value.get("success_criteria", [])
+            if isinstance(item, str)
+        ) if isinstance(value.get("success_criteria", []), list) else [],
+        "tasks": projected_tasks,
+    }
+
+
+def _fingerprint(value: Any) -> str:
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _semantic_plan_fingerprint(value: dict[str, Any]) -> str:
+    """Stable digest of the normalized semantic plan, excluding IDs and metadata."""
+    return _fingerprint(_semantic_plan_projection(value))
+
+
+def _semantic_plan_structure_fingerprint(value: dict[str, Any]) -> str:
+    """Identify equivalent task/action graphs despite task-key or prose rewrites."""
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list):
+        return _fingerprint({"tasks_type": type(tasks).__name__})
+    keys = {
+        task["key"]: index for index, task in enumerate(tasks)
+        if isinstance(task, dict) and isinstance(task.get("key"), str)
+    }
+    node_signatures = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            node_signatures.append(_fingerprint({"invalid_type": type(task).__name__}))
+            continue
+        operations = [*_as_list(task.get("operations")), *_as_list(task.get("semantic_operations"))]
+        cases = [_fingerprint_case(case) for case in _as_list(task.get("verification_cases"))]
+        node_signatures.append(_fingerprint({
+            "task_kind": _fingerprint_text(task.get("task_kind")),
+            "operations": sorted({_fingerprint_operation(item, structural=True)
+                                  for item in operations}),
+            "owned_paths": sorted(_fingerprint_path(item) for item in _as_list(task.get("owned_paths"))
+                                  if isinstance(item, str)),
+            "write_targets": sorted(_fingerprint_path(item) for item in _as_list(task.get("write_targets"))
+                                    if isinstance(item, str)),
+            "verification_mode": _fingerprint_text(task.get("verification_mode")),
+            "verification_cases": sorted(
+                cases, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)),
+        }))
+    node_ids = []
+    occurrences: dict[str, int] = {}
+    for signature in node_signatures:
+        occurrence = occurrences.get(signature, 0)
+        occurrences[signature] = occurrence + 1
+        node_ids.append(f"{signature}:{occurrence}")
+    edges = []
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        dependencies = task.get("depends_on", [])
+        if not isinstance(dependencies, list):
+            continue
+        for dependency in dependencies:
+            if isinstance(dependency, str) and dependency in keys:
+                edges.append((node_ids[keys[dependency]], node_ids[index]))
+            else:
+                edges.append((f"unknown:{_fingerprint_text(dependency)}", node_ids[index]))
+    return _fingerprint({
+        "task_count": len(tasks),
+        "task_complexity": _fingerprint_text(value.get("task_complexity")),
+        "execution_strategy": _fingerprint_text(value.get("execution_strategy")),
+        "granularity_reason": _fingerprint_text(value.get("granularity_reason")),
+        "nodes": sorted(node_signatures),
+        "edges": sorted(edges),
+    })
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _semantic_plan_changed_fields(previous: dict[str, Any], candidate: dict[str, Any]
+                                  ) -> tuple[list[str], list[str]]:
+    old = _semantic_plan_projection(previous)
+    new = _semantic_plan_projection(candidate)
+    fields = [
+        "task_count", "task_kind", "objective", "description", "semantic_needs",
+        "operations", "dependencies", "write_targets", "owned_paths",
+        "success_criteria", "verification_cases", "execution_strategy",
+            "task_complexity", "granularity_reason", "decomposition_reason",
+            "unsupported_requirements",
+    ]
+    values_old = {
+        "task_count": old["task_count"],
+        "task_kind": [task["task_kind"] for task in old["tasks"]],
+        "objective": [task["objective"] for task in old["tasks"]],
+        "description": [task["description"] for task in old["tasks"]],
+        "semantic_needs": [task["semantic_needs"] for task in old["tasks"]],
+        "operations": [[*task["operations"], *task["semantic_operations"]] for task in old["tasks"]],
+        "dependencies": [task["dependencies"] for task in old["tasks"]],
+        "write_targets": [task["write_targets"] for task in old["tasks"]],
+        "owned_paths": [task["owned_paths"] for task in old["tasks"]],
+        "success_criteria": [task["success_criteria"] for task in old["tasks"]],
+        "verification_cases": [task["verification_cases"] for task in old["tasks"]],
+        "execution_strategy": old["execution_strategy"],
+        "task_complexity": old["task_complexity"],
+        "granularity_reason": old["granularity_reason"],
+        "decomposition_reason": old["decomposition_reason"],
+        "unsupported_requirements": old["unsupported_requirements"],
+    }
+    values_new = {
+        "task_count": new["task_count"],
+        "task_kind": [task["task_kind"] for task in new["tasks"]],
+        "objective": [task["objective"] for task in new["tasks"]],
+        "description": [task["description"] for task in new["tasks"]],
+        "semantic_needs": [task["semantic_needs"] for task in new["tasks"]],
+        "operations": [[*task["operations"], *task["semantic_operations"]] for task in new["tasks"]],
+        "dependencies": [task["dependencies"] for task in new["tasks"]],
+        "write_targets": [task["write_targets"] for task in new["tasks"]],
+        "owned_paths": [task["owned_paths"] for task in new["tasks"]],
+        "success_criteria": [task["success_criteria"] for task in new["tasks"]],
+        "verification_cases": [task["verification_cases"] for task in new["tasks"]],
+        "execution_strategy": new["execution_strategy"],
+        "task_complexity": new["task_complexity"],
+        "granularity_reason": new["granularity_reason"],
+        "decomposition_reason": new["decomposition_reason"],
+        "unsupported_requirements": new["unsupported_requirements"],
+    }
+    changed = [field for field in fields if values_old[field] != values_new[field]]
+    unchanged = [field for field in fields if values_old[field] == values_new[field]]
+    return changed, unchanged
+
+
+def _plans_semantically_equivalent(left: dict[str, Any], right: dict[str, Any], *,
+                                   compiler_error: dict[str, Any] | None = None,
+                                   required_delta: dict[str, Any] | None = None) -> bool:
+    if _semantic_plan_fingerprint(left) == _semantic_plan_fingerprint(right):
+        return True
+    if (_semantic_plan_structure_fingerprint(left) !=
+            _semantic_plan_structure_fingerprint(right)):
+        return False
+    # An unchanged action graph is normally a semantic repeat. Allow a same-graph
+    # repair only when its normalized semantic change satisfies the active,
+    # cause-specific Compiler invariant (for example, a corrected criterion).
+    if compiler_error is not None and required_delta is not None:
+        delta_satisfied, _reason = _repair_delta_satisfied(
+            left, right, compiler_error, required_delta)
+        return not delta_satisfied
+    return True
+
+
+def _required_plan_delta(value: dict[str, Any], compiler_error: dict[str, Any],
+                         fingerprint: str | None) -> dict[str, Any]:
+    error_type = str(compiler_error.get("type") or "PlanValidationError")
+    message = str(compiler_error.get("message") or "")
+    result: dict[str, Any] = {
+        "must_change": ["semantic task structure or the compiler-rejected field"],
+        "must_not_repeat": ["the rejected normalized Semantic Plan or equivalent task graph"],
+        "must_satisfy_all": [
+            "the current compiler rejection is resolved",
+            "the plan is materially different from every rejected plan",
+        ],
+        "compiler_error": error_type,
+        "repair_check": "diagnostic_field_changed",
+    }
+    if fingerprint:
+        result["rejected_plan_fingerprint"] = fingerprint
+    if error_type == "OverfragmentedPlan" and "excess simple Tasks" in message:
+        from .plan_granularity import EXPECTED_TASK_RANGES
+        task_complexity = value.get("task_complexity")
+        expected = EXPECTED_TASK_RANGES.get(task_complexity)
+        count = len(value.get("tasks", [])) if isinstance(value.get("tasks"), list) else 0
+        result["must_change"] = ["task_count OR granularity_reason"]
+        result["must_not_repeat"] = [f"the same {count}-task decomposition without a valid reason"]
+        result["repair_check"] = "overfragmented"
+        if expected:
+            result["expected_task_range"] = list(expected)
+            result["must_satisfy_any"] = [
+                f"task_count <= {expected[1]}",
+                "valid_granularity_reason grounded in independent outcomes or preserved boundaries",
+            ]
+    elif error_type == "OverfragmentedPlan":
+        result["must_change"] = [
+            "execution_strategy, task structure, or the Compiler decomposition boundary"
+        ]
+        result["must_not_repeat"] = ["the same delegation/action graph rejected by the Compiler"]
+        result["must_satisfy_all"] = [
+            "the Compiler decomposition checks no longer classify the plan as overfragmented",
+            "the plan is materially different from every rejected plan",
+        ]
+        result["repair_check"] = "decomposition_graph"
+    elif (error_type == "InvalidDependencyGraph"
+          or re.search(r"dependenc|depends_on|cycle", message, re.I)):
+        result["must_change"] = ["dependencies or semantic task keys"]
+        result["must_satisfy_all"] = [
+            "every dependency resolves to one existing task key",
+            "no task depends on itself",
+            "the dependency graph is acyclic",
+            "the plan is materially different from every rejected plan",
+        ]
+        result["repair_check"] = "dependency_graph"
+    elif "task_complexity" in message:
+        result["must_change"] = ["task_complexity"]
+        result["must_satisfy_all"] = ["task_complexity is simple, multi_step or complex"]
+        result["repair_check"] = "task_complexity"
+    elif "execution_strategy" in message:
+        result["must_change"] = ["execution_strategy"]
+        result["must_satisfy_all"] = ["execution_strategy is single_worker or multi_worker"]
+        result["repair_check"] = "execution_strategy"
+    elif "decomposition_reason" in message:
+        result["must_change"] = ["decomposition_reason"]
+        result["must_satisfy_all"] = ["decomposition_reason contains 20 to 1000 characters"]
+        result["repair_check"] = "decomposition_reason"
+    elif "granularity_reason" in message:
+        result["must_change"] = ["granularity_reason"]
+        result["must_satisfy_all"] = [
+            "granularity_reason is valid for the proposed task boundaries",
+            "the plan is materially different from every rejected plan",
+        ]
+        result["repair_check"] = "granularity_reason"
+    else:
+        result["must_change_fields"] = _repair_fields_from_diagnostic(message)
+    return result
+
+
+def _repair_fields_from_diagnostic(message: str) -> list[str]:
+    """Map known Compiler diagnostics to the semantic fields that can repair them."""
+    patterns = (
+        ("dependencies", r"dependenc|depends_on|cycle"),
+        ("task_complexity", r"task_complexity"),
+        ("execution_strategy", r"execution_strategy"),
+        ("decomposition_reason", r"decomposition_reason"),
+        ("granularity_reason", r"granularity_reason"),
+        ("task_kind", r"task_kind"),
+        ("operations", r"operation"),
+        ("write_targets", r"write[_ ]target|write operation|writer|write scope"),
+        ("owned_paths", r"owned[_ ]path|ownership|creator|owns path"),
+        ("verification_cases", r"verification case|verification_cases"),
+        ("success_criteria", r"criterion|criteria|success_criteria"),
+        ("semantic_needs", r"semantic_needs|semantic need"),
+        ("unsupported_requirements", r"unsupported"),
+        ("objective", r"objective"),
+    )
+    fields = [field for field, pattern in patterns if re.search(pattern, message, re.I)]
+    return fields or ["semantic_task_structure"]
+
+
+def _semantic_dependency_graph_status(value: dict[str, Any]) -> tuple[bool, str]:
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return False, "tasks_missing"
+
+    def key_slug(raw: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(raw).casefold()).strip("_")[:64]
+
+    keys: list[str] = []
+    for index, task in enumerate(tasks, 1):
+        if not isinstance(task, dict):
+            return False, "task_not_object"
+        key = key_slug(task.get("key") or task.get("objective") or "") or f"step_{index}"
+        if key in keys:
+            return False, "duplicate_task_key"
+        keys.append(key)
+
+    dependencies: list[list[int]] = []
+    for index, task in enumerate(tasks):
+        raw_dependencies = task.get("depends_on", [])
+        if not isinstance(raw_dependencies, list):
+            return False, "dependencies_not_list"
+        resolved: list[int] = []
+        for raw_dependency in raw_dependencies:
+            dependency = key_slug(raw_dependency)
+            if dependency not in keys:
+                return False, "unknown_dependency"
+            target = keys.index(dependency)
+            if target == index:
+                return False, "self_dependency"
+            resolved.append(target)
+        dependencies.append(resolved)
+
+    visited: set[int] = set()
+    active: set[int] = set()
+
+    def visit(index: int) -> bool:
+        if index in active:
+            return False
+        if index in visited:
+            return True
+        active.add(index)
+        if not all(visit(dependency) for dependency in dependencies[index]):
+            return False
+        active.remove(index)
+        visited.add(index)
+        return True
+
+    if not all(visit(index) for index in range(len(tasks))):
+        return False, "dependency_cycle"
+    return True, "dependency_graph_valid"
+
+
+def _compiler_decomposition_status(value: dict[str, Any]) -> tuple[bool, str]:
+    """Mirror the Compiler's pure decomposition gate before spending another attempt."""
+    tasks = value.get("tasks")
+    complexity = value.get("task_complexity")
+    strategy = value.get("execution_strategy")
+    reason = value.get("decomposition_reason")
+    if (not isinstance(tasks, list) or not tasks
+            or complexity not in {"simple", "multi_step", "complex"}
+            or strategy not in {"single_worker", "multi_worker"}
+            or not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 1000):
+        return False, "decomposition_contract_invalid"
+    if any(not isinstance(task, dict) for task in tasks):
+        return False, "task_not_object"
+    if any(not isinstance(task.get("write_targets", []), list)
+           or any(not isinstance(path, str) for path in task.get("write_targets", []))
+           for task in tasks):
+        return False, "write_targets_invalid"
+    if strategy == "single_worker" or len(tasks) == 1:
+        return True, "decomposition_not_overfragmented"
+    graph_valid, graph_reason = _semantic_dependency_graph_status(value)
+    if not graph_valid:
+        return False, graph_reason
+
+    def key_slug(raw: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(raw).casefold()).strip("_")[:64]
+
+    keys = [
+        key_slug(task.get("key") or task.get("objective") or "") or f"step_{index}"
+        for index, task in enumerate(tasks, 1)
+    ]
+    by_key = {key: index for index, key in enumerate(keys)}
+    dependencies = []
+    for task in tasks:
+        dependencies.append({
+            by_key[key_slug(dependency)]
+            for dependency in task.get("depends_on", [])
+        })
+    count = len(tasks)
+    review_or_qa = any(task.get("task_kind") in {"review", "testing"} for task in tasks)
+    implementation_only = all(task.get("task_kind") in {
+        "file_creation", "program_creation", "code_change", "general"
+    } for task in tasks)
+    linear = all(dependencies[index] == {index - 1} for index in range(1, count))
+    same_targets = any(
+        set(left.get("write_targets", [])) & set(right.get("write_targets", []))
+        for left, right in zip(tasks, tasks[1:])
+    )
+    stems = [{
+        str(path).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        for path in task.get("write_targets", [])
+    } for task in tasks]
+    coupled_pair = False
+    if count == 2 and linear and complexity != "complex":
+        from .plan_compiler import _responsibility_similarity
+        coupled_pair = bool(stems[0] & stems[1]) or (
+            _responsibility_similarity(tasks[0], tasks[1]) >= 0.6)
+    vague = re.search(
+        r"(?i)(multiple? files?|several files?|many steps?|different operations?|"
+        r"html.?css.?js|acceptance criteria|more than one file)", reason)
+    concrete = re.search(
+        r"(?i)(independent (?:audit|review|verification)|controlled qa|"
+        r"separate subsystems?|distinct (?:interface|dependency|speciali[sz])|"
+        r"parallel (?:implementation|development))", reason)
+    overfragmented = bool((vague and not concrete) or (
+        implementation_only and not review_or_qa and (
+            complexity == "simple" or same_targets or coupled_pair or
+            (count >= 3 and linear and complexity != "complex")
+        )
+    ))
+    return (not overfragmented,
+            "decomposition_overfragmented" if overfragmented
+            else "decomposition_not_overfragmented")
+
+
+def _repair_delta_satisfied(previous: dict[str, Any], candidate: dict[str, Any],
+                            compiler_error: dict[str, Any], required_delta: dict[str, Any]
+                            ) -> tuple[bool, str]:
+    candidate_tasks = candidate.get("tasks")
+    if (not isinstance(candidate_tasks, list) or not candidate_tasks
+            or len(candidate_tasks) > MAX_PLAN_TASKS
+            or any(not isinstance(task, dict) for task in candidate_tasks)):
+        return False, "semantic_plan_shape_invalid"
+    changed, _unchanged = _semantic_plan_changed_fields(previous, candidate)
+    repair_check = required_delta.get("repair_check")
+    if repair_check == "overfragmented":
+        expected = required_delta.get("expected_task_range")
+        old_tasks, new_tasks = previous.get("tasks", []), candidate.get("tasks", [])
+        old_count = len(old_tasks) if isinstance(old_tasks, list) else 0
+        new_count = len(new_tasks) if isinstance(new_tasks, list) else 0
+        maximum = expected[1] if isinstance(expected, list) and len(expected) == 2 else None
+        count_resolves = maximum is not None and new_count <= maximum and new_count < old_count
+        old_reason = _fingerprint_text(previous.get("granularity_reason"))
+        new_reason = _fingerprint_text(candidate.get("granularity_reason"))
+        reason_changed = bool(new_reason and new_reason != old_reason)
+        reason_valid = False
+        if reason_changed and isinstance(new_tasks, list):
+            from .plan_granularity import has_concrete_granularity_reason
+            reason_valid = has_concrete_granularity_reason(
+                candidate.get("granularity_reason"), new_tasks, {"preserved_boundaries": []})
+        if count_resolves:
+            return True, "task_count_within_expected_range"
+        if reason_changed and reason_valid:
+            return True, "concrete_granularity_reason"
+        return False, "overfragmentation_delta_not_resolved"
+    if repair_check == "dependency_graph":
+        return _semantic_dependency_graph_status(candidate)
+    if repair_check == "decomposition_graph":
+        return _compiler_decomposition_status(candidate)
+    if repair_check == "task_complexity":
+        valid = candidate.get("task_complexity") in {"simple", "multi_step", "complex"}
+        return (valid and "task_complexity" in changed,
+                "task_complexity_valid" if valid and "task_complexity" in changed
+                else "task_complexity_delta_not_resolved")
+    if repair_check == "execution_strategy":
+        valid = candidate.get("execution_strategy") in {"single_worker", "multi_worker"}
+        return (valid and "execution_strategy" in changed,
+                "execution_strategy_valid" if valid and "execution_strategy" in changed
+                else "execution_strategy_delta_not_resolved")
+    if repair_check == "decomposition_reason":
+        reason = candidate.get("decomposition_reason")
+        valid = isinstance(reason, str) and 20 <= len(reason.strip()) <= 1000
+        return (valid and "decomposition_reason" in changed,
+                "decomposition_reason_valid" if valid and "decomposition_reason" in changed
+                else "decomposition_reason_delta_not_resolved")
+    if repair_check == "granularity_reason":
+        reason = candidate.get("granularity_reason")
+        tasks = candidate.get("tasks")
+        valid = False
+        if isinstance(tasks, list):
+            from .plan_granularity import has_concrete_granularity_reason
+            valid = has_concrete_granularity_reason(reason, tasks, {"preserved_boundaries": []})
+        return valid, "granularity_reason_valid" if valid else "granularity_reason_delta_not_resolved"
+
+    required_fields = required_delta.get("must_change_fields", [])
+    if not isinstance(required_fields, list):
+        required_fields = []
+    if required_fields == ["semantic_task_structure"]:
+        structural_fields = {
+            "task_count", "task_kind", "objective", "description", "semantic_needs",
+            "operations", "dependencies", "write_targets", "owned_paths",
+            "success_criteria", "verification_cases", "execution_strategy",
+        "task_complexity", "granularity_reason", "decomposition_reason",
+        "unsupported_requirements",
+        }
+        field_changes = structural_fields.intersection(changed)
+    else:
+        field_changes = set(required_fields).intersection(changed)
+    if field_changes:
+        return True, "compiler_fields_changed:" + ",".join(sorted(field_changes))
+    return False, "compiler_rejection_delta_not_resolved"
+
+
+class SemanticPlanRepairGuard:
+    """Reject repaired plans that repeat a rejected graph before Plan Compiler."""
+
+    @staticmethod
+    def check(previous: dict[str, Any], candidate: dict[str, Any], *,
+              compiler_error: dict[str, Any], required_delta: dict[str, Any]) -> dict[str, Any]:
+        previous_fingerprint = _semantic_plan_fingerprint(previous)
+        new_fingerprint = _semantic_plan_fingerprint(candidate)
+        delta_satisfied, delta_reason = _repair_delta_satisfied(
+            previous, candidate, compiler_error, required_delta)
+        equivalent = _plans_semantically_equivalent(
+            previous, candidate, compiler_error=compiler_error,
+            required_delta=required_delta)
+        # A valid delta is necessary, but cannot make an already rejected
+        # semantic graph acceptable again.
+        accepted = delta_satisfied and not equivalent
+        changed_fields, unchanged_fields = _semantic_plan_changed_fields(previous, candidate)
+        return {
+            "previous_fingerprint": previous_fingerprint,
+            "new_fingerprint": new_fingerprint,
+            "previous_structure_fingerprint": _semantic_plan_structure_fingerprint(previous),
+            "new_structure_fingerprint": _semantic_plan_structure_fingerprint(candidate),
+            "equivalent": equivalent,
+            "materially_different": not equivalent,
+            "changed_fields": changed_fields,
+            "unchanged_fields": unchanged_fields,
+            "compiler_error": compiler_error,
+            "required_delta": required_delta,
+            "delta_satisfied": delta_satisfied,
+            "delta_reason": delta_reason,
+            "result": "material_change_accepted" if accepted else "no_material_change",
+        }
+
+
+def _bounded_normalized_plan(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep a compact canonical plan record for orchestration diagnostics."""
+    projection = _semantic_plan_projection(value)
+    tasks = projection.get("tasks", [])
+    bounded_tasks = []
+    for task in tasks[:MAX_PLAN_TASKS]:
+        if not isinstance(task, dict):
+            bounded_tasks.append({"invalid": True})
+            continue
+        bounded = {
+            key: copy.deepcopy(task[key]) for key in (
+                "task_kind", "objective", "description", "dependencies",
+                "execution_strategy", "task_complexity",
+            ) if key in task
+        }
+        bounded["objective"] = str(bounded.get("objective") or "")[:240]
+        bounded["description"] = str(bounded.get("description") or "")[:240]
+        for key in ("semantic_needs", "operations", "semantic_operations",
+                    "write_targets", "owned_paths", "success_criteria"):
+            items = task.get(key)
+            if isinstance(items, list):
+                bounded[key] = [str(item)[:180] for item in items[:8]]
+        if isinstance(task.get("granularity"), dict):
+            bounded["granularity"] = {
+                key: str(text)[:180]
+                for key, text in task["granularity"].items()
+            }
+        bounded_tasks.append(bounded)
+    return sanitize({
+        "task_count": projection.get("task_count"),
+        "task_complexity": projection.get("task_complexity"),
+        "execution_strategy": projection.get("execution_strategy"),
+        "granularity_reason": projection.get("granularity_reason", "")[:300],
+        "unsupported_requirements": projection.get("unsupported_requirements", [])[:8],
+        "success_criteria": projection.get("success_criteria", [])[:8],
+        "tasks": bounded_tasks,
+    })
+
+
+class RejectedSemanticPlanRegistry:
+    """Orchestration-local history of compiler and Repair Guard rejections."""
+
+    def __init__(self, orchestration_id: str | None = None):
+        self.orchestration_id = orchestration_id
+        self.entries: list[dict[str, Any]] = []
+        self.snapshots: dict[str, dict[str, Any]] = {}
+        self.errors: dict[str, dict[str, Any]] = {}
+        self.structure_errors: dict[str, dict[str, Any]] = {}
+        self.values: dict[str, dict[str, Any]] = {}
+        self.deltas: dict[str, dict[str, Any]] = {}
+        self.compiler_rejection_count = 0
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def match(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        fingerprint = _semantic_plan_fingerprint(plan)
+        structure_fingerprint = _semantic_plan_structure_fingerprint(plan)
+        for entry in self.entries:
+            if entry["fingerprint"] == fingerprint:
+                return {"entry": entry, "match_kind": "fingerprint"}
+            if entry["structure_fingerprint"] == structure_fingerprint:
+                prior_plan = self.values.get(entry["fingerprint"])
+                prior_error = self.errors.get(entry["fingerprint"])
+                prior_delta = self.deltas.get(entry["fingerprint"])
+                if (prior_plan is None or prior_error is None or prior_delta is None
+                        or _plans_semantically_equivalent(
+                            prior_plan, plan, compiler_error=prior_error,
+                            required_delta=prior_delta)):
+                    return {"entry": entry, "match_kind": "semantic_structure"}
+        return None
+
+    def register(self, plan: dict[str, Any], *, rejection_error: dict[str, Any],
+                 required_plan_delta: dict[str, Any], planner_attempt: int,
+                 compiler_attempt: int | None, rejection_kind: str,
+                 snapshot: dict[str, Any] | None = None
+                 ) -> tuple[dict[str, Any], bool]:
+        existing = self.match(plan)
+        if existing is not None:
+            return existing["entry"], False
+
+        fingerprint = _semantic_plan_fingerprint(plan)
+        structure_fingerprint = _semantic_plan_structure_fingerprint(plan)
+        error = sanitize(copy.deepcopy(rejection_error))
+        raw_tasks = plan.get("tasks")
+        entry = {
+            "orchestration_id": self.orchestration_id,
+            "event_sequence": len(self.entries) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "fingerprint": fingerprint,
+            "structure_fingerprint": structure_fingerprint,
+            "normalized_plan": _bounded_normalized_plan(plan),
+            "rejection_error_type": str(error.get("type") or "PlanValidationError")[:120],
+            "rejection_reason": str(error.get("message") or "")[:600],
+            "compiler_attempt": compiler_attempt,
+            "planner_attempt": planner_attempt,
+            "required_plan_delta": sanitize(copy.deepcopy(required_plan_delta)),
+            "task_count": len(raw_tasks) if isinstance(raw_tasks, list) else 0,
+            "task_complexity": plan.get("task_complexity"),
+            "execution_strategy": plan.get("execution_strategy"),
+            "rejection_kind": rejection_kind,
+        }
+        self.entries.append(entry)
+        self.snapshots[fingerprint] = copy.deepcopy(snapshot or entry["normalized_plan"])
+        self.errors[fingerprint] = error
+        self.structure_errors.setdefault(structure_fingerprint, error)
+        self.values[fingerprint] = copy.deepcopy(plan)
+        self.deltas[fingerprint] = copy.deepcopy(required_plan_delta)
+        if rejection_kind == "compiler":
+            self.compiler_rejection_count += 1
+        return entry, True
+
+    def export(self) -> list[dict[str, Any]]:
+        return sanitize(copy.deepcopy(self.entries))
+
+    def prompt_history(self) -> list[dict[str, Any]]:
+        """Return the bounded plan/error summary sent to a full-replan request."""
+        return [{
+            "plan_number": entry["event_sequence"],
+            "fingerprint": entry["fingerprint"],
+            "structure_fingerprint": entry["structure_fingerprint"],
+            "task_count": entry["task_count"],
+            "task_complexity": entry["task_complexity"],
+            "execution_strategy": entry["execution_strategy"],
+            "error": entry["rejection_error_type"],
+            "issue": entry["rejection_reason"][:300],
+            "rejection_kind": entry["rejection_kind"],
+            "required_plan_delta": copy.deepcopy(entry["required_plan_delta"]),
+            "rejected_structure": copy.deepcopy(entry["normalized_plan"]),
+        } for entry in self.entries]
+
+
+class VerificationCriterionReferenceError(PlanValidationError):
+    """A declared semantic case reference has zero or multiple final matches."""
+
+    def __init__(self, *, task_key: str, task_id: str, case_id: str, reference: str,
+                 available: list[str], reason: str, semantic_task_keys: list[str] | None = None):
+        self.diagnostics = sanitize({
+            "task_key": task_key, "task_id": task_id, "case_id": case_id,
+            "semantic_criterion_reference": reference[:MAX_CRITERION_CHARS],
+            "available_local_criteria": [item[:MAX_CRITERION_CHARS] for item in available[:MAX_CRITERIA]],
+            "reason": reason, "stage": "after_criterion_reconciliation",
+            "semantic_task_keys": semantic_task_keys or [task_key],
+        })
+        label = ("Verification case references an unknown local criterion." if reason == "unknown" else
+                 "Verification case has an ambiguous local criterion reference.")
+        super().__init__(label + " " + json.dumps(self.diagnostics, ensure_ascii=False))
+
+
 class PlanGenerationError(RuntimeError):
     """A configured planner model failed to produce a valid plan."""
+
+
+class PlannerUnableToProduceMateriallyDifferentPlan(PlanGenerationError):
+    """Compatibility base for the former repeated-plan failure."""
+
+    def __init__(self, diagnostics: dict[str, Any]):
+        self.diagnostics = sanitize(diagnostics)
+        super().__init__(
+            "PlannerUnableToProduceMateriallyDifferentPlan: "
+            + json.dumps(self.diagnostics, ensure_ascii=False)
+        )
+
+
+class PlannerUnableToProduceAcceptablePlan(PlannerUnableToProduceMateriallyDifferentPlan):
+    """Bounded planning could not satisfy all rejected-plan constraints."""
+
+    def __init__(self, diagnostics: dict[str, Any]):
+        self.diagnostics = sanitize(diagnostics)
+        PlanGenerationError.__init__(
+            self,
+            "PlannerUnableToProduceAcceptablePlan: "
+            + json.dumps(self.diagnostics, ensure_ascii=False)
+        )
+
+
+class VerificationBindingInvariantError(PlanGenerationError):
+    """Compiler lost a valid reference; model repair cannot fix this invariant."""
+
+    def __init__(self, diagnostics: dict[str, Any]):
+        self.diagnostics = sanitize(diagnostics)
+        super().__init__("Compiler lost a reconciled verification criterion during binding. " +
+                         json.dumps(self.diagnostics, ensure_ascii=False))
 
 
 class OllamaPlanner:
@@ -1279,6 +2090,26 @@ def normalize_plan(value: Any, *, diagnostics: dict[str, Any] | None = None,
     result[CRITERION_LINKS_FIELD] = _normalize_criterion_links(
         raw.get(CRITERION_LINKS_FIELD), result["success_criteria"], tasks, diagnostics,
         repair_model_criteria=repair_model_criteria)
+    for task in tasks:
+        local_rows = [row for row in result[CRITERION_LINKS_FIELD]["local"] if row["task_id"] == task["id"]]
+        local = {row["id"]: row["criterion"] for row in local_rows}
+        for case in task.get("verification_cases", []):
+            refs = case.get("supports_criteria", [])
+            ids = case.get("supports_acceptance_criterion_ids", [])
+            matches = []
+            for ref in refs:
+                candidates = criterion_reference_matches(ref, local_rows)
+                if len(candidates) != 1:
+                    raise VerificationCriterionReferenceError(
+                        task_key=task["id"], task_id=task["id"], case_id=case["id"], reference=ref,
+                        available=list(local.values()), reason="unknown" if not candidates else "ambiguous")
+                matches.append(candidates[0])
+            if any(ref not in local for ref in ids):
+                raise PlanValidationError("Verification case references an unknown local criterion.")
+            if refs and ids and {row["id"] for row in matches} != set(ids):
+                raise PlanValidationError("Verification case text and criterion IDs disagree.")
+            if refs:
+                case["supports_criteria"] = list(dict.fromkeys(row["criterion"] for row in matches))
     return result
 
 
@@ -1524,7 +2355,7 @@ def fallback_plan(prompt: str) -> dict[str, Any]:
 
 
 class Planner:
-    """Create plans from a structured model callback, with exactly one repair."""
+    """Create bounded semantic plans and compile only guard-approved repairs."""
 
     def __init__(self, decide: Callable[[str, dict[str, Any]], Any] | None = None, *,
                  offline: bool = False):
@@ -1722,7 +2553,8 @@ class Planner:
                 ) from second_error
 
     def create_plan_for_spec(self, task_spec: dict[str, Any],
-                             context: dict[str, Any] | None = None) -> dict[str, Any]:
+                             context: dict[str, Any] | None = None, *,
+                             orchestration_id: str | None = None) -> dict[str, Any]:
         """Plan HOW from canonical intent, then compile runtime identifiers."""
         from .plan_compiler import compile_semantic_plan
         from .task_spec import render_task_spec, validate_task_spec
@@ -1787,7 +2619,11 @@ class Planner:
             "depends_on (semantic task keys), semantic_needs, operations, success_criteria, "
             "owned_paths and write_targets. "
             "For explicit verification inputs supply verification_mode=independent_cases and "
-            "verification_cases=[{id: stable case ID, input: exact bounded stdin string}] on the testing task. "
+            "verification_cases=[{id: stable case ID, input: exact bounded stdin string, "
+            "supports_criteria: semantic success_criteria texts verified by this case}] on the testing task. "
+            "Declare exact relationships; never invent criteria or choose runtime criterion IDs. "
+            "Compiler resolves references after reconciling final local criteria. Several cases may support "
+            "one aggregate criterion, and a case may support several criteria. Binding is optional. "
             "Each independent input starts a fresh process; never concatenate separate cases into one stdin. "
             "Put all independent cases of the same program in one testing task, never one task per input. "
             "Testing tasks have empty owned_paths and write_targets and report results in their response. "
@@ -1898,13 +2734,313 @@ class Planner:
         original_for_repair = None
         affected_for_repair: set[int] = set()
         preserve_all_repair_tasks = False
-        for attempt in range(2):
+        force_full_replan = False
+        registry = RejectedSemanticPlanRegistry(orchestration_id)
+        rejected_plan_snapshots = registry.snapshots
+        rejected_plan_errors = registry.errors
+        rejected_plan_structure_errors = registry.structure_errors
+        rejected_plan_values = registry.values
+        rejected_plan_deltas = registry.deltas
+        self.metrics["rejected_plan_history"] = []
+        repair_guard_state: dict[str, Any] | None = None
+        repair_attempt_count = 0
+        compiler_attempt_count = 0
+
+        def reject_invalid_repair_shape(raw_value: Any, error: Exception | None = None) -> None:
+            active_error = repair_guard_state["compiler_error"] if repair_guard_state else {}
+            required_delta = (repair_guard_state["required_plan_delta"]
+                              if repair_guard_state else {})
+            previous = repair_guard_state["plan"] if repair_guard_state else {}
+            previous_fingerprint = _semantic_plan_fingerprint(previous) if previous else None
+            message = ("Planner repair output must be a Semantic Plan object with a non-empty "
+                       "tasks array of task objects.")
+            if error is not None:
+                message = f"{message} {type(error).__name__}: {str(error)[:240]}"
+            failure = {"type": "InvalidSemanticPlanShape", "message": message}
+            self.metrics.setdefault("planner_events", []).append({
+                "event_type": "planner.repair_delta_checked",
+                "attempt": repair_attempt_count,
+                "planner_attempt": attempt + 1,
+                "previous_fingerprint": previous_fingerprint,
+                "new_fingerprint": None,
+                "changed_fields": [],
+                "unchanged_fields": [],
+                "compiler_error": active_error,
+                "required_delta": required_delta,
+                "seen_before": False,
+                "required_delta_satisfied": False,
+                "materially_different": False,
+                "result": "invalid_semantic_plan_shape",
+                "semantic_equivalent": None,
+                "delta_reason": "semantic_plan_shape_invalid",
+                "candidate_type": type(raw_value).__name__,
+                "rejected_plan_count": len(registry),
+            })
+            self.metrics["planner_events"].append({
+                "event_type": "planner.repair_required_delta_failed",
+                "planner_attempt": attempt + 1,
+                "fingerprint": None,
+                "previous_error": active_error,
+                "required_plan_delta": required_delta,
+                "failed_check": "semantic_plan_shape_invalid",
+                "changed_fields": [],
+                "unchanged_fields": [],
+                "compiler_attempts_consumed": compiler_attempt_count,
+            })
+            raise PlannerUnableToProduceAcceptablePlan({
+                "failure_reason": "invalid_semantic_plan_shape",
+                "planner_attempt": attempt + 1,
+                "repair_attempt_count": repair_attempt_count,
+                "max_repair_attempts": MAX_SEMANTIC_PLAN_REPAIRS,
+                "compiler_attempts_consumed": compiler_attempt_count,
+                "candidate_type": type(raw_value).__name__,
+                "compiler_error": active_error,
+                "required_plan_delta": required_delta,
+                "invalid_output": failure,
+                "rejected_plan_count": len(registry),
+                "rejected_plan_history": registry.prompt_history(),
+            })
+
+        for attempt in range(MAX_SEMANTIC_PLAN_ATTEMPTS):
+            candidate_fingerprint = None
+            candidate_structure_fingerprint = None
+            previous_structure_error = None
+            compiler_invoked = False
+            snapshot: dict[str, Any] = {}
             try:
-                compiler_started_at = compiler_timestamp()
-                compiler_started = time.monotonic()
                 value = None
                 value = json.loads(semantic) if isinstance(semantic, str) else semantic
-                if (attempt and (affected_for_repair or preserve_all_repair_tasks)
+                snapshot = semantic_plan_snapshot(value)
+                self.metrics["planner_semantic_plan"] = snapshot
+                self.metrics.setdefault("planner_semantic_plan_attempts", []).append(snapshot)
+                if (attempt and repair_guard_state is not None
+                        and not isinstance(value, dict)):
+                    reject_invalid_repair_shape(value)
+                candidate_fingerprint = (
+                    _semantic_plan_fingerprint(value) if isinstance(value, dict) else None
+                )
+                candidate_structure_fingerprint = (
+                    _semantic_plan_structure_fingerprint(value) if isinstance(value, dict) else None
+                )
+                if candidate_fingerprint is not None:
+                    self.metrics.setdefault("planner_events", []).append({
+                        "event_type": "planner.plan_fingerprint_created",
+                        "attempt": attempt + 1,
+                        "repair_attempt": repair_attempt_count if attempt else 0,
+                        "fingerprint": candidate_fingerprint,
+                        "structure_fingerprint": candidate_structure_fingerprint,
+                    })
+                if attempt and repair_guard_state is not None and isinstance(value, dict):
+                    active_error = repair_guard_state["compiler_error"]
+                    active_delta = repair_guard_state["required_plan_delta"]
+                    guard_result = SemanticPlanRepairGuard.check(
+                        repair_guard_state["plan"], value,
+                        compiler_error=active_error, required_delta=active_delta)
+                    repeated_match = registry.match(value)
+                    seen_before = repeated_match is not None
+                    required_delta_satisfied = bool(guard_result["delta_satisfied"])
+                    materially_different = (
+                        not seen_before and not guard_result["equivalent"])
+                    if seen_before:
+                        guard_outcome = "repeated_rejected_plan"
+                    elif not required_delta_satisfied:
+                        guard_outcome = "required_delta_unsatisfied"
+                    elif not materially_different:
+                        guard_outcome = "material_change_missing"
+                    else:
+                        guard_outcome = "material_change_accepted"
+
+                    guard_event = {
+                        "event_type": "planner.repair_delta_checked",
+                        "attempt": repair_attempt_count,
+                        "planner_attempt": attempt + 1,
+                        "previous_fingerprint": guard_result["previous_fingerprint"],
+                        "new_fingerprint": guard_result["new_fingerprint"],
+                        "previous_structure_fingerprint": guard_result[
+                            "previous_structure_fingerprint"],
+                        "new_structure_fingerprint": guard_result["new_structure_fingerprint"],
+                        "changed_fields": guard_result["changed_fields"],
+                        "unchanged_fields": guard_result["unchanged_fields"],
+                        "compiler_error": active_error,
+                        "required_delta": active_delta,
+                        "seen_before": seen_before,
+                        "required_delta_satisfied": required_delta_satisfied,
+                        "materially_different": materially_different,
+                        "result": guard_outcome,
+                        "semantic_equivalent": guard_result["equivalent"],
+                        "delta_reason": guard_result["delta_reason"],
+                        "rejected_plan_count": len(registry),
+                    }
+                    self.metrics.setdefault("planner_events", []).append(guard_event)
+
+                    if guard_outcome == "material_change_accepted":
+                        self.metrics["planner_events"].append({
+                            **guard_event,
+                            "event_type": "planner.repair_material_change_accepted",
+                        })
+                        repair_guard_state = None
+                    else:
+                        failure_reason = (
+                            "repeated_rejected_plan" if seen_before
+                            else "required_plan_delta_unsatisfied" if not required_delta_satisfied
+                            else "material_change_missing"
+                        )
+                        matched_entry = repeated_match["entry"] if repeated_match else None
+                        if matched_entry is not None:
+                            self.metrics["planner_events"].append({
+                                "event_type": "planner.rejected_plan_repeated",
+                                "planner_attempt": attempt + 1,
+                                "fingerprint": candidate_fingerprint,
+                                "structure_fingerprint": candidate_structure_fingerprint,
+                                "matching_rejected_attempt": matched_entry["planner_attempt"],
+                                "previous_error": {
+                                    "type": matched_entry["rejection_error_type"],
+                                    "message": matched_entry["rejection_reason"],
+                                },
+                                "match_kind": repeated_match["match_kind"],
+                                "rejection_count": len(registry),
+                                "rejected_plan_count": len(registry),
+                            })
+                        else:
+                            local_error = {
+                                "type": "RequiredPlanDeltaUnsatisfied",
+                                "message": guard_result["delta_reason"],
+                            }
+                            entry, registered = registry.register(
+                                value, rejection_error=local_error,
+                                required_plan_delta=active_delta,
+                                planner_attempt=attempt + 1, compiler_attempt=None,
+                                rejection_kind="repair_guard", snapshot=snapshot)
+                            self.metrics["rejected_plan_history"] = registry.export()
+                            if registered:
+                                self.metrics["planner_events"].append({
+                                    "event_type": "planner.rejected_plan_registered",
+                                    **{key: entry[key] for key in (
+                                        "orchestration_id", "event_sequence", "fingerprint",
+                                        "structure_fingerprint",
+                                        "rejection_error_type", "rejection_reason", "compiler_attempt",
+                                        "planner_attempt", "required_plan_delta", "task_count",
+                                        "task_complexity", "execution_strategy", "timestamp",
+                                        "rejection_kind", "normalized_plan",
+                                    )},
+                                })
+                            self.metrics["planner_events"].append({
+                                "event_type": "planner.repair_required_delta_failed",
+                                "planner_attempt": attempt + 1,
+                                "fingerprint": candidate_fingerprint,
+                                "previous_error": active_error,
+                                "required_plan_delta": active_delta,
+                                "failed_check": guard_result["delta_reason"],
+                                "changed_fields": guard_result["changed_fields"],
+                                "unchanged_fields": guard_result["unchanged_fields"],
+                                "compiler_attempts_consumed": compiler_attempt_count,
+                            })
+                        if not materially_different:
+                            self.metrics["planner_events"].append({
+                                **guard_event,
+                                "event_type": "planner.repair_no_material_change",
+                                "full_replan_required": True,
+                            })
+                        if repair_attempt_count >= MAX_SEMANTIC_PLAN_REPAIRS or self.decide is None:
+                            raise PlannerUnableToProduceAcceptablePlan({
+                                "failure_reason": failure_reason,
+                                "planner_attempt": attempt + 1,
+                                "repair_attempt_count": repair_attempt_count,
+                                "max_repair_attempts": MAX_SEMANTIC_PLAN_REPAIRS,
+                                "matched_rejected_attempt": (
+                                    matched_entry["planner_attempt"] if matched_entry else None),
+                                "previous_compiler_error": active_error,
+                                "required_plan_delta": active_delta,
+                                "rejected_plan_count": len(registry),
+                                "rejected_plan_history": registry.prompt_history(),
+                            })
+
+                        force_full_replan = True
+                        original_for_repair = copy.deepcopy(value)
+                        affected_for_repair = set()
+                        preserve_all_repair_tasks = False
+                        next_required_delta = copy.deepcopy(active_delta)
+                        next_required_delta["rejected_plan_fingerprints"] = [
+                            entry["fingerprint"] for entry in registry.entries]
+                        next_required_delta["must_be_structurally_different"] = True
+                        repair_payload = {
+                            "instruction": (
+                                "This Semantic Plan was rejected locally before Plan Compiler. "
+                                "Do not return it or any semantically equivalent plan from the rejected "
+                                "history. Produce a full replan that resolves the latest compiler error "
+                                "and satisfies required_plan_delta. A wording, ID, ordering or naming change "
+                                "does not count as a material change."
+                            ),
+                            "canonical_task_spec": public_spec,
+                            "previous_semantic_plan": snapshot,
+                            "rejected_plan_history": registry.prompt_history(),
+                            "rejected_plan_fingerprints": [
+                                entry["fingerprint"] for entry in registry.entries],
+                            "rejected_semantic_plans": [
+                                entry["normalized_plan"] for entry in registry.entries],
+                            "compiler_error": active_error,
+                            "previous_compiler_error": active_error,
+                            "required_plan_delta": next_required_delta,
+                            "repair_guard_result": {
+                                "failure_reason": failure_reason,
+                                "matching_rejected_attempt": (
+                                    matched_entry["planner_attempt"] if matched_entry else None),
+                                "changed_fields": guard_result["changed_fields"],
+                                "unchanged_fields": guard_result["unchanged_fields"],
+                                "semantic_equivalent": guard_result["equivalent"],
+                                "required_delta_satisfied": required_delta_satisfied,
+                                "delta_reason": guard_result["delta_reason"],
+                            },
+                            "rules": {
+                                "preserve_user_scope": True,
+                                "do_not_add_requirements": True,
+                                "replan_entire_plan": True,
+                                "must_differ_from_rejected_plans": True,
+                            },
+                        }
+                        encoded = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
+                        if len(encoded) > 40000:
+                            raise PlanGenerationError(
+                                "Semantic plan repair payload exceeds the bounded limit.")
+                        repair_attempt_count += 1
+                        self.metrics["planner_events"].append({
+                            "event_type": "planner.repair_requested",
+                            "error_type": "PlannerRepairGuard",
+                            "failure_reason": failure_reason,
+                            "attempt": repair_attempt_count,
+                            "previous_fingerprint": guard_result["previous_fingerprint"],
+                            "new_fingerprint": guard_result["new_fingerprint"],
+                            "compiler_error": active_error,
+                            "required_plan_delta": next_required_delta,
+                            "full_replan_required": True,
+                        })
+                        semantic = self._call(encoded, {
+                            **limited_context,
+                            "_freya_repair": True,
+                            "_freya_replan": True,
+                        })
+                        self.metrics["planner_events"].append({
+                            "event_type": "planner.repair_completed",
+                            "full_replan": True,
+                            "attempt_number": repair_attempt_count,
+                        })
+                        continue
+                if (candidate_fingerprint is not None
+                        and candidate_fingerprint in rejected_plan_snapshots):
+                    self.metrics.setdefault("planner_events", []).append({
+                        "event_type": "planner.duplicate_plan_rejected",
+                        "attempt_number": attempt + 1,
+                        "rejection_count": len(rejected_plan_snapshots),
+                    })
+                    raise RepeatedSemanticPlanError(
+                        rejected_plan_errors.get(candidate_fingerprint)
+                    )
+                if attempt and candidate_structure_fingerprint is not None:
+                    previous_structure_error = rejected_plan_structure_errors.get(
+                        candidate_structure_fingerprint
+                    )
+                if (attempt and not force_full_replan and previous_structure_error is None
+                        and (affected_for_repair or preserve_all_repair_tasks)
                         and isinstance(value, dict)
                         and isinstance(original_for_repair, dict)):
                     old_tasks = original_for_repair.get("tasks", [])
@@ -1912,16 +3048,18 @@ class Planner:
                                   if isinstance(task, dict)}
                     old_keys = {task.get("key") for task in old_tasks if isinstance(task, dict)}
                     if not set(new_by_key) <= old_keys:
-                        raise PlanValidationError(
+                        raise PlanGenerationError(
                             "Planner repair added a new semantic task outside the rejected boundary.")
                     for index, task in enumerate(old_tasks, 1):
                         if (index not in affected_for_repair and isinstance(task, dict)
                                 and new_by_key.get(task.get("key")) != task):
-                            raise PlanValidationError(
+                            raise PlanGenerationError(
                                 "Planner repair changed or removed an unaffected semantic task.")
-                snapshot = semantic_plan_snapshot(value)
-                self.metrics["planner_semantic_plan"] = snapshot
-                self.metrics.setdefault("planner_semantic_plan_attempts", []).append(snapshot)
+                force_full_replan = False
+                compiler_started_at = compiler_timestamp()
+                compiler_started = time.monotonic()
+                compiler_attempt_count += 1
+                compiler_invoked = True
                 plan = compile_semantic_plan(value, spec, resource_catalog=resource_catalog)
                 scope_adjustments = list(resource_catalog.scope_adjustments)
                 self.metrics["scope_adjustments"] = scope_adjustments
@@ -2040,7 +3178,7 @@ class Planner:
                 self.metrics["preferred_skill_warnings"] = preferred_skill_warnings
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Success",
-                    attempt_number=attempt + 1, plan=compiled,
+                    attempt_number=compiler_attempt_count, plan=compiled,
                 )
                 record["preferred_skill_warnings"] = preferred_skill_warnings
                 record["scope_adjustments"] = scope_adjustments
@@ -2060,10 +3198,11 @@ class Planner:
                 record_validation("planner", "accepted", detail=f"Compiled {len(compiled['tasks'])} tasks.",
                                   normalized_response=compiled)
                 return compiled
-            except (UnsupportedResourceRequirement, SkillCompatibilityError, PlannerScopeError) as exc:
+            except (UnsupportedResourceRequirement, SkillCompatibilityError, PlannerScopeError,
+                    VerificationBindingInvariantError) as exc:
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Failed",
-                    attempt_number=attempt + 1, error=exc,
+                    attempt_number=compiler_attempt_count, error=exc,
                 )
                 record["planner_semantic_plan"] = self.metrics.get("planner_semantic_plan", {})
                 record["scope_adjustments"] = self.metrics.get("scope_adjustments", [])
@@ -2074,49 +3213,202 @@ class Planner:
                 raise
             except (ValueError, TypeError, PlanValidationError) as exc:
                 from .llm_trace import record_validation
-                record_validation("planner", "rejected", detail=f"{type(exc).__name__}: {exc}")
+                rejected_error = {"type": type(exc).__name__, "message": str(exc)[:600]}
+                record_validation("planner", "rejected",
+                                  detail=f"{rejected_error['type']}: {rejected_error['message']}")
                 record = compiler_metrics(
                     compiler_started_at, compiler_started, "Failed",
-                    attempt_number=attempt + 1, error=exc,
+                    attempt_number=compiler_attempt_count, error=exc,
+                ) if compiler_invoked else None
+                if record is not None:
+                    record["compiler_events"] = list(getattr(resource_catalog, "compiler_events", []))
+                    self.metrics["semantic_compiler"] = record
+                    self.metrics["semantic_compiler_attempts"].append(record)
+                repeated_plan = isinstance(exc, RepeatedSemanticPlanError)
+                previous_compiler_error = (
+                    exc.previous_error if repeated_plan else None
                 )
-                record["compiler_events"] = list(getattr(resource_catalog, "compiler_events", []))
-                self.metrics["semantic_compiler"] = record
-                self.metrics["semantic_compiler_attempts"].append(record)
-                if attempt or self.decide is None:
-                    raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
+                repeated_match = registry.match(value) if isinstance(value, dict) else None
+                if repeated_match is not None:
+                    repeated_plan = True
+                    matched_entry = repeated_match["entry"]
+                    previous_compiler_error = registry.errors.get(
+                        matched_entry["fingerprint"], {
+                            "type": matched_entry["rejection_error_type"],
+                            "message": matched_entry["rejection_reason"],
+                        })
+                    self.metrics.setdefault("planner_events", []).append({
+                        "event_type": "planner.rejected_plan_repeated",
+                        "planner_attempt": attempt + 1,
+                        "fingerprint": candidate_fingerprint,
+                        "structure_fingerprint": candidate_structure_fingerprint,
+                        "matching_rejected_attempt": matched_entry["planner_attempt"],
+                        "previous_error": previous_compiler_error,
+                        "match_kind": repeated_match["match_kind"],
+                        "rejection_count": len(registry),
+                        "rejected_plan_count": len(registry),
+                        "secondary_defense": True,
+                    })
+                if (not repeated_plan and previous_structure_error is not None
+                        and rejected_error == previous_structure_error):
+                    repeated_plan = True
+                    previous_compiler_error = previous_structure_error
+                    self.metrics.setdefault("planner_events", []).append({
+                        "event_type": "planner.duplicate_plan_rejected",
+                        "attempt_number": attempt + 1,
+                        "rejection_count": len(registry),
+                        "match": "same_task_graph_and_compiler_error",
+                    })
+                    exc = RepeatedSemanticPlanError(previous_compiler_error)
                 if not isinstance(value, dict):
+                    if attempt and repair_guard_state is not None:
+                        reject_invalid_repair_shape(value, exc)
                     raise PlanGenerationError(f"Semantic plan is invalid: {exc}") from exc
                 original_for_repair = copy.deepcopy(value)
                 message = str(exc)[:600]
                 affected_paths = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", message)
                 affected_ids = sorted({int(number) for number in re.findall(r"\btask-(\d+)\b", message)})
+                reference_diagnostic = None
+                if isinstance(exc, VerificationCriterionReferenceError):
+                    reference_diagnostic = exc.diagnostics
+                    from .plan_compiler import _slug
+                    semantic_keys = set(reference_diagnostic["semantic_task_keys"])
+                    affected_ids = [index for index, task in enumerate(value.get("tasks", []), 1)
+                                    if _slug(str(task.get("key") or task.get("objective") or "")) in semantic_keys]
+                    affected_paths = []
                 from .plan_compiler import OverfragmentedPlan
                 consolidation = isinstance(exc, OverfragmentedPlan)
                 affected_for_repair = (set(range(1, len(value.get("tasks", [])) + 1))
                                        if consolidation else set(affected_ids))
                 preserve_all_repair_tasks = message.startswith("Planner unsupported claim")
+                if consolidation:
+                    # Every task belongs to the rejected decomposition. A
+                    # consolidated repair may use a new semantic key for the
+                    # resulting task; keys are labels, not scope boundaries.
+                    force_full_replan = True
+                if repeated_plan:
+                    force_full_replan = True
+                    affected_for_repair = set()
+                    preserve_all_repair_tasks = False
                 error_type = type(exc).__name__
+                error_for_guard = (previous_compiler_error
+                                   if repeated_plan and previous_compiler_error else rejected_error)
+                required_delta = _required_plan_delta(
+                    value, error_for_guard, candidate_fingerprint)
+                if candidate_fingerprint is not None:
+                    entry, registered = registry.register(
+                        value, rejection_error=error_for_guard,
+                        required_plan_delta=required_delta,
+                        planner_attempt=attempt + 1,
+                        compiler_attempt=compiler_attempt_count if compiler_invoked else None,
+                        rejection_kind="compiler" if compiler_invoked else "planner_validation",
+                        snapshot=snapshot,
+                    )
+                    self.metrics["rejected_plan_history"] = registry.export()
+                    if registered:
+                        self.metrics.setdefault("planner_events", []).append({
+                            "event_type": "planner.rejected_plan_registered",
+                            **{key: entry[key] for key in (
+                                "orchestration_id", "event_sequence", "fingerprint",
+                                "structure_fingerprint",
+                                "rejection_error_type", "rejection_reason", "compiler_attempt",
+                                "planner_attempt", "required_plan_delta", "task_count",
+                                "task_complexity", "execution_strategy", "timestamp",
+                                "rejection_kind", "normalized_plan",
+                            )},
+                        })
+                        if candidate_structure_fingerprint is not None:
+                            rejected_plan_structure_errors.setdefault(
+                                candidate_structure_fingerprint, error_for_guard)
+                elif repeated_plan:
+                    entry = repeated_match["entry"] if repeated_match else {}
+                full_replan_required = repeated_plan or len(registry) > 1
+                force_full_replan = full_replan_required or consolidation
+                repair_guard_state = {
+                    "plan": copy.deepcopy(value),
+                    "fingerprint": candidate_fingerprint,
+                    "compiler_error": error_for_guard,
+                    "required_plan_delta": required_delta,
+                }
+                if repair_attempt_count >= MAX_SEMANTIC_PLAN_REPAIRS or self.decide is None:
+                    failure_reason = (
+                        "repeated_rejected_plan" if repeated_plan
+                        else "new_compiler_rejection_after_repair_limit" if compiler_invoked
+                        else "planner_validation_rejected_after_repair_limit"
+                    )
+                    raise PlannerUnableToProduceAcceptablePlan({
+                        "failure_reason": failure_reason,
+                        "repair_attempt_count": repair_attempt_count,
+                        "max_repair_attempts": MAX_SEMANTIC_PLAN_REPAIRS,
+                        "planner_attempt": attempt + 1,
+                        "compiler_attempt": compiler_attempt_count if compiler_invoked else None,
+                        "compiler_error": error_for_guard,
+                        "rejected_plan_count": len(registry),
+                        "rejected_plan_history": registry.prompt_history(),
+                    }) from exc
                 diagnostic = {"type": error_type, "message": message,
                               "affected_tasks": [f"task-{number}" for number in affected_ids],
-                              "affected_paths": affected_paths}
+                              "affected_paths": affected_paths,
+                              "rejected_plan_count": len(registry),
+                              **({"previous_compiler_error": previous_compiler_error}
+                                 if repeated_plan and previous_compiler_error else {})}
+                if reference_diagnostic is not None:
+                    diagnostic["verification_criterion_reference"] = reference_diagnostic
                 self.metrics.setdefault("planner_events", []).append({
                     "event_type": "planner.repair_requested", "error_type": error_type,
                     "affected_tasks": diagnostic["affected_tasks"],
                     "affected_paths": affected_paths,
-                    "original_task_count": len(value.get("tasks", []))})
+                    **({"verification_criterion_reference": reference_diagnostic}
+                       if reference_diagnostic is not None else {}),
+                    "original_task_count": len(value.get("tasks", [])),
+                    **({"previous_compiler_error": previous_compiler_error}
+                       if repeated_plan and previous_compiler_error else {}),
+                    "full_replan_required": full_replan_required,
+                    "attempt": repair_attempt_count + 1,
+                    "compiler_error": error_for_guard,
+                    "required_plan_delta": required_delta})
                 repair_payload = {
-                    "instruction": ("Consolidate unjustified worker tasks and update execution_strategy and "
-                                    "decomposition_reason. Return the complete semantic plan JSON."
-                                    if consolidation else
-                                    "Repair only the compiler-rejected part of this semantic plan. Return the complete semantic plan JSON."),
+                    "instruction": (
+                        "Several previously rejected Semantic Plans exist. Replan the complete request, "
+                        "do not reproduce any rejected structure, and resolve the latest compiler error."
+                        if full_replan_required and len(registry) > 1 else
+                        "The submitted plan repeats a rejected Semantic Plan. Do not return any rejected "
+                        "plan, even with changed wording or task keys. Replan the complete request."
+                        if repeated_plan else
+                        "Consolidate unjustified Tasks or provide a concrete granularity_reason grounded "
+                        "in preserved boundaries or independent outcomes. Task count is independent of "
+                        "Worker count. Preserve justified strategy and decomposition."
+                        if consolidation else
+                        "Repair the compiler-rejected field and satisfy the required plan delta."
+                    ) + (
+                        " Preserve the canonical Task Spec scope, satisfy required_plan_delta, and return "
+                        "the complete semantic plan JSON."
+                    ),
                     "canonical_task_spec": public_spec,
-                    "previous_semantic_plan": original_for_repair,
+                    "previous_semantic_plan": snapshot,
+                    "rejected_plan_history": registry.prompt_history(),
+                    "rejected_plan_fingerprints": [
+                        item["fingerprint"] for item in registry.entries],
+                    "rejected_semantic_plans": [
+                        item["normalized_plan"] for item in registry.entries],
                     "compiler_error": diagnostic,
-                    "rules": {"preserve_unaffected_tasks": not consolidation,
-                              "preserve_user_scope": True, "do_not_add_requirements": True},
+                    "required_plan_delta": required_delta,
+                    "rules": {"preserve_unaffected_tasks": not full_replan_required,
+                              "preserve_user_scope": True, "do_not_add_requirements": True,
+                              "replan_entire_plan": full_replan_required,
+                              "must_differ_from_rejected_plans": True},
                 }
                 encoded = json.dumps(repair_payload, ensure_ascii=False, separators=(",", ":"))
                 if len(encoded) > 40000:
                     raise PlanGenerationError("Semantic plan repair payload exceeds the bounded limit.") from exc
-                semantic = self._call(encoded, {**limited_context, "_freya_repair": True})
-                self.metrics["planner_events"].append({"event_type": "planner.repair_completed"})
+                repair_attempt_count += 1
+                semantic = self._call(encoded, {
+                    **limited_context,
+                    "_freya_repair": True,
+                    "_freya_replan": full_replan_required,
+                })
+                self.metrics["planner_events"].append({
+                    "event_type": "planner.repair_completed",
+                    "full_replan": full_replan_required,
+                    "attempt_number": repair_attempt_count,
+                })

@@ -19,18 +19,30 @@ EXTERNAL_STATE = "external_state"
 TASK_OUTPUT = "task_output"
 
 
+def normalize_criterion_reference(criterion: str) -> str:
+    """Shared safe surface identity, preserving words and diacritics."""
+    text = str(criterion or "").casefold()
+    text = re.sub(r"(?<!`)`([\w./\\-]+\.[a-z0-9]+)`(?!`)", r"\1", text)
+    return re.sub(r"\s+([.!])$", r"\1", re.sub(r"\s+", " ", text).strip())
+
+
+def normalize_mechanical_criterion(criterion: str) -> str:
+    """Mechanical language grammars additionally fold grammatical accents."""
+    return normalize_criterion_reference(_fold(str(criterion or "")))
+
+
 def verification_mode(criterion: str) -> str:
     """Decision authority is separate from the ability to gather evidence.
 
-    Only a bare presence/readability assertion is resolved without a model.
-    Content, structure and execution results always require semantic judgment.
+    Full-match grammars recognize only bare observable assertions. Mechanical
+    execution still requires exact criterion evidence before deciding its truth.
     """
-    text = _fold(str(criterion or "").strip())
+    text = normalize_mechanical_criterion(criterion)
     path = r"[\w./\\-]+\.[a-z0-9]+"
     nouns = r"(?:files?|archivos?|artifacts?|artefactos?)"
     prefix = r"(?:(?:the|a|an|el|la|los|las|un|una)\s+)?"
     adjective = r"(?:(?:project|required|requested|output|expected|del proyecto)\s+)?"
-    named = r"(?:" + nouns + r"\s+)?" + path
+    named = r"(?:" + nouns + r"\s+)?" + path + r"(?:\s+" + nouns + r")?"
     multiple = named + r"(?:(?:,\s*|\s+and\s+|\s+y\s+)" + named + r")*"
     subject = prefix + r"(?:" + multiple + r"|" + adjective + nouns + r"(?:\s+del proyecto)?)"
     readable = r"(?:\s+and\s+(?:is readable|can be read)|\s+y\s+(?:es legible|puede leerse))"
@@ -40,7 +52,38 @@ def verification_mode(criterion: str) -> str:
         return "file_readable"
     if re.fullmatch(subject + r"\s+(?:(?:is|are|ha(?:ve|s)? been|fue(?:ron)?|estan?)\s+)?(?:exists?|exist|existe[n]?|created|present|saved|cread[oa]s?|guardad[oa]s?)(?:\s+(?:in|en)\s+(?:the |el )?(?:workspace|project|proyecto))?[.!]?", text):
         return "file_exists"
+    if re.fullmatch(r"(?:the )?(?:script|command|program|process) "
+                    r"(?:executes|runs|exits) successfully"
+                    r"(?: with (?:temperature|input) [+-]?\d+(?:\.\d+)?)?[.!]?", text):
+        return "command_success"
+    # An aggregate execution predicate remains mechanical only when its input
+    # list contains labels/values, without another behavioral assertion. Actual
+    # coverage is checked against compiled cases by Evaluator, never by prose.
+    input_atom = r"(?:[+-]?\d+(?:\.\d+)?|(?:an? )?[a-z-]+ input|`[^`\n]+`|'[^'\n]+')"
+    input_list = input_atom + r"(?:(?:,\s*(?:and )?| and )" + input_atom + r")*"
+    if re.fullmatch(r"(?:the )?(?:script|command|program|process) "
+                    r"(?:executes|runs|exits) successfully with (?:inputs?|temperatures?) "
+                    + input_list + r"[.!]?", text):
+        return "case_set_success"
+    if re.fullmatch(r"(?:all )?(?:pytest|unittest)(?: tests)? pass[.!]?", text):
+        return "test_suite_success"
+    if re.fullmatch(r"(?:the )?(?:program|project|code) compiles successfully[.!]?", text):
+        return "compilation_success"
+    if re.fullmatch(r"ruff completes successfully[.!]?", text):
+        return "lint_success"
     return "semantic"
+
+
+def decision_authority(criterion: str) -> str:
+    """Evidence type selects collection resources; authority selects a judge."""
+    return "semantic" if verification_mode(criterion) == "semantic" else "deterministic"
+
+
+def mechanical_execution_requirement(criterion: str) -> str | None:
+    mode = verification_mode(criterion)
+    return {"command_success": "command", "case_set_success": "command", "compilation_success": "compilation",
+            "lint_success": "ruff", "test_suite_success":
+            "pytest" if "pytest" in normalize_mechanical_criterion(criterion) else "unittest"}.get(mode)
 
 
 def _fold(value: str) -> str:
@@ -69,6 +112,8 @@ _TEST_PATTERNS = (
                r"\b(?:exit status|exit code|stdout|output|codigo de salida|salida)\b"),
 )
 _RUNTIME_PATTERNS = (
+    re.compile(r"^(?:the )?(?:script|command|program|process)\b.{0,70}"
+               r"\b(?:executes?|runs?|exits?) successfully\b"),
     re.compile(r"\b(?:application|app|program|calculator|interface|feature|function|operation|"
                r"aplicacion|programa|calculadora|interfaz|funcion|operacion|acciones?)\b.{0,100}"
                r"\b(?:works?|working|functional|operates?|behaves?|performs?|responds?|handles?|"
@@ -117,6 +162,12 @@ def classify_criterion(criterion: str) -> str:
     Rules match predicates and their subjects, rather than rejecting a criterion
     because it contains one broad adjective such as ``correct`` or ``functional``.
     """
+    mode = verification_mode(criterion)
+    mechanical_evidence = {"file_exists": ARTIFACT_EXISTS, "file_readable": ARTIFACT_EXISTS,
+                           "command_success": RUNTIME_BEHAVIOR, "case_set_success": RUNTIME_BEHAVIOR, "test_suite_success": TEST_RESULT,
+                           "compilation_success": COMPILATION_RESULT, "lint_success": TEST_RESULT}
+    if mode in mechanical_evidence:
+        return mechanical_evidence[mode]
     text = _fold(str(criterion or "").strip())
     categories = semantic_categories(text)
     if categories & {"deployment", "publication", "network_action", "external_action"}:

@@ -1098,7 +1098,8 @@ class Store(IntegrationStoreMixin):
         item["evaluated_task_ids"] = _load(item.pop("evaluated_task_ids_json", "[]")) or []
         item["context_truncated"] = bool(item["context_truncated"])
         item["deterministic"] = bool(item["deterministic"])
-        for field in ("confidence", "criteria", "issues", "missing_evidence",
+        for field in ("confidence", "criteria", "issues", "missing_evidence", "evidence_fingerprint",
+                      "missing_verification_cases", "evidence_states",
                       "recommended_action", "evaluation_status", "failure_class",
                       "recommended_runtime_action", "reason", "routing_target"):
             item[field] = evaluation.get(field)
@@ -1618,6 +1619,20 @@ class Store(IntegrationStoreMixin):
             raise ValueError("Unknown recovery action.")
         now = utcnow()
         with self._connection(write=True) as c:
+            existing = c.execute(
+                "SELECT * FROM orchestration_recovery_actions WHERE orchestration_id=? "
+                "AND plan_task_id=? AND source_attempt=?", (oid, plan_task_id, int(source_attempt)),
+            ).fetchone()
+            if existing is not None:
+                prior = self._recovery(existing)
+                equivalent = (prior["source_evaluation_id"] == source_evaluation_id
+                              and prior["action"] == action
+                              and prior["instructions"] == sanitize(decision.get("instructions") or "")
+                              and prior["exclude_agent_ids"] == (decision.get("exclude_agent_ids") or [])
+                              and prior["affected_task_ids"] == (decision.get("affected_task_ids") or []))
+                if equivalent:
+                    return prior
+                raise ValueError("recovery_source_conflict: this execution attempt already has a different recovery decision.")
             run = c.execute("SELECT status FROM orchestration_runs WHERE id=?", (oid,)).fetchone()
             if run is None:
                 raise KeyError(oid)
@@ -1715,7 +1730,7 @@ class Store(IntegrationStoreMixin):
                         (now, oid, worker_id),
                     )
             elif action == "gather_evidence":
-                observers = [task_id for task_id in affected_ids if task_id != plan_task_id]
+                observers = [task_id for task_id in affected_ids if task_id != plan_task_id] or [plan_task_id]
                 if len(observers) != 1:
                     raise ValueError("Evidence gathering requires exactly one assigned observation Task.")
                 observer_id = observers[0]
@@ -1723,7 +1738,7 @@ class Store(IntegrationStoreMixin):
                     "SELECT state FROM orchestration_task_nodes WHERE orchestration_id=? AND plan_task_id=?",
                     (oid, observer_id),
                 ).fetchone()
-                if observer is None or observer["state"] != "runtime_success":
+                if observer is None or observer["state"] != ("recovery_pending" if observer_id == plan_task_id else "runtime_success"):
                     raise ValueError("Evidence observation Task must have completed runtime execution.")
                 cursor = c.execute(
                     "UPDATE orchestration_task_nodes SET state='runtime_success',evaluation_id=NULL,"

@@ -65,10 +65,6 @@ def _presence(criterion: str) -> bool:
     # classification: "file exists and contains logic" has independent value.
     if verification_mode(criterion) in {"file_exists", "file_readable"}:
         return True
-    if re.fullmatch(r"(?:(?:the|el|la)\s+)?[\w./\\-]+\.[a-z0-9]+\s+"
-                    r"(?:file|archivo)\s+(?:exists?|is readable|existe|es legible)[.!]?",
-                    criterion.strip(), re.I):
-        return True
     return bool(re.fullmatch(
         r"(?:(?:the|a|el|la)\s+)?(?:directory|folder|directorio|carpeta)\s+"
         r"[\w./\\-]+\s+(?:exists?|is created|existe|est[aá] creado)[.!]?",
@@ -86,6 +82,8 @@ def _mechanical(task: dict[str, Any]) -> str | None:
         if _READ_ONLY.search(_text(task)):
             return "prerequisite_inspection"
     if operations & {"create_file", "modify_file", "overwrite_file"}:
+        if operations == {"create_file"} and criteria and all(_presence(item) for item in criteria):
+            return "scaffold"
         if (re.search(r"\b(?:implement|implementation|logic|public api|conversion|"
                       r"implementar|implementaci[oó]n|l[oó]gica|conversi[oó]n)\b", _text(task), re.I)
                 and not _SCAFFOLD.search(_text(task))):
@@ -113,9 +111,11 @@ def _canonical_boundary(spec: dict[str, Any]) -> str:
     affirmative = [re.sub(r"\b(?:do not|don't|never|avoid|no|sin|evitar|nunca)\s+(?:\w+\s+){0,4}"
                           r"(?:empty (?:files?|director(?:y|ies)|folders?|artifacts?)|"
                           r"placeholders?|scaffolds?|archivos? vac[ií]os?|"
-                          r"directorios? vac[ií]os?|carpetas? vac[ií]as?)\b",
+                          r"directorios? vac[ií]os?|carpetas? vac[ií]as?|"
+                          r"empty [\w./\\-]+\.[a-z0-9]+)\b",
                           "", text, flags=re.I) for text in texts]
-    if any(_BOUNDARY.search(text) or _SCAFFOLD.search(text) for text in affirmative):
+    if any(_BOUNDARY.search(text) or _SCAFFOLD.search(text) or
+           re.search(r"\bempty [\w./\\-]+\.[a-z0-9]+\b", text, re.I) for text in affirmative):
         return "canonical_intermediate_or_phase_boundary"
     return ""
 
@@ -138,6 +138,27 @@ def _boundary(task: dict[str, Any], *, source: bool) -> str:
     if _BOUNDARY.search(_text(task)):
         return "task_phase_boundary"
     return ""
+
+
+def has_concrete_granularity_reason(reason: Any, tasks: list[dict[str, Any]],
+                                    summary: dict[str, Any]) -> bool:
+    """Require an explanation and graph-grounded independent value/boundaries.
+
+    Counts and Worker strategy are not evidence of meaningful Task granularity.
+    This metadata explains decomposition; it never grants a permission.
+    """
+    if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 1000:
+        return False
+    if not re.search(r"\b(?:independent|separately recoverable|public interfaces?|"
+                     r"approval|security|policy|rollback|recovery|consumers?|dependencies|"
+                     r"subsystems?|qa|audit|review|independiente[s]?|aprobaci[oó]n|"
+                     r"recuperaci[oó]n|fases)\b", reason, re.I):
+        return False
+    protected = {item[field] for item in summary.get("preserved_boundaries", [])
+                 if item["reason"] != "distinct_or_parallel_workers"
+                 for field in ("source_task_key", "target_task_key")}
+    return all(_mechanical(task) is None or task.get("key") in protected or
+               bool(_boundary(task, source=True)) for task in tasks)
 
 
 def _validate_graph(tasks: list[dict[str, Any]], keys: list[str]) -> None:

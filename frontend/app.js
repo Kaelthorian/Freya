@@ -1,13 +1,13 @@
 import { state, api, esc, number, route, toast, serialize } from './core.js';
 import { icon } from './icons.js';
 import { empty, button } from './components.js';
-import { freya, dashboard, agents, agentDetail, skills, skillDetail, tasks, taskDetail, logs, metricsView, settings, approvals } from './views.js';
+import { dashboard, agents, agentDetail, skills, skillDetail, tasks, taskDetail, logs, metricsView, settings, approvals } from './views.js';
 import { agentDialog, skillDialog, assignDialog, confirmAction, setDialogRefresh, chooseWorkspace } from './dialogs.js';
 
 const main = document.querySelector('#main-content');
-const pages = [['freya', 'Freya'], ['agents', 'Agents'], ['skills', 'Skills'], ['approvals', 'Approvals'], ['logs', 'Logs'], ['metrics', 'Metrics'], ['settings', 'Settings']];
-document.querySelector('#navigation').innerHTML = pages.map(([key, title], index) => `${index === 4 ? '<div class="nav-label secondary-nav-label">OBSERVABILITY</div>' : ''}${index === 6 ? '<div class="nav-divider"></div>' : ''}<a href="#/${key}" class="nav-item" data-nav="${key}">${icon(key)}<span>${title}</span>${key === 'agents' ? '<span class="nav-count" id="agent-count">0</span>' : ''}${key === 'dashboard' ? '<span class="nav-active-dot"></span>' : ''}</a>`).join('');
+const pages = [['dashboard', 'Dashboard'], ['logs', 'Logs'], ['skills', 'Skills']];
 let renderSequence = 0, refreshing = false, refreshAgain = false, debounceTimer, currentKey = '';
+let preparedAllLogsText = null;
 const freyaTerminalStatuses = new Set(['Success', 'Failed', 'Cancelled']);
 const freyaObservedStatuses = new Map();
 const freyaObservedApprovalIds = new Set();
@@ -272,19 +272,21 @@ function updateChrome() {
   const current = route(), title = pages.find(([page]) => page === current.page)?.[1] || 'Workspace';
   document.querySelector('#breadcrumb').textContent = title;
   document.querySelector('#breadcrumb-icon').innerHTML = icon(current.page);
-  document.title = `${title} · Agent Control Center`;
+  document.title = `FREYA · ${title}`;
   document.querySelectorAll('[data-nav]').forEach(link => { const active = link.dataset.nav === current.page; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
-  document.querySelector('#agent-count').textContent = number(state.agents.length);
   const m = state.metrics || {}, good = state.health?.status === 'ok';
   document.querySelector('#system-overview').innerHTML = `<span class="header-system-status"><span class="dot ${good ? 'success' : 'error'}"></span>${good ? 'System online' : 'API offline'}</span><span class="header-divider"></span><span>${icon('agents')}<strong>${number(m.active_agents)}</strong> active</span><span>${icon('activity')}<strong>${number(m.running_tasks)}</strong> running</span>`;
 }
 
 function preserveUI() {
   const active = document.activeElement, focused = main.contains(active) && active.name ? { name: active.name, filter: active.dataset.filter, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd, value: active.value } : null;
-  return { y: window.scrollY, focused, open: [...main.querySelectorAll('details[open][data-detail]')].map(element => element.dataset.detail) };
+  const consoleBody = main.querySelector('.mission-console-body');
+  return { y: window.scrollY, focused, consoleScrollTop: consoleBody?.scrollTop, open: [...main.querySelectorAll('details[open][data-detail]')].map(element => element.dataset.detail) };
 }
 function restoreUI(saved) {
   saved.open.forEach(id => [...main.querySelectorAll('details[data-detail]')].find(item => item.dataset.detail === id)?.setAttribute('open', ''));
+  const consoleBody = main.querySelector('.mission-console-body');
+  if (consoleBody && saved.consoleScrollTop != null) consoleBody.scrollTop = saved.consoleScrollTop;
   if (saved.focused) {
     const target = [...main.querySelectorAll('[name]')].find(item => item.name === saved.focused.name && item.dataset.filter === saved.focused.filter);
     if (target) { target.value = saved.focused.value; target.focus({ preventScroll: true }); try { target.setSelectionRange(saved.focused.selectionStart, saved.focused.selectionEnd); } catch {} }
@@ -293,12 +295,13 @@ function restoreUI(saved) {
 }
 
 async function render(navigation = false) {
-  const sequence = ++renderSequence, current = route(), saved = preserveUI();
+  const current = route();
+  if (current.page === 'freya') { location.hash = '#/dashboard'; return; }
+  const sequence = ++renderSequence, saved = preserveUI();
   updateChrome();
   try {
     let html;
-    if (current.page === 'freya') html = await freya();
-    else if (current.page === 'dashboard') html = dashboard();
+    if (current.page === 'dashboard') html = await dashboard();
     else if (current.page === 'agents') html = current.id ? await agentDetail(current.id) : agents();
     else if (current.page === 'skills') html = current.id ? await skillDetail(current.id) : skills();
     else if (current.page === 'tasks') { location.hash = current.id ? `#/logs?task_id=${encodeURIComponent(current.id)}` : '#/logs'; return; }
@@ -375,7 +378,30 @@ document.addEventListener('click', async event => {
     if (action === 'agent-tab') { state.tab = value; return render(); }
     if (action === 'clear-logs') { state.filters.logs = {}; return render(); }
     if (action === 'show-freya-activity') { state.freyaRunId = id; return render(); }
-    if (action === 'copy-logs') { const events = await api('/logs?limit=10000'); await navigator.clipboard.writeText(events.map(e => `${e.timestamp} [${e.level}] Task ${e.task_id || 'system'} Agent ${e.agent_name || e.agent_id || '—'} ${e.event_type}${e.tool ? ` · ${e.tool}` : ''}${e.capability ? ` · capability=${e.capability}` : ''}${e.policy_decision ? ` · policy=${e.policy_decision}` : ''}${e.error ? ` · ${e.error}` : ''}`).join('\n')); toast('All logs copied to the clipboard.'); return; }
+    if (action === 'copy-logs') {
+      event.preventDefault();
+      if (preparedAllLogsText !== null) {
+        const clipboardWrite = navigator.clipboard.writeText(preparedAllLogsText);
+        await clipboardWrite;
+        preparedAllLogsText = null;
+        toast('All logs copied to the clipboard.');
+        return;
+      }
+      const clipboardText = api('/logs?limit=10000').then(events => events.map(e => e.timestamp + ' [' + e.level + '] Task ' + (e.task_id || 'system') + ' Agent ' + (e.agent_name || e.agent_id || '—') + ' ' + e.event_type + (e.tool ? ' · ' + e.tool : '') + (e.capability ? ' · capability=' + e.capability : '') + (e.policy_decision ? ' · policy=' + e.policy_decision : '') + (e.error ? ' · ' + e.error : '')).join('\n'));
+      if (navigator.clipboard?.write && typeof ClipboardItem === 'function') {
+        try {
+          const item = new ClipboardItem({ 'text/plain': clipboardText.then(text => new Blob([text], { type: 'text/plain' })) });
+          await navigator.clipboard.write([item]);
+          toast('All logs copied to the clipboard.');
+          return;
+        } catch (clipboardError) {
+          if (clipboardError?.name !== 'NotAllowedError' && !/activation/i.test(String(clipboardError?.message || ''))) throw clipboardError;
+        }
+      }
+      preparedAllLogsText = await clipboardText;
+      toast('Logs are ready. Click Copy all logs again to copy them.');
+      return;
+    }
     if (action === 'copy-orchestration-logs') {
       target.disabled = true;
       const events = await orchestrationLogExport(id);

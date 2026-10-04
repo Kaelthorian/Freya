@@ -14,9 +14,9 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── task_spec.py          canonical intent, clarification questions, revisions and deterministic rendering
 │   ├── activity.py           persisted orchestration timeline, phase durations and performance read model
 │   ├── task_analyst.py       legacy version-3 rewrite compatibility
-│   ├── planner.py            semantic strategy and legacy plan schema compatibility
+│   ├── planner.py            semantic strategy, bounded repair with duplicate rejection and legacy plan schema compatibility
 │   ├── plan_scope.py         semantic scope guard and bounded pre-resolution plan snapshot
-│   ├── plan_evidence.py      criterion evidence classification and capability compatibility
+│   ├── plan_evidence.py      criterion evidence/authority classification, shared mechanical grammar and capability compatibility
 │   ├── plan_granularity.py   conservative mechanical-prerequisite fusion before runtime IDs and ownership
 │   ├── runtime_resources.py  global resource catalog, exact resolution and tool/capability compatibility
 │   ├── plan_compiler.py      scope/granularity/evidence reconciliation, write-overlap guard, ownership, resources, IDs and DAG validation
@@ -27,7 +27,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── execution_graph.py    deterministic DAG state transitions and dependency release
 │   ├── project_state.py      per-orchestration artifact metadata, bounded context snapshots and accepted updates
 │   ├── final_state.py        parent-owned current file snapshot and authoritative verification fact extraction
-│   ├── evaluator.py          final-state criterion mapping, presence/readability gates, semantic decisions and tool-free Ollama adapter
+│   ├── evaluator.py          final-state criterion binding, mechanical decisions, semantic review and tool-free Ollama adapter
 │   ├── recovery.py           origin-aware Worker recovery, read-only evidence gathering, validated replanning and log-grounded failure diagnosis
 │   ├── integration.py        global verifier contract, direct-proof decision, append-only replanner and grounded result integrator
 │   ├── integration_proof.py  bounded evidence catalog and explicit local-to-global criterion proof mapping
@@ -42,7 +42,7 @@ bounded task runtime and workspace-scoped programming tools.
 │   ├── transport.py          streamed Ollama chat, per-component limits, provider health and call telemetry
 │   ├── llm_trace.py          redacted, bounded model-call tracing and debug prompt capture
 │   ├── settings.py           central startup debug/budget settings, local/env precedence and spawn snapshot
-│   ├── verification_cases.py bounded case contracts, compatible QA task grouping and deterministic batch expansion
+│   ├── verification_cases.py bounded case contracts, exact surface reference matcher, compatible QA grouping and batch expansion
 │   ├── storage.py            transactional SQLite repository and metrics
 │   ├── schema.sql            persistent tables and indexes
 │   ├── config.py             agent defaults, catalogue and validation
@@ -96,6 +96,12 @@ selects them.
    `RuntimeResourceCatalog` from `capabilities.py` and `Toolbox` schemas.
    `planner.py` receives only semantic operation IDs and descriptions; it emits
    task meaning, kind, dependencies, outcomes, criteria, durable `owned_paths` and `write_targets`.
+   `planner.py` keeps an orchestration-local `RejectedSemanticPlanRegistry` and
+   runs `SemanticPlanRepairGuard` on every repair response before Plan Compiler.
+   It rejects repeats across the full history, checks a cause-specific
+   `required_plan_delta`, and permits at most three bounded Planner repairs;
+   only a materially corrected and Compiler-validated result proceeds to
+   runtime. `RepeatedSemanticPlanError` remains a secondary defense.
    `plan_compiler.py` calls `plan_scope.py` to remove work not supported by
    explicit Task Spec intent, then verifies unsupported claims and assigns one
    permanent plan-task owner per concrete write path. Before ID allocation, equivalent
@@ -185,10 +191,19 @@ selects them.
    the action ledger without model repair. `task.result_contract` logs sanitized
    diagnostics, while `freya.evaluation.completed` logs Python-aggregated
    criterion decisions and bounded input evidence for non-accepted outcomes.
-   Evaluator sends only unresolved semantic criteria to Ollama with bounded
-   current files and final test/command/lint/compile facts. It omits execution
-   history and resolves only bare existence/readability plus required evidence
-   gates deterministically. Unavailable resources route to Orchestrator for
+   Evaluator collects and binds full current facts by criterion ID before making
+   decisions; `evaluator.evidence_prepared` records those IDs before deterministic
+   evaluation or an LLM call. Only unresolved semantic criteria go to Ollama,
+   each with its associated file/case facts and an explicit criterion-evidence
+   map, not a global evidence bag. Exact and strong semantic/structural local-to-
+   global links reuse the same fact IDs without extra executions. Bare
+   existence/readability and explicitly mechanical run results remain
+   deterministic; expected cases gate both mechanical and semantic criteria.
+   Ledger case/step events reconstruct facts if final actions are absent.
+   `tests/test_evidence_recovery.py` exercises the real Worker/Python pipeline,
+   per-criterion evidence, missing-only case recovery and idempotent persistence.
+   Binding errors and unchanged evidence stop collection instead of rerunning QA.
+   Unavailable resources route to Orchestrator for
    resource review without granting permissions. Repair plus one retry is bounded
    to four calls on the same immutable final snapshot.
    The worker also stops byte-identical duplicate writes without requiring read-back and reports

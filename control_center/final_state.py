@@ -22,6 +22,65 @@ MAX_CONTENT_CHARS = 12_000
 MAX_SNAPSHOT_CHARS = 48_000
 
 
+def runtime_ledger_rows(runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover completed command observations from the parent-owned event ledger.
+
+    Events enrich their action by step ID. Diffs/readbacks only supply current
+    observation targets; historical content is never accepted as final content.
+    """
+    starts: dict[str, dict[str, Any]] = {}
+    rows: dict[str, dict[str, Any]] = {}
+    for event in runtime.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("event_type")
+        step = str(event.get("step_id") or event.get("event_id") or "")
+        if kind == "step.started" and step:
+            starts[step] = event
+        elif kind in {"step.finished", "verification.case_completed"}:
+            prior = rows.get(step, {})
+            row = {**starts.get(step, {}), **prior, **event}
+            if kind == "step.finished" and prior.get("case_id"):
+                # Real Runtime publishes case_completed before step.finished.
+                # The latter's input is argv metadata, not the case's stdin.
+                row.update({key: prior[key] for key in ("case_id", "input", "success", "status",
+                    "exit_code", "stdout", "stderr", "supports_acceptance_criterion_ids") if key in prior})
+            if kind == "verification.case_completed":
+                row.update(type="command_execution", tool="run_command")
+            if row.get("tool") != "run_command":
+                continue
+            arguments = row.get("arguments") or starts.get(step, {}).get("input") or {}
+            if isinstance(arguments, dict):
+                row.setdefault("command", arguments.get("argv", []))
+            row["event_id"] = step
+            if kind == "step.finished" and not prior.get("case_id"):
+                row["success"] = event.get("status") == "Success"
+                row["status"] = "passed" if row["success"] else "failed"
+            rows[step or str(event.get("id") or len(rows))] = row
+    return list(rows.values())
+
+
+def evidence_fingerprint(snapshot: dict[str, Any], criterion_ids: list[str] | None = None) -> str:
+    """Hash material current observations, excluding delivery/provenance IDs.
+
+    Equivalent re-execution must not manufacture progress by changing a runtime
+    ID, event ID, timestamp or evidence ordering.
+    """
+    rows = []
+    for kind in ("files", "verification_facts"):
+        for fact in snapshot.get(kind, []):
+            supported = fact.get("supports_acceptance_criterion_ids", [])
+            if kind == "verification_facts" and criterion_ids and supported and not set(supported) & set(criterion_ids):
+                continue
+            row = {key: fact[key] for key in (
+                "path", "exists", "readable", "content_sha256", "content", "case_id", "input",
+                "source_task_id", "command", "stdin_sha256", "kind", "check", "status", "exit_code",
+                "stdout", "stderr", "output", "program_started", "environment_available",
+                "error_class", "content_truncated", "supports_acceptance_criterion_ids") if key in fact}
+            rows.append(json.dumps(row, sort_keys=True, ensure_ascii=False))
+    return hashlib.sha256(json.dumps(sorted(set(rows)), ensure_ascii=False).encode()).hexdigest()
+
+
 def criterion_paths(text: str) -> list[str]:
     """Extract named relative file targets, without interpreting their content."""
     return re.findall(r"(?<![\w./\\-])[\w./\\-]+\.[A-Za-z0-9]+(?![\w./\\-])", text)
@@ -83,6 +142,17 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
         verification = runtime.get("verification") or result.get("verification") or {}
         evidence = verification.get("evidence", [])
         actions = result.get("actions", [])
+        # Reusing prior independent cases is safe across read-only observations,
+        # never across a subsequent mutation of the executable workspace. A
+        # dependency module can change without appearing in command argv.
+        mutated = bool(result.get("workspace_diffs")) or any(
+            isinstance(action, dict) and action.get("success") is True and action.get("changed") is True
+            and action.get("tool") in {"write_file", "edit_file"} for action in actions)
+        mutated |= any(isinstance(event, dict) and event.get("event_type") == "workspace.diff"
+                       for event in runtime.get("events", []))
+        if mutated:
+            latest = {identifier: fact for identifier, fact in latest.items()
+                      if fact.get("kind") in {"visual_result", "external_state"}}
         # Verification rows enrich the same action event rather than replay it.
         enriched = {item.get("event_id"): item for item in evidence
                     if isinstance(item, dict) and item.get("event_id")}
@@ -102,6 +172,16 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
             rows.append(row)
         rows.extend(item for item in evidence if isinstance(item, dict)
                     and (not item.get("event_id") or item["event_id"] not in consumed))
+        # Merge event metadata into the same observation, never create a second
+        # proof for the same step. Case events are authoritative Runtime facts.
+        by_event = {row.get("event_id"): index for index, row in enumerate(rows) if row.get("event_id")}
+        for event_row in runtime_ledger_rows(runtime):
+            index = by_event.get(event_row.get("event_id"))
+            if index is None:
+                rows.append(event_row)
+            else:
+                rows[index] = {**event_row, **rows[index], **{key: event_row[key] for key in
+                    ("case_id", "input", "supports_acceptance_criterion_ids") if key in event_row}}
         for row in rows:
             kind = verification_kind(row)
             if not kind:
@@ -123,10 +203,14 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
             status = row.get("status") or (
                 "passed" if row.get("success") is True else
                 "failed" if row.get("success") is False else "unknown")
-            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool) and status not in {"failed", "unavailable"}:
                 status = "passed" if exit_code == 0 else "failed"
+            if row.get("success") is False:
+                status = "failed"
             if row.get("policy_decision") in {"deny", "denied"} or row.get("error_class") in {
-                    *INFRASTRUCTURE_ERRORS, "policy_denied", "approval_denied", "unknown_tool"} or row.get("program_started") is False:
+                    *INFRASTRUCTURE_ERRORS, "policy_denied", "approval_denied", "unknown_tool"} or (
+                    row.get("program_started") is False or row.get("environment_available") is False
+                    or row.get("status") == "unavailable"):
                 status = "unavailable"
             fact = {key: row[key] for key in (
                 "check", "tool", "capability", "exit_code", "command", "path",
@@ -143,6 +227,8 @@ def final_verification_facts(runtime_tasks: list[dict[str, Any]]) -> list[dict[s
                         source_task_id=runtime.get("source_task_id") or row.get("source_task_id"),
                         worker_id=runtime.get("config", {}).get(
                             "worker_assignment", {}).get("worker_id") or row.get("worker_id"))
+            if isinstance(fact.get("input"), str) and not fact.get("stdin_sha256"):
+                fact["stdin_sha256"] = hashlib.sha256(fact["input"].encode()).hexdigest()
             if status == "unavailable":
                 fact.update(kind="execution_environment", type="execution_environment",
                             program_started=False, environment_available=False, exit_code=None,
@@ -191,6 +277,14 @@ def build_final_state(planned_task: dict[str, Any], runtime_tasks: list[dict[str
                      *((runtime.get("verification") or result.get("verification") or {}).get("evidence") or [])]:
             if isinstance(item, dict) and item.get("path"):
                 targets.append(item["path"])
+        for event in runtime.get("events", []):
+            if isinstance(event, dict) and event.get("event_type") in {"workspace.diff", "step.finished"}:
+                payload = event.get("output") if isinstance(event.get("output"), dict) else event
+                if payload.get("path"):
+                    targets.append(payload["path"])
+                arguments = event.get("input") if isinstance(event.get("input"), dict) else {}
+                if arguments.get("path"):
+                    targets.append(arguments["path"])
     targets = list(dict.fromkeys(path for path in targets if isinstance(path, str)
                                 and "runtime_envs" not in Path(path.replace("\\", "/")).parts))
     snapshot: dict[str, Any] = {"snapshot_version": SNAPSHOT_VERSION, "files": [],

@@ -230,9 +230,14 @@ Planner repair call.
 
 `unsupported_requirements` is a Planner proposal, not a resource decision.
 The Plan Compiler checks it against explicit Task Spec obligations and the
-runtime operation catalog. A false claim enters one bounded Planner repair;
-the repair input contains `canonical_task_spec`, `previous_semantic_plan`,
-`compiler_error` and preservation rules. Plan-wide `success_criteria` belong
+runtime operation catalog. A false claim enters bounded Planner repair; the
+repair input contains `canonical_task_spec`, `previous_semantic_plan`,
+`rejected_semantic_plans`, `compiler_error` and preservation rules. The Planner
+normally allows one repair. If its response repeats a previously rejected plan,
+a canonical plan fingerprint or the same action graph with the same compiler
+error rejects it and forces one additional full replan. A corrected proposal
+still passes all Compiler checks before it can be persisted or dispatched.
+Plan-wide `success_criteria` belong
 to Global Verification; task-level `success_criteria` belong to the local
 Evaluator. Exact matching text may create a proof link without copying a global
 criterion into a task.
@@ -245,8 +250,10 @@ or permissions. The Plan Compiler maps
 `execution.pytest`/`run_command`. The compiled plan schema is version 4 and is
 the only input to AgentFactory. Legacy capability and tool declarations are
 ignored as non-authoritative hints. Unknown operations and unsupported external
-actions fail closed; only genuine structural contradictions get one bounded
-repair. The Planner owns `task_kind`; the Task Analyst records only canonical
+actions fail closed; a rejected plan normally receives one bounded repair.
+Repeating a previously rejected proposal raises
+`RepeatedSemanticPlanError`, emits `planner.duplicate_plan_rejected` and forces
+a complete replan; exhaustion fails closed. The Planner owns `task_kind`; the Task Analyst records only canonical
 user intent. A write adds read-back verification, overwrite requires explicit
 replacement intent, and a Python mention in a debugging task does not
 reclassify it as program creation.
@@ -254,7 +261,9 @@ reclassify it as program creation.
 A Task may contain several `operations` and `semantic_needs`. Optional
 `granularity` contains bounded explanatory text in `logical_outcome`,
 `independent_value` and `preserve_boundary`; optional plan-level
-`granularity_reason` justifies counts above advisory ranges. These declarations
+`granularity_reason` justifies counts above normal ranges. Unjustified `simple`
+excess after normalization raises `OverfragmentedPlan`, even for `single_worker`.
+These declarations
 do not grant access. Before runtime IDs and ownership, Compiler absorbs only
 safe mechanical prerequisites into their direct logical successor. Meaningful
 checkpoints and independent QA remain separate. Existing orchestration logs
@@ -262,7 +271,9 @@ publish `planner.granularity_summary`, `plan_compiler.granularity_analyzed`,
 `plan_compiler.tasks_merged` and `plan_compiler.granularity_warning`. Merge events
 include proposed positional `source_task_ids`, generated `result_task_id`,
 reason and operations; analyzed/summary events include before/after counts,
-complexity and ID mapping. See [PLAN_GRANULARITY.md](PLAN_GRANULARITY.md).
+complexity and ID mapping. `planner.duplicate_plan_rejected` records repeat
+attempts without persisting raw model output. See
+[PLAN_GRANULARITY.md](PLAN_GRANULARITY.md).
 
 For example, the compiler persists a runtime task equivalent to:
 
@@ -677,21 +688,50 @@ structured response is invalid: `actions` contains bounded tool outcomes,
 including `changed` and `already_satisfied` for no-op writes; `artifacts` contains
 successful file changes, and `verification.evidence` may contain
 `command_execution` records with `command`, `exit_code`, `output` and
-`supports_acceptance_criteria`. Evaluator version 9 uses a parent-prepared `final_state` snapshot (version 1).
+`supports_acceptance_criteria`. Evaluator version 11 uses a parent-prepared `final_state` snapshot (version 1).
 The durable input includes current files, authoritative verification facts,
 criterion associations and explicit content limits. Current existence/readability
-for every required target are the only deterministic success checks. Content,
-structure, modification claims and test/command/lint/compile meaning go to the
-semantic model. `exit_code=0`, typed content checks and `symbol_presence` cannot
+for every required target are deterministic success checks. Explicit mechanical
+command/suite/lint/compiler success uses exactly bound or unambiguous final
+facts. Content, structure, modification claims and behavior go to the semantic
+model. `exit_code=0`, typed content checks and `symbol_presence` cannot
 accept a semantic criterion automatically. Historical actions, diffs,
 `already_satisfied`, old readbacks and superseded checks remain audit data.
 
+Before deterministic evaluation or an LLM call, `evaluator.evidence_prepared`
+records the stable criterion ID and its associated evidence IDs in
+`criterion_evidence`. The semantic request contains only unresolved criteria;
+each entry includes its ID/text and full associated facts, while the
+`criterion_evidence` map provides the explicit ID binding. It does not include a
+global `final_state` evidence bucket. A fact carries `evidence_id`,
+`criterion_id`, `type`, `source`, optional `verification_case_id`, `status`,
+input, stdout/stderr, exit code, and current file content/path when applicable.
+`evaluator.criterion_evidence_decided` remains the post-decision audit event.
+
 Independent verification tasks carry `verification_mode=independent_cases` and
-`verification_cases=[{"id":"case-id","input":"0\n"}]` through semantic and
+`verification_cases=[{"id":"case-id","input":"0\n","supports_criteria":["The script executes successfully with temperature 0."]}]` through semantic and
 compiled plans into task config. IDs must be unique and bounded; at most 20
 cases and 16000 characters per input are allowed. Each case runs the same
 model-selected argv in a fresh venv Python process through normal capability policy.
 `interactive_session` keeps a single multiline stdin invocation.
+`supports_criteria` is optional semantic criterion text. Compiler resolves it
+only after Task normalization, resource compilation and evidence reconciliation,
+against the final local criteria. Safe surface equality normalizes whitespace
+and paired inline-code paths; unknown and ambiguous references fail explicitly.
+Resolved `supports_acceptance_criterion_ids` are Compiler-owned. Each case may
+support several criteria and each criterion may receive several cases, including
+one aggregate execution criterion for all inputs. Worker actions, final facts
+and normalized evidence preserve the
+resolved links plus `case_id`, `input`, `stdin_sha256`, `verification_id` and
+`check_id`. No input-position or stdout association is inferred. Unlinked legacy
+commands remain evidence for semantic review. `evaluator.verification_case_bound`
+records criterion/case/evidence IDs and the declared association method.
+Resolved criterion IDs in case facts override text/context associations. Compiler events
+`verification_case_binding_started`, `verification_case_bound`,
+`verification_case_unbound` and `verification_case_binding_failed` use the
+`plan_compiler.` prefix and contain Task/case/reference identities without stdin.
+Reference errors include bounded available final criteria and original semantic
+Task keys for targeted repair; internal binding invariants fail without Planner repair.
 Runtime `verification.case_completed` events and structured actions expose
 `case_id`, exact sanitized `input`, technical status, `exit_code`, `stdout` and
 `stderr`. Evaluator receives these fields in final verification facts; a failed
@@ -711,6 +751,24 @@ block and fails conservatively for resource review without granting permissions
 or automatically retrying the incapable Worker. Failed criterion rows retain
 `origin_task_id`, cited `failed_facts` and `affected_artifacts` for granular Recovery.
 Existing JSON evaluation rows remain readable; no SQL migration is needed.
+
+Evaluation rows additionally expose `missing_verification_cases` (`task_id`,
+`case_id`), `evidence_states` (`criterion_id`, state: `missing`, `unbound`,
+`insufficient`, `contradictory`, `associated`) and `evidence_fingerprint`.
+Absent declared cases are coverage gates even for semantic criteria. Complete
+bound case sets prove explicit aggregate execution success deterministically;
+semantic output assertions still require review. Parent-owned case/step events
+can supply facts independently of serialized final actions. Global links reuse
+the same IDs with association method `global_local_link`.
+`evidence_binding_error` produces evaluation `error`, `reject` and Orchestrator
+routing, with no `gather_evidence`. `evaluator.criterion_evidence_decided` exposes
+criterion/evidence IDs, evidence type, case ID, association method, decision
+authority and evaluation result.
+Recovery v5 snapshots include `worker_id`, `evidence_before` and the missing
+case IDs; subsequent evaluations carry the material after fingerprint.
+`recovery.evidence_no_progress` and `recovery.source_conflict` stop repeated
+collection. Equivalent source-key decisions reuse the existing action; conflicting
+ones fail explicitly as `recovery_source_conflict`. No UNIQUE constraint is removed.
 
 Events distinguish `evaluation.final_state_snapshot_created`,
 `evaluation.deterministic_fact`, `evaluation.criterion.deterministic`,

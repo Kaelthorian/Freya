@@ -22,7 +22,7 @@ from control_center.evaluator import (
     validate_evaluation,
 )
 from control_center.final_state import build_final_state, final_verification_facts
-from control_center.plan_evidence import verification_mode
+from control_center.plan_evidence import verification_mode, decision_authority, classify_criterion
 from control_center.execution_graph import ExecutionGraph
 from control_center.planner import PLAN_SCHEMA_VERSION
 from control_center.storage import Store
@@ -103,6 +103,133 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(seen, [])
         self.assertEqual(outcome["metrics"]["criteria_deterministic"], 1)
 
+    def test_markdown_created_file_uses_final_state_without_history_or_model(self):
+        criterion = "The file `temperature_converter.py` is created in the workspace."
+        outcome, seen = self.run_evaluation([criterion], contents={"temperature_converter.py": "current"})
+        self.assertEqual(outcome["criteria"][0]["status"], "satisfied")
+        self.assertEqual(outcome["criterion_details"][0]["decision_source"], "deterministic")
+        self.assertEqual((seen, outcome["metrics"]["model_calls"]), ([], 0))
+
+    def test_surface_normalization_does_not_erase_semantic_claims(self):
+        for criterion in ("`app.py` exists and correctly converts Celsius.",
+                          "The file `app.py` is created in the workspace and contains correct code.",
+                          "The script executes successfully with temperature 0 and prints 32.00.",
+                          "All pytest tests pass and addition works correctly.",
+                          "`not a path` exists.", "``app.py`` exists."):
+            with self.subTest(criterion=criterion):
+                self.assertEqual(verification_mode(criterion), "semantic")
+                self.assertEqual(decision_authority(criterion), "semantic")
+        self.assertEqual(classify_criterion("The script executes successfully with temperature 0."), "runtime_behavior")
+
+    def test_exact_bound_command_success_and_failure_are_deterministic(self):
+        criterion = "The script executes successfully with temperature 0."
+        for code in (0, 1):
+            with self.subTest(code=code):
+                outcome, seen = self.run_evaluation([criterion], checks=[{
+                    "type": "command_execution", "case_id": "case_0", "input": "0\n",
+                    "stdin_sha256": "digest", "verification_id": "verify-zero", "check_id": "check-zero",
+                    "tool": "run_command", "command": ["python", "temperature_converter.py"],
+                    "program_started": True, "environment_available": True,
+                    "exit_code": code, "status": "passed" if code == 0 else "failed",
+                    "supports_acceptance_criteria": [criterion], "stdout": "32.00", "stderr": ""}])
+                detail = outcome["criterion_details"][0]
+                self.assertEqual(detail["status"], "satisfied" if code == 0 else "unsatisfied")
+                self.assertEqual(detail["decision_source"], "deterministic")
+                self.assertEqual(seen, [])
+                record = next(row for row in outcome["context_snapshot"]["evidence_catalog"] if row.get("case_id"))
+                for field in ("input", "stdin_sha256", "verification_id", "check_id"):
+                    self.assertIn(field, record)
+                association = next(event for event in outcome["events"] if event["event_type"] ==
+                                   "evaluator.verification_case_bound")
+                self.assertEqual(association["verification_case_id"], "case_0")
+                self.assertEqual(association["association_method"], "declared_verification_case")
+
+    def test_bound_infrastructure_failure_is_unknown_and_routes_to_orchestrator(self):
+        criterion = "The script executes successfully with temperature 0."
+        for fields in ({"status": "unavailable"}, {"program_started": False, "environment_available": False},
+                       {"program_started": False, "status": "passed", "exit_code": 0},
+                       {"environment_available": False, "status": "failed", "exit_code": 1}):
+            with self.subTest(fields=fields):
+                outcome, seen = self.run_evaluation([criterion], checks=[{
+                    "type": "command_execution", "case_id": "case_0", "input": "0",
+                    "supports_acceptance_criteria": [criterion], **fields}])
+                self.assertEqual(outcome["criteria"][0]["status"], "unknown")
+                self.assertEqual(outcome["routing_target"], "orchestrator")
+                self.assertEqual(seen, [])
+
+    def test_wrong_case_or_missing_case_link_cannot_auto_accept(self):
+        zero = "The script executes successfully with temperature 0."
+        hundred = "The script executes successfully with temperature 100."
+        for links in ([zero], []):
+            with self.subTest(links=links):
+                outcome, seen = self.run_evaluation([hundred], checks=[{
+                    "type": "command_execution", "case_id": "case_0", "input": "0",
+                    "tool": "run_command", "command": ["python", "temperature_converter.py"],
+                    "exit_code": 0, "status": "passed", "supports_acceptance_criteria": links}],
+                    model=lambda _, context: semantic(context["planned_task"]["success_criteria"], "unknown"))
+                self.assertEqual(outcome["criteria"][0]["status"], "unknown")
+                self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
+                self.assertEqual(len(seen), 1)
+
+    def test_invalid_input_case_is_direct_evidence_but_remains_semantic(self):
+        criterion = "The script handles an invalid input gracefully."
+        outcome, seen = self.run_evaluation([criterion], checks=[{
+            "type": "command_execution", "case_id": "case_invalid", "input": "abc\n",
+            "tool": "run_command", "exit_code": 0, "stdout": "Invalid input...",
+            "supports_acceptance_criteria": [criterion]}])
+        self.assertEqual(verification_mode(criterion), "semantic")
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
+        semantic_criterion = seen[0]["semantic_criteria"][0]
+        fact = semantic_criterion["evidence"][0]
+        self.assertEqual(semantic_criterion["criterion_id"], fact["criterion_id"])
+        self.assertEqual(fact["evidence_id"], seen[0]["criterion_evidence"][fact["criterion_id"]][0])
+        self.assertEqual(fact["verification_case_id"], "case_invalid")
+        self.assertEqual(fact["stdout"], "Invalid input...")
+        self.assertEqual(fact["association"], "declared_verification_case")
+
+    def test_explicit_runner_results_are_deterministic(self):
+        for criterion, command, capability in (
+            ("All pytest tests pass.", ["python", "-m", "pytest"], "execution.pytest"),
+            ("All unittest tests pass.", ["python", "-m", "unittest"], "execution.unittest"),
+            ("The program compiles successfully.", ["python", "-m", "py_compile", "app.py"], "execution.py_compile"),
+            ("Ruff completes successfully.", ["ruff", "check", "."], "execution.ruff")):
+            for code in (0, 1):
+                with self.subTest(criterion=criterion, code=code):
+                    outcome, seen = self.run_evaluation([criterion], checks=[{
+                        "tool": "run_command", "command": command, "capability": capability,
+                        "exit_code": code, "status": "passed" if code == 0 else "failed"}])
+                    self.assertEqual(outcome["criteria"][0]["status"], "satisfied" if code == 0 else "unsatisfied")
+                    self.assertEqual(outcome["criterion_details"][0]["decision_source"], "deterministic")
+                    self.assertEqual(seen, [])
+
+    def test_exact_final_pytest_status_without_exit_code_is_sufficient(self):
+        for status in ("passed", "failed"):
+            outcome, seen = self.run_evaluation(["All pytest tests pass."], checks=[{
+                "type": "pytest_result", "check": "tests:pytest", "status": status}])
+            self.assertEqual(outcome["criteria"][0]["status"], "satisfied" if status == "passed" else "unsatisfied")
+            self.assertEqual(seen, [])
+
+    def test_individual_pytest_test_does_not_prove_suite_success(self):
+        outcome, seen = self.run_evaluation(["All pytest tests pass."], checks=[{
+            "type": "pytest_result", "test_id": "test_addition", "status": "passed",
+            "tool": "run_command", "command": ["python", "-m", "pytest", "tests/test_addition.py"]}])
+        self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
+        self.assertEqual(len(seen), 1)
+
+    def test_case_id_links_preserve_normalized_metadata(self):
+        criteria = [{"id": "LC-1", "criterion": "The script executes successfully with temperature 0."},
+                    {"id": "LC-2", "criterion": "The script executes successfully with temperature 100."}]
+        fact = {"id": "F-case_0", "type": "command_execution", "case_id": "case_0", "input": "0\n",
+                "stdin_sha256": "digest", "verification_id": "v0", "check_id": "c0",
+                "status": "passed", "exit_code": 0, "supports_acceptance_criterion_ids": ["LC-1"]}
+        normalized = normalize_final_state_evidence({"verification_facts": [fact]}, {"acceptance_criteria": criteria})
+        self.assertEqual([ref["id"] for ref in normalized["by_criterion"][0]["evidence"]], ["F-case_0"])
+        self.assertEqual(normalized["by_criterion"][1]["evidence"], [])
+        record = normalized["records"][0]
+        for field in ("case_id", "input", "stdin_sha256", "verification_id", "check_id",
+                      "supports_acceptance_criterion_ids"):
+            self.assertEqual(record[field], fact[field])
+
     def test_created_deleted_history_uses_current_missing_file(self):
         outcome, seen = self.run_evaluation(["File x.js exists."], targets=["x.js"],
             result={"artifacts": [{"path": "x.js", "change_type": "created"},
@@ -145,7 +272,10 @@ class EvaluatorTests(unittest.TestCase):
                              "supports_acceptance_criteria": [criterion]}])
                 self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
                 self.assertEqual(len(seen), 1)
-                self.assertEqual(seen[0]["final_state"]["files"][0]["content"], "final code")
+                fact = seen[0]["semantic_criteria"][0]["evidence"][0]
+                self.assertEqual((fact["type"], fact["path"], fact["content"]),
+                                 ("file_readback", "app.js", "final code"))
+                self.assertNotIn("final_state", seen[0])
 
     def test_greeting_regression_has_final_content_without_history(self):
         criterion = "El archivo contiene hola mundo y debajo freya funcionando."
@@ -159,7 +289,9 @@ class EvaluatorTests(unittest.TestCase):
         serialized = json.dumps(seen[0], ensure_ascii=False)
         for obsolete in ("obsolete", "old readback", "already_satisfied", "workspace_diffs", "actions", "change_type"):
             self.assertNotIn(obsolete, serialized)
-        self.assertEqual(seen[0]["final_state"]["files"][0]["content"], "hola mundo\nfreya funcionando")
+        fact = seen[0]["semantic_criteria"][0]["evidence"][0]
+        self.assertEqual((fact["path"], fact["content"]),
+                         ("saludo.txt", "hola mundo\nfreya funcionando"))
         self.assertEqual(outcome["metrics"]["criteria_semantic"], 1)
 
     def test_mixed_criteria_only_semantic_content_goes_to_model(self):
@@ -173,7 +305,9 @@ class EvaluatorTests(unittest.TestCase):
         outcome, seen = self.run_evaluation(["Addition works correctly."], checks=[
             {"type": "test_result", "test_id": "test_addition", "status": "passed", "exit_code": 0}])
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0]["final_state"]["verification_facts"][0]["test_id"], "test_addition")
+        fact = seen[0]["semantic_criteria"][0]["evidence"][0]
+        self.assertEqual(fact["test_id"], "test_addition")
+        self.assertEqual(fact["association"], "test_id_reference")
         self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
 
     def test_failed_test_is_granular_semantic_fact(self):
@@ -185,12 +319,14 @@ class EvaluatorTests(unittest.TestCase):
         criteria = ["Addition works correctly.", "Division by zero is handled correctly."]
         def model(_, context):
             response = semantic(criteria)
+            failed = next(fact for fact in context["semantic_criteria"][1]["evidence"]
+                          if fact["status"] == "failed")
             response["criteria"][1].update(status="unsatisfied", reason="test_division_by_zero failed.",
-                evidence=[context["final_state"]["verification_facts"][-1]["id"]])
+                evidence=[failed["evidence_id"]])
             return response
         outcome, seen = self.run_evaluation(criteria, checks=checks, model=model)
-        facts = seen[0]["final_state"]["verification_facts"]
-        self.assertEqual(len(facts), 5)
+        facts = seen[0]["semantic_criteria"][1]["evidence"]
+        self.assertEqual(len(facts), 1)
         self.assertEqual([fact["test_id"] for fact in facts if fact["status"] == "failed"], ["test_division_by_zero"])
         self.assertEqual([item["status"] for item in outcome["criteria"]], ["satisfied", "unsatisfied"])
 
@@ -198,7 +334,7 @@ class EvaluatorTests(unittest.TestCase):
         checks = [{"type": "test_result", "test_id": "test_addition", "status": "failed", "output": "obsolete FAILURE"},
                   {"type": "test_result", "test_id": "test_addition", "status": "passed", "output": "final PASS"}]
         _, seen = self.run_evaluation(["Addition works correctly."], checks=checks)
-        facts = seen[0]["final_state"]["verification_facts"]
+        facts = seen[0]["semantic_criteria"][0]["evidence"]
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["status"], "passed")
         self.assertNotIn("obsolete FAILURE", json.dumps(seen[0]))
@@ -207,7 +343,9 @@ class EvaluatorTests(unittest.TestCase):
         outcome, seen = self.run_evaluation(["Program prints the requested greeting."], result={"actions": [
             {"tool": "run_command", "arguments": {"argv": ["python", "hello.py"]}, "success": True,
              "exit_code": 0, "stdout": "Hello World", "stderr": "", "output": "Hello World"}]})
-        fact = seen[0]["final_state"]["verification_facts"][0]
+        self.assertEqual(seen[0]["semantic_criteria"][0]["evidence"], [])
+        fact = next(row for row in outcome["context_snapshot"]["evidence_catalog"]
+                    if row["collection"] == "verification")
         self.assertEqual((fact["exit_code"], fact["stdout"], fact["stderr"]), (0, "Hello World", ""))
         self.assertEqual(outcome["metrics"]["criteria_deterministic"], 0)
 
@@ -216,12 +354,14 @@ class EvaluatorTests(unittest.TestCase):
             (["python", "-m", "py_compile", "app.py"], "execution.py_compile", "compilation")):
             for exit_code in (0, 1):
                 with self.subTest(command=command, exit_code=exit_code):
-                    _, seen = self.run_evaluation(["Code is correct."], checks=[
+                    outcome, seen = self.run_evaluation(["Code is correct."], checks=[
                         {"tool": "run_command", "command": command, "capability": capability,
                          "exit_code": exit_code, "stdout": "details", "stderr": ""}])
-                    fact = seen[0]["final_state"]["verification_facts"][0]
+                    fact = next(row for row in outcome["context_snapshot"]["evidence_catalog"]
+                                if row.get("kind"))
                     self.assertEqual(fact["kind"], kind)
                     self.assertEqual(fact["status"], "passed" if exit_code == 0 else "failed")
+                    self.assertEqual(seen[0]["semantic_criteria"][0]["evidence"], [])
 
     def test_pytest_missing_available_resources_requests_evidence_without_model(self):
         outcome, seen = self.run_evaluation(["All pytest tests pass."],
@@ -245,12 +385,12 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "accepted")
         self.assertEqual(len(seen), 1)
 
-    def test_failed_required_pytest_is_reviewed_semantically(self):
+    def test_failed_required_pytest_is_decided_deterministically(self):
         outcome, seen = self.run_evaluation(["All pytest tests pass."], checks=[
             {"check": "tests:pytest", "status": "failed", "exit_code": 1, "output": "one failed"}],
             model=lambda _, data: semantic(data["planned_task"]["success_criteria"], "unsatisfied"))
         self.assertEqual(outcome["status"], "rejected")
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen, [])
 
     def test_compile_verifiability_does_not_select_deterministic_content_judgment(self):
         for criterion in ("File app.js contains the exact requested code.", "JavaScript defines calculate().",
@@ -262,11 +402,11 @@ class EvaluatorTests(unittest.TestCase):
         def model(_, data):
             calls.append(copy.deepcopy(data))
             if len(calls) < 3:
-                data["final_state"]["files"][0]["content"] = "model mutation"
+                data["semantic_criteria"][0]["evidence"][0]["content"] = "model mutation"
                 return "invalid"
             return semantic(data["planned_task"]["success_criteria"])
         outcome, _ = self.run_evaluation(["app.js contains correct code."], contents={"app.js": "original"}, model=model)
-        self.assertEqual(calls[2]["final_state"]["files"][0]["content"], "original")
+        self.assertEqual(calls[2]["semantic_criteria"][0]["evidence"][0]["content"], "original")
         self.assertEqual(outcome["metrics"]["model_calls"], 3)
 
     def test_semantic_payload_bounded_and_omission_explicit(self):
@@ -285,12 +425,13 @@ class EvaluatorTests(unittest.TestCase):
         criteria = ["The Python script contains the requested greeting."]
         _, seen = self.run_evaluation(criteria,
             contents={f"file{index}.py": "x" * 12000 for index in range(15)})
-        state = seen[0]["final_state"]
-        self.assertTrue(state["omitted_records"])
-        included = {item["id"] for key in ("files", "verification_facts", "task_outputs")
-                    for item in state[key]}
-        self.assertTrue(all(ref["id"] in included for group in seen[0]["evidence_by_criterion"]
-                            for ref in group["evidence"]))
+        row = seen[0]["semantic_criteria"][0]
+        self.assertLess(len(row["evidence"]), 15)
+        self.assertTrue(seen[0]["context_truncated"])
+        self.assertTrue(any(item.get("content_truncated") for item in row["evidence"]))
+        included = {item["evidence_id"] for item in row["evidence"]}
+        self.assertEqual(set(seen[0]["criterion_evidence"][row["criterion_id"]]), included)
+        self.assertNotIn("final_state", seen[0])
 
     def test_final_output_claim_has_a_stable_observation_id(self):
         state = build_final_state({}, [{"id": "runtime-real", "result": {"summary": "final answer"}}], None)

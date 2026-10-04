@@ -23,7 +23,7 @@ from .security import sanitize
 from .transport import model_profile, model_request, request_json
 
 
-RECOVERY_VERSION = 4
+RECOVERY_VERSION = 5
 FAILURE_ANALYSIS_VERSION = 1
 RECOVERY_ACTIONS = {
     "retry_same_agent", "retry_different_agent", "replan_subgraph", "gather_evidence", "fail",
@@ -848,7 +848,13 @@ class RecoveryController:
         self.last_context = context
         if evaluation.get("status") == "accepted":
             raise RecoveryValidationError("Accepted evaluations must not enter recovery.")
-        if action_count >= max_actions:
+        evidence_hash = evaluation.get("evidence_fingerprint")
+        if evaluation.get("reason") == "evidence_binding_error":
+            decision = self._fail("evidence_binding_error: repair the evidence association, do not re-execute work.", task_id)
+        elif evidence_hash and any(item.get("action") == "gather_evidence" and
+                (item.get("snapshot") or {}).get("evidence_before") == evidence_hash for item in history):
+            decision = self._fail("evidence_binding_error: evidence is unchanged after gathering.", task_id)
+        elif action_count >= max_actions:
             decision = self._fail("The orchestration recovery-action budget is exhausted.", task_id)
         elif model_calls_used >= max_model_calls:
             decision = self._fail("The orchestration recovery model-call budget is exhausted.", task_id)

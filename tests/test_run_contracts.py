@@ -22,6 +22,9 @@ from control_center.runtime import Runtime
 from control_center.storage import Store
 from control_center.planner import semantic_plan_response_format
 from control_center.plan_compiler import compile_semantic_plan
+from control_center.planner import validate_plan, PlanValidationError
+from control_center.evaluator import Evaluator
+from tests.test_plan_granularity import CONVERTER_REQUEST, converter_plan
 from tests.test_task_spec import _analyst_response
 from tests import test_control_runtime as worker_fixtures
 
@@ -249,6 +252,61 @@ class InformationGroundingTests(unittest.TestCase):
 
 
 class CaseContractTests(unittest.TestCase):
+    def test_case_contract_cannot_be_lost_on_a_merged_implementation_task(self):
+        proposal = converter_plan()
+        creation = proposal['tasks'][0]
+        creation['verification_cases'] = [{'id': 'creation-check', 'input': '',
+                                          'supports_criteria': creation['success_criteria']}]
+        with self.assertRaisesRegex(PlanValidationError, 'testing tasks only'):
+            compile_semantic_plan(proposal, deterministic_task_spec(CONVERTER_REQUEST))
+
+    def test_case_links_are_resolved_after_merge_and_cannot_invent_criteria(self):
+        proposal = converter_plan()
+        checks = ['The script executes successfully with temperature 0.',
+                  'The script executes successfully with temperature 100.',
+                  'The script handles an invalid input gracefully.']
+        proposal['tasks'][2]['success_criteria'] = checks
+        for case, criterion in zip(proposal['tasks'][2]['verification_cases'], checks):
+            case['supports_criteria'] = [criterion]
+        compiled = compile_semantic_plan(proposal, deterministic_task_spec(CONVERTER_REQUEST))
+        self.assertEqual(compiled['task_count'], 2)
+        rows = {row['criterion']: row['id'] for row in compiled['criterion_links']['local']}
+        for case, criterion in zip(compiled['tasks'][1]['verification_cases'], checks):
+            self.assertEqual(case['supports_acceptance_criterion_ids'], [rows[criterion]])
+        self.assertEqual(validate_plan(compiled), compiled)
+        schema = semantic_plan_response_format({})['properties']['tasks']['items']['anyOf'][1]
+        fields = schema['properties']['verification_cases']['items']['properties']
+        self.assertIn('supports_criteria', fields)
+        self.assertNotIn('supports_acceptance_criterion_ids', fields)
+        for fields in ({'supports_criteria': ['Invented criterion.']},
+                       {'supports_acceptance_criterion_ids': ['LC-900']},
+                       {'capabilities': ['execution.python_script']}):
+            with self.subTest(fields=fields), self.assertRaises(PlanValidationError):
+                invalid = converter_plan()
+                invalid['tasks'][2]['verification_cases'][0].update(fields)
+                compile_semantic_plan(invalid, deterministic_task_spec(CONVERTER_REQUEST))
+        compiled['tasks'][1]['verification_cases'][0]['supports_acceptance_criterion_ids'] = ['LC-900']
+        with self.assertRaises(PlanValidationError):
+            validate_plan(compiled)
+
+    def test_case_links_do_not_normalize_input_or_accept_invalid_metadata(self):
+        case = {'id': 'session', 'input': ' 0\n\n 100\n', 'supports_criteria': ['A specific check.']}
+        self.assertEqual(normalize_cases([case]), [case])
+        for refs in ('not an array', [None], [''], ['x' * 1001]):
+            with self.subTest(refs=refs), self.assertRaises(ValueError):
+                normalize_cases([{**case, 'supports_criteria': refs}])
+
+    def test_grouped_sibling_cases_keep_their_own_criterion_links(self):
+        tasks = [{'key': f'case_{index}', 'objective': 'Run converter.py', 'description': 'Run converter.py',
+            'task_kind': 'testing', 'verification_mode': 'independent_cases',
+            'verification_cases': [{'id': f'input-{index}', 'input': value,
+                                    'supports_criteria': [f'Case {index} is correct.']}],
+            'operations': ['run_python_script'], 'depends_on': ['implement'],
+            'owned_paths': [], 'write_targets': [], 'success_criteria': [f'Case {index} is correct.']}
+            for index, value in enumerate(['0\n', '100\n', 'abc\n'])]
+        grouped, _, _ = group_case_tasks(tasks, [task['key'] for task in tasks])
+        self.assertEqual([case['supports_criteria'] for case in grouped[0]['verification_cases']],
+                         [[f'Case {index} is correct.'] for index in range(3)])
     def test_compiler_groups_cases_and_rewires_dependent_review(self):
         spec = deterministic_task_spec('Review existing converter.py in Python. Run with 0, 100 and abc.')
         tasks = [{'key': f'case-{index}', 'task_kind': 'testing',
@@ -349,6 +407,82 @@ class CaseContractTests(unittest.TestCase):
 class CaseRuntimeTests(unittest.TestCase):
     setUp = worker_fixtures.WorkerTests.setUp
     run_worker = worker_fixtures.WorkerTests.run_worker
+
+    def test_temperature_converter_plan_worker_venv_final_state_and_evaluation(self):
+        """Real Worker/venv processes with injected Planner and Evaluator replies."""
+        proposal = converter_plan()
+        exists = 'The file `temperature_converter.py` is created in the workspace.'
+        checks = ['The script executes successfully with temperature 0.',
+                  'The script executes successfully with temperature 100.',
+                  'The script handles an invalid input gracefully.']
+        proposal['tasks'][0]['success_criteria'] = [exists]
+        proposal['success_criteria'] = [exists]
+        proposal['tasks'][2]['success_criteria'] = checks
+        for case, criterion in zip(proposal['tasks'][2]['verification_cases'], checks):
+            case['supports_criteria'] = [criterion]
+        compiled = compile_semantic_plan(proposal, deterministic_task_spec(CONVERTER_REQUEST))
+        self.assertEqual((compiled['task_count'], compiled['worker_count']), (2, 1))
+        implementation, qa = compiled['tasks']
+        self.assertEqual(implementation['semantic_operations'], ['create_file', 'modify_file'])
+        self.assertEqual(qa['depends_on'], [implementation['id']])
+        source = ('try:\n    celsius = float(input("Celsius: "))\n'
+                  '    print(f"{celsius * 9 / 5 + 32:.2f}")\n'
+                  'except ValueError:\n    print("Invalid input")\n')
+        creation = self.run_worker([answer(calls=[('write_file', {
+            'path': 'temperature_converter.py', 'content': source})]), answer('Implemented')],
+            config={'verification': {'enabled': False}}, prompt=implementation['description'])
+        self.assertEqual(creation['status'], 'Success', creation.get('error'))
+        execution = self.run_worker([answer(calls=[('run_command', {
+            'argv': ['python', 'temperature_converter.py']})])],
+            tools=qa['required_tools'], config={'permissions': 'execute',
+            'verification_mode': qa['verification_mode'], 'verification_cases': qa['verification_cases'],
+            'verification': {'enabled': False},
+            'output': {'format': 'structured', 'include': ['summary', 'actions', 'artifacts',
+                                                          'verification', 'limitations']}},
+            prompt=qa['description'])
+        self.assertEqual(execution['status'], 'Success', execution.get('error'))
+        self.assertEqual(execution['model_calls'], 1)
+        execution['id'] = 'runtime-qa'
+        execution['source_task_id'] = qa['id']
+        rows = compiled['criterion_links']['local']
+        planned = {**qa, 'success_criteria': [row['criterion'] for row in rows],
+                   'acceptance_criteria': [{'id': row['id'], 'criterion': row['criterion']} for row in rows],
+                   'write_targets': ['temperature_converter.py']}
+        state = build_final_state(planned, [execution], str(self.workspace))
+        facts = state['verification_facts']
+        self.assertEqual([fact['case_id'] for fact in facts], ['case_0', 'case_100', 'case_invalid'])
+        self.assertEqual([fact['exit_code'] for fact in facts], [0, 0, 0])
+        for fact, output in zip(facts, ['32.00', '212.00', 'Invalid input']):
+            self.assertIn(output, fact['stdout'])
+            self.assertTrue(fact['program_started'])
+            self.assertTrue(fact['environment_available'])
+            self.assertIn('supports_acceptance_criterion_ids', fact)
+        reviewed = []
+        def review(_prompt, context):
+            reviewed.append(context)
+            self.assertEqual(context['planned_task']['success_criteria'], [rows[0]['criterion'], checks[2]])
+            group = next(group for group in context['semantic_criteria'] if group['criterion'] == checks[2])
+            invalid = next(fact for fact in group['evidence'] if fact.get('case_id') == 'case_invalid')
+            refs = [fact['evidence_id'] for fact in group['evidence']]
+            self.assertIn(invalid['evidence_id'], refs)
+            self.assertEqual({fact['case_id'] for fact in group['evidence'] if fact.get('case_id')},
+                             {'case_invalid'})
+            self.assertIn('Invalid input', invalid['stdout'])
+            source = next(fact for item in context['semantic_criteria'] for fact in item['evidence']
+                          if item['criterion'] == rows[0]['criterion'] and fact.get('type') == 'file_readback')
+            self.assertIn('ValueError', source['content'])
+            return {'criteria': [{'criterion': criterion, 'status': 'satisfied',
+                    'reason': 'Current source and direct case output satisfy the criterion.',
+                    'evidence': [invalid['evidence_id']], 'confidence': 1.0}
+                    for criterion in context['planned_task']['success_criteria']]}
+        outcome = Evaluator(review).evaluate(planned_task=planned,
+                    runtime_task={**execution, 'final_state': state}, execution_node={})
+        self.assertEqual(outcome['status'], 'accepted')
+        details = {row['criterion']: row for row in outcome['criterion_details']}
+        for criterion in [exists, *checks[:2]]:
+            self.assertEqual(details[criterion]['decision_source'], 'deterministic')
+        self.assertEqual(details[checks[2]]['decision_source'], 'semantic')
+        self.assertEqual((outcome['metrics']['model_calls'], len(reviewed)), (1, 1))
 
     def test_fenced_code_without_action_gets_one_tool_correction(self):
         result = self.run_worker([answer('```python\nprint("hello")\n```'),

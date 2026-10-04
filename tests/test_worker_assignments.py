@@ -500,17 +500,19 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
             execution_node=call["execution_node"],
         )
         criterion_evidence = next(
-            item for item in observed_context["evidence_by_criterion"]
+            item for item in observed_context["semantic_criteria"]
             if item["criterion"] == criterion
         )
         self.assertTrue(criterion_evidence["evidence"])
-        state = observed_context["final_state"]
-        self.assertTrue(state["files"])
+        self.assertTrue(observed_context["criterion_evidence"][criterion_evidence["criterion_id"]])
         self.assertNotIn("worker_context", observed_context)
         self.assertNotIn("runtime_task", observed_context)
-        for item in state["files"]:
-            if item["exists"]:
-                self.assertEqual(item["content"], (Path(call["runtime_task"]["workspace"]) / item["path"]).read_text(encoding="utf-8"))
+        readbacks = [item for item in criterion_evidence["evidence"]
+                     if item.get("type") == "file_readback"]
+        self.assertTrue(readbacks)
+        for item in readbacks:
+            self.assertEqual(item["content"],
+                             (Path(call["runtime_task"]["workspace"]) / item["path"]).read_text(encoding="utf-8"))
 
     def test_runtime_failure_prevents_worker_semantic_evaluation(self):
         plan = compile_plan([
@@ -596,11 +598,13 @@ class WorkerAssignmentRuntimeTests(unittest.TestCase):
                             for name, code in [("addition", 0), ("subtraction", 0), ("multiplication", 0),
                                                ("division", 0), ("test_division_by_zero", 1)]]})
         def review(_, context):
-            facts = context["final_state"]["verification_facts"]
+            criterion_row = next(item for item in context["semantic_criteria"]
+                                 if item["criterion"] == criterion)
+            facts = criterion_row["evidence"]
             failed = next(item for item in facts if item["status"] == "failed")
             return {"criteria": [{"criterion": criterion, "status": "partial", "confidence": 1,
                                   "reason": "The zero case needs revision; other operations passed.",
-                                  "evidence": [failed["id"]]}]}
+                                  "evidence": [failed["evidence_id"]]}]}
         recovery = FailRecovery()
         oid, _, runtime, _ = self.execute_plan(plan, evaluator=Evaluator(review), recovery=recovery,
                                                runtime=FactRuntime(self.store))

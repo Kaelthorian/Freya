@@ -6,18 +6,41 @@ import re
 import unicodedata
 from typing import Any
 
+from .plan_evidence import normalize_criterion_reference
+
 MAX_CASES = 20
 MAX_INPUT_CHARS = 16_000
 MODES = {"independent_cases", "interactive_session"}
 
 
-def normalize_cases(value: Any) -> list[dict[str, str]]:
+def criterion_reference_matches(reference: str, criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exact canonical surface equality; no substring, position or fuzzy match."""
+    canonical = normalize_criterion_reference(reference)
+    return [row for row in criteria
+            if normalize_criterion_reference(row["criterion"]) == canonical]
+
+
+def case_response_format(*, compiled: bool = False) -> dict[str, Any]:
+    properties = {"id": {"type": "string", "maxLength": 100},
+                  "input": {"type": "string", "maxLength": MAX_INPUT_CHARS},
+                  "supports_criteria": {"type": "array", "maxItems": 100,
+                                        "items": {"type": "string", "maxLength": 1000}}}
+    if compiled:
+        properties["supports_acceptance_criterion_ids"] = {
+            "type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1000}}
+    return {"type": "array", "maxItems": MAX_CASES, "items": {
+        "type": "object", "properties": properties,
+        "required": ["id", "input"], "additionalProperties": False}}
+
+
+def normalize_cases(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) > MAX_CASES:
         raise ValueError("verification_cases must contain at most 20 cases.")
     cases, used = [], set()
     for index, case in enumerate(value, 1):
-        if not isinstance(case, dict) or set(case) - {"id", "input"} or "input" not in case:
-            raise ValueError("A verification case needs id and input only.")
+        if (not isinstance(case, dict) or set(case) - {
+                "id", "input", "supports_criteria", "supports_acceptance_criterion_ids"} or "input" not in case):
+            raise ValueError("A verification case needs bounded id, input and optional criterion links only.")
         identifier = case.get("id", f"case-{index}")
         content = case["input"]
         if (not isinstance(identifier, str) or not re.fullmatch(r"[\w:-]{1,100}", identifier)
@@ -25,7 +48,16 @@ def normalize_cases(value: Any) -> list[dict[str, str]]:
                 or "\x00" in content):
             raise ValueError("Invalid or duplicate verification case identity/input.")
         used.add(identifier)
-        cases.append({"id": identifier, "input": content})
+        normalized = {"id": identifier, "input": content}
+        for field in ("supports_criteria", "supports_acceptance_criterion_ids"):
+            if field not in case:
+                continue
+            refs = case[field]
+            if (not isinstance(refs, list) or len(refs) > 100 or
+                    any(not isinstance(ref, str) or not ref.strip() or len(ref) > 1000 for ref in refs)):
+                raise ValueError("Verification case criterion links must be bounded non-empty text.")
+            normalized[field] = list(dict.fromkeys(ref.strip() for ref in refs))
+        cases.append(normalized)
     return cases
 
 
@@ -76,7 +108,7 @@ def _explicit_input_list(body: str) -> list[dict[str, str]]:
                             for i, value in enumerate(dict.fromkeys(values), 1)])
 
 
-def expand_case_calls(calls: list[dict[str, Any]], cases: list[dict[str, str]]) -> tuple[list[dict[str, Any]], bool]:
+def expand_case_calls(calls: list[dict[str, Any]], cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     """Expand one model-selected argv without bypassing normal tool/policy dispatch."""
     for index, call in enumerate(calls):
         function = call.get("function", {}) if isinstance(call, dict) else {}

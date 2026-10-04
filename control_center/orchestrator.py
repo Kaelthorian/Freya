@@ -21,11 +21,12 @@ from .recovery import (FAILURE_ANALYSIS_VERSION, RECOVERY_VERSION,
                        deterministic_failure_diagnosis,
                        semantic_failure_fingerprint)
 from .security import sanitize
-from .final_state import build_final_state, criterion_paths
+from .final_state import build_final_state, criterion_paths, evidence_fingerprint
 from .settings import get_settings
 from .evaluator import EVALUATION_FIELDS, EVALUATOR_VERSION, Evaluator, technical_failure_evaluation
 from .planner import MAX_PLAN_TASKS, PLAN_SCHEMA_VERSION, Planner
 from .plan_compiler import planned_write_target_grants
+from .plan_evidence import normalize_criterion_reference
 from .runtime_resources import planner_resource_context
 from .skills import skill_summary
 from .storage import ORCHESTRATION_ACTIVE_STATUSES, ORCHESTRATION_TERMINAL_STATUSES, utcnow
@@ -1110,8 +1111,6 @@ class Orchestrator(IntegrationOrchestrationMixin):
         if not isinstance(attempts, list):
             single = planning_metrics.get("semantic_compiler")
             attempts = [single] if isinstance(single, dict) else []
-        if not attempts:
-            return
         for compiler in attempts:
             if not isinstance(compiler, dict) or not compiler.get("started_at"):
                 continue
@@ -1345,6 +1344,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 item for item in self.store.get_execution_graph(oid)["nodes"]
                 if item["plan_task_id"] == planned_task_id
             )
+            task = self._observation_task(task, node)
             selection_attempt = int(node.get("attempt", 0)) + 1
             context = self._selection_context(current_run)
             required_agent_id = None
@@ -1728,7 +1728,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         unique_criteria: list[str] = []
         seen_criteria: set[str] = set()
         for item in criteria:
-            key = str(item.get("criterion") or "").strip().casefold()
+            key = normalize_criterion_reference(item.get("criterion"))
             if key and key not in seen_criteria:
                 seen_criteria.add(key)
                 unique_criteria.append(item["criterion"])
@@ -1876,6 +1876,9 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "description": "Worker Assignment: " + worker_id,
             "success_criteria": unique_criteria,
             "acceptance_criteria": acceptance_criteria,
+            "criterion_links": criterion_links,
+            "verification_cases": [{**case, "source_task_id": task["id"]}
+                                   for task, _, _ in task_runs for case in task.get("verification_cases", [])],
             "owned_paths": owned_paths, "write_targets": write_targets,
             "read_targets": list(dict.fromkeys(path for task, _, _ in task_runs
                                               for path in task.get("read_targets", []))),
@@ -1897,6 +1900,18 @@ class Orchestrator(IntegrationOrchestrationMixin):
         }
         # Serialized dispatch insertion order includes later Recovery attempts.
         snapshot_runs = [{**runtime, "source_task_id": task["id"]} for task, _, runtime in task_runs]
+        # A narrowed observation retains independent passed cases from earlier
+        # attempts. Last observation wins by stable check identity, not by run ID.
+        present_ids = {runtime["id"] for runtime in snapshot_runs}
+        for attempt in self.store.list_execution_attempts(oid):
+            runtime_id = attempt.get("runtime_task_id")
+            if attempt["plan_task_id"] in task_ids and runtime_id and runtime_id not in present_ids:
+                historical = self.store.get_task(runtime_id)
+                if historical["status"] == "Success":
+                    snapshot_runs.append({**historical, "source_task_id": attempt["plan_task_id"]})
+                    present_ids.add(runtime_id)
+        for runtime in snapshot_runs:
+            runtime["events"] = self.store.list_events(task_id=runtime["id"], limit=10000)
         execution_order = self.store.runtime_creation_order([runtime["id"] for runtime in snapshot_runs])
         order = {runtime_id: index for index, runtime_id in enumerate(execution_order)}
         snapshot_runs.sort(key=lambda runtime: order[runtime["id"]])
@@ -1914,6 +1929,22 @@ class Orchestrator(IntegrationOrchestrationMixin):
             "worker_id": worker_id, "assigned_task_ids": task_ids,
         }
         return planned, runtime_aggregate, execution_node, worker_context, criteria
+
+    def _observation_task(self, task: dict, node: dict) -> dict:
+        """Narrow an existing QA Task to missing cases, without changing policy."""
+        if not node.get("recovery_action_id") or not task.get("verification_cases"):
+            return task
+        recovery = self.store.get_recovery(node["recovery_action_id"])
+        if recovery["action"] != "gather_evidence":
+            return task
+        missing = (recovery.get("snapshot") or {}).get("missing_verification_cases") or []
+        wanted = {item["case_id"] for item in missing if item.get("task_id") == task["id"]}
+        if not wanted:
+            return task
+        cases = [case for case in task["verification_cases"] if case["id"] in wanted]
+        if {case["id"] for case in cases} != wanted:
+            raise ValueError("Evidence observation refers to an undeclared verification case.")
+        return {**task, "verification_cases": cases}
 
     def _evaluate_worker_assignment(self, oid: str, plan: dict, assignment: dict,
                                    deadline: float) -> None:
@@ -2028,13 +2059,14 @@ class Orchestrator(IntegrationOrchestrationMixin):
             return
 
         base_evaluation = {key: outcome[key] for key in EVALUATION_FIELDS if key in outcome}
-        base_evaluation.update({key: outcome[key] for key in ("reason", "routing_target") if key in outcome})
-        by_criterion = {str(item.get("criterion") or "").strip().casefold(): item
+        base_evaluation.update({key: outcome[key] for key in ("reason", "routing_target", "evidence_states",
+                               "missing_verification_cases") if key in outcome})
+        by_criterion = {normalize_criterion_reference(item.get("criterion")): item
                         for item in base_evaluation.get("criteria", []) if isinstance(item, dict)}
         criterion_results = []
         criterion_metadata = {item["criterion_id"]: item for item in criteria}
         for criterion in planned["acceptance_criteria"]:
-            decision = by_criterion.get(str(criterion["criterion"]).strip().casefold())
+            decision = by_criterion.get(normalize_criterion_reference(criterion["criterion"]))
             if decision is None:
                 decision = {"status": "unknown", "reason": "No criterion decision was returned.",
                             "evidence": []}
@@ -2068,6 +2100,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
         failed_criterion_ids = [item["criterion_id"] for item in failed_criteria]
         failed_task_id = failed_task_ids[0] if failed_task_ids else task_ids[0]
         metrics = dict(outcome.get("metrics") or {})
+        evaluation["evidence_fingerprint"] = evidence_fingerprint(runtime_aggregate["final_state"])
         metrics.update({
             "worker_evaluation_model_calls": int(metrics.get("model_calls", 0) or 0),
             "worker_evaluation_tokens": int(metrics.get("total_tokens", 0) or 0),
@@ -2190,6 +2223,24 @@ class Orchestrator(IntegrationOrchestrationMixin):
         revisions = self.store.list_plan_revisions(oid)
         history = [item for item in recoveries
                    if item["plan_task_id"] == task_id]
+        current_fingerprint = evaluation.get("evidence_fingerprint")
+        prior_observations = [item for item in recoveries if item["action"] == "gather_evidence"
+                              and (item.get("snapshot") or {}).get("worker_id") == worker_id]
+        occupied = [item for item in history if int(item["source_attempt"]) == int(target["attempt"])]
+        if occupied or (current_fingerprint and any(
+                (item.get("snapshot") or {}).get("evidence_before") == current_fingerprint
+                for item in prior_observations)):
+            reason = ("evidence_binding_error: recovery produced no new relevant observation."
+                      if not occupied else "evaluation_recovery_conflict: this source attempt already has a recovery decision.")
+            if self.store.fail_recovery_pending(oid, task_id, attempt=int(target["attempt"]),
+                    evaluation_id=target["evaluation_id"], reason=reason):
+                self.store.set_worker_status(oid, worker_id, "failed", evaluation_id=target["evaluation_id"])
+                self.store.add_orchestration_event(oid, {"event_type": "recovery.source_conflict" if occupied else "recovery.evidence_no_progress",
+                    "status": "Failed", "worker_id": worker_id, "task_id": task_id,
+                    "evidence_before": ((occupied or prior_observations)[-1].get("snapshot") or {}).get("evidence_before"),
+                    "evidence_after": current_fingerprint,
+                    "message": reason})
+            return
         def recorded_model_calls(item: dict) -> int:
             value = (item.get("metrics") or {}).get("model_calls", 0)
             return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
@@ -2267,7 +2318,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "message": "Required verification is unavailable under the current resource contract. Freya cannot grant it automatically.",
                 })
                 decision = {
-                    "action": "fail", "reason": "required_capability_unavailable: orchestrator resource review required.",
+                    "action": "fail", "reason": (str(evaluation.get("reason") or "required_capability_unavailable")
+                                                   + ": orchestrator review required."),
                     "instructions": "", "exclude_agent_ids": [], "affected_task_ids": [task_id],
                     "fingerprint": semantic_failure_fingerprint(task_id, current_agent_id or "", evaluation),
                     "metrics": {"model_calls": 0},
@@ -2364,8 +2416,15 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     "reason": "Missing evidence cannot be gathered within this Worker Assignment's existing read-only capabilities.",
                 }
             else:
-                observer = candidates[-1]
-                decision["affected_task_ids"] = [task_id, observer["id"]]
+                missing_cases = evaluation.get("missing_verification_cases") or []
+                missing_tasks = {item.get("task_id") for item in missing_cases}
+                relevant = [candidate for candidate in candidates if candidate["id"] in missing_tasks]
+                observer = (relevant or candidates)[-1]
+                if observer.get("verification_cases") and not relevant:
+                    decision = {**decision, "action": "fail", "affected_task_ids": [task_id],
+                        "reason": "evidence_insufficient: no missing declared case can be observed; repeating completed cases cannot repair evaluation."}
+                if decision["action"] == "gather_evidence":
+                    decision["affected_task_ids"] = list(dict.fromkeys([task_id, observer["id"]]))
                 missing = "; ".join(str(item) for item in evaluation.get("missing_evidence", [])[:10])
                 retry_prompt = (
                     "WORKER EVIDENCE COLLECTION (READ ONLY)\n"
@@ -2395,6 +2454,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
                 source_evaluation_id=target["evaluation_id"], decision=decision,
                 recovery_version=RECOVERY_VERSION, prompt=retry_prompt,
                 snapshot={"evaluation_status": evaluation.get("status"), "limits": limits,
+                          "worker_id": worker_id, "evidence_before": current_fingerprint,
+                          "missing_verification_cases": evaluation.get("missing_verification_cases", []),
                           "allowed_replan_scope": sorted(allowed_scope),
                           "workspace_state": workspace_state},
             )
@@ -3444,6 +3505,7 @@ class Orchestrator(IntegrationOrchestrationMixin):
                     runtime_context, project_context = self._project_context_for_dispatch(
                         oid, plan, task, run,
                     )
+                    task = self._observation_task(task, node)
                     worker_assignment = assignments_by_task.get(task["id"])
                     active_tools = list(agent.get("config", {}).get(
                         "active_task_tools", agent.get("tools", []),
@@ -3689,7 +3751,8 @@ class Orchestrator(IntegrationOrchestrationMixin):
             operational_prompt = render_task_spec(spec)
             with self.planner_lock:
                 try:
-                    plan = self.planner.create_plan_for_spec(spec, context)
+                    plan = self.planner.create_plan_for_spec(
+                        spec, context, orchestration_id=oid)
                 finally:
                     planning_metrics = dict(self.planner.metrics)
                     self._record_plan_compiler_activity(oid, planning_metrics)

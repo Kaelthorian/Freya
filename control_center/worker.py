@@ -1554,13 +1554,19 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                         "changed": result.changed,
                         "already_satisfied": bool(result.already_satisfied),
                         **({"case_id": call["verification_case"]["id"],
-                            "input": call["verification_case"]["input"]} if call.get("verification_case") else {}),
+                            "input": call["verification_case"]["input"],
+                            "supports_acceptance_criterion_ids": list(call["verification_case"].get(
+                                "supports_acceptance_criterion_ids", [])),
+                            "supports_acceptance_criteria": list(call["verification_case"].get(
+                                "supports_criteria", []))} if call.get("verification_case") else {}),
                     })
                     if call.get("verification_case"):
                         verification_state["attempted"] = True
                         publish("event", event={"event_type": "verification.case_completed",
                                 "case_id": call["verification_case"]["id"],
                                 "input": call["verification_case"]["input"],
+                                "supports_acceptance_criterion_ids": list(call["verification_case"].get(
+                                    "supports_acceptance_criterion_ids", [])),
                                 "exit_code": result.exit_code, "stdout": result.stdout,
                                 "stderr": result.stderr, "success": result.success,
                                 "status": "unavailable" if result.program_started is False else "passed" if result.success else "failed",
@@ -1573,6 +1579,10 @@ def _run_task_impl(task: dict[str, Any], project_root: Path,
                             verification.get("completion_criteria", []),
                             safe_args.get("argv", []), result,
                         )
+                        if call.get("verification_case"):
+                            # Do not broaden case links with exit/output heuristics.
+                            supported = [criterion for criterion in supported if criterion in
+                                         call["verification_case"].get("supports_criteria", [])]
                         if supported:
                             previously_supported = {
                                 criterion for row in command_evidence

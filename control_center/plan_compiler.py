@@ -5,18 +5,21 @@ import re
 import copy
 from typing import Any
 
-from .planner import MAX_PLAN_TASKS, TASK_KIND_VALUES, PlanValidationError, validate_plan
+from .planner import (MAX_PLAN_TASKS, TASK_KIND_VALUES, PlanValidationError, validate_plan,
+                      VerificationCriterionReferenceError, VerificationBindingInvariantError)
 from .plan_scope import reconcile_plan_scope, semantic_categories
 from .runtime_resources import RuntimeResourceCatalog, UnsupportedResourceRequirement
 from .task_spec import validate_task_spec, _action_matches, _scope_tokens
 from .cross_task import CrossTaskRequestError, normalize_owned_paths, owned_path_key
 from .plan_evidence import (
     COMPILATION_RESULT, RUNTIME_BEHAVIOR, TEST_RESULT, classify_criterion,
-    evidence_is_supported, verification_mode,
+    evidence_is_supported, verification_mode, decision_authority, normalize_criterion_reference,
 )
 from .security import sanitize
-from .verification_cases import normalize_cases, explicit_cases, group_case_tasks, MODES
-from .plan_granularity import EXPECTED_TASK_RANGES, normalize_task_granularity
+from .verification_cases import (normalize_cases, explicit_cases, group_case_tasks, MODES,
+                                 criterion_reference_matches)
+from .plan_granularity import (EXPECTED_TASK_RANGES, normalize_task_granularity,
+                               has_concrete_granularity_reason)
 
 
 WRITE_CAPABILITIES = {"filesystem.create", "filesystem.modify", "filesystem.overwrite"}
@@ -202,10 +205,56 @@ def _default_task_criterion(task: dict[str, Any], runtime: dict[str, Any]) -> st
     return "The task result is reported."
 
 
+_GLOBAL_CRITERION_CONCEPTS = {
+    "temperature_conversion": {"temperature", "celsius", "fahrenheit", "convert", "converts",
+                               "converted", "converting", "conversion", "converter"},
+    "console_input": {"input", "inputs", "console", "prompt", "prompts", "stdin", "enter"},
+    "result_display": {"output", "outputs", "display", "displays", "result", "results",
+                       "show", "shows", "print", "prints"},
+    "number_format": {"decimal", "decimals", "format", "formatted", "formatting", "precision"},
+    "invalid_input_handling": {"invalid", "error", "errors", "valueerror", "graceful", "gracefully",
+                               "handle", "handles", "handled", "handling", "crash", "crashes"},
+}
+_AGGREGATE_GLOBAL_CRITERION = re.compile(
+    r"\b(?:overall|entire|whole|all requirements|every requirement|complete(?:d)?|"
+    r"requested (?:result|outcome)|all requested|meets? the request)\b", re.I,
+)
+
+
+def _global_criterion_link_method(global_criterion: str, local_criterion: str) -> str | None:
+    """Return only explicit, aggregate, or strong semantic support relationships."""
+    if (normalize_criterion_reference(global_criterion)
+            == normalize_criterion_reference(local_criterion)):
+        return "exact_criterion"
+    if _AGGREGATE_GLOBAL_CRITERION.search(global_criterion):
+        return "aggregate_global_criterion"
+
+    def features(value: str) -> tuple[set[str], set[str], set[str]]:
+        tokens = set(_scope_tokens(value))
+        concepts = {name for name, variants in _GLOBAL_CRITERION_CONCEPTS.items()
+                    if tokens & variants}
+        paths = {item.replace("\\", "/").casefold() for item in
+                 re.findall(r"(?<![\w./\\-])[\w./\\-]+\.[A-Za-z][A-Za-z0-9]*(?![\w./\\-])", value)}
+        values = set(re.findall(r"(?<!\w)[+-]?\d+(?:\.\d+)?(?!\w)", value))
+        return concepts, paths, values
+
+    global_concepts, global_paths, global_values = features(global_criterion)
+    local_concepts, local_paths, local_values = features(local_criterion)
+    if global_paths & local_paths:
+        return "shared_artifact_path"
+    shared = global_concepts & local_concepts
+    if len(shared) >= 2:
+        return "shared_semantic_concepts"
+    if shared and global_values & local_values and shared & {
+            "temperature_conversion", "console_input", "result_display", "invalid_input_handling"}:
+        return "shared_case_and_behavior"
+    return None
+
+
 def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                                   resources: list[dict[str, Any]],
                                   dependencies: list[set[int]],
-                                  catalog: RuntimeResourceCatalog) -> None:
+                                  catalog: RuntimeResourceCatalog) -> dict[str, list[str]]:
     """Move a criterion to one clear verifier or reject it before execution."""
     ancestors = _dependency_ancestors(dependencies)
     original_criteria: list[list[str]] = []
@@ -230,6 +279,7 @@ def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                 task_key=keys[index], task_id=f"task-{index + 1}",
                 criterion=criterion[:300], evidence_type=evidence_type,
                 verification_mode=verification_mode(criterion),
+                decision_authority=decision_authority(criterion),
                 required_capabilities=list(capabilities), verifiable=supported,
                 reason=reason,
             )
@@ -284,6 +334,7 @@ def _reconcile_criterion_evidence(tasks: list[dict[str, Any]], keys: list[str],
                 reason="all original criteria were reassigned to their verifier",
             )
         task["success_criteria"] = criteria
+    return {key: list(task["success_criteria"]) for key, task in zip(keys, tasks)}
 
 
 def _assign_write_owners(tasks: list[dict[str, Any]],
@@ -495,6 +546,50 @@ def _compiler_event(catalog: RuntimeResourceCatalog, name: str, **details: Any) 
     catalog.compiler_events.append(sanitize({"event_type": name, **details}))
 
 
+def _bind_verification_cases(tasks: list[dict[str, Any]], keys: list[str],
+                             local_links: list[dict[str, Any]], catalog: RuntimeResourceCatalog,
+                             reconciled_criteria: dict[str, list[str]],
+                             origins: dict[tuple[str, str], list[str]]) -> None:
+    """Resolve many-to-many references only after reconciliation and ID allocation."""
+    for task, key in zip(tasks, keys):
+        local = [row for row in local_links if row["task_id"] == task["id"]]
+        available = [row["criterion"] for row in local]
+        for case in task.get("verification_cases", []):
+            identity = {"task_key": key, "task_id": task["id"],
+                        "case_id": case["id"], "verification_case_id": case["id"]}
+            _compiler_event(catalog, "plan_compiler.verification_case_binding_started", **identity)
+            refs = case.get("supports_criteria", [])
+            if not refs:
+                _compiler_event(catalog, "plan_compiler.verification_case_unbound", **identity,
+                                reason="no_explicit_criterion_reference")
+                continue
+            resolved = []
+            for ref in refs:
+                matches = criterion_reference_matches(ref, local)
+                if len(matches) != 1:
+                    error = VerificationCriterionReferenceError(
+                        task_key=key, task_id=task["id"], case_id=case["id"], reference=ref,
+                        available=available, reason="unknown" if not matches else "ambiguous",
+                        semantic_task_keys=origins.get((key, case["id"]), [key]))
+                    # Only a reference already resolved to this Task by the
+                    # reconciler can reveal an internal loss during binding.
+                    expected = [{"criterion": item} for item in reconciled_criteria.get(key, [])]
+                    internal = not matches and bool(criterion_reference_matches(ref, expected))
+                    _compiler_event(catalog, "plan_compiler.verification_case_binding_failed",
+                                    **error.diagnostics, error_type=("VerificationBindingInvariantError"
+                                    if internal else "VerificationCriterionReferenceError"))
+                    if internal:
+                        raise VerificationBindingInvariantError(error.diagnostics)
+                    raise error
+                resolved.append(matches[0])
+                _compiler_event(catalog, "plan_compiler.verification_case_bound", **identity,
+                                semantic_criterion_reference=ref,
+                                resolved_criterion_id=matches[0]["id"], criterion_id=matches[0]["id"],
+                                association_method="declared_verification_case")
+            case["supports_criteria"] = list(dict.fromkeys(row["criterion"] for row in resolved))
+            case["supports_acceptance_criterion_ids"] = list(dict.fromkeys(row["id"] for row in resolved))
+
+
 def _verify_unsupported_claims(plan: dict[str, Any], spec: dict[str, Any],
                                catalog: RuntimeResourceCatalog) -> None:
     claims = plan.get("unsupported_requirements", [])
@@ -637,12 +732,29 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
             raise PlanValidationError("Semantic task references are ambiguous.")
         keys.append(key)
     dependency_indexes = _dependency_indexes(raw_tasks, keys)
+    # Validate shape only. Criterion membership cannot be known until after
+    # reconciliation, which may transfer a producer's criterion to its verifier.
+    case_origins = {}
+    for item, key in zip(raw_tasks, keys):
+        try:
+            cases = normalize_cases(item.get("verification_cases", []))
+            if cases and item.get("task_kind") != "testing":
+                raise ValueError("Verification cases belong on testing tasks only.")
+            for case in cases:
+                case_origins[(key, case["id"])] = [key]
+                if "supports_acceptance_criterion_ids" in case:
+                    raise ValueError("Semantic cases cannot choose compiled criterion IDs.")
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
     if value.get('execution_strategy', 'single_worker') == 'single_worker':
         try:
             raw_tasks, keys, case_groups = group_case_tasks(raw_tasks, keys)
         except ValueError as exc:
             raise PlanValidationError(str(exc)) from exc
         for group in case_groups:
+            for case_id in group['case_ids']:
+                case_origins[(group['target_task_key'], case_id)] = [
+                    key for key in group['source_task_keys'] if (key, case_id) in case_origins]
             _compiler_event(resource_catalog, 'plan_compiler.verification_cases_grouped', **group)
         dependency_indexes = _dependency_indexes(raw_tasks, keys)
     # Preserve the existing multi-Worker delegation gate. Normalization only
@@ -673,12 +785,20 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
     _compiler_event(resource_catalog, "plan_compiler.granularity_analyzed", **granularity)
     if expected and len(raw_tasks) > expected[1]:
         justification = str(value.get("granularity_reason") or "").strip()
+        justified = has_concrete_granularity_reason(justification, raw_tasks, granularity)
         _compiler_event(resource_catalog, "plan_compiler.granularity_warning",
                         stage="after_normalization", task_count=len(raw_tasks),
                         task_complexity=value["task_complexity"], expected_range=list(expected),
                         justification=justification,
-                        reason="above_normal_range_justified" if justification else
-                               "explicit_granularity_justification_missing")
+                        reason="above_normal_range_justified" if justified else
+                               "explicit_granularity_justification_missing_or_invalid")
+        if value["task_complexity"] == "simple" and not justified:
+            _compiler_event(resource_catalog, "plan_compiler.overfragmented",
+                            stage="after_normalization", task_count=len(raw_tasks),
+                            execution_strategy=value.get("execution_strategy"),
+                            reason="unjustified_task_granularity")
+            raise OverfragmentedPlan("OverfragmentedPlan: excess simple Tasks need a concrete "
+                                     "granularity_reason grounded in independent outcomes or preserved boundaries.")
     dependency_indexes = _dependency_indexes(raw_tasks, keys)
     preliminary_resources = [
         compile_semantic_task_resources(item, resource_catalog, require_task_kind=True)
@@ -686,7 +806,7 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
     ]
     _validate_write_scope_overlaps(
         raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog)
-    _reconcile_criterion_evidence(
+    reconciled_criteria = _reconcile_criterion_evidence(
         raw_tasks, keys, preliminary_resources, dependency_indexes, resource_catalog)
     write_owners = _assign_write_owners(raw_tasks, resource_catalog)
     # Compatibility for older/injected planners that omit the typed case field.
@@ -774,11 +894,20 @@ def compile_semantic_plan(value: Any, task_spec: dict[str, Any], *,
     for task in tasks:
         for criterion in task["success_criteria"]:
             local_number += 1
+            supports = []
+            for index, global_item in enumerate(global_criteria, 1):
+                method = _global_criterion_link_method(global_item, criterion)
+                if method:
+                    global_id = f"GC-{index}"
+                    supports.append(global_id)
+                    _compiler_event(resource_catalog, "plan_compiler.local_global_criterion_bound",
+                                    local_criterion_id=f"lc-{local_number}",
+                                    global_criterion_id=global_id, method=method)
             links["local"].append({
-                "id": f"LC-{local_number}", "task_id": task["id"], "criterion": criterion,
-                "supports_global_criteria": [f"GC-{index}" for index, global_item in
-                                             enumerate(global_criteria, 1) if global_item == criterion],
+                "id": f"lc-{local_number}", "task_id": task["id"], "criterion": criterion,
+                "supports_global_criteria": supports,
             })
+    _bind_verification_cases(tasks, keys, links["local"], resource_catalog, reconciled_criteria, case_origins)
     for warning in resource_catalog.preferred_skill_warnings_for_tasks(tasks):
         if warning not in resource_catalog.preferred_skill_warnings:
             resource_catalog.preferred_skill_warnings.append(warning)

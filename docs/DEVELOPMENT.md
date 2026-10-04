@@ -19,7 +19,9 @@ with `SandboxUnavailable` when Docker/image is absent. Python runs with host
 account permissions; see [Python execution](PYTHON_EXECUTION.md).
 
 The runtime uses the Python standard library. If `psutil` is installed,
-`/api/health` reports CPU and RAM; otherwise telemetry is unavailable.
+`/api/health` reports CPU and RAM. Utilization, VRAM, and temperature for the
+first NVIDIA GPU are reported when `nvidia-smi` is available; otherwise GPU
+telemetry is marked unavailable.
 
 ## Run the platform
 
@@ -112,8 +114,23 @@ For example, `modify_file` derives `filesystem.modify` and `edit_file`; `create_
 `filesystem.create` and `write_file`; `run_python_script` derives
 `execution.python_script` and `run_command`; and `run_pytest` derives
 `execution.pytest` and `run_command`. Unknown operations and unsupported
-external actions fail closed. A real structural contradiction can receive one
-bounded repair; an unknown or unsupported resource cannot.
+external actions fail closed. A real structural contradiction normally gets
+bounded repairs with an explicit `required_plan_delta`. An orchestration-local
+`RejectedSemanticPlanRegistry` retains normalized proposals and causes from every
+Compiler or local guard rejection. Before any repair reaches Plan Compiler,
+`SemanticPlanRepairGuard` compares stable fingerprints and task-graph structure,
+ignoring generated IDs, metadata, field order and wording-only edits. It rejects
+rotations among earlier rejected plans, and a unique plan must still resolve the
+latest cause-specific delta. For `OverfragmentedPlan`, that means reducing the
+task count to the rejected plan's expected maximum or providing a concrete
+granularity reason grounded in actual independent outcomes or preserved
+boundaries. Dependency repairs must produce a valid, acyclic graph. The bounded
+loop permits one initial proposal and at most three Planner repairs; exhaustion
+raises `PlannerUnableToProduceAcceptablePlan` with a diagnostic `failure_reason`
+and rejected-plan history. `PlannerUnableToProduceMateriallyDifferentPlan`
+remains its compatibility base class, and `RepeatedSemanticPlanError` remains a
+secondary defense. Corrected proposals still pass Compiler validation. Other
+invalid repairs, unknown operations and unsupported resources fail closed.
 The Compiler owns the single scope reconciliation and semantic-plan validation
 pass. It verifies Planner `unsupported_requirements` against requested intent
 and the runtime catalog before resource resolution. Before runtime identities
@@ -123,6 +140,29 @@ checkpoints and approval/security/phase/recovery boundaries remain separate;
 existing compiled plans are not rewritten. See
 [PLAN_GRANULARITY.md](PLAN_GRANULARITY.md) for the algorithm, advisory ranges,
 events, converter example and focused regression command.
+After normalization, excess `simple` Tasks without a concrete graph-grounded
+`granularity_reason` fail as `OverfragmentedPlan`, independently of Worker count.
+`planner.plan_fingerprint_created`, `planner.rejected_plan_registered`,
+`planner.repair_delta_checked`, `planner.rejected_plan_repeated`,
+`planner.repair_required_delta_failed`, `planner.repair_no_material_change` and
+`planner.repair_material_change_accepted` record normalized fingerprints,
+changed fields, required deltas and pre-Compiler decisions without persisting
+raw model output. `planner.duplicate_plan_rejected` remains the secondary exact
+repeat defense. `tests.test_plan_decomposition` verifies renamed/equivalent
+plans, A/B rotation rejection, cause-specific deltas, full replanning and bounded
+exhaustion without unnecessary Compiler attempts.
+Verification cases may declare exact local `supports_criteria` texts; Compiler
+resolves stable criterion IDs and rejects unknown references.
+Binding runs after evidence reconciliation, so a runtime criterion moved from
+implementation to its dependent testing Task can be referenced there. The same
+surface matcher validates compiled plans; ambiguous references are rejected.
+`tests.test_verification_bindings` covers many-to-many and unbound cases,
+reassignment, targeted repair, internal invariants and the exact aggregate
+temperature-converter request through real Worker/venv processes.
+Final-state Evaluator resolves explicitly mechanical success from exactly bound facts while
+retaining semantic behavior review. The converter regression in
+`tests.test_run_contracts` uses real Worker/venv execution and injected model
+replies; it does not validate live Ollama behavior.
 The unique creator owns a path; one writer or one explicit owner also resolves
 deterministically. Unordered tasks cannot share a write target; use a real
 dependency for a sequential create/modify or modify/modify handoff. Such
@@ -311,6 +351,16 @@ block and fails conservatively for resource review without retrying the same
 Worker or granting permission. Existing read-only observer/testing Tasks may
 collect available evidence while preserving completed mutations.
 
+Run `python -m unittest tests.test_evidence_recovery -v` for ledger-only evidence,
+local/global fact sharing, complete and missing case sets, contradictory and
+unbound facts, and equivalent/concurrent recovery persistence. The converter
+regressions use real Worker execution and real Python processes with injected
+model replies: three cases finish the orchestration successfully without Recovery;
+two cases recover only the missing third and reuse earlier facts. A deliberately
+repeating observer stops after one gather action when material fingerprints match.
+They do not validate live Ollama semantic judgments. `missing_verification_cases`
+must narrow the existing QA activation rather than alter policy or plan intent.
+
 The built-in Task Analyst leaves an unnamed programming language and interface
 unspecified. The Planner chooses implementation strategy from the ready Task
 Spec; a clarification is asked only when a missing decision changes the product
@@ -326,14 +376,21 @@ stores a sanitized response preview, validation error, repair outcome and
 fallback status. A failed format repair is diagnostic and does not itself
 invalidate final-state evidence. Controlled command results require semantic interpretation.
 
-The semantic input is assembled in `Evaluator._semantic_context`: unresolved
-criteria and stable references accompany bounded `final_state.files`,
-`verification_facts` and final task outputs marked as agent claims. It excludes
-Worker history, old readbacks, actions, diffs and `already_satisfied`. Snapshot
-content limits and omission markers are explicit. Durable snapshots also preserve
-current evidence associations for Integration and criterion/fact origins for
-Recovery. Compiler telemetry reports `verification_mode` separately from evidence
-availability. See [Architecture](ARCHITECTURE.md#semantic-evaluation).
+`normalize_final_state_evidence`, called from `Evaluator._bounded_context`,
+collects and binds full facts to stable criterion IDs before deterministic
+evaluation. `evaluator.evidence_prepared` records the mapping before any model
+call. The Compiler resolves exact and strong semantic/structural local-to-global
+support; global criteria reuse the linked fact IDs without another execution.
+`Evaluator._semantic_context` then sends only unresolved criteria, with each
+criterion's own associated facts and an explicit `criterion_evidence` ID map. It
+does not send a global final-state evidence bag. The grouped facts preserve
+verification case IDs, input/output streams and file readback content where
+available. Worker history, old readbacks, actions, diffs and `already_satisfied`
+remain excluded. Snapshot content limits and omission markers are explicit.
+Durable snapshots preserve evidence associations for Integration and criterion/
+fact origins for Recovery. Compiler telemetry reports `verification_mode`
+separately from evidence availability. See
+[Architecture](ARCHITECTURE.md#semantic-evaluation).
 
 An identical write alone does not populate the Worker's current-attempt read map.
 Evaluator presence checks separately observe the current file, independent of

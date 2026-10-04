@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from control_center.api import Application
@@ -66,6 +68,38 @@ class ApiTests(unittest.TestCase):
         data = response.read()
         connection.close()
         return response.status, json.loads(data)
+
+    def test_gpu_telemetry_reads_nvidia_smi_metrics_and_caches_them(self):
+        app = Application(self.store, self.runtime, self.directory)
+        result = subprocess.CompletedProcess(
+            args=["nvidia-smi"], returncode=0,
+            stdout="NVIDIA Test GPU, 57, 2048, 8192, 63\n", stderr="",
+        )
+        with patch.object(app, "_psutil", None):
+            with patch("control_center.api.subprocess.run", return_value=result) as run:
+                telemetry = app.system()
+                cached = app.system()
+
+        self.assertFalse(telemetry["available"])
+        self.assertTrue(telemetry["gpu_available"])
+        self.assertEqual(telemetry["gpu_name"], "NVIDIA Test GPU")
+        self.assertEqual(telemetry["gpu_percent"], 57)
+        self.assertEqual(telemetry["gpu_memory_used_bytes"], 2048 * 1024 * 1024)
+        self.assertEqual(telemetry["gpu_memory_total_bytes"], 8192 * 1024 * 1024)
+        self.assertEqual(telemetry["gpu_temperature_c"], 63)
+        self.assertEqual(cached, telemetry)
+        run.assert_called_once()
+
+    def test_gpu_telemetry_is_unavailable_when_nvidia_smi_is_missing(self):
+        app = Application(self.store, self.runtime, self.directory)
+        with patch("control_center.api.subprocess.run", side_effect=FileNotFoundError):
+            telemetry = app._gpu_telemetry()
+
+        self.assertFalse(telemetry["gpu_available"])
+        self.assertIsNone(telemetry["gpu_percent"])
+        self.assertIsNone(telemetry["gpu_memory_used_bytes"])
+        self.assertIsNone(telemetry["gpu_memory_total_bytes"])
+        self.assertIsNone(telemetry["gpu_temperature_c"])
 
     def test_crud_snapshot_and_historical_logs_survive_delete(self):
         status, agent = self.request("POST", "/api/agents", {"name": "Developer"})
